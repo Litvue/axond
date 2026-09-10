@@ -2,8 +2,8 @@
 //!
 //! Boot sequence: install telemetry (logs always, OTLP only when configured),
 //! load + validate config (fail fast, delta B2), snapshot the environment for
-//! credential resolution, connect the configured usage sinks, build shared
-//! state, install the reload triggers, then serve.
+//! credential resolution, connect the configured usage sinks, open the Store,
+//! build shared state, install the reload triggers, then serve.
 //!
 //! Termination is the boot sequence in reverse and bounded at every step:
 //! `SIGTERM` fails readiness, then closes admission, then lets admitted requests
@@ -21,30 +21,28 @@ mod admin;
 mod admission;
 mod aliases;
 mod api;
-// Derived availability and discovery evaluation (#206). Contract only: no
-// provider is polled, no observation is persisted, and no request is enforced
-// against a verdict, so `serve` constructs no index and every snapshot carries
-// the empty one.
+// Withdrawn derived availability evaluation (#206, ADR 0063). `serve`
+// constructs no index; every snapshot carries the empty one.
 #[allow(dead_code)]
 mod availability;
-// Contracts only: the durable implementations land in #141/#142, so nothing
-// here is constructed by `serve` yet and the runtime stays stateless.
+// The catalogue import (`[catalog]`) and its models.dev adapter are what `serve`
+// constructs here. The control-plane, secret-store, and object-storage backends
+// alongside them belong to the withdrawn stateful product (ADR 0063) and
+// compile only because `desired_state` and the operator commands still name
+// their types.
 #[allow(dead_code)]
 mod backends;
 mod budget;
 mod config;
-// Stateful revision convergence (#142). `serve` constructs the production
-// projection after the listener is live. Candidates without a recoverable
-// project workload principal still receive the typed refusal and readiness
-// stays fail-closed; complete projected revisions can serve authenticated
-// inference.
+// Withdrawn stateful revision convergence (ADR 0063). `serve` constructs none
+// of it; the tree compiles for the backoff, clock, and secret-resolution types
+// the live modules still borrow from it.
 #[allow(dead_code)]
 mod convergence;
 mod credentials;
 mod discovery;
-// The desired-state domain the durable contracts are expressed in. Contract
-// only, for the same reason `backends` is: no revision is loaded or published on
-// the request path yet.
+// Withdrawn desired-state domain (ADR 0063). Compiles for the identifier and
+// policy types the live modules still borrow from it.
 #[allow(dead_code)]
 mod desired_state;
 mod error;
@@ -78,18 +76,16 @@ mod secret_redaction;
 mod settlement;
 mod shutdown;
 mod state;
-// The authenticated status contract (#199). Stateful `serve` constructs the
-// dependency and revision observers; `/healthz` remains process liveness while
-// `/readyz` reflects whether a complete serving snapshot is active.
+// Dependency observation behind the withdrawn `/admin/v1/status` diagnostic
+// (#199, ADR 0063). `serve` still runs the probes; no route reads them.
 #[allow(dead_code)]
 mod status;
 mod store;
 mod streaming;
 mod telemetry;
 // One tenant cannot reach another (#225), asserted at the layers a black-box
-// suite cannot see: row-level security, the administrative service over a real
-// journal, and the projection a replica converges on. Tests only, and every
-// scenario needs PostgreSQL.
+// suite cannot see: row-level security and the projection a replica converges
+// on. Tests only, and every scenario needs PostgreSQL.
 #[cfg(test)]
 mod tenant_isolation;
 #[cfg(test)]
@@ -103,40 +99,10 @@ use std::time::{Duration, Instant};
 use budget::{BudgetStore, StoreBudget};
 use clap::{Arg, ArgAction, Command};
 use config::Config;
-use convergence::{
-    ConvergenceSettings, LastKnownGood, MaterialLedger, Reconciler, RevisionCompiler,
-    RevisionStatus, SnapshotSink, SystemClock,
-};
 use rate_limit::RateLimiter;
 use revocation::RevocationStore;
 use state::{AppState, ReplicaObservability};
 use usage::UsageRuntime;
-
-/// Publishes the serving snapshot and its administrative directory as one
-/// generation. The directory is updated after the serving swap so a request can
-/// never gain administrative authority for a revision the data plane does not
-/// yet serve.
-struct ServingSnapshotSink {
-    state: AppState,
-    authorization: admin::runtime::AuthorizationState,
-}
-
-impl SnapshotSink for ServingSnapshotSink {
-    fn admit(&self, snapshot: &state::ConfigSnapshot) -> Result<(), policy::ActivationRefusal> {
-        SnapshotSink::admit(&self.state, snapshot)
-    }
-
-    fn publish(&self, snapshot: state::ConfigSnapshot) -> Result<(), state::SnapshotError> {
-        let authorization = snapshot.admin_authorization_handle();
-        SnapshotSink::publish(&self.state, snapshot)?;
-        self.authorization.update(authorization);
-        Ok(())
-    }
-
-    fn generation(&self) -> u64 {
-        SnapshotSink::generation(&self.state)
-    }
-}
 
 fn main() -> anyhow::Result<()> {
     let matches = cli().get_matches();
@@ -144,15 +110,10 @@ fn main() -> anyhow::Result<()> {
         Some(("mint", args)) => mint::run(args),
         Some(("keygen", args)) => mint::keygen(args),
         Some(("revoke", args)) => mint::revoke(args),
-        Some(("budget", args)) => match args.subcommand() {
-            Some(("migrate-redis", args)) => migrate_redis_budget(args),
-            _ => unreachable!("clap validates subcommands"),
-        },
         Some(("check", args)) => match args.subcommand() {
             Some(("preflight", args)) => preflight(args),
             _ => unreachable!("clap validates subcommands"),
         },
-        Some(("admin", args)) => admin::cli::run(args),
         Some(("migrate", args)) => match args.subcommand() {
             Some(("status", args)) => migrate_control_plane(args, Migration::Status),
             Some(("apply", args)) => migrate_control_plane(args, Migration::Apply),
@@ -166,11 +127,10 @@ fn main() -> anyhow::Result<()> {
 
 fn cli() -> Command {
     Command::new("axond")
-        .about("A stateless, self-hosted AI gateway")
+        .about("A store-backed, self-hosted AI gateway")
         .version(env!("CARGO_PKG_VERSION"))
         .subcommand_required(false)
         .arg_required_else_help(false)
-        .subcommand(admin::cli::command())
         .subcommand(
             Command::new("revoke")
                 .about("Add a minted-token JTI to the revocation denylist")
@@ -197,34 +157,6 @@ fn cli() -> Command {
                         .long("config")
                         .value_name("PATH")
                         .help("Config file path"),
-                ),
-        )
-        .subcommand(
-            Command::new("budget")
-                .about("Budget state maintenance")
-                .subcommand_required(true)
-                .subcommand(
-                    Command::new("migrate-redis")
-                        .about(
-                            "Move Redis budget state to the v2 layout `namespace_limit_microdollars` needs",
-                        )
-                        .arg(
-                            Arg::new("config")
-                                .long("config")
-                                .value_name("PATH")
-                                .help("Config file path"),
-                        )
-                        .arg(
-                            Arg::new("namespace")
-                                .long("namespace")
-                                .value_name("ID")
-                                .action(ArgAction::Append)
-                                .help(
-                                    "A namespace the v1 keys are attributed against; repeat \
-                                     once per namespace. Required in stateful mode, where the \
-                                     bootstrap file declares none",
-                                ),
-                        ),
                 ),
         )
         .subcommand(
@@ -493,48 +425,6 @@ fn migration_exit(which: Migration, report: &ops::migrate::Report) -> anyhow::Re
     }
 }
 
-/// Carry Redis budget state into the v2 key layout, with the fleet stopped.
-/// Separate from `serve` on purpose: enabling a namespace cap must not silently
-/// migrate (or reset) shared spend as a side effect of a rolling restart.
-fn migrate_redis_budget(args: &clap::ArgMatches) -> anyhow::Result<()> {
-    let config_path = args
-        .get_one::<String>("config")
-        .cloned()
-        .or_else(|| std::env::var("AXOND_CONFIG").ok())
-        .unwrap_or_else(|| "axond.toml".to_owned());
-    let config = Config::load(&config_path)
-        .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
-    let env: HashMap<String, String> = std::env::vars().collect();
-    let runtime = tokio::runtime::Runtime::new()?;
-    // The v1 keys are attributed against the namespaces that wrote them, which
-    // the file names in stateless mode and cannot name at all in stateful mode —
-    // there, `[[namespace]]` is control-plane owned, so the operator passes the
-    // list the projection serves with `--namespace`.
-    // Distinct: an id may legitimately appear twice, and the same id offered
-    // twice as a candidate owner of a key is not an ambiguity.
-    let namespaces: Vec<String> = args
-        .get_many::<String>("namespace")
-        .map(|ids| ids.cloned().collect::<Vec<_>>())
-        .unwrap_or_else(|| {
-            config
-                .namespace
-                .iter()
-                .map(|namespace| namespace.id.clone())
-                .collect()
-        })
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let report = runtime.block_on(budget::migrate_redis(&config.budget, &namespaces, &env))?;
-    eprintln!(
-        "migrated {} subject ledger(s) into {} namespace total(s), carrying {} micro-dollars; \
-         dropped {} stale reservation hash(es)",
-        report.subjects, report.namespaces, report.carried_microdollars, report.reservation_hashes
-    );
-    Ok(())
-}
-
 #[tokio::main]
 async fn serve() -> anyhow::Result<()> {
     // Held until shutdown so the exporters flush; a no-op when telemetry is off.
@@ -549,118 +439,14 @@ async fn serve() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to load config from `{config_path}`: {e}"))?;
 
     let env: HashMap<String, String> = std::env::vars().collect();
-    let bootstrap_config = config.clone();
-    // Resolve the cache before opening durable dependencies. A valid compiled
-    // serving record is the explicit permit for deferred backend construction;
-    // a missing or unauthenticated record never turns a stateful outage into a
-    // keyless process.
-    let cache = configured_cache(&config, &env)?;
-    // The encrypted serving cache contains the request-path projection. The
-    // signed desired-state sibling contains the administrative directory that
-    // authenticates a human OIDC identity's scope and role. Restore that view
-    // only when its verified revision is exactly the one the serving cache will
-    // restore; a stale or mismatched directory may never authorize against a
-    // different serving snapshot. If the signed sibling is absent or cannot be
-    // read, the data plane may still recover, but non-breakglass admin requests
-    // remain fail-closed until durable convergence returns.
-    let cached_authorization = if config.is_stateful() {
-        match cache.as_ref() {
-            Some(cache) if cache.compiled_exists() => match cache.load() {
-                Ok(Some(revision)) => {
-                    match desired_state::AuthorizationSnapshot::of(revision.state()) {
-                        Ok(authorization) => Some((revision.id(), Arc::new(authorization))),
-                        Err(error) => {
-                            tracing::warn!(
-                                error = %error,
-                                "the signed desired-state cache could not rebuild its administrative directory"
-                            );
-                            None
-                        }
-                    }
-                }
-                Ok(None) => None,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "the signed desired-state cache could not be authenticated for administrative recovery"
-                    );
-                    None
-                }
-            },
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let cached_serving = if config.is_stateful() {
-        match cache.as_ref() {
-            Some(cache) if cache.compiled_exists() => match cache.load_compiled() {
-                Ok(Some(record)) => match state::ConfigSnapshot::from_cached_serving(
-                    bootstrap_config.clone(),
-                    &env,
-                    record,
-                ) {
-                    Ok((revision, snapshot)) => {
-                        let snapshot = match cached_authorization.as_ref() {
-                            Some((authorization_revision, authorization))
-                                if *authorization_revision == revision =>
-                            {
-                                snapshot.with_admin_authorization(Arc::clone(authorization))
-                            }
-                            Some((authorization_revision, _)) => {
-                                tracing::warn!(
-                                    serving_revision = %revision,
-                                    authorization_revision = %authorization_revision,
-                                    "the signed and encrypted recovery caches name different revisions; cached OIDC administration remains unavailable"
-                                );
-                                snapshot
-                            }
-                            None => snapshot,
-                        };
-                        Some((revision, snapshot))
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            error = %error,
-                            "compiled serving cache was refused; the replica remains unready"
-                        );
-                        None
-                    }
-                },
-                Ok(None) => {
-                    tracing::warn!(
-                        "compiled serving cache disappeared during boot; the replica remains unready"
-                    );
-                    None
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "compiled serving cache could not be authenticated; the replica remains unready"
-                    );
-                    None
-                }
-            },
-            _ => None,
-        }
-    } else {
-        None
-    };
-    // Stateful boot is allowed to expose liveness, authenticated administration,
-    // and a 503 readiness result even when neither the control plane nor a valid
-    // compiled cache is available. This is the fail-closed boundary: the
-    // deferred store and convergence loop keep retrying, but no empty snapshot
-    // reaches inference.
-    let allow_recovery = config.is_stateful();
 
-    // No-datastore defaults: usage to stdout, budget always-allow. Durable
-    // usage sinks and shared (Redis / Postgres) budget backends are opt-in via
-    // config. Both are connected here, so a misconfigured datastore fails at
-    // boot rather than discarding records — or denying every request — later.
-    // A `[usage_journal]` section is what turns the best-effort path into a
-    // durable one, and it is connected here for the same reason: a deployment
-    // that asked for billing-grade usage and cannot reach its outbox must fail
-    // at boot rather than fail closed on every request (ADR 0049).
+    // Usage goes to stdout unless a sink is configured; durable sinks are
+    // connected here, so a misconfigured datastore fails at boot rather than
+    // discarding records later. A `[usage_journal]` section is what turns the
+    // best-effort path into a durable one, and it is connected here for the
+    // same reason: a deployment that asked for billing-grade usage and cannot
+    // reach its outbox must fail at boot rather than fail closed on every
+    // request (ADR 0049).
     let UsageRuntime {
         delivery: usage,
         worker: usage_worker,
@@ -675,9 +461,7 @@ async fn serve() -> anyhow::Result<()> {
         "usage delivery"
     );
     // Built before the stores and shared with them: the caps they enforce are
-    // read out of it per request, so a publication changes what is enforced
-    // without rebuilding a connection (#150). Until a control plane publishes,
-    // it holds exactly the bootstrap file's values.
+    // read out of it per request (#150). It holds the file's values.
     let policy = Arc::new(policy::PolicyRuntime::bootstrap(&config));
     let storage = config
         .storage
@@ -709,25 +493,6 @@ async fn serve() -> anyhow::Result<()> {
         tracing::info!(backend = revocation.name(), "token revocation");
     }
 
-    // Built before the inference state takes ownership of the config, and before
-    // the listener exists: stateful boot may defer an unavailable control plane so
-    // the listener can expose authenticated administration and fail-closed
-    // readiness while convergence retries. In stateless mode this opens nothing.
-    let change_signal = config
-        .is_stateful()
-        .then(|| Arc::new(convergence::ChangeSignal::new()));
-    let admin = admin::runtime::surface_with_change_signal_and_recovery(
-        &config,
-        &env,
-        change_signal.clone(),
-        allow_recovery,
-    )
-    .await
-    .map_err(|e| {
-        anyhow::anyhow!("a stateful deployment could not bring up its administrative surface: {e}")
-    })?;
-    let _ = admin.mode;
-
     // Metadata ingestion, brought up before the listener and owned by a task of
     // its own: every import runs off the request path, and a request cannot reach
     // the source or the store even indirectly (#146). A deployment that imports
@@ -738,33 +503,10 @@ async fn serve() -> anyhow::Result<()> {
     // later than the drain it cannot outlive, and nothing in the drain waits on
     // it.
     let (stop_catalogue, catalogue_stopped) = tokio::sync::oneshot::channel::<()>();
-    let catalogue = if allow_recovery {
-        backends::catalog_runtime::start_allow_unavailable(
-            &config.catalog,
-            config
-                .control_plane
-                .as_ref()
-                .and_then(|plane| plane.dsn_env.as_deref()),
-            &env,
-            async move {
-                let _ = catalogue_stopped.await;
-            },
-        )
-        .await
-    } else {
-        backends::catalog_runtime::start(
-            &config.catalog,
-            config
-                .control_plane
-                .as_ref()
-                .and_then(|plane| plane.dsn_env.as_deref()),
-            &env,
-            async move {
-                let _ = catalogue_stopped.await;
-            },
-        )
-        .await
-    }
+    let catalogue = backends::catalog_runtime::start(&config.catalog, None, &env, async move {
+        let _ = catalogue_stopped.await;
+    })
+    .await
     .map_err(|e| anyhow::anyhow!("catalogue import configuration failed: {e}"))?;
     if catalogue.is_some() {
         tracing::info!(
@@ -774,19 +516,12 @@ async fn serve() -> anyhow::Result<()> {
             "catalogue imports"
         );
     }
-    let admin = match catalogue.as_ref() {
-        Some(handle) => admin.with_catalog_handle(handle.clone()),
-        None => admin,
-    };
 
     // What this replica can say about itself: every dependency it opened is
     // observed, including the bounded catalogue report when imports are enabled.
     // No posture touches `/readyz`.
     let plan = ReplicaObservability::plan_with_catalogue(
-        admin
-            .control_plane
-            .as_ref()
-            .map(|observed| (Arc::clone(&observed.store), observed.pacing.clone())),
+        None,
         budget.as_ref(),
         rate_limiter.as_ref(),
         revocation.as_ref(),
@@ -806,17 +541,9 @@ async fn serve() -> anyhow::Result<()> {
         );
     }
     let (observability, status_refresher) = ReplicaObservability::observing(plan);
-    let revision_status = config
-        .is_stateful()
-        .then(|| Arc::new(RevisionStatus::new(Box::new(SystemClock))));
-    let observability = match revision_status.as_ref() {
-        Some(status) => observability.with_revision(Arc::clone(status)),
-        None => observability,
-    };
 
     // The catalogue report is added to whatever posture this replica already
-    // observes: importing metadata is orthogonal to administering a control
-    // plane, and a replica may do either, both, or neither.
+    // observes: a replica may import metadata or not.
     let observability = match catalogue.as_ref() {
         None => observability,
         Some(handle) => observability.with_catalogue(Arc::clone(handle.status())),
@@ -853,67 +580,9 @@ async fn serve() -> anyhow::Result<()> {
     // Kept past the router so the sinks can be flushed after the last request:
     // shutdown is the one point where durability outranks the request path.
     let resources = state.clone();
-    // Assemble the stateful convergence loop only after its immutable serving
-    // state exists. The first bootstrap attempt is started after the listener
-    // binds, so a slow control plane cannot delay liveness registration.
-    let reconciler = if config.is_stateful() {
-        let store = admin
-            .control_plane
-            .as_ref()
-            .map(|observed| Arc::clone(&observed.store))
-            .ok_or_else(|| anyhow::anyhow!("stateful boot opened no control-plane store"))?;
-        let resolver = admin
-            .secret_resolver
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| anyhow::anyhow!("stateful boot opened no secret resolver"))?;
-        let compiler = RevisionCompiler::with_secrets(
-            bootstrap_config,
-            env.clone(),
-            crate::convergence::StateModelProjection,
-            Arc::new(crate::convergence::SecretMaterialization::new(
-                resolver,
-                MaterialLedger::new(),
-            )),
-        );
-        let compiler = match catalogue.as_ref() {
-            Some(handle) => compiler.with_catalogue(handle.store()),
-            None => compiler,
-        };
-        let compiler = Arc::new(compiler);
-        let reconciler = Arc::new(Reconciler::with_status(
-            store,
-            compiler,
-            Arc::new(ServingSnapshotSink {
-                state: state.clone(),
-                authorization: admin.authorization.clone(),
-            }),
-            ConvergenceSettings::default(),
-            cache,
-            Arc::new(SystemClock),
-            revision_status
-                .clone()
-                .expect("stateful mode has a convergence status"),
-        ));
-        Some(reconciler)
-    } else {
-        None
-    };
 
-    if let (Some(reconciler), Some((revision, snapshot))) = (reconciler.as_ref(), cached_serving) {
-        reconciler
-            .restore_cached(revision, snapshot)
-            .map_err(|error| {
-                anyhow::anyhow!("compiled serving cache could not be restored: {error}")
-            })?;
-        tracing::info!(%revision, "restored compiled serving snapshot from last-known-good cache");
-    }
-
-    // ADR 0063: `/admin/v1` is unmounted. Management is `/api/v1`. The
-    // control-plane surface stays compiled (`mod admin`) for tests of the
-    // withdrawn tree, but `serve` does not merge it.
-    let inference = routes::router(state.clone());
-    let app = inference.layer(telemetry::TelemetryLayer);
+    // Inference under `/ns/{ns}/v1` and management under `/api/v1` (ADR 0063).
+    let app = routes::router(state.clone()).layer(telemetry::TelemetryLayer);
 
     tracing::info!(
         %bind,
@@ -959,30 +628,6 @@ async fn serve() -> anyhow::Result<()> {
             discovery::run(state, stop_discovery_rx).await;
         })
     };
-    let (stop_converging, stop_converging_rx) = tokio::sync::oneshot::channel::<()>();
-    let converging = reconciler.map(|reconciler| {
-        let shutdown = Arc::clone(&lifecycle);
-        let signal = change_signal
-            .clone()
-            .expect("stateful mode has a convergence change signal");
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = stop_converging_rx => {
-                    tracing::debug!("stateful convergence stopped by serve shutdown");
-                }
-                _ = async {
-                    match reconciler.bootstrap().await {
-                        Ok(revision) => tracing::info!(%revision, "stateful serving snapshot ready"),
-                        Err(error) => tracing::warn!(
-                            error = %error,
-                            "stateful bootstrap did not publish a snapshot; the bounded convergence loop will retry"
-                        ),
-                    }
-                    reconciler.run(signal, shutdown.closed()).await;
-                } => {}
-            }
-        })
-    });
     let served = axum::serve(listener, app).with_graceful_shutdown(drain);
     // Only used if the server ends without ever being signalled.
     let boot = shutdown::Plan::from(&resources.config().config.shutdown);
@@ -1006,10 +651,6 @@ async fn serve() -> anyhow::Result<()> {
     {
         discovering.abort();
         tracing::debug!("discovery task aborted at shutdown");
-    }
-    let _ = stop_converging.send(());
-    if let Some(converging) = converging {
-        let _ = converging.await;
     }
 
     // Nothing below waits on the import: its work is metadata, and the budget
@@ -1112,111 +753,9 @@ async fn serve() -> anyhow::Result<()> {
     }
 }
 
-/// Resolve the cache's path and signing key from references only. A partially
-/// configured cache is a boot configuration error; silently disabling it would
-/// turn a deployment mistake into an outage-only capacity failure.
-fn configured_cache(
-    config: &Config,
-    env: &HashMap<String, String>,
-) -> anyhow::Result<Option<LastKnownGood>> {
-    let path = config
-        .convergence
-        .cache_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty());
-    let key_name = config
-        .convergence
-        .cache_key_env
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty());
-    match (path, key_name) {
-        (None, None) => Ok(None),
-        (Some(path), Some(name)) => {
-            let key = env
-                .get(name)
-                .filter(|key| !key.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("last-known-good key env `{name}` is unset"))?;
-            LastKnownGood::from_base64(path, key)
-                .map(Some)
-                .map_err(|error| {
-                    anyhow::anyhow!("last-known-good cache configuration failed: {error}")
-                })
-        }
-        _ => anyhow::bail!("last-known-good cache requires both `cache_path` and `cache_key_env`"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_partial_last_known_good_configuration_is_rejected() {
-        let mut config = Config::from_toml_str(
-            "[[namespace]]\nid = \"platform\"\ndefault = true\n\
-             [[provider]]\nid = \"openai\"\nkind = \"openai\"\nbase_url = \"https://api.openai.com/v1\"\n\
-             [[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n",
-        )
-        .expect("a minimal stateless config");
-        config.convergence.cache_path = Some("/tmp/axond-lkg".to_owned());
-        let error = configured_cache(&config, &HashMap::new())
-            .expect_err("a cache without a key reference is not fail-closed configuration");
-        assert!(error.to_string().contains("requires both"), "{error}");
-    }
-
-    #[test]
-    fn a_short_last_known_good_key_is_rejected_without_rendering_it() {
-        let mut config = Config::from_toml_str(
-            "[[namespace]]\nid = \"platform\"\ndefault = true\n\
-             [[provider]]\nid = \"openai\"\nkind = \"openai\"\nbase_url = \"https://api.openai.com/v1\"\n\
-             [[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n",
-        )
-        .expect("a minimal stateless config");
-        config.convergence.cache_path = Some("/tmp/axond-lkg".to_owned());
-        config.convergence.cache_key_env = Some("GW_LKG_KEY".to_owned());
-        let env = HashMap::from([(
-            String::from("GW_LKG_KEY"),
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 16]),
-        )]);
-        let error = configured_cache(&config, &env)
-            .expect_err("the cache MAC key must meet the authenticated format bound");
-        assert!(error.to_string().contains("exactly 32 bytes"), "{error}");
-        assert!(!error.to_string().contains("7"), "{error}");
-    }
-
-    #[test]
-    fn a_cache_key_rejects_whitespace_and_raw_passphrases_without_rendering_them() {
-        let mut config = Config::from_toml_str(
-            "[[namespace]]\nid = \"platform\"\ndefault = true\n\
-             [[provider]]\nid = \"openai\"\nkind = \"openai\"\nbase_url = \"https://api.openai.com/v1\"\n\
-             [[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n",
-        )
-        .expect("a minimal stateless config");
-        config.convergence.cache_path = Some("/tmp/axond-lkg".to_owned());
-        config.convergence.cache_key_env = Some("GW_LKG_KEY".to_owned());
-        for key in [
-            " cache-signing-material-that-must-not-render ".to_owned(),
-            "cache-signing-material-that-must-not-render\n".to_owned(),
-        ] {
-            let env = HashMap::from([(String::from("GW_LKG_KEY"), key.clone())]);
-            let error = configured_cache(&config, &env).expect_err("whitespace must be refused");
-            assert!(error.to_string().contains("whitespace"), "{error}");
-            assert!(!error.to_string().contains(&key), "{error}");
-        }
-        let env = HashMap::from([(
-            String::from("GW_LKG_KEY"),
-            "cache-signing-material-that-must-not-render".to_owned(),
-        )]);
-        let error = configured_cache(&config, &env).expect_err("raw passphrases must be refused");
-        assert!(error.to_string().contains("base64"), "{error}");
-        assert!(
-            !error
-                .to_string()
-                .contains("cache-signing-material-that-must-not-render")
-        );
-    }
 
     /// The grammar itself, pinned: `axond <command> <action> --config PATH`, with
     /// the flag in one place. Operators write these into runbooks and Helm hooks,
@@ -1329,6 +868,26 @@ mod tests {
     fn no_subcommand_is_still_serve() {
         let matches = cli().try_get_matches_from(["axond"]).expect("serve");
         assert!(matches.subcommand().is_none());
+    }
+
+    /// The commands ADR 0063 withdrew with `/admin/v1` and the Redis budget
+    /// backend are unknown to the parser rather than accepted and inert.
+    #[test]
+    fn the_withdrawn_commands_are_not_parsed() {
+        for argv in [
+            vec!["axond", "admin", "state", "--config", "/etc/axond.toml"],
+            vec!["axond", "budget", "migrate-redis", "--config", "/etc/axond.toml"],
+        ] {
+            let error = cli()
+                .try_get_matches_from(&argv)
+                .expect_err("a withdrawn command must not parse");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
+                "`{}`: {error}",
+                argv.join(" ")
+            );
+        }
     }
 
     #[test]

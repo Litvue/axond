@@ -613,18 +613,6 @@ mod tests {
             cache.encode_compiled(&snapshot, revision.id()),
             Err(crate::convergence::LastKnownGoodError::CompiledIneligible { .. })
         ));
-        let error = match crate::state::ConfigSnapshot::from_cached_serving(
-            stateful_bootstrap(),
-            &HashMap::new(),
-            cached,
-        ) {
-            Ok(_) => panic!("authenticated flat-v2 credential material crossed a restart"),
-            Err(error) => error,
-        };
-        assert!(
-            error.contains("not eligible for cold restoration"),
-            "{error}"
-        );
     }
 
     #[tokio::test]
@@ -748,22 +736,8 @@ mod tests {
             snapshot.config.namespace[0].policy.is_none(),
             "blob-only static policy must not fabricate exact distributed caps"
         );
-
-        let cached = snapshot.cached_serving(revision.id());
-        let (_, restored) = crate::state::ConfigSnapshot::from_cached_serving(
-            stateful_bootstrap(),
-            &HashMap::new(),
-            cached,
-        )
-        .unwrap();
-        assert_eq!(restored.config.gateway_token_epoch[0].min_iat, 303);
-        assert!(
-            restored
-                .middleware("acme")
-                .has_scope(MiddlewareScope::Request)
-        );
-        assert!(restored.config.namespace[0].project.is_none());
-        assert!(restored.config.namespace[0].policy.is_none());
+        assert_eq!(snapshot.config.gateway_token_epoch[0].min_iat, 303);
+        assert!(snapshot.config.namespace[0].project.is_none());
     }
 
     #[test]
