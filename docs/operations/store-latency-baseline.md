@@ -31,7 +31,7 @@ the test database — so nothing carries over between them.
 | `steady-streamed` | Closed-loop paced SSE streams, read to completion. | The same path when the request holds no connection while streaming; TTFT is the number that moves. |
 | `burst` | Waves of simultaneous requests with a 250 ms pause between waves. | What a pool does when demand arrives all at once and goes away: fills, retains idle sessions up to the pool size, and reuses them on the next wave (#465). |
 | `summaries` | The steady buffered loop while management readers loop over `GET /api/v1/namespaces/platform/usage`. | Management reads sharing the connection or pool with inference, over a small index. |
-| `slow-store` | The same, over a usage index pre-seeded with hundreds of thousands of rows. | The slow-Store case without a fault injector: each summary holds the connection for a while, and inference queues behind it (#464). #463 bounds how many of those waiters occupy Tokio's blocking pool (one `spawn_blocking` at a time; the rest wait async and then 503). |
+| `slow-store` | The same, over a usage index pre-seeded with hundreds of thousands of rows. | Management summaries over a large index. After #464 they run on a read-only SQLite connection and do not take the inference dispatch slot. |
 | `large-payload` | Buffered requests carrying a large native prompt and relaying a 256 KiB answer. | The payload the gateway copies and re-encodes, on the same Store path (#466). |
 
 Two tiers offer the same scenarios at different scales:
@@ -330,8 +330,19 @@ What the phases say, on this host:
   in the 250–1000 ms bucket: throughput falls from 581 to 124 req/s and p99
   from 106 to 473 ms. Over a small index (`summaries`) the same readers cost
   almost nothing (554 req/s, resolve wait 28 ms). The coupling is the held
-  connection, not the number of summaries — the mechanism
-  [#464](https://github.com/Litvue/axond/issues/464) breaks.
+  connection, not the number of summaries. [#464](https://github.com/Litvue/axond/issues/464)
+  breaks that coupling: `summarize_usage` opens a second, read-only connection
+  (`PRAGMA query_only=ON`) to the same WAL file and has its own dispatch slot.
+  `EXPLAIN QUERY PLAN` of the summary `SELECT` is `SEARCH axond_store_usage USING INDEX sqlite_autoindex_axond_store_usage_1 (namespace=? AND period=?)`.
+  That is the unique `(namespace, period, request_id)` index, not a covering
+  `(namespace, period, model, status)` index. A covering index would speed the
+  fold (29 ms vs 38 ms at 200 000 rows in a release microbench) and would add a
+  second b-tree insert on every usage append. The reader lane is what keeps
+  the 38 ms fold off admits and charges. `:memory:` stores have no second
+  connection; those summaries still share the writer. `Config::load` refuses
+  `:memory:`, so a production store always has the reader. The unit test
+  `file_store_summaries_run_beside_a_held_writer_dispatch` holds the writer slot
+  and still completes a summary.
 - **On Postgres the pool isolates inference from summaries, and the charge is
   the cost.** `slow-store` leaves `namespace_resolve` at 2.8 ms wait / 2.0 ms
   query and inference at 783 req/s while each summary holds a session for
