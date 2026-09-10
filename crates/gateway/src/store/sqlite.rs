@@ -133,7 +133,7 @@ impl SqliteStore {
         migrate_tombstone_expires_at(&conn)?;
         migrate_provider_models_source(&conn)?;
         sweep_expired_holds(&conn)?;
-        let reader = open_reader(&conn)?;
+        let reader = open_reader(path, &conn)?;
         Ok(Self {
             writer: Lane::new(conn),
             reader,
@@ -388,7 +388,7 @@ fn unavailable(err: rusqlite::Error) -> StoreError {
 /// memory index exist for the read-only connection to attach to. The writer's
 /// `PRAGMA database_list` reports an empty file for `:memory:` and for
 /// `mode=memory` URIs alike, whichever spelling `path` used.
-fn open_reader(writer: &Connection) -> Result<Option<Lane>, StoreError> {
+fn open_reader(path: &str, writer: &Connection) -> Result<Option<Lane>, StoreError> {
     let file: String = writer
         .query_row(
             "SELECT file FROM pragma_database_list WHERE name = 'main'",
@@ -399,18 +399,58 @@ fn open_reader(writer: &Connection) -> Result<Option<Lane>, StoreError> {
     if file.is_empty() {
         return Ok(None);
     }
-    // `file` is the WAL's filesystem path. Opening `path` again would reuse a
-    // URI `mode=rw` / `mode=rwc` that SQLITE_OPEN_READ_ONLY then refuses.
-    let conn = Connection::open_with_flags(
-        &file,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| StoreError::Unavailable(format!("sqlite usage reader: {error}")))?;
+    // `file` is the WAL's filesystem path. Reopening `path` would keep a URI
+    // `mode=rw` / `mode=rwc` that SQLITE_OPEN_READ_ONLY then refuses. Other URI
+    // keys (vfs, cache, nolock, psow, immutable) stay so the two connections
+    // share a locking protocol.
+    let (filename, flags) = reader_open_target(path, &file);
+    let conn = Connection::open_with_flags(&filename, flags)
+        .map_err(|error| StoreError::Unavailable(format!("sqlite usage reader: {error}")))?;
     conn.pragma_update(None, "query_only", "ON")
         .map_err(unavailable)?;
     conn.pragma_update(None, "busy_timeout", 5000)
         .map_err(unavailable)?;
     Ok(Some(Lane::new(conn)))
+}
+
+fn reader_open_target(configured: &str, resolved_file: &str) -> (String, OpenFlags) {
+    let readonly = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Some(query) = sqlite_file_uri_query(configured) else {
+        return (resolved_file.to_owned(), readonly);
+    };
+    let mut uri = sqlite_file_uri(resolved_file);
+    uri.push_str("?mode=ro");
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+        if key.eq_ignore_ascii_case("mode") {
+            continue;
+        }
+        uri.push('&');
+        uri.push_str(pair);
+    }
+    (uri, readonly | OpenFlags::SQLITE_OPEN_URI)
+}
+
+fn sqlite_file_uri_query(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("file:")?;
+    let rest = rest.split_once('#').map(|(rest, _)| rest).unwrap_or(rest);
+    rest.split_once('?').map(|(_, query)| query)
+}
+
+fn sqlite_file_uri(file: &str) -> String {
+    let mut uri = String::from("file:");
+    for &byte in file.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                uri.push(char::from(byte));
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
 }
 
 fn now_ms() -> i64 {
@@ -2696,6 +2736,17 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn reader_open_target_replaces_mode_and_keeps_nolock() {
+        let (uri, flags) = super::reader_open_target(
+            "file:/data/store.sqlite?mode=rwc&nolock=1",
+            "/data/store.sqlite",
+        );
+        assert_eq!(uri, "file:/data/store.sqlite?mode=ro&nolock=1");
+        assert!(flags.contains(OpenFlags::SQLITE_OPEN_URI));
+        assert!(flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY));
+    }
+
     #[tokio::test]
     async fn a_file_uri_with_mode_rwc_still_opens_a_summary_reader() {
         let db = TempDb::new("summary-uri");
@@ -2711,6 +2762,24 @@ mod tests {
             .summarize_usage("wsp_x", "p")
             .await
             .expect("reader attached despite URI mode=rwc");
+        assert_eq!(rows, summary_rows(&THREE_ROWS_SUMMARY));
+    }
+
+    #[tokio::test]
+    async fn a_file_uri_with_nolock_still_opens_a_summary_reader() {
+        let db = TempDb::new("summary-nolock");
+        let uri = format!("file:{}?mode=rwc&nolock=1", db.0.display());
+        let store = SqliteStore::open(&uri).expect("uri open");
+        add_namespace(&store, "wsp_x").await;
+        store
+            .append_usage_batch(three_rows("wsp_x"))
+            .await
+            .expect("append");
+        let _held = store.hold_dispatch().await;
+        let rows = store
+            .summarize_usage("wsp_x", "p")
+            .await
+            .expect("reader keeps the writer's nolock URI option");
         assert_eq!(rows, summary_rows(&THREE_ROWS_SUMMARY));
     }
 
