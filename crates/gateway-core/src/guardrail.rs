@@ -1587,7 +1587,7 @@ impl io::Write for CountingWriter {
     }
 }
 
-fn serialized_json_len(value: &Value) -> Result<usize, MiddlewareError> {
+pub fn serialized_json_len(value: &Value) -> Result<usize, MiddlewareError> {
     let mut writer = CountingWriter::default();
     serde_json::to_writer(&mut writer, value).map_err(|_| MiddlewareError::Failed)?;
     writer.flush().map_err(|_| MiddlewareError::Failed)?;
@@ -2313,6 +2313,19 @@ mod tests {
             pattern: r"[a-z]+@example\.com".to_owned(),
             action: GuardrailAction::Redact,
         }
+    }
+
+    #[test]
+    fn serialized_json_len_matches_compact_to_string_without_the_string() {
+        let body = json!({
+            "model": "upstream-model",
+            "unknown_native_field": {"keep": true},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        assert_eq!(
+            serialized_json_len(&body).unwrap(),
+            serde_json::to_string(&body).unwrap().len()
+        );
     }
 
     fn state_and_token(
