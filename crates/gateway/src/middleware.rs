@@ -33,7 +33,7 @@ use crate::config::Config;
 use crate::desired_state::ContentMiddlewareRegistration;
 use crate::error::GatewayError;
 use crate::rate_limit::{RateLimitError, RateLimitKey, RateLimitPermit};
-use crate::settlement::SettlementReservation;
+use crate::settlement::{SettlementReservation, SettlementSlot};
 use crate::state::AppState;
 use crate::store::BudgetAdmit;
 
@@ -961,7 +961,9 @@ pub struct MiddlewareExecution {
     /// The settlement capacity the request reserved at admission, carried here
     /// because this owner already follows the request into buffered completion
     /// or streaming accounting — wherever its one settlement is spawned from.
-    settlement: Option<SettlementReservation>,
+    /// Shared with [`CoreBudgetHold`] so cancellation consumes this slot
+    /// instead of `try_spawn`ing a second one.
+    settlement: SettlementSlot,
 }
 
 struct InvocationCapacity {
@@ -1004,7 +1006,7 @@ impl MiddlewareExecution {
             surface,
             core_rate_limit_permit: None,
             core_budget: None,
-            settlement: None,
+            settlement: SettlementSlot::default(),
         }
     }
 
@@ -1021,14 +1023,20 @@ impl MiddlewareExecution {
             surface: None,
             core_rate_limit_permit: None,
             core_budget: None,
-            settlement: None,
+            settlement: SettlementSlot::default(),
         }
     }
 
     /// Hold the settlement capacity admission reserved for this request until
     /// the path that settles it takes it back with [`Self::take_settlement`].
     pub(crate) fn reserve_settlement(&mut self, reservation: SettlementReservation) {
-        self.settlement = Some(reservation);
+        self.settlement.insert(reservation);
+    }
+
+    /// The slot both completion and cancellation accounting take the reservation
+    /// from, so the reserved capacity is transferred exactly once.
+    pub(crate) fn settlement_slot(&self) -> SettlementSlot {
+        self.settlement.clone()
     }
 
     /// The reserved settlement capacity, for the one settlement this request
@@ -1111,6 +1119,7 @@ impl MiddlewareExecution {
             key,
             reservation: Some(reservation),
             estimated_input_tokens,
+            settlement: self.settlement.clone(),
         });
         Ok(())
     }
@@ -1595,6 +1604,9 @@ pub(crate) struct CoreBudgetHold {
     key: BudgetKey,
     reservation: Option<Reservation>,
     estimated_input_tokens: u64,
+    /// Same slot as [`MiddlewareExecution::settlement`]: Drop consumes it so a
+    /// zero-charge release is spawned under the request's own reservation.
+    settlement: SettlementSlot,
 }
 
 impl CoreBudgetHold {
@@ -1626,19 +1638,17 @@ impl Drop for CoreBudgetHold {
         };
         let state = self.state.clone();
         let key = self.key.clone();
-        // A release settles zero, which the Store ledger records as nothing. It
-        // takes settlement capacity only if some is free: under saturation the
-        // request's own reservation is still with its owner, and skipping a
-        // zero-charge write loses no spend.
         let settlements = self.state.0.settlements.clone();
-        if settlements
-            .try_spawn(async move {
+        // Consume the request's admission reservation rather than try_spawn:
+        // at capacity that slot is why a second reserve would refuse, and a
+        // skipped release would leave the hold until TTL.
+        settlements.spawn_reserved(
+            self.settlement.take(),
+            async move {
                 state.0.budget.release(&key, &reservation).await;
-            })
-            .is_err()
-        {
-            tracing::debug!("zero-charge budget release skipped at settlement capacity");
-        }
+            },
+            "zero-charge budget release",
+        );
     }
 }
 

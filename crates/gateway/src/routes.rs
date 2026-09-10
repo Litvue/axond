@@ -69,7 +69,7 @@ use crate::namespace::NamespaceId;
 use crate::pricing::{AliasPrices, Ineligible, RequestPrice};
 use crate::principals::{Capability, Presented, PrincipalStoreError, TokenVerificationError};
 use crate::rate_limit::{RateLimitKey, RateLimitPermit};
-use crate::settlement::SettlementReservation;
+use crate::settlement::{SettlementReservation, SettlementSlot};
 use crate::shutdown::Phase;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::status::{StatusResponse, StatusScope};
@@ -1924,8 +1924,14 @@ async fn serve(
         .await;
     }
 
-    let mut reservation_guard = (accounting_mode == CoreAccountingMode::Legacy)
-        .then(|| BudgetReservation::new(state.clone(), budget_key, reservation));
+    let mut reservation_guard = (accounting_mode == CoreAccountingMode::Legacy).then(|| {
+        BudgetReservation::new(
+            state.clone(),
+            budget_key,
+            reservation,
+            middleware_execution.settlement_slot(),
+        )
+    });
     let outcome = match dispatch_with_failover(
         &state, &snapshot, &caller, model, &prices, &body, &wire,
     )
@@ -2431,7 +2437,14 @@ async fn stream_with_failover(
     let mut reservation_guard = middleware_execution
         .core_budget_context()
         .is_none()
-        .then(|| BudgetReservation::new(state.clone(), hold.key.clone(), hold.reservation.clone()));
+        .then(|| {
+            BudgetReservation::new(
+                state.clone(),
+                hold.key.clone(),
+                hold.reservation.clone(),
+                middleware_execution.settlement_slot(),
+            )
+        });
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
@@ -2828,14 +2841,21 @@ struct BudgetReservation {
     state: AppState,
     key: BudgetKey,
     reservation: Option<Reservation>,
+    settlement: SettlementSlot,
 }
 
 impl BudgetReservation {
-    fn new(state: AppState, key: BudgetKey, reservation: Reservation) -> Self {
+    fn new(
+        state: AppState,
+        key: BudgetKey,
+        reservation: Reservation,
+        settlement: SettlementSlot,
+    ) -> Self {
         Self {
             state,
             key,
             reservation: Some(reservation),
+            settlement,
         }
     }
 
@@ -2884,19 +2904,16 @@ impl Drop for BudgetReservation {
         };
         let state = self.state.clone();
         let key = self.key.clone();
-        // A release settles zero, so under saturation it is skipped rather than
-        // given capacity a real charge is waiting for; see `CoreBudgetHold`.
-        if self
-            .state
-            .0
-            .settlements
-            .try_spawn(async move {
+        // Same transfer as `CoreBudgetHold`: consume the request's reserved slot
+        // so a zero-charge release is not refused because that slot still
+        // occupies capacity.
+        self.state.0.settlements.spawn_reserved(
+            self.settlement.take(),
+            async move {
                 state.0.budget.release(&key, &reservation).await;
-            })
-            .is_err()
-        {
-            tracing::debug!("zero-charge budget release skipped at settlement capacity");
-        }
+            },
+            "zero-charge budget release",
+        );
     }
 }
 

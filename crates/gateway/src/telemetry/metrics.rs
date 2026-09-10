@@ -15,7 +15,7 @@
 use std::sync::OnceLock;
 
 use gateway_core::CircuitState;
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, ObservableGauge, UpDownCounter};
 use opentelemetry::{KeyValue, global};
 
 use crate::usage::UsageRecord;
@@ -83,7 +83,9 @@ struct Instruments {
     shutdown_abandoned_settlements: Counter<u64>,
     settlement_in_flight: UpDownCounter<i64>,
     settlement_queue_wait: Histogram<f64>,
-    settlement_oldest_pending_age: Gauge<u64>,
+    /// Held so the collection callback stays registered for the process lifetime.
+    #[allow(dead_code)]
+    settlement_oldest_pending_age: ObservableGauge<u64>,
     settlement_failures: Counter<u64>,
     config_reloads: Counter<u64>,
     config_generation: Gauge<u64>,
@@ -353,11 +355,14 @@ impl Instruments {
                 )
                 .build(),
             settlement_oldest_pending_age: meter
-                .u64_gauge("axond.settlement.oldest_pending_age")
+                .u64_observable_gauge("axond.settlement.oldest_pending_age")
                 .with_unit("ms")
                 .with_description(
                     "Age of the oldest settlement still queued or executing; 0 when none is.",
                 )
+                .with_callback(|observer| {
+                    observer.observe(crate::settlement::oldest_pending_age_ms(), &[]);
+                })
                 .build(),
             settlement_failures: meter
                 .u64_counter("axond.settlement.failures")
@@ -1018,15 +1023,6 @@ pub fn record_settlement_queue_wait(ms: f64) {
         return;
     };
     instruments.settlement_queue_wait.record(ms, &[]);
-}
-
-/// Age of the oldest settlement still outstanding, republished on every
-/// enqueue and every completion.
-pub fn record_settlement_oldest_pending_age(ms: u64) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.settlement_oldest_pending_age.record(ms, &[]);
 }
 
 /// One settlement that did not complete. `reason` is the closed vocabulary in

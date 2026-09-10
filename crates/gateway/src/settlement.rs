@@ -32,7 +32,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -121,6 +121,11 @@ struct Shared {
     reserved: AtomicU64,
     queued: AtomicU64,
     running: AtomicU64,
+    /// Spawned settlements that have not yet finished. Stays nonzero across
+    /// the queued-to-executing cutover, where `queued` is decremented before
+    /// `running` is incremented; [`Settlements::await_idle`] watches this
+    /// rather than the sum of the stage counters.
+    spawned: AtomicU64,
     /// When each spawned settlement was enqueued, keyed by its sequence number,
     /// so the age of the oldest one is a lookup rather than a scan.
     backlog: Mutex<BTreeMap<u64, Instant>>,
@@ -141,6 +146,9 @@ pub struct Backlog {
     pub queued: u64,
     /// Settlements executing against the Store.
     pub executing: u64,
+    /// Spawned settlements not yet finished. Equal to `queued + executing`
+    /// except during the queued-to-executing cutover, which this count covers.
+    pub spawned: u64,
     /// Age of the oldest spawned settlement, queued or executing.
     pub oldest_age: Option<Duration>,
 }
@@ -148,25 +156,28 @@ pub struct Backlog {
 impl Backlog {
     /// Spawned settlements not yet finished: the work shutdown waits for.
     pub fn unsettled(self) -> u64 {
-        self.queued + self.executing
+        self.spawned
     }
 }
 
 impl Settlements {
     pub fn new(limits: SettlementLimits) -> Self {
-        Self {
+        let settlements = Self {
             shared: Arc::new(Shared {
                 pending: limits.max_pending.map(|n| Arc::new(Semaphore::new(n))),
                 executing: limits.max_in_flight.map(|n| Arc::new(Semaphore::new(n))),
                 reserved: AtomicU64::new(0),
                 queued: AtomicU64::new(0),
                 running: AtomicU64::new(0),
+                spawned: AtomicU64::new(0),
                 backlog: Mutex::new(BTreeMap::new()),
                 sequence: AtomicU64::new(0),
                 finished: watch::Sender::new(0),
                 limits,
             }),
-        }
+        };
+        register_age_source(&settlements.shared);
+        settlements
     }
 
     pub fn from_config(config: &AdmissionConfig) -> Self {
@@ -261,6 +272,28 @@ impl Settlements {
         }
     }
 
+    /// Spawn `future` under capacity this request already reserved, so
+    /// cancellation accounting cannot be refused because that same slot still
+    /// occupies the ceiling. Without a reservation this is [`Self::try_spawn`],
+    /// and a refusal is loud: an admitted charge is never dropped in silence.
+    pub fn spawn_reserved<F>(
+        &self,
+        reservation: Option<SettlementReservation>,
+        future: F,
+        what: &'static str,
+    ) where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        match reservation {
+            Some(reserved) => self.spawn(reserved, future),
+            None => {
+                if self.try_spawn(future).is_err() {
+                    self.refuse(what);
+                }
+            }
+        }
+    }
+
     /// A settlement refused by [`Self::try_spawn`] whose work was a charge or a
     /// record: counted and logged, because it is spend this process will not
     /// account for.
@@ -281,6 +314,7 @@ impl Settlements {
             reserved: shared.reserved.load(Ordering::Acquire),
             queued: shared.queued.load(Ordering::Acquire),
             executing: shared.running.load(Ordering::Acquire),
+            spawned: shared.spawned.load(Ordering::Acquire),
             oldest_age: shared.oldest_age(),
         }
     }
@@ -293,11 +327,11 @@ impl Settlements {
         let _ = tokio::time::timeout(bound, async {
             // Subscribed before the counts are read, so a settlement finishing
             // in between bumps a version this receiver has not seen and
-            // `changed()` returns at once.
+            // `changed()` returns at once. The waiter watches `spawned`, not
+            // `queued + running`: those two stage counters are both briefly
+            // zero while `start_executing` cuts over.
             let mut finished = shared.finished.subscribe();
-            while shared.queued.load(Ordering::Acquire) + shared.running.load(Ordering::Acquire)
-                != 0
-            {
+            while shared.spawned.load(Ordering::Acquire) != 0 {
                 if finished.changed().await.is_err() {
                     return;
                 }
@@ -306,6 +340,32 @@ impl Settlements {
         .await;
         self.backlog()
     }
+}
+
+/// The process's live settlement capacity, so
+/// `axond.settlement.oldest_pending_age` can be observed at collection time
+/// rather than frozen at the last enqueue or completion.
+static AGE_SOURCE: OnceLock<Mutex<Weak<Shared>>> = OnceLock::new();
+
+fn age_source() -> &'static Mutex<Weak<Shared>> {
+    AGE_SOURCE.get_or_init(|| Mutex::new(Weak::new()))
+}
+
+fn register_age_source(shared: &Arc<Shared>) {
+    *age_source().lock().expect("settlement age source") = Arc::downgrade(shared);
+}
+
+/// Age of the oldest spawned settlement, in milliseconds, or `0` when the
+/// backlog is empty. The oldest-pending-age gauge observes this at collection
+/// so a stalled settlement keeps climbing.
+pub(crate) fn oldest_pending_age_ms() -> u64 {
+    age_source()
+        .lock()
+        .expect("settlement age source")
+        .upgrade()
+        .and_then(|shared| shared.oldest_age())
+        .map(|age| age.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Shared {
@@ -332,10 +392,32 @@ impl Shared {
             .first_key_value()
             .map(|(_, enqueued)| enqueued.elapsed())
     }
+}
 
-    fn publish_oldest_age(&self) {
-        let age = self.oldest_age().unwrap_or(Duration::ZERO);
-        metrics::record_settlement_oldest_pending_age(age.as_millis() as u64);
+/// The one admission-reserved settlement slot a request may spend. Middleware
+/// and legacy cancellation accounting take from the same slot so the capacity
+/// is transferred exactly once — never released and then `try_spawn`ed, which
+/// refuses when that same slot still occupies the ceiling.
+#[derive(Clone)]
+pub(crate) struct SettlementSlot {
+    inner: Arc<Mutex<Option<SettlementReservation>>>,
+}
+
+impl Default for SettlementSlot {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl SettlementSlot {
+    pub fn insert(&self, reservation: SettlementReservation) {
+        *self.inner.lock().expect("settlement slot") = Some(reservation);
+    }
+
+    pub fn take(&self) -> Option<SettlementReservation> {
+        self.inner.lock().expect("settlement slot").take()
     }
 }
 
@@ -422,8 +504,8 @@ impl Guard {
             .expect("settlement backlog")
             .insert(sequence, enqueued);
         shared.queued.fetch_add(1, Ordering::AcqRel);
+        shared.spawned.fetch_add(1, Ordering::AcqRel);
         metrics::record_settlement_stage_entered(STAGE_QUEUED);
-        shared.publish_oldest_age();
         Self {
             shared,
             _permit: permit,
@@ -457,12 +539,12 @@ impl Drop for Guard {
                 metrics::record_settlement_stage_left(STAGE_EXECUTING);
             }
         }
+        self.shared.spawned.fetch_sub(1, Ordering::AcqRel);
         self.shared
             .backlog
             .lock()
             .expect("settlement backlog")
             .remove(&self.sequence);
-        self.shared.publish_oldest_age();
         if let Some(reason) = outcome.failure_reason() {
             metrics::record_settlement_failure(reason);
             tracing::error!(
@@ -684,5 +766,101 @@ mod tests {
             idle.reserved, 1,
             "an unspawned reservation is reported, not waited for"
         );
+    }
+
+    #[test]
+    fn spawned_count_covers_the_queued_to_executing_stage_gap() {
+        let settlements = Settlements::new(limits(1, 1));
+        let guard = Guard::enqueue(settlements.reserve().unwrap());
+        assert_eq!(settlements.backlog().spawned, 1);
+        assert_eq!(settlements.backlog().queued, 1);
+        // The cutover decrements `queued` before incrementing `running`. A
+        // waiter that summed the stage counters would see idle here and flush
+        // sinks before the settlement had written.
+        guard.shared.queued.fetch_sub(1, Ordering::AcqRel);
+        let stages = guard.shared.queued.load(Ordering::Acquire)
+            + guard.shared.running.load(Ordering::Acquire);
+        assert_eq!(stages, 0, "the stage counters have a visible gap");
+        assert_eq!(
+            guard.shared.spawned.load(Ordering::Acquire),
+            1,
+            "spawned stays nonzero across the cutover await_idle watches"
+        );
+        guard.shared.queued.fetch_add(1, Ordering::AcqRel);
+        drop(guard);
+        assert_eq!(settlements.backlog().spawned, 0);
+    }
+
+    #[tokio::test]
+    async fn await_idle_waits_for_spawned_work_not_the_sum_of_stages() {
+        let settlements = Settlements::new(SettlementLimits {
+            max_pending: Some(1),
+            max_in_flight: Some(1),
+            queue_wait: None,
+            execution_timeout: None,
+        });
+        let (hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+        settlements.spawn(settlements.reserve().unwrap(), async {
+            let _ = hold_rx.await;
+        });
+        tokio::task::yield_now().await;
+        let waiter = {
+            let settlements = settlements.clone();
+            tokio::spawn(async move { settlements.await_idle(Duration::from_millis(40)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "await_idle must not return while a settlement is still spawned"
+        );
+        drop(hold_tx);
+        let leftovers = waiter.await.expect("waiter");
+        assert_eq!(leftovers.unsettled(), 0);
+    }
+
+    #[tokio::test]
+    async fn spawn_reserved_consumes_the_request_slot_at_capacity() {
+        let settlements = Settlements::new(limits(1, 1));
+        let reserved = settlements.reserve().expect("the one slot");
+        assert!(
+            settlements.try_spawn(async {}).is_err(),
+            "try_spawn cannot take a second slot the request still holds"
+        );
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_for_task = Arc::clone(&ran);
+        settlements.spawn_reserved(
+            Some(reserved),
+            async move {
+                ran_for_task.fetch_add(1, Ordering::AcqRel);
+            },
+            "zero-charge budget release",
+        );
+        settle_soon(&settlements).await;
+        assert_eq!(ran.load(Ordering::Acquire), 1);
+        settlements
+            .reserve()
+            .expect("the consumed slot was released after the reserved spawn");
+    }
+
+    #[tokio::test]
+    async fn oldest_pending_age_advances_without_enqueue_or_completion() {
+        let settlements = Settlements::new(limits(1, 1));
+        let (hold_tx, hold_rx) = tokio::sync::oneshot::channel::<()>();
+        settlements.spawn(settlements.reserve().unwrap(), async {
+            let _ = hold_rx.await;
+        });
+        tokio::task::yield_now().await;
+        let first = settlements
+            .backlog()
+            .oldest_age
+            .expect("a spawned settlement has an age");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let later = settlements.backlog().oldest_age.expect("still spawned");
+        assert!(
+            later > first,
+            "age is computed from the enqueue Instant, so a stall climbs"
+        );
+        drop(hold_tx);
+        settle_soon(&settlements).await;
     }
 }
