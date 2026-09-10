@@ -1,0 +1,4 @@
+{
+  "name": "Axond",
+  "install": "cargo fetch --locked && cargo build --workspace --locked"
+}
