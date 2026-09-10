@@ -103,9 +103,9 @@ selectable adapter. It must prove:
 - malformed, hash-mismatched, unknown-schema, and unwrappable records are
   `Corrupt` or `Invalid`, never retried as outages.
 
-Azure Blob Storage block blobs are the first production adapter. The domain
-trait must expose only provider-neutral bytes and opaque version tokens so S3
-ETags and Google Cloud Storage generations can implement the same contract.
+Azure Blob Storage block blobs were the first production adapter, then withdrawn
+with the stateful control plane (ADR 0063). The in-tree object-store protocol
+and in-memory fake remain; no cloud blob SDK ships in the production binary.
 Cloud-specific leases, queues, notifications, and list consistency cannot be
 required for correctness.
 
