@@ -210,11 +210,6 @@ impl Journal {
         })
     }
 
-    /// The store as the administrative service holds it.
-    pub(crate) fn store(&self) -> Arc<dyn ControlPlaneStore> {
-        self.store.clone()
-    }
-
     pub(crate) fn schema(&self) -> &str {
         &self.schema
     }
@@ -237,13 +232,6 @@ impl Journal {
         self.publish("two-tenants", ExpectedRevision::Empty, two_tenant_state())
             .await
             .expect("two tenants that reference nothing of each other's publish")
-    }
-
-    pub(crate) async fn head(&self) -> Option<RevisionId> {
-        self.store
-            .desired_revision()
-            .await
-            .expect("the head is readable")
     }
 
     /// The head revision, hydrated as a replica hydrates it.

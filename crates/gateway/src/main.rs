@@ -14,10 +14,6 @@
 //! `[reload] watch` is on, a change to the config file) re-runs this same load +
 //! validate path and swaps the result in atomically (ADR 0011).
 
-// Withdrawn `/admin/v1` control-plane surface (ADR 0063). Kept compiled for
-// tests of that tree; `serve` does not mount it. Management is `/api/v1`.
-#[allow(dead_code)]
-mod admin;
 mod admission;
 mod aliases;
 mod api;
