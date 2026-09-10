@@ -24,6 +24,7 @@ pub use error::{
 pub use failover::{FailoverDecision, FailoverPolicy, FailoverTarget};
 pub use guardrail::{
     DeterministicGuardrail, GuardrailAction, GuardrailCompileError, GuardrailRule,
+    serialized_json_len,
 };
 pub use middleware::{
     Middleware, MiddlewareDeclaration, MiddlewareError, MiddlewareFailurePosture, MiddlewareNeed,

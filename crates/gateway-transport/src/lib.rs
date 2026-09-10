@@ -23,6 +23,7 @@
 //! is governed by the idle bound instead.
 
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -30,6 +31,7 @@ use futures::{Stream, StreamExt};
 use gateway_core::{ProviderAdapter, ProviderError, ProviderRequest, ProviderResponse, Surface};
 use opentelemetry::global;
 use opentelemetry_http::HeaderInjector;
+use reqwest::header::CONTENT_TYPE;
 use secrecy::{ExposeSecret, SecretString};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -56,19 +58,91 @@ pub enum AuthScheme {
     Header(&'static str),
 }
 
+/// Compact JSON already encoded for a POST. Auth stays off this value so
+/// credential retries can reuse the same bytes.
+#[derive(Clone, Debug)]
+pub struct EncodedJson {
+    bytes: Bytes,
+}
+
+impl EncodedJson {
+    pub fn from_value(value: &serde_json::Value) -> Self {
+        Self {
+            bytes: encode_json_bytes(value),
+        }
+    }
+
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+}
+
+fn encode_json_bytes(value: &serde_json::Value) -> Bytes {
+    Bytes::from(serde_json::to_vec(value).expect("serde_json::Value serializes to compact JSON"))
+}
+
+fn needs_stream_flag(body: &serde_json::Value) -> bool {
+    body.as_object()
+        .is_some_and(|object| object.get("stream") != Some(&serde_json::Value::Bool(true)))
+}
+
 /// A request forwarded to a provider in the provider's own wire shape.
 ///
 /// Nothing here is translated: the body is the caller's, the path is the
 /// provider's, and `headers` carries whatever the wire shape itself requires
 /// (Anthropic's `anthropic-version`, for instance). Deciding those is wire
 /// knowledge and belongs to the caller; the transport only sends them.
+///
+/// The JSON is encoded once at construction. Streamed dispatch re-encodes only
+/// when it must insert `stream: true`. Secrets stay in per-attempt headers.
 pub struct NativeCall {
     /// Provider name, used to attribute a failure to the upstream.
     pub provider: &'static str,
     /// Path appended to the provider's `base_url`, e.g. `/messages`.
     pub path: &'static str,
-    pub body: serde_json::Value,
     pub headers: Vec<(&'static str, String)>,
+    body: serde_json::Value,
+    encoded: EncodedJson,
+    streamed: OnceLock<Bytes>,
+}
+
+impl NativeCall {
+    pub fn new(
+        provider: &'static str,
+        path: &'static str,
+        body: serde_json::Value,
+        headers: Vec<(&'static str, String)>,
+    ) -> Self {
+        let encoded = EncodedJson::from_value(&body);
+        Self {
+            provider,
+            path,
+            headers,
+            body,
+            encoded,
+            streamed: OnceLock::new(),
+        }
+    }
+
+    pub fn encoded_json(&self, stream: bool) -> Bytes {
+        if !stream || !needs_stream_flag(&self.body) {
+            return self.encoded.bytes.clone();
+        }
+        self.streamed
+            .get_or_init(|| {
+                let mut body = self.body.clone();
+                if let Some(object) = body.as_object_mut() {
+                    object.insert("stream".to_owned(), serde_json::Value::Bool(true));
+                }
+                encode_json_bytes(&body)
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn encoding_count(&self) -> usize {
+        1 + usize::from(self.streamed.get().is_some())
+    }
 }
 
 /// Per-phase bounds on one upstream call.
@@ -474,34 +548,36 @@ impl HttpDispatcher {
         deadline: Deadline,
     ) -> Result<ProviderResponse, TransportError> {
         let body = adapter.encode_request(surface, request)?;
-        let url = format!(
-            "{}/chat/completions",
-            upstream.base_url.trim_end_matches('/')
-        );
+        self.dispatch_encoded(
+            adapter,
+            upstream,
+            surface,
+            &EncodedJson::from_value(&body),
+            deadline,
+        )
+        .await
+    }
 
-        let mut req = self.client.post(url).json(&body);
-        req = match &upstream.auth {
-            AuthScheme::Bearer => req.bearer_auth(upstream.api_key.expose_secret()),
-            AuthScheme::Header(name) => req.header(*name, upstream.api_key.expose_secret()),
-        };
-
-        let resp = self
-            .send_bounded(req.headers(trace_context_headers()), deadline)
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = self.error_body(resp, deadline).await;
-            return Err(upstream_failure(
+    /// Adapter dispatch with a body that was already encoded. Credential retries
+    /// reuse the same bytes; auth headers stay per-attempt.
+    pub async fn dispatch_encoded(
+        &self,
+        adapter: &dyn ProviderAdapter,
+        upstream: &Upstream,
+        surface: Surface,
+        body: &EncodedJson,
+        deadline: Deadline,
+    ) -> Result<ProviderResponse, TransportError> {
+        let json = self
+            .send_encoded(
                 adapter.name(),
                 upstream,
-                status.as_u16(),
-                &text,
-            ));
-        }
-        let text = self.buffered_body(resp, deadline).await?;
-
-        let json: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| TransportError::Http(format!("decode upstream body: {e}")))?;
+                "/chat/completions",
+                &[],
+                body.bytes.clone(),
+                deadline,
+            )
+            .await?;
         Ok(adapter.decode_response(surface, json)?)
     }
 
@@ -547,22 +623,15 @@ impl HttpDispatcher {
         call: &NativeCall,
         deadline: Deadline,
     ) -> Result<serde_json::Value, TransportError> {
-        let resp = self
-            .send_bounded(self.native_request(upstream, call, false), deadline)
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = self.error_body(resp, deadline).await;
-            return Err(upstream_failure(
-                call.provider,
-                upstream,
-                status.as_u16(),
-                &text,
-            ));
-        }
-        let text = self.buffered_body(resp, deadline).await?;
-        serde_json::from_str(&text)
-            .map_err(|e| TransportError::Http(format!("decode upstream body: {e}")))
+        self.send_encoded(
+            call.provider,
+            upstream,
+            call.path,
+            &call.headers,
+            call.encoded_json(false),
+            deadline,
+        )
+        .await
     }
 
     /// Streaming native dispatch, the streamed twin of [`Self::send`]: the
@@ -574,45 +643,86 @@ impl HttpDispatcher {
         call: &NativeCall,
         deadline: Deadline,
     ) -> Result<ByteStream, TransportError> {
-        let resp = self
-            .send_bounded(self.native_request(upstream, call, true), deadline)
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = self.error_body(resp, deadline).await;
-            return Err(upstream_failure(
-                call.provider,
-                upstream,
-                status.as_u16(),
-                &text,
-            ));
-        }
-        Ok(self.idle_bounded_stream(resp))
+        self.open_encoded_stream(
+            call.provider,
+            upstream,
+            call.path,
+            &call.headers,
+            call.encoded_json(true),
+            deadline,
+        )
+        .await
     }
 
-    fn native_request(
+    fn encoded_json_request(
         &self,
         upstream: &Upstream,
-        call: &NativeCall,
-        stream: bool,
+        path: &str,
+        headers: &[(&'static str, String)],
+        body: Bytes,
     ) -> reqwest::RequestBuilder {
-        let mut body = call.body.clone();
-        // Only the streamed twin asserts `stream`: a buffered native body is
-        // forwarded exactly as the caller wrote it, and a route without a
-        // `stream` parameter at all (embeddings) would reject one.
-        if stream && let Some(object) = body.as_object_mut() {
-            object.insert("stream".to_owned(), serde_json::Value::Bool(true));
-        }
-        let url = format!("{}{}", upstream.base_url.trim_end_matches('/'), call.path);
-        let mut req = self.client.post(url).json(&body);
+        let url = format!("{}{}", upstream.base_url.trim_end_matches('/'), path);
+        let mut req = self
+            .client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body);
         req = match &upstream.auth {
             AuthScheme::Bearer => req.bearer_auth(upstream.api_key.expose_secret()),
             AuthScheme::Header(name) => req.header(*name, upstream.api_key.expose_secret()),
         };
-        for (name, value) in &call.headers {
+        for (name, value) in headers {
             req = req.header(*name, value);
         }
         req.headers(trace_context_headers())
+    }
+
+    async fn send_encoded(
+        &self,
+        provider: &str,
+        upstream: &Upstream,
+        path: &str,
+        headers: &[(&'static str, String)],
+        body: Bytes,
+        deadline: Deadline,
+    ) -> Result<serde_json::Value, TransportError> {
+        let resp = self
+            .send_bounded(
+                self.encoded_json_request(upstream, path, headers, body),
+                deadline,
+            )
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = self.error_body(resp, deadline).await;
+            return Err(upstream_failure(provider, upstream, status.as_u16(), &text));
+        }
+        let text = self.buffered_body(resp, deadline).await?;
+        serde_json::from_str(&text)
+            .map_err(|e| TransportError::Http(format!("decode upstream body: {e}")))
+    }
+
+    async fn open_encoded_stream(
+        &self,
+        provider: &str,
+        upstream: &Upstream,
+        path: &str,
+        headers: &[(&'static str, String)],
+        body: Bytes,
+        deadline: Deadline,
+    ) -> Result<ByteStream, TransportError> {
+        let resp = self
+            .send_bounded(
+                self.encoded_json_request(upstream, path, headers, body),
+                deadline,
+            )
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = self.error_body(resp, deadline).await;
+            return Err(upstream_failure(provider, upstream, status.as_u16(), &text));
+        }
+        Ok(self.idle_bounded_stream(resp))
     }
 
     /// Streaming dispatch: encode via the adapter, POST with `stream: true`,
@@ -634,34 +744,15 @@ impl HttpDispatcher {
         if let Some(object) = body.as_object_mut() {
             object.insert("stream".to_owned(), serde_json::Value::Bool(true));
         }
-        let url = format!(
-            "{}/chat/completions",
-            upstream.base_url.trim_end_matches('/')
-        );
-
-        let mut req = self
-            .client
-            .post(url)
-            .headers(trace_context_headers())
-            .json(&body);
-        req = match &upstream.auth {
-            AuthScheme::Bearer => req.bearer_auth(upstream.api_key.expose_secret()),
-            AuthScheme::Header(name) => req.header(*name, upstream.api_key.expose_secret()),
-        };
-
-        let resp = self.send_bounded(req, deadline).await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = self.error_body(resp, deadline).await;
-            return Err(upstream_failure(
-                adapter.name(),
-                upstream,
-                status.as_u16(),
-                &text,
-            ));
-        }
-
-        Ok(self.idle_bounded_stream(resp))
+        self.open_encoded_stream(
+            adapter.name(),
+            upstream,
+            "/chat/completions",
+            &[],
+            EncodedJson::from_value(&body).bytes,
+            deadline,
+        )
+        .await
     }
 }
 
@@ -861,5 +952,115 @@ mod tests {
 
         assert!(message.contains("example.test/v1/messages"), "{message}");
         assert!(!message.contains("pw"), "{message}");
+    }
+
+    #[test]
+    fn credential_retries_share_one_encoded_body() {
+        let body = serde_json::json!({
+            "model": "upstream-model",
+            "unknown_native_field": {"keep": true},
+            "messages": [{"role": "user", "content": "x".repeat(32 * 1024)}]
+        });
+        let call = NativeCall::new(
+            "openai",
+            "/chat/completions",
+            body.clone(),
+            vec![("x-api-key", "sk-secret".to_owned())],
+        );
+        let first = call.encoded_json(false);
+        let parsed: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(
+            parsed["unknown_native_field"],
+            serde_json::json!({"keep": true})
+        );
+        assert_eq!(parsed["model"], "upstream-model");
+        assert!(!std::str::from_utf8(&first).unwrap().contains("sk-secret"));
+        assert_eq!(call.encoding_count(), 1);
+        for _ in 0..7 {
+            let again = call.encoded_json(false);
+            assert_eq!(first.as_ptr(), again.as_ptr());
+            assert_eq!(first.len(), again.len());
+        }
+        assert_eq!(call.encoding_count(), 1);
+
+        let changed = NativeCall::new(
+            "openai",
+            "/chat/completions",
+            serde_json::json!({
+                "model": "upstream-model",
+                "unknown_native_field": {"keep": true},
+                "messages": [{"role": "user", "content": "rewritten by middleware"}]
+            }),
+            vec![],
+        );
+        assert_ne!(first.as_ref(), changed.encoded_json(false).as_ref());
+    }
+
+    #[test]
+    fn stream_flag_mutation_reencodes_and_buffered_bytes_stay_distinct() {
+        let body = serde_json::json!({
+            "model": "claude-3",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let call = NativeCall::new("anthropic", "/messages", body, vec![]);
+        let buffered = call.encoded_json(false);
+        assert_eq!(call.encoding_count(), 1);
+        let streamed = call.encoded_json(true);
+        assert_eq!(call.encoding_count(), 2);
+        let streamed_again = call.encoded_json(true);
+        assert_eq!(streamed.as_ptr(), streamed_again.as_ptr());
+        assert_ne!(buffered.as_ref(), streamed.as_ref());
+        let parsed: serde_json::Value = serde_json::from_slice(&streamed).unwrap();
+        assert_eq!(parsed["stream"], true);
+        let buffered_parsed: serde_json::Value = serde_json::from_slice(&buffered).unwrap();
+        assert!(buffered_parsed.get("stream").is_none());
+
+        let already = NativeCall::new(
+            "openai",
+            "/chat/completions",
+            serde_json::json!({"model": "gpt-4o", "stream": true, "messages": []}),
+            vec![],
+        );
+        let as_written = already.encoded_json(false);
+        let as_stream = already.encoded_json(true);
+        assert_eq!(as_written.as_ptr(), as_stream.as_ptr());
+        assert_eq!(already.encoding_count(), 1);
+    }
+
+    #[test]
+    fn encoded_json_clones_share_storage_across_attempts() {
+        let body = serde_json::json!({"input": "hello", "dimensions": 2});
+        let encoded = EncodedJson::from_value(&body);
+        let first = encoded.as_bytes().clone();
+        for _ in 0..4 {
+            assert_eq!(first.as_ptr(), encoded.as_bytes().as_ptr());
+        }
+        assert_eq!(first.len(), serde_json::to_vec(&body).unwrap().len());
+    }
+
+    #[test]
+    fn payload_reuse_cpu_sample() {
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "y".repeat(256 * 1024)}]
+        });
+        let retries = 8usize;
+        let call = NativeCall::new("openai", "/chat/completions", body.clone(), vec![]);
+        let start = std::time::Instant::now();
+        for _ in 0..retries {
+            let _ = call.encoded_json(false);
+        }
+        let reused = start.elapsed();
+        let start = std::time::Instant::now();
+        for _ in 0..retries {
+            let cloned = body.clone();
+            let _ = serde_json::to_vec(&cloned).unwrap();
+        }
+        let naive = start.elapsed();
+        let encoded_len = call.encoded_json(false).len();
+        eprintln!(
+            "payload_reuse_cpu_sample body_len={encoded_len} retries={retries} reuse={reused:?} naive_clone_serialize={naive:?}"
+        );
+        assert_eq!(call.encoding_count(), 1);
     }
 }

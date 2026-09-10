@@ -41,11 +41,13 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use gateway_core::{
     CircuitDecision, FailoverDecision, FailoverPolicy, FailoverTarget, MiddlewareScope,
-    MiddlewareSurface, ModelPrice, ModelUsage, NativeMessagesDecoder, ProviderError,
-    ProviderRequest, ProviderResponse, ProviderStreamDecoder, Surface, Usage,
+    MiddlewareSurface, ModelPrice, ModelUsage, NativeMessagesDecoder, ProviderAdapter,
+    ProviderError, ProviderRequest, ProviderResponse, ProviderStreamDecoder, Surface, Usage,
+    serialized_json_len,
 };
 use gateway_transport::{
-    AuthScheme, Deadline, NativeCall, TimeoutBound, TimeoutKind, TransportError, Upstream,
+    AuthScheme, Deadline, EncodedJson, NativeCall, TimeoutBound, TimeoutKind, TransportError,
+    Upstream,
 };
 use http_body::Body as HttpBody;
 use secrecy::ExposeSecret;
@@ -1430,12 +1432,12 @@ impl Wire {
     }
 
     fn call(&self, body: Value, provider: &'static str) -> NativeCall {
-        NativeCall {
+        NativeCall::new(
             provider,
-            path: self.route.upstream_path(),
+            self.route.upstream_path(),
             body,
-            headers: self.headers.clone(),
-        }
+            self.headers.clone(),
+        )
     }
 }
 
@@ -3267,6 +3269,32 @@ struct PooledAttempt {
     credential_id: String,
 }
 
+enum PreparedPoolCall {
+    Adapter(EncodedJson),
+    Native(NativeCall),
+}
+
+fn prepare_pool_call(
+    adapter: &dyn ProviderAdapter,
+    wire: &Wire,
+    target_model: &str,
+    body: Value,
+) -> Result<PreparedPoolCall, TransportError> {
+    match wire.route {
+        Route::ChatCompletions => adapter
+            .encode_request(
+                Surface::ChatCompletions,
+                ProviderRequest {
+                    model: target_model.to_string(),
+                    body,
+                },
+            )
+            .map(|encoded| PreparedPoolCall::Adapter(EncodedJson::from_value(&encoded)))
+            .map_err(TransportError::from),
+        _ => Ok(PreparedPoolCall::Native(wire.call(body, adapter.name()))),
+    }
+}
+
 /// Walk the credential pool: dispatch with the first credential, and on a
 /// credential-scoped failure (rate limit / quota) park that credential and
 /// retry the *same* target with the next one. Target-level failover is a
@@ -3284,6 +3312,8 @@ async fn dispatch_over_pool(
 ) -> PooledAttempt {
     let adapter = adapter_for(provider.kind);
     let mut exhausted: Option<PooledAttempt> = None;
+    let mut body = Some(body);
+    let mut prepared: Option<PreparedPoolCall> = None;
 
     for (index, skipped) in plan.parked.iter().enumerate() {
         let span = telemetry::credential_lease_span(
@@ -3308,36 +3338,46 @@ async fn dispatch_over_pool(
                 ProviderKind::Openai | ProviderKind::OpenaiCompatible => AuthScheme::Bearer,
             },
         };
-        let result = async {
-            match wire.route {
-                Route::ChatCompletions => {
-                    let request = ProviderRequest {
-                        model: target_model.to_string(),
-                        body: body.clone(),
+        if prepared.is_none() {
+            match prepare_pool_call(
+                adapter.as_ref(),
+                wire,
+                target_model,
+                body.take().expect("request body is prepared once"),
+            ) {
+                Ok(call) => prepared = Some(call),
+                Err(err) => {
+                    telemetry::finish_credential_lease(&lease_span, telemetry::LEASE_ERROR);
+                    return PooledAttempt {
+                        result: Err(err),
+                        credential_id: lease.id.clone(),
                     };
+                }
+            }
+        }
+        let prepared = prepared.as_ref().expect("prepared on first attempt");
+        let result = async {
+            match prepared {
+                PreparedPoolCall::Adapter(encoded) => {
                     state
                         .0
                         .dispatcher
-                        .dispatch(
+                        .dispatch_encoded(
                             adapter.as_ref(),
                             &upstream,
                             Surface::ChatCompletions,
-                            request,
+                            encoded,
                             deadline,
                         )
                         .await
                 }
-                route => state
+                PreparedPoolCall::Native(call) => state
                     .0
                     .dispatcher
-                    .send(
-                        &upstream,
-                        &wire.call(body.clone(), adapter.name()),
-                        deadline,
-                    )
+                    .send(&upstream, call, deadline)
                     .await
                     .map(|body| ProviderResponse {
-                        usage: route.native_usage(&body),
+                        usage: wire.route.native_usage(&body),
                         body,
                     }),
             }
@@ -3420,7 +3460,7 @@ fn to_usage(u: &gateway_core::ModelUsage) -> Usage {
 /// provider reports no usage. Not held against the namespace cap (ADR 0064).
 fn estimate_usage(body: &Value) -> (Usage, usize) {
     const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1_024;
-    let body_bytes = serde_json::to_string(body).map(|s| s.len()).unwrap_or(0);
+    let body_bytes = serialized_json_len(body).unwrap_or(0);
     let input_tokens = (body_bytes / 4) as u64;
     let output_tokens = requested_output_tokens(body).unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
     (
@@ -3846,6 +3886,29 @@ mod tests {
             500_000,
             "the estimate uses the allowance the provider will honor"
         );
+    }
+
+    #[test]
+    fn estimate_usage_measures_the_final_json_including_unknown_fields() {
+        let body = json!({
+            "model": "upstream-model",
+            "unknown_native_field": {"keep": true},
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 32
+        });
+        let expected = serialized_json_len(&body).unwrap();
+        let via_string = serde_json::to_string(&body).unwrap().len();
+        let (usage, bytes) = estimate_usage(&body);
+        assert_eq!(bytes, expected);
+        assert_eq!(bytes, via_string);
+        assert_eq!(usage.input_tokens, (expected / 4) as u64);
+        assert_eq!(usage.output_tokens, 32);
+
+        let mut expanded = body.clone();
+        expanded["messages"][0]["content"] = json!("hello from middleware");
+        let (_, expanded_bytes) = estimate_usage(&expanded);
+        assert!(expanded_bytes > bytes);
+        assert_eq!(expanded_bytes, serialized_json_len(&expanded).unwrap());
     }
 
     /// The inbound key every test config declares, and the secret the caller
