@@ -25,8 +25,8 @@ mod otlp;
 mod postgres;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -590,11 +590,20 @@ struct QueuedAppend {
     enqueued_at: Instant,
 }
 
+/// Serializes a blocking enqueue with the worker's depth decrement. Held across
+/// `try_send` plus the increment so a successful send is never visible to
+/// `recv` before occupancy is recorded, and concurrent failed sends cannot
+/// inflate the histogram sample.
+struct BlockingIndex {
+    tx: std::sync::mpsc::SyncSender<QueuedAppend>,
+    admit: Arc<Mutex<()>>,
+}
+
 /// The request path's handle on the index worker's queue. Two shapes because
 /// the SQLite worker is an OS thread that must wait without a runtime, while
 /// the Postgres worker is a task that must wait without a thread.
 enum IndexQueue {
-    Blocking(std::sync::mpsc::SyncSender<QueuedAppend>),
+    Blocking(BlockingIndex),
     Async(tokio::sync::mpsc::Sender<QueuedAppend>),
 }
 
@@ -603,19 +612,16 @@ impl IndexQueue {
     /// slot count after this send, matching `axond.usage.index.queue.depth`.
     fn try_enqueue(&self, item: QueuedAppend, depth: &AtomicU64) -> Result<u64, IndexOutcome> {
         match self {
-            Self::Blocking(tx) => {
-                // `SyncSender` has no reserve. Increment first so the worker
-                // cannot wrap the counter if it recvs another slot before we
-                // record this send; undo if the channel rejects the item.
-                let occupied = depth.fetch_add(1, Ordering::AcqRel) + 1;
-                match tx.try_send(item) {
-                    Ok(()) => Ok(occupied),
-                    Err(error) => {
-                        take_index_slot(depth);
-                        Err(match error {
-                            std::sync::mpsc::TrySendError::Full(_) => IndexOutcome::Saturated,
-                            std::sync::mpsc::TrySendError::Disconnected(_) => IndexOutcome::Closed,
-                        })
+            Self::Blocking(queue) => {
+                let _admit = queue
+                    .admit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match queue.tx.try_send(item) {
+                    Ok(()) => Ok(depth.fetch_add(1, Ordering::AcqRel) + 1),
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => Err(IndexOutcome::Saturated),
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                        Err(IndexOutcome::Closed)
                     }
                 }
             }
@@ -728,13 +734,18 @@ impl IndexTelemetry {
         }
     }
 
-    /// One Store write of `batch` finished with `outcome`.
-    fn wrote(&self, batch: &[QueuedAppend], outcome: IndexOutcome, error: Option<&str>) {
+    /// One Store write of `batch` finished with `outcome`. `queue_age_ms` is
+    /// how long the oldest event had already waited when the write *began*,
+    /// not when it returned — otherwise a slow Store transaction looks like
+    /// queue delay.
+    fn wrote(
+        &self,
+        batch: &[QueuedAppend],
+        outcome: IndexOutcome,
+        error: Option<&str>,
+        queue_age_ms: f64,
+    ) {
         let rows = batch.len() as u64;
-        let queue_age_ms = batch
-            .first()
-            .map(|oldest| oldest.enqueued_at.elapsed().as_secs_f64() * 1_000.0)
-            .unwrap_or_default();
         crate::telemetry::metrics::record_usage_index_batch(outcome.as_str(), rows, queue_age_ms);
         self.count(outcome, rows);
         #[cfg(test)]
@@ -837,10 +848,20 @@ impl UsageDelivery {
         let depth = Arc::clone(&self.index_depth);
         let queue = if store.blocking_usage_index() {
             let (tx, rx) = std::sync::mpsc::sync_channel(settings.capacity);
+            let admit = Arc::new(Mutex::new(()));
+            let worker_admit = Arc::clone(&admit);
             match std::thread::Builder::new()
                 .name("axond-usage-index".into())
                 .spawn(move || {
-                    sqlite_usage_index_worker(store, rx, stop, settings, telemetry, depth)
+                    sqlite_usage_index_worker(
+                        store,
+                        rx,
+                        stop,
+                        settings,
+                        telemetry,
+                        depth,
+                        worker_admit,
+                    )
                 }) {
                 Ok(handle) => drop(handle),
                 Err(error) => {
@@ -851,7 +872,7 @@ impl UsageDelivery {
                     return;
                 }
             }
-            IndexQueue::Blocking(tx)
+            IndexQueue::Blocking(BlockingIndex { tx, admit })
         } else if tokio::runtime::Handle::try_current().is_ok() {
             let (tx, rx) = tokio::sync::mpsc::channel(settings.capacity);
             drop(tokio::spawn(async_usage_index_worker(
@@ -1103,6 +1124,13 @@ fn take_index_slot(depth: &AtomicU64) {
     depth.fetch_sub(1, Ordering::AcqRel);
 }
 
+fn oldest_queue_age_ms(batch: &[QueuedAppend]) -> f64 {
+    batch
+        .first()
+        .map(|oldest| oldest.enqueued_at.elapsed().as_secs_f64() * 1_000.0)
+        .unwrap_or_default()
+}
+
 impl QueuedAppend {
     fn take(self, depth: &AtomicU64) -> Self {
         take_index_slot(depth);
@@ -1110,6 +1138,32 @@ impl QueuedAppend {
             self.enqueued_at.elapsed().as_secs_f64() * 1000.0,
         );
         self
+    }
+
+    fn take_blocking(self, depth: &AtomicU64, admit: &Mutex<()>) -> Self {
+        {
+            let _admit = admit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            take_index_slot(depth);
+        }
+        crate::telemetry::metrics::record_usage_index_dequeued(
+            self.enqueued_at.elapsed().as_secs_f64() * 1000.0,
+        );
+        self
+    }
+}
+
+fn drain_blocking_index(
+    rx: &std::sync::mpsc::Receiver<QueuedAppend>,
+    depth: &AtomicU64,
+    admit: &Mutex<()>,
+) {
+    while rx.try_recv().is_ok() {
+        let _admit = admit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        take_index_slot(depth);
     }
 }
 
@@ -1125,14 +1179,13 @@ fn sqlite_usage_index_worker(
     settings: UsageIndexSettings,
     telemetry: Arc<IndexTelemetry>,
     depth: Arc<AtomicU64>,
+    admit: Arc<Mutex<()>>,
 ) {
     let mut batch: Vec<QueuedAppend> = Vec::with_capacity(settings.max_batch);
     while let Ok(first) = rx.recv() {
-        let first = first.take(&depth);
+        let first = first.take_blocking(&depth, &admit);
         if stop.load(Ordering::Acquire) {
-            while rx.try_recv().is_ok() {
-                take_index_slot(&depth);
-            }
+            drain_blocking_index(&rx, &depth, &admit);
             return;
         }
         batch.push(first);
@@ -1145,21 +1198,25 @@ fn sqlite_usage_index_worker(
                 rx.recv_timeout(remaining).map_err(|_| ())
             };
             match next {
-                Ok(item) => batch.push(item.take(&depth)),
+                Ok(item) => batch.push(item.take_blocking(&depth, &admit)),
                 Err(()) => break,
             }
         }
         if stop.load(Ordering::Acquire) {
-            while rx.try_recv().is_ok() {
-                take_index_slot(&depth);
-            }
+            drain_blocking_index(&rx, &depth, &admit);
             return;
         }
         let events: Vec<crate::store::UsageAppend> =
             batch.iter().map(|item| item.event.clone()).collect();
+        let queue_age_ms = oldest_queue_age_ms(&batch);
         match store.append_usage_batch_sync(&events) {
-            Ok(()) => telemetry.wrote(&batch, IndexOutcome::Accepted, None),
-            Err(error) => telemetry.wrote(&batch, IndexOutcome::Failed, Some(&error.to_string())),
+            Ok(()) => telemetry.wrote(&batch, IndexOutcome::Accepted, None, queue_age_ms),
+            Err(error) => telemetry.wrote(
+                &batch,
+                IndexOutcome::Failed,
+                Some(&error.to_string()),
+                queue_age_ms,
+            ),
         }
         batch.clear();
     }
@@ -1202,12 +1259,16 @@ async fn async_usage_index_worker(
         }
         let events: Vec<crate::store::UsageAppend> =
             batch.iter().map(|item| item.event.clone()).collect();
+        let queue_age_ms = oldest_queue_age_ms(&batch);
         match tokio::time::timeout(settings.write_timeout, store.append_usage_batch(events)).await {
-            Ok(Ok(())) => telemetry.wrote(&batch, IndexOutcome::Accepted, None),
-            Ok(Err(error)) => {
-                telemetry.wrote(&batch, IndexOutcome::Failed, Some(&error.to_string()))
-            }
-            Err(_) => telemetry.wrote(&batch, IndexOutcome::Timeout, None),
+            Ok(Ok(())) => telemetry.wrote(&batch, IndexOutcome::Accepted, None, queue_age_ms),
+            Ok(Err(error)) => telemetry.wrote(
+                &batch,
+                IndexOutcome::Failed,
+                Some(&error.to_string()),
+                queue_age_ms,
+            ),
+            Err(_) => telemetry.wrote(&batch, IndexOutcome::Timeout, None, queue_age_ms),
         }
         batch.clear();
     }
