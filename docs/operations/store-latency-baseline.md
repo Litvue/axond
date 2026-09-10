@@ -103,7 +103,7 @@ period, or request identity ever becomes a label.
 | `axond.store.query_duration` | Time the connection was held: the statement or transaction itself, captured before the SQLite mutex is released (so runtime join delay is not counted as Store execution). Recorded only for calls that reached a connection. |
 | `axond.store.operations` | Calls by outcome: `ok`, `error`, or `saturated` (Postgres pool permit not granted within its wait bound). |
 | `axond.store.connections_opened` | Successful Postgres session opens, including reconnects after the pool shed idle sessions between bursts. Failed `connect()` attempts are not counted. |
-| `axond.usage.index.queue.depth` | Occupied slots in the bounded usage-index queue at each accepted enqueue, from a sender/worker atomic rather than a later `capacity()` sample. |
+| `axond.usage.index.queue.depth` | Occupied slots in the bounded usage-index queue at each accepted enqueue, from the channel's remaining capacity after `try_reserve`. |
 | `axond.usage.index.queue.wait` | How long a usage record waited in that queue before the worker took it. |
 
 Read them as a pair: an acquire wait that grows while query duration stays flat

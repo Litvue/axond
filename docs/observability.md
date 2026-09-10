@@ -183,9 +183,12 @@ destination receives by exactly what the refusals in
 | `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. `shutdown` means the termination flush could not write them. Billing-grade mode has no buffer to drop from: a failed write stays journaled, so watch `axond.usage.journal.lost` there instead. |
 | `axond.usage.flushes` | counter | `axond.usage_sink`, `axond.flush_outcome` | Termination flushes of a buffered sink: `flushed`, `failed`, or `timeout`. |
 | `axond.usage.journal.appends` | counter | `axond.usage_journal`, `axond.journal.outcome` | Billing-grade appends. Anything but `accepted` / `already_present` is a request refused or an event lost. |
-| `axond.usage.index.appends` | counter | `axond.index.outcome` | Management usage-index writes. `accepted` landed; `failed` and `timeout` are best-effort losses of the summary index, not of billing. |
-| `axond.usage.index.queue.depth` | histogram | — | Exact depth of the bounded usage-index queue (capacity 256) observed each time a record is enqueued behind the request. Label-free so it keeps short-lived peaks between exports; a maximum at capacity means the next record is dropped from the index, not from billing. |
-| `axond.usage.index.queue.wait` | histogram (ms) | — | How long an enqueued record waited before the index worker took it: the age of the background queue. Grows when the Store is slow or contended by the request path — read it with `axond.store.acquire_wait`. |
+| `axond.usage.index.appends` | counter | `axond.index.outcome` | Management usage-index events (`axond_store_usage`, what `GET .../usage` reads). `accepted` landed; the rest are best-effort losses of the summary index, not of billing: `saturated` (the bounded queue was full, dropped without waiting), `closed` (the index worker is not running), `failed` (the Store refused the batch), `timeout` (the batch write missed its deadline). See the migration note below. |
+| `axond.usage.index.batches` | counter | `axond.index.outcome` | Store writes the index worker made, one transaction each; only `accepted`, `failed`, `timeout` occur. `appends / batches` is the achieved batch size. |
+| `axond.usage.index.batch_size` | histogram | — | Events per index write. Buckets are powers of two up to the `4096` ceiling, so an unbatched deployment reads as all-ones. |
+| `axond.usage.index.queue_age` | histogram (ms) | — | How long the oldest event of each index write waited in the queue before the write began. The queue-pressure signal: rising age with `saturated` drops means the Store cannot keep up at `[storage.usage_index]`'s batch size. |
+| `axond.usage.index.queue.depth` | histogram | — | Occupied slots in the bounded usage-index queue at each accepted enqueue. Label-free so it keeps short-lived peaks between exports; a peak at `buffer_capacity` means the next record is dropped from the index, not from billing. |
+| `axond.usage.index.queue.wait` | histogram (ms) | — | How long an enqueued record waited before the index worker took it. Grows when the Store is slow or contended by the request path — read it with `axond.store.acquire_wait`. |
 | `axond.usage.journal.deliveries` | counter | `axond.usage_journal`, `axond.usage_journal.consumer`, `axond.journal.delivery` | Journaled events handed to their destinations. |
 | `axond.usage.journal.depth` | gauge | `axond.usage_journal`, `axond.usage_journal.consumer` | Events awaiting delivery. Read against `axond.usage.journal.capacity`. |
 | `axond.usage.journal.in_flight` | gauge | same | Events under an unexpired lease. |
@@ -223,6 +226,14 @@ destination receives by exactly what the refusals in
 | `axond.catalog.refusals` | counter | `axond.catalog.reason` | Catalogue imports refused, by typed reason: `unreachable`, `denied`, `oversized`, `not_json`, `schema`, `id_mismatch`, `identifier`, `unknown_status`, `unknown_modality`, `price`, `unknown_tier_type`, `duplicate_tier`, `neutral_price`, `uncanonicalizable_text`, `ambiguous_model_key`, `content`, `unsupported_endpoint`, `unknown`. A refusal keeps the previous catalogue active, so nothing else moves when one happens. The JSON Pointer and message the refusal also carries are logged, never labelled. |
 | `axond.catalog.active_age` | gauge (ms) | — | How long since the active catalogue was last confirmed current — admitted, or answered `304`. Absent, not zero, before a first import. |
 | `axond.catalog.consecutive_refusals` | gauge | — | Imports refused in a row. Reset by any admitted or confirmed-unchanged import. |
+
+**`axond.index.outcome` migration.** Before the usage index was batched, a full
+index queue was counted as `timeout` although nothing had waited, and a missing
+worker as `failed`. Both values keep their names and now carry only their literal
+meaning: `timeout` is an elapsed write deadline, `failed` a Store error. Two new
+values carry what used to be folded in: `saturated` (queue full) and `closed`
+(worker not running). An alert that read `timeout` as "the index is overloaded"
+should select `saturated` instead, or `outcome != "accepted"` for any loss.
 
 Every instrument and label above is declared in a catalogue inside the binary,
 and tests fail if the code builds an instrument or records a label the catalogue

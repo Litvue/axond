@@ -322,6 +322,13 @@ const JOURNAL_CONSUMER: Label = Label::open("axond.usage_journal.consumer", Labe
 
 const POISON_REASONS: &[&str] = crate::usage::journal::POISON_REASONS;
 
+/// `axond.index.outcome`: how a management usage-index event ended, bounded by
+/// [`IndexOutcome`](crate::usage::IndexOutcome). `saturated` and `closed` were
+/// added alongside the original three; before them a full queue was counted as
+/// `timeout` and a missing worker as `failed`, so `timeout` now means only an
+/// elapsed write deadline and `failed` only a Store error.
+const INDEX_OUTCOME: Label = Label::closed("axond.index.outcome", crate::usage::INDEX_OUTCOMES);
+
 const ADMISSION_RESOURCE: Label = Label::closed(
     "axond.admission.resource",
     &[
@@ -504,10 +511,29 @@ pub const CATALOG: &[MetricSpec] = &[
         name: "axond.usage.index.appends",
         kind: InstrumentKind::Counter,
         unit: None,
-        labels: &[Label::closed(
-            "axond.index.outcome",
-            &["accepted", "failed", "timeout"],
-        )],
+        labels: &[INDEX_OUTCOME],
+    },
+    // One Store write per increment, so `appends / batches` is the achieved
+    // batch size and `batches` the transaction rate the Store is asked for.
+    // Only `accepted`, `failed`, and `timeout` occur here: `saturated` and
+    // `closed` are decided before a write exists.
+    MetricSpec {
+        name: "axond.usage.index.batches",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[INDEX_OUTCOME],
+    },
+    MetricSpec {
+        name: "axond.usage.index.batch_size",
+        kind: InstrumentKind::Histogram,
+        unit: None,
+        labels: &[],
+    },
+    MetricSpec {
+        name: "axond.usage.index.queue_age",
+        kind: InstrumentKind::Histogram,
+        unit: Some("ms"),
+        labels: &[],
     },
     MetricSpec {
         name: "axond.usage.journal.deliveries",
@@ -1581,6 +1607,28 @@ mod tests {
                     )
                 });
             }
+        }
+    }
+
+    /// The usage-index outcome vocabulary is duplicated as strings for the const
+    /// catalogue, so it has to be exactly the enum — and the two original
+    /// values that changed meaning must still be present, or a dashboard
+    /// selecting on them breaks instead of reading the narrower meaning.
+    #[test]
+    fn every_usage_index_outcome_is_catalogued() {
+        let outcomes: Vec<&str> = crate::usage::IndexOutcome::ALL
+            .iter()
+            .map(|outcome| outcome.as_str())
+            .collect();
+        assert_eq!(crate::usage::INDEX_OUTCOMES, outcomes.as_slice());
+        for metric in ["axond.usage.index.appends", "axond.usage.index.batches"] {
+            for outcome in &outcomes {
+                validate_label_value(metric, "axond.index.outcome", outcome)
+                    .expect("every emitted outcome is catalogued");
+            }
+        }
+        for legacy in ["accepted", "failed", "timeout"] {
+            assert!(outcomes.contains(&legacy), "`{legacy}` must keep existing");
         }
     }
 

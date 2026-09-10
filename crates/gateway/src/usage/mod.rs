@@ -475,21 +475,281 @@ pub struct UsageDelivery {
     /// can summarize rows the request path already recorded.
     store: std::sync::OnceLock<Arc<dyn crate::store::Store>>,
     /// Bounded queue into the usage-index worker. `append_store` only
-    /// `try_send`s; a full queue drops the event rather than spawning work.
-    index_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<QueuedIndexEvent>>,
-    /// Occupied slots in `index_tx` (reserved permits plus queued events).
-    /// Incremented after `try_reserve` succeeds and decremented when the worker
-    /// receives or drains, so the histogram cannot wrap or exceed the bound.
-    index_depth: Arc<AtomicU64>,
+    /// `try_reserve`s; a full queue drops the event rather than spawning work.
+    index_tx: std::sync::OnceLock<IndexQueue>,
     /// Set on drop so the worker abandons queued items after the in-flight write.
     index_stop: Arc<AtomicBool>,
+    /// Counters and rate-limited logs shared with the index worker.
+    index: Arc<IndexTelemetry>,
     /// Test-only witness for [`UsageDelivery::count_unheard_refusal`]: the loss
     /// counter it moves is a global instrument no test can read back.
     #[cfg(test)]
     unheard: std::sync::atomic::AtomicU64,
-    /// Test-only: events `try_send` rejected because the index worker was full.
+}
+
+/// Batching policy for the management usage index. Built from
+/// `[storage.usage_index]`; the defaults are what a deployment that never set
+/// the table gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageIndexSettings {
+    /// Events queued ahead of the worker before the request path drops.
+    pub capacity: usize,
+    /// Rows per Store transaction, at most
+    /// [`MAX_USAGE_INDEX_BATCH`](crate::store::MAX_USAGE_INDEX_BATCH).
+    pub max_batch: usize,
+    /// How long a partial batch waits for company before it is written anyway.
+    pub flush_interval: Duration,
+    /// Bound on one cancellable (Postgres) batch write inside the worker. Not
+    /// configurable: the session's own `statement_timeout` is 5 s, and this is
+    /// the tighter bound so a slow index write is abandoned before it can hold
+    /// the worker for longer than a batch is worth.
+    pub write_timeout: Duration,
+}
+
+impl Default for UsageIndexSettings {
+    fn default() -> Self {
+        Self {
+            capacity: 1024,
+            max_batch: 256,
+            flush_interval: Duration::from_millis(50),
+            write_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+impl UsageIndexSettings {
+    /// The settings as the worker applies them: a batch never exceeds the
+    /// queue, the Store's bound, or falls below one row, whatever the file said.
+    fn bounded(self) -> Self {
+        let capacity = self.capacity.max(1);
+        Self {
+            capacity,
+            max_batch: self
+                .max_batch
+                .clamp(1, crate::store::MAX_USAGE_INDEX_BATCH)
+                .min(capacity),
+            ..self
+        }
+    }
+}
+
+/// How one management usage-index event ended. A bounded vocabulary, because it
+/// is the `axond.index.outcome` metric dimension.
+///
+/// `Saturated` and `Closed` were split out of `Timeout` and `Failed`: a full
+/// queue used to be counted as a timeout although nothing ever waited, and a
+/// missing worker as a Store failure. The two older values keep their names and
+/// now mean only what they say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOutcome {
+    /// The Store committed the row (or already had it).
+    Accepted,
+    /// The bounded queue was full: the event was dropped without waiting.
+    Saturated,
+    /// The worker is gone (never started, or stopped), so nothing could take it.
+    Closed,
+    /// The Store refused the write.
+    Failed,
+    /// The Store write did not finish inside its deadline.
+    Timeout,
+}
+
+impl IndexOutcome {
     #[cfg(test)]
-    index_timeouts: std::sync::atomic::AtomicU64,
+    pub const ALL: [Self; 5] = [
+        Self::Accepted,
+        Self::Saturated,
+        Self::Closed,
+        Self::Failed,
+        Self::Timeout,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Saturated => "saturated",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Every [`IndexOutcome`], as the strings the metric catalogue enumerates. A
+/// test holds it to the enum.
+pub const INDEX_OUTCOMES: &[&str] = &["accepted", "saturated", "closed", "failed", "timeout"];
+
+/// One event waiting for the index worker, stamped so the worker can report how
+/// long it waited.
+struct QueuedAppend {
+    event: crate::store::UsageAppend,
+    enqueued_at: Instant,
+}
+
+/// The request path's handle on the index worker's queue. One tokio channel
+/// for both workers: `try_reserve` is non-blocking, occupancy is the channel's
+/// own remaining-capacity count, and the SQLite worker uses `blocking_recv`
+/// so it still needs no runtime.
+struct IndexQueue(tokio::sync::mpsc::Sender<QueuedAppend>);
+
+impl IndexQueue {
+    /// Occupy one slot and hand the event to the worker. Returns the occupied
+    /// slot count after this send, matching `axond.usage.index.queue.depth`.
+    fn try_enqueue(&self, item: QueuedAppend) -> Result<u64, IndexOutcome> {
+        match self.0.try_reserve() {
+            Ok(permit) => {
+                // Sample before `send`: the permit already occupies a slot, and
+                // the worker cannot recv this item until we publish it.
+                let occupied = (self.0.max_capacity() - self.0.capacity()) as u64;
+                permit.send(item);
+                Ok(occupied)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(IndexOutcome::Saturated),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(IndexOutcome::Closed),
+        }
+    }
+}
+
+/// A log line that is emitted at most once per [`Self::INTERVAL`] while the
+/// condition persists, carrying how many occurrences it stands for. The metric
+/// counters it accompanies are incremented on every occurrence regardless.
+struct RateLimitedLog {
+    last_emitted: std::sync::Mutex<Option<Instant>>,
+    suppressed: AtomicU64,
+    #[cfg(test)]
+    emitted: AtomicU64,
+}
+
+impl RateLimitedLog {
+    /// A sustained overflow or outage is one line every ten seconds, not one per
+    /// event: the exact count is on the counter.
+    const INTERVAL: Duration = Duration::from_secs(10);
+
+    fn new() -> Self {
+        Self {
+            last_emitted: std::sync::Mutex::new(None),
+            suppressed: AtomicU64::new(0),
+            #[cfg(test)]
+            emitted: AtomicU64::new(0),
+        }
+    }
+
+    /// `Some(suppressed)` when the caller should log now, with the number of
+    /// occurrences since the last line that went unlogged.
+    fn should_emit(&self) -> Option<u64> {
+        let now = Instant::now();
+        let mut last = self
+            .last_emitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if last.is_some_and(|last| now.duration_since(last) < Self::INTERVAL) {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        *last = Some(now);
+        #[cfg(test)]
+        self.emitted.fetch_add(1, Ordering::Relaxed);
+        Some(self.suppressed.swap(0, Ordering::Relaxed))
+    }
+}
+
+/// What the index worker and the request path share about the index: the
+/// rate-limited logs for its two persistent failure modes, and in tests the
+/// exact per-outcome counts the global instruments cannot be read back for.
+struct IndexTelemetry {
+    /// Request-path drops: the queue was full or the worker is gone.
+    drop_log: RateLimitedLog,
+    /// Worker-side failures: the Store refused or did not answer in time.
+    write_log: RateLimitedLog,
+    #[cfg(test)]
+    outcomes: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>>,
+    #[cfg(test)]
+    batches: AtomicU64,
+    #[cfg(test)]
+    largest_batch: AtomicU64,
+}
+
+impl IndexTelemetry {
+    fn new() -> Self {
+        Self {
+            drop_log: RateLimitedLog::new(),
+            write_log: RateLimitedLog::new(),
+            #[cfg(test)]
+            outcomes: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            #[cfg(test)]
+            batches: AtomicU64::new(0),
+            #[cfg(test)]
+            largest_batch: AtomicU64::new(0),
+        }
+    }
+
+    /// An event the request path could not hand to the worker.
+    fn dropped(&self, outcome: IndexOutcome, request_id: &str) {
+        crate::telemetry::metrics::record_usage_index_append(outcome.as_str(), 1);
+        self.count(outcome, 1);
+        if let Some(suppressed) = self.drop_log.should_emit() {
+            tracing::error!(
+                request_id = %request_id,
+                outcome = outcome.as_str(),
+                suppressed,
+                "store usage append dropped: {}",
+                match outcome {
+                    IndexOutcome::Saturated => "the index queue is full",
+                    _ => "the index worker is not running",
+                }
+            );
+        }
+    }
+
+    /// One Store write of `batch` finished with `outcome`. `queue_age_ms` is
+    /// how long the oldest event had already waited when the write *began*,
+    /// not when it returned — otherwise a slow Store transaction looks like
+    /// queue delay.
+    fn wrote(
+        &self,
+        batch: &[QueuedAppend],
+        outcome: IndexOutcome,
+        error: Option<&str>,
+        queue_age_ms: f64,
+    ) {
+        let rows = batch.len() as u64;
+        crate::telemetry::metrics::record_usage_index_batch(outcome.as_str(), rows, queue_age_ms);
+        self.count(outcome, rows);
+        #[cfg(test)]
+        {
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            self.largest_batch.fetch_max(rows, Ordering::Relaxed);
+        }
+        if outcome == IndexOutcome::Accepted {
+            return;
+        }
+        if let Some(suppressed) = self.write_log.should_emit() {
+            let first = batch
+                .first()
+                .map_or("", |first| first.event.request_id.as_str());
+            tracing::error!(
+                request_id = %first,
+                rows,
+                outcome = outcome.as_str(),
+                error = error.unwrap_or("write deadline elapsed"),
+                suppressed,
+                "store usage append batch was lost"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    fn count(&self, outcome: IndexOutcome, n: u64) {
+        *self
+            .outcomes
+            .lock()
+            .expect("outcomes")
+            .entry(outcome.as_str())
+            .or_default() += n;
+    }
+
+    #[cfg(not(test))]
+    fn count(&self, _: IndexOutcome, _: u64) {}
 }
 
 /// A usage event that could not be made durable, and the request that must now
@@ -504,12 +764,6 @@ pub struct NotDurable {
 }
 
 impl UsageDelivery {
-    /// Bound on one Postgres (cancellable) index write inside the worker.
-    const STORE_INDEX_TIMEOUT: Duration = Duration::from_secs(2);
-    /// Queued index events before `append_store` drops rather than blocking.
-    /// The top bucket of `axond.usage.index.queue.depth` is this bound.
-    pub(crate) const STORE_INDEX_QUEUE: usize = 256;
-
     /// Telemetry-grade: best effort, non-blocking, lossy under overload.
     pub fn telemetry(fanout: UsageFanout) -> Self {
         Self {
@@ -518,12 +772,10 @@ impl UsageDelivery {
             on_undurable: UndurablePolicy::Serve,
             store: std::sync::OnceLock::new(),
             index_tx: std::sync::OnceLock::new(),
-            index_depth: Arc::new(AtomicU64::new(0)),
             index_stop: Arc::new(AtomicBool::new(false)),
+            index: Arc::new(IndexTelemetry::new()),
             #[cfg(test)]
             unheard: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            index_timeouts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -536,27 +788,33 @@ impl UsageDelivery {
             on_undurable,
             store: std::sync::OnceLock::new(),
             index_tx: std::sync::OnceLock::new(),
-            index_depth: Arc::new(AtomicU64::new(0)),
             index_stop: Arc::new(AtomicBool::new(false)),
+            index: Arc::new(IndexTelemetry::new()),
             #[cfg(test)]
             unheard: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(test)]
-            index_timeouts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Index usage for `GET /api/v1/namespaces/{ns}/usage`. Idempotent.
-    pub fn attach_store(&self, store: Arc<dyn crate::store::Store>) {
+    ///
+    /// One worker per delivery: an OS thread for a Store whose index write is
+    /// blocking (SQLite), a task otherwise (Postgres). Either way the request
+    /// path only ever `try_send`s onto a queue of `settings.capacity`, and the
+    /// worker writes what has queued in transactions of at most
+    /// `settings.max_batch` rows, lingering `settings.flush_interval` for a
+    /// partial batch to fill.
+    pub fn attach_store(&self, store: Arc<dyn crate::store::Store>, settings: UsageIndexSettings) {
         if self.store.set(Arc::clone(&store)).is_err() {
             return;
         }
-        let (tx, rx) = tokio::sync::mpsc::channel(Self::STORE_INDEX_QUEUE);
+        let settings = settings.bounded();
         let stop = Arc::clone(&self.index_stop);
-        let depth = Arc::clone(&self.index_depth);
+        let telemetry = Arc::clone(&self.index);
+        let (tx, rx) = tokio::sync::mpsc::channel(settings.capacity);
         if store.blocking_usage_index() {
             match std::thread::Builder::new()
                 .name("axond-usage-index".into())
-                .spawn(move || sqlite_usage_index_worker(store, rx, stop, depth))
+                .spawn(move || sqlite_usage_index_worker(store, rx, stop, settings, telemetry))
             {
                 Ok(handle) => drop(handle),
                 Err(error) => {
@@ -569,69 +827,44 @@ impl UsageDelivery {
             }
         } else if tokio::runtime::Handle::try_current().is_ok() {
             drop(tokio::spawn(async_usage_index_worker(
-                store, rx, stop, depth,
+                store, rx, stop, settings, telemetry,
             )));
         } else {
             tracing::error!("store usage-index worker needs a tokio runtime");
             return;
         }
-        let _ = self.index_tx.set(tx);
+        let _ = self.index_tx.set(IndexQueue(tx));
     }
 
     /// Best-effort management-index append. Fire-and-forget: `try_send` onto
     /// one worker, never `spawn_blocking` per record. A successful journal
     /// append must not wait here. Idempotency is the Store's `request_id`
-    /// primary key.
+    /// primary key, which is also what lets the worker retry nothing: a batch
+    /// that fails is counted and dropped, and the next request's row is new.
     fn append_store(&self, record: &UsageRecord) {
         if self.store.get().is_none() {
             return;
         }
-        let request_id = record.request_id.clone();
         let event = crate::store::UsageAppend {
-            request_id: request_id.clone(),
+            request_id: record.request_id.clone(),
             namespace: record.namespace.clone(),
             period: record.period.clone(),
             model: record.model.clone(),
             status: record.status.as_str().to_owned(),
             cost_microdollars: record.cost_microdollars,
         };
-        let Some(tx) = self.index_tx.get() else {
-            tracing::error!(
-                request_id = %request_id,
-                "store usage append failed"
-            );
-            crate::telemetry::metrics::record_usage_index_append("failed");
+        let Some(queue) = self.index_tx.get() else {
+            self.index.dropped(IndexOutcome::Closed, &record.request_id);
             return;
         };
-        match tx.try_reserve() {
-            Ok(permit) => {
-                // The permit occupies a real slot, so the worker cannot recv
-                // this event until `send` below. Depth is then occupied slots,
-                // not in-flight send attempts.
-                let depth = self.index_depth.fetch_add(1, Ordering::AcqRel) + 1;
-                permit.send(QueuedIndexEvent {
-                    enqueued: Instant::now(),
-                    event,
-                });
-                crate::telemetry::metrics::record_usage_index_enqueued(depth);
+        match queue.try_enqueue(QueuedAppend {
+            event,
+            enqueued_at: Instant::now(),
+        }) {
+            Ok(occupied) => {
+                crate::telemetry::metrics::record_usage_index_enqueued(occupied);
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                tracing::error!(
-                    request_id = %request_id,
-                    "store usage append timed out"
-                );
-                crate::telemetry::metrics::record_usage_index_append("timeout");
-                #[cfg(test)]
-                self.index_timeouts
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                tracing::error!(
-                    request_id = %request_id,
-                    "store usage append failed"
-                );
-                crate::telemetry::metrics::record_usage_index_append("failed");
-            }
+            Err(outcome) => self.index.dropped(outcome, &record.request_id),
         }
     }
 
@@ -762,11 +995,41 @@ impl UsageDelivery {
         self.unheard.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// How many index events were dropped because the worker queue was full.
+    /// How many index events ended in `outcome`, exactly, whether they were
+    /// dropped on the request path or written (or not) by the worker.
     #[cfg(test)]
-    pub fn index_timeouts(&self) -> u64 {
-        self.index_timeouts
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub fn index_outcome(&self, outcome: IndexOutcome) -> u64 {
+        self.index
+            .outcomes
+            .lock()
+            .expect("outcomes")
+            .get(outcome.as_str())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Store writes the index worker has made, and the largest of them.
+    #[cfg(test)]
+    pub fn index_batches(&self) -> (u64, u64) {
+        (
+            self.index.batches.load(Ordering::Relaxed),
+            self.index.largest_batch.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Log lines the two rate-limited index logs have emitted: `(drops, writes)`.
+    #[cfg(test)]
+    pub fn index_log_lines(&self) -> (u64, u64) {
+        (
+            self.index.drop_log.emitted.load(Ordering::Relaxed),
+            self.index.write_log.emitted.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Ask the index worker to exit after its next dequeue, as `Drop` does.
+    #[cfg(test)]
+    pub fn stop_index_worker(&self) {
+        self.index_stop.store(true, Ordering::Release);
     }
 
     /// Record where the caller has no way to refuse: a stream that has already
@@ -804,99 +1067,124 @@ impl Drop for UsageDelivery {
     }
 }
 
-/// One usage event on its way to the index worker, stamped when it was queued
-/// so the worker can report how long the background index trailed the request.
-struct QueuedIndexEvent {
-    enqueued: Instant,
-    event: crate::store::UsageAppend,
+fn oldest_queue_age_ms(batch: &[QueuedAppend]) -> f64 {
+    batch
+        .first()
+        .map(|oldest| oldest.enqueued_at.elapsed().as_secs_f64() * 1_000.0)
+        .unwrap_or_default()
 }
 
-impl QueuedIndexEvent {
-    fn dequeue(self) -> crate::store::UsageAppend {
+impl QueuedAppend {
+    fn take(self) -> Self {
         crate::telemetry::metrics::record_usage_index_dequeued(
-            self.enqueued.elapsed().as_secs_f64() * 1000.0,
+            self.enqueued_at.elapsed().as_secs_f64() * 1000.0,
         );
-        self.event
+        self
     }
 }
 
+/// The blocking (SQLite) index worker: block for the first queued event, gather
+/// what else arrives within `flush_interval` up to `max_batch`, write the batch
+/// in one transaction on this thread, repeat. Exits when every sender is gone or
+/// the delivery is dropped; queued events are then abandoned, which is the
+/// crash-loss the index accepts (ADR 0064 keeps the budget charge elsewhere).
 fn sqlite_usage_index_worker(
     store: Arc<dyn crate::store::Store>,
-    mut rx: tokio::sync::mpsc::Receiver<QueuedIndexEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<QueuedAppend>,
     stop: Arc<AtomicBool>,
-    depth: Arc<AtomicU64>,
+    settings: UsageIndexSettings,
+    telemetry: Arc<IndexTelemetry>,
 ) {
-    while let Some(queued) = rx.blocking_recv() {
-        take_index_slot(&depth);
+    let mut batch: Vec<QueuedAppend> = Vec::with_capacity(settings.max_batch);
+    while let Some(first) = rx.blocking_recv() {
+        let first = first.take();
         if stop.load(Ordering::Acquire) {
-            drain_index_queue(&mut rx, &depth);
-            break;
+            while rx.try_recv().is_ok() {}
+            return;
         }
-        let event = queued.dequeue();
-        let request_id = event.request_id.clone();
-        let outcome = match store.append_usage_sync(event) {
-            Ok(()) => "accepted",
-            Err(error) => {
-                tracing::error!(
-                    request_id = %request_id,
-                    error = %error,
-                    "store usage append failed"
-                );
-                "failed"
+        batch.push(first);
+        let deadline = Instant::now()
+            .checked_add(settings.flush_interval)
+            .unwrap_or_else(Instant::now);
+        while batch.len() < settings.max_batch {
+            match rx.try_recv() {
+                Ok(item) => batch.push(item.take()),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
             }
-        };
-        crate::telemetry::metrics::record_usage_index_append(outcome);
+        }
+        if stop.load(Ordering::Acquire) {
+            while rx.try_recv().is_ok() {}
+            return;
+        }
+        let events: Vec<crate::store::UsageAppend> =
+            batch.iter().map(|item| item.event.clone()).collect();
+        let queue_age_ms = oldest_queue_age_ms(&batch);
+        match store.append_usage_batch_sync(&events) {
+            Ok(()) => telemetry.wrote(&batch, IndexOutcome::Accepted, None, queue_age_ms),
+            Err(error) => telemetry.wrote(
+                &batch,
+                IndexOutcome::Failed,
+                Some(&error.to_string()),
+                queue_age_ms,
+            ),
+        }
+        batch.clear();
     }
 }
 
+/// The task (Postgres) index worker: the same gather-then-write loop, with each
+/// write bounded by `settings.write_timeout`. A write that misses the deadline
+/// is dropped and counted as `timeout`; dedup on `request_id` means a statement
+/// that finishes server-side after being abandoned costs nothing.
 async fn async_usage_index_worker(
     store: Arc<dyn crate::store::Store>,
-    mut rx: tokio::sync::mpsc::Receiver<QueuedIndexEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<QueuedAppend>,
     stop: Arc<AtomicBool>,
-    depth: Arc<AtomicU64>,
+    settings: UsageIndexSettings,
+    telemetry: Arc<IndexTelemetry>,
 ) {
-    while let Some(queued) = rx.recv().await {
-        take_index_slot(&depth);
+    let mut batch: Vec<QueuedAppend> = Vec::with_capacity(settings.max_batch);
+    while let Some(first) = rx.recv().await {
+        let first = first.take();
         if stop.load(Ordering::Acquire) {
-            drain_index_queue(&mut rx, &depth);
-            break;
+            while rx.try_recv().is_ok() {}
+            return;
         }
-        let event = queued.dequeue();
-        let request_id = event.request_id.clone();
-        let outcome = match tokio::time::timeout(
-            UsageDelivery::STORE_INDEX_TIMEOUT,
-            store.append_usage(event),
-        )
-        .await
-        {
-            Ok(Ok(())) => "accepted",
-            Ok(Err(error)) => {
-                tracing::error!(
-                    request_id = %request_id,
-                    error = %error,
-                    "store usage append failed"
-                );
-                "failed"
+        batch.push(first);
+        let deadline = tokio::time::Instant::now()
+            .checked_add(settings.flush_interval)
+            .unwrap_or_else(tokio::time::Instant::now);
+        while batch.len() < settings.max_batch {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(item)) => batch.push(item.take()),
+                Ok(None) | Err(_) => break,
             }
-            Err(_) => {
-                tracing::error!(
-                    request_id = %request_id,
-                    "store usage append timed out"
-                );
-                "timeout"
-            }
-        };
-        crate::telemetry::metrics::record_usage_index_append(outcome);
-    }
-}
-
-fn take_index_slot(depth: &AtomicU64) {
-    depth.fetch_sub(1, Ordering::AcqRel);
-}
-
-fn drain_index_queue(rx: &mut tokio::sync::mpsc::Receiver<QueuedIndexEvent>, depth: &AtomicU64) {
-    while rx.try_recv().is_ok() {
-        take_index_slot(depth);
+        }
+        if stop.load(Ordering::Acquire) {
+            while rx.try_recv().is_ok() {}
+            return;
+        }
+        let events: Vec<crate::store::UsageAppend> =
+            batch.iter().map(|item| item.event.clone()).collect();
+        let queue_age_ms = oldest_queue_age_ms(&batch);
+        match tokio::time::timeout(settings.write_timeout, store.append_usage_batch(events)).await {
+            Ok(Ok(())) => telemetry.wrote(&batch, IndexOutcome::Accepted, None, queue_age_ms),
+            Ok(Err(error)) => telemetry.wrote(
+                &batch,
+                IndexOutcome::Failed,
+                Some(&error.to_string()),
+                queue_age_ms,
+            ),
+            Err(_) => telemetry.wrote(&batch, IndexOutcome::Timeout, None, queue_age_ms),
+        }
+        batch.clear();
     }
 }
 
@@ -1253,6 +1541,20 @@ mod tests {
         ) -> Result<(), crate::store::StoreError> {
             std::future::pending().await
         }
+        async fn append_usage_batch(
+            &self,
+            _: Vec<crate::store::UsageAppend>,
+        ) -> Result<(), crate::store::StoreError> {
+            std::future::pending().await
+        }
+        fn append_usage_batch_sync(
+            &self,
+            _: &[crate::store::UsageAppend],
+        ) -> Result<(), crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable(
+                "this store has no synchronous usage-index path".into(),
+            ))
+        }
         async fn summarize_usage(
             &self,
             _: &str,
@@ -1264,9 +1566,40 @@ mod tests {
 
     /// Blocking usage-index store whose first sync write waits until `release`
     /// is dropped, so the queue can be filled without the worker draining it.
+    /// Records every batch it is handed, and fails them all when `fail` is set.
     struct ParkingIndexStore {
         entered: Arc<std::sync::Barrier>,
         release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        batches: std::sync::Mutex<Vec<usize>>,
+        fail: bool,
+    }
+
+    impl ParkingIndexStore {
+        fn parked(
+            entered: Arc<std::sync::Barrier>,
+            release: std::sync::mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                entered,
+                release: std::sync::Mutex::new(Some(release)),
+                batches: std::sync::Mutex::new(Vec::new()),
+                fail: false,
+            }
+        }
+
+        /// Never parks; every batch is refused.
+        fn failing() -> Self {
+            Self {
+                entered: Arc::new(std::sync::Barrier::new(1)),
+                release: std::sync::Mutex::new(None),
+                batches: std::sync::Mutex::new(Vec::new()),
+                fail: true,
+            }
+        }
+
+        fn batches(&self) -> Vec<usize> {
+            self.batches.lock().expect("batches").clone()
+        }
     }
 
     #[async_trait]
@@ -1360,16 +1693,32 @@ mod tests {
         ) -> Result<(), crate::store::StoreError> {
             Ok(())
         }
+        async fn append_usage_batch(
+            &self,
+            events: Vec<crate::store::UsageAppend>,
+        ) -> Result<(), crate::store::StoreError> {
+            self.append_usage_batch_sync(&events)
+        }
         fn blocking_usage_index(&self) -> bool {
             true
         }
         fn append_usage_sync(
             &self,
-            _: crate::store::UsageAppend,
+            event: crate::store::UsageAppend,
         ) -> Result<(), crate::store::StoreError> {
+            self.append_usage_batch_sync(std::slice::from_ref(&event))
+        }
+        fn append_usage_batch_sync(
+            &self,
+            events: &[crate::store::UsageAppend],
+        ) -> Result<(), crate::store::StoreError> {
+            self.batches.lock().expect("batches").push(events.len());
             if let Some(rx) = self.release.lock().expect("release mutex").take() {
                 self.entered.wait();
                 let _ = rx.recv();
+            }
+            if self.fail {
+                return Err(crate::store::StoreError::Unavailable("index down".into()));
             }
             Ok(())
         }
@@ -1397,7 +1746,7 @@ mod tests {
     #[tokio::test]
     async fn a_store_index_append_does_not_delay_the_record_verdict() {
         let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
-        delivery.attach_store(Arc::new(SlowIndexStore));
+        delivery.attach_store(Arc::new(SlowIndexStore), UsageIndexSettings::default());
         let started = Instant::now();
         delivery
             .record(&sample_record())
@@ -1412,7 +1761,7 @@ mod tests {
     #[tokio::test]
     async fn a_journaled_append_does_not_wait_on_the_usage_index() {
         let delivery = billing(bounded(8), UndurablePolicy::Refuse);
-        delivery.attach_store(Arc::new(SlowIndexStore));
+        delivery.attach_store(Arc::new(SlowIndexStore), UsageIndexSettings::default());
         let started = Instant::now();
         delivery.record(&sample_record()).await.expect("append");
         assert!(
@@ -1425,7 +1774,10 @@ mod tests {
     async fn sqlite_usage_index_worker_lands_a_row_without_blocking_record() {
         let store = Arc::new(crate::store::SqliteStore::open(":memory:").expect("sqlite"));
         let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
-        delivery.attach_store(Arc::clone(&store) as Arc<dyn crate::store::Store>);
+        delivery.attach_store(
+            Arc::clone(&store) as Arc<dyn crate::store::Store>,
+            UsageIndexSettings::default(),
+        );
         let record = sample_record();
         let started = Instant::now();
         delivery
@@ -1459,40 +1811,384 @@ mod tests {
         );
     }
 
+    /// Poll `probe` until it holds, or fail after a bounded wait. The index
+    /// worker is asynchronous by design, so its effects are awaited, not assumed.
+    async fn eventually(what: &str, mut probe: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if probe() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{what} did not happen within the wait");
+    }
+
+    fn fast_index(capacity: usize, max_batch: usize) -> UsageIndexSettings {
+        UsageIndexSettings {
+            capacity,
+            max_batch,
+            flush_interval: Duration::from_millis(1),
+            write_timeout: Duration::from_millis(50),
+        }
+    }
+
+    /// A full queue drops on the request path without waiting, is counted as
+    /// `saturated` exactly once per event (never as `timeout`, which nothing
+    /// here did), and logs once rather than once per drop. Everything that did
+    /// queue is written when the Store comes back, in batches no larger than
+    /// `max_batch`, and nothing is written twice.
     #[tokio::test]
     async fn a_full_sqlite_index_queue_drops_without_blocking_record() {
+        const CAPACITY: usize = 8;
+        const OVERFLOW: usize = 5;
         let entered = Arc::new(std::sync::Barrier::new(2));
         let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let store = Arc::new(ParkingIndexStore::parked(Arc::clone(&entered), release_rx));
         let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
-        delivery.attach_store(Arc::new(ParkingIndexStore {
-            entered: Arc::clone(&entered),
-            release: std::sync::Mutex::new(Some(release_rx)),
-        }));
+        delivery.attach_store(
+            Arc::clone(&store) as Arc<dyn Store>,
+            fast_index(CAPACITY, 4),
+        );
         delivery
             .record(&sample_record())
             .await
             .expect("first event is dequeued");
+        // The worker is now parked inside its first write with the queue empty.
         entered.wait();
         let started = Instant::now();
-        for _ in 0..UsageDelivery::STORE_INDEX_QUEUE {
+        for _ in 0..CAPACITY + OVERFLOW {
             delivery
                 .record(&sample_record())
                 .await
-                .expect("queued or dropped");
+                .expect("queued or dropped, never awaited");
         }
-        delivery
-            .record(&sample_record())
-            .await
-            .expect("overflow is dropped, not awaited");
         assert!(
             started.elapsed() < Duration::from_millis(200),
             "a full index queue must not stall the inference verdict"
         );
-        assert!(
-            delivery.index_timeouts() >= 1,
-            "a full index queue counts timeout"
+        assert_eq!(
+            delivery.index_outcome(IndexOutcome::Saturated),
+            OVERFLOW as u64,
+            "every overflow event is counted exactly once as saturated"
+        );
+        assert_eq!(delivery.index_outcome(IndexOutcome::Timeout), 0);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Failed), 0);
+        assert_eq!(
+            delivery.index_log_lines().0,
+            1,
+            "a sustained overflow is one log line, not one per drop"
         );
         drop(release_tx);
+        eventually("the queued events are written", || {
+            delivery.index_outcome(IndexOutcome::Accepted) == (1 + CAPACITY) as u64
+        })
+        .await;
+        let batches = store.batches();
+        assert_eq!(batches.iter().sum::<usize>(), 1 + CAPACITY);
+        assert!(batches.iter().all(|size| *size <= 4), "{batches:?}");
+        assert!(
+            batches.len() < 1 + CAPACITY,
+            "the backlog was batched: {batches:?}"
+        );
+    }
+
+    /// A Store outage costs index rows, not memory or latency: the queue never
+    /// holds more than its capacity, no transaction is asked for more than
+    /// `max_batch` rows, every event is accounted for exactly once as either
+    /// `saturated` or `failed`, and the failing writes log at a bounded rate.
+    #[tokio::test]
+    async fn an_index_outage_keeps_the_queue_and_batches_bounded() {
+        const CAPACITY: usize = 16;
+        const MAX_BATCH: usize = 4;
+        const SENT: u64 = 400;
+        let store = Arc::new(ParkingIndexStore::failing());
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(
+            Arc::clone(&store) as Arc<dyn Store>,
+            fast_index(CAPACITY, MAX_BATCH),
+        );
+        for _ in 0..SENT {
+            delivery
+                .record(&sample_record())
+                .await
+                .expect("best effort");
+        }
+        eventually("every event is accounted for", || {
+            delivery.index_outcome(IndexOutcome::Saturated)
+                + delivery.index_outcome(IndexOutcome::Failed)
+                == SENT
+        })
+        .await;
+        assert_eq!(delivery.index_outcome(IndexOutcome::Accepted), 0);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Timeout), 0);
+        let batches = store.batches();
+        assert!(
+            batches.iter().all(|size| (1..=MAX_BATCH).contains(size)),
+            "{batches:?}"
+        );
+        assert_eq!(
+            batches.iter().map(|size| *size as u64).sum::<u64>(),
+            delivery.index_outcome(IndexOutcome::Failed)
+        );
+        let (writes, largest) = delivery.index_batches();
+        assert_eq!(writes, batches.len() as u64);
+        assert_eq!(largest, *batches.iter().max().expect("some writes") as u64);
+        let (drop_lines, write_lines) = delivery.index_log_lines();
+        assert!(drop_lines <= 1, "{drop_lines} overflow lines");
+        assert_eq!(
+            write_lines,
+            1,
+            "{} failing writes logged once",
+            batches.len()
+        );
+    }
+
+    /// The rate limiter's contract in isolation: the first occurrence logs, the
+    /// rest inside the window are suppressed and counted, and the next line after
+    /// the window carries the suppressed count so nothing is silently lost.
+    #[test]
+    fn a_rate_limited_log_emits_once_per_window_and_reports_what_it_skipped() {
+        let log = RateLimitedLog::new();
+        assert_eq!(log.should_emit(), Some(0));
+        for _ in 0..7 {
+            assert_eq!(log.should_emit(), None);
+        }
+        assert_eq!(log.suppressed.load(Ordering::Relaxed), 7);
+        *log.last_emitted.lock().expect("lock") =
+            Some(Instant::now() - RateLimitedLog::INTERVAL - Duration::from_millis(1));
+        assert_eq!(log.should_emit(), Some(7));
+        assert_eq!(log.should_emit(), None);
+    }
+
+    /// A worker that is gone is `closed`, not `failed`: nothing about the Store
+    /// is known, and the request path found nobody to hand the event to.
+    #[tokio::test]
+    async fn an_index_worker_that_has_stopped_is_counted_as_closed() {
+        let store = Arc::new(crate::store::SqliteStore::open(":memory:").expect("sqlite"));
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(store, fast_index(8, 8));
+        delivery.stop_index_worker();
+        // The worker only observes the flag when it dequeues, so the first event
+        // is what wakes it into exiting; the ones after it find the queue closed.
+        for _ in 0..200 {
+            delivery
+                .record(&sample_record())
+                .await
+                .expect("best effort");
+            if delivery.index_outcome(IndexOutcome::Closed) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(delivery.index_outcome(IndexOutcome::Closed) > 0);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Failed), 0);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Saturated), 0);
+    }
+
+    /// A delivery that never got a worker (no store attached is fine; a store
+    /// attached and no queue is not) counts `closed` too.
+    #[tokio::test]
+    async fn a_store_without_a_worker_is_counted_as_closed_not_failed() {
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        let _ = delivery.store.set(Arc::new(SlowIndexStore));
+        delivery
+            .record(&sample_record())
+            .await
+            .expect("best effort");
+        assert_eq!(delivery.index_outcome(IndexOutcome::Closed), 1);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Failed), 0);
+    }
+
+    /// The async (Postgres-shaped) worker: a write that outlives its deadline is
+    /// `timeout`, and the whole batch is counted, once, under that outcome.
+    #[tokio::test]
+    async fn an_index_write_past_its_deadline_is_counted_as_timeout() {
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(Arc::new(SlowIndexStore), fast_index(8, 8));
+        for _ in 0..3 {
+            delivery
+                .record(&sample_record())
+                .await
+                .expect("best effort");
+        }
+        eventually("the batch times out", || {
+            delivery.index_outcome(IndexOutcome::Timeout) == 3
+        })
+        .await;
+        assert_eq!(delivery.index_outcome(IndexOutcome::Failed), 0);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Saturated), 0);
+        assert_eq!(delivery.index_batches().0, 1, "one write for the batch");
+    }
+
+    /// The async worker classifies a Store refusal as `failed`.
+    #[tokio::test]
+    async fn an_index_write_the_store_refuses_is_counted_as_failed() {
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(Arc::new(crate::store::UnavailableStore), fast_index(8, 8));
+        delivery
+            .record(&sample_record())
+            .await
+            .expect("best effort");
+        eventually("the write fails", || {
+            delivery.index_outcome(IndexOutcome::Failed) == 1
+        })
+        .await;
+        assert_eq!(delivery.index_outcome(IndexOutcome::Timeout), 0);
+    }
+
+    /// Bounds hold whatever the file said: a batch larger than the queue or the
+    /// Store's ceiling is clamped, and a zero is one.
+    #[test]
+    fn index_settings_are_bounded_before_the_worker_sees_them() {
+        let bounded = UsageIndexSettings {
+            capacity: 0,
+            max_batch: 0,
+            ..UsageIndexSettings::default()
+        }
+        .bounded();
+        assert_eq!((bounded.capacity, bounded.max_batch), (1, 1));
+        let bounded = UsageIndexSettings {
+            capacity: 100_000,
+            max_batch: 50_000,
+            ..UsageIndexSettings::default()
+        }
+        .bounded();
+        assert_eq!(bounded.max_batch, crate::store::MAX_USAGE_INDEX_BATCH);
+        let bounded = UsageIndexSettings {
+            capacity: 8,
+            max_batch: 64,
+            ..UsageIndexSettings::default()
+        }
+        .bounded();
+        assert_eq!(bounded.max_batch, 8);
+    }
+
+    /// Informational, not a gate: the before/after numbers for #468.
+    ///
+    /// Enqueues the same events through the index worker with `max_batch = 1`
+    /// (the previous one-transaction-per-event behaviour) and with the default
+    /// batch, against a file-backed SQLite store so each commit pays its fsync.
+    /// The queue is sized to the run so neither mode drops and the comparison is
+    /// of drain rate and transaction count; a second run at the previous queue
+    /// bound (256) shows what the same burst costs in `saturated` drops.
+    /// Throughout the drain a request-path Store read is probed for its worst
+    /// latency, the "does batching starve inference" number.
+    ///
+    /// `cargo test -p axond --all-features -- --ignored --nocapture usage_index_bench`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "benchmark: run by hand with --ignored --nocapture"]
+    async fn usage_index_bench() {
+        const EVENTS: u64 = 4_000;
+        let before = UsageIndexSettings {
+            max_batch: 1,
+            ..UsageIndexSettings::default()
+        };
+        let after = UsageIndexSettings::default();
+        for (label, settings) in [
+            (
+                "before, unbounded run (max_batch = 1, capacity = 4000)",
+                UsageIndexSettings {
+                    capacity: EVENTS as usize,
+                    ..before
+                },
+            ),
+            (
+                "after, unbounded run (max_batch = 256, capacity = 4000)",
+                UsageIndexSettings {
+                    capacity: EVENTS as usize,
+                    ..after
+                },
+            ),
+            (
+                "before, previous queue (max_batch = 1, capacity = 256)",
+                UsageIndexSettings {
+                    capacity: 256,
+                    ..before
+                },
+            ),
+            (
+                "after, previous queue (max_batch = 256, capacity = 256)",
+                UsageIndexSettings {
+                    capacity: 256,
+                    ..after
+                },
+            ),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "axond-usage-index-bench-{}-{}.sqlite",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            let store = Arc::new(
+                crate::store::SqliteStore::open(path.to_str().expect("utf8")).expect("sqlite"),
+            );
+            store
+                .put_namespace(crate::store::NamespaceRecord {
+                    id: "acme".into(),
+                    attrs: serde_json::json!({}),
+                    blocklist: None,
+                })
+                .await
+                .expect("namespace");
+            let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+            delivery.attach_store(Arc::clone(&store) as Arc<dyn Store>, settings);
+            let record = sample_record();
+            let period = record.period.clone().expect("period");
+            let started = Instant::now();
+            for _ in 0..EVENTS {
+                let event = UsageRecord {
+                    request_id: identity::next_request_id().to_string(),
+                    ..record.clone()
+                };
+                delivery.record(&event).await.expect("telemetry");
+            }
+            let enqueued = started.elapsed();
+            let mut indexed = 0;
+            let mut worst_read = Duration::ZERO;
+            let mut reads = 0u64;
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while Instant::now() < deadline {
+                let at = Instant::now();
+                store
+                    .get_namespace("acme")
+                    .await
+                    .expect("read")
+                    .expect("row");
+                worst_read = worst_read.max(at.elapsed());
+                reads += 1;
+                indexed = store
+                    .summarize_usage(&record.namespace, &period)
+                    .await
+                    .expect("summary")
+                    .iter()
+                    .map(|row| row.count)
+                    .sum::<u64>();
+                if indexed + delivery.index_outcome(IndexOutcome::Saturated) >= EVENTS {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            let elapsed = started.elapsed();
+            let (batches, largest) = delivery.index_batches();
+            println!(
+                "{label}:\n  {indexed} indexed of {EVENTS} in {:.2}s ({:.0} records/s; enqueue \
+                 took {:?})\n  {batches} store transactions, largest {largest} rows, {} \
+                 saturated drops\n  worst request-path store read during the drain {:?} over \
+                 {reads} probes",
+                elapsed.as_secs_f64(),
+                indexed as f64 / elapsed.as_secs_f64(),
+                enqueued,
+                delivery.index_outcome(IndexOutcome::Saturated),
+                worst_read,
+            );
+            drop(delivery);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+            let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+        }
     }
 
     #[tokio::test]

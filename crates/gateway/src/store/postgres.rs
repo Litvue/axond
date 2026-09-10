@@ -248,6 +248,37 @@ fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+/// Bind parameters per usage-index row: `request_id, namespace, period, model,
+/// status, cost_microdollars`. `recorded_at` is the server's `now()`.
+const USAGE_COLUMNS: usize = 6;
+
+/// A multi-row `INSERT ... ON CONFLICT (request_id) DO NOTHING` with one
+/// parameter set per row — the batch form of the single-row append, with the
+/// same nullable `period` / `cost_microdollars` and the same server-side
+/// `recorded_at`.
+fn usage_insert_sql(rows: usize) -> String {
+    let mut sql = String::with_capacity(160 + rows * 40);
+    sql.push_str(
+        "INSERT INTO axond_store_usage \
+            (request_id, namespace, period, model, status, cost_microdollars, recorded_at) \
+         VALUES ",
+    );
+    for row in 0..rows {
+        if row > 0 {
+            sql.push_str(", ");
+        }
+        sql.push('(');
+        for column in 0..USAGE_COLUMNS {
+            sql.push('$');
+            sql.push_str(&(row * USAGE_COLUMNS + column + 1).to_string());
+            sql.push_str(", ");
+        }
+        sql.push_str("now())");
+    }
+    sql.push_str(" ON CONFLICT (request_id) DO NOTHING");
+    sql
+}
+
 async fn probe_schema(client: &Client) -> Result<(), StoreError> {
     client
         .batch_execute(
@@ -1165,6 +1196,50 @@ impl Store for PostgresStore {
             Ok(())
         })
         .await
+    }
+
+    async fn append_usage_batch(&self, events: Vec<UsageAppend>) -> Result<(), StoreError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        if events.len() > super::MAX_USAGE_INDEX_BATCH {
+            return Err(StoreError::Invalid(format!(
+                "usage-index batch of {} rows exceeds the bound of {}",
+                events.len(),
+                super::MAX_USAGE_INDEX_BATCH
+            )));
+        }
+        let sql = usage_insert_sql(events.len());
+        let costs: Vec<Option<i64>> = events
+            .iter()
+            .map(|event| event.cost_microdollars.map(sql_amount_saturating))
+            .collect();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            Vec::with_capacity(events.len() * USAGE_COLUMNS);
+        for (event, cost) in events.iter().zip(&costs) {
+            params.push(&event.request_id);
+            params.push(&event.namespace);
+            params.push(&event.period);
+            params.push(&event.model);
+            params.push(&event.status);
+            params.push(cost);
+        }
+        self.with_client(StoreOp::UsageAppend, async move |client| {
+            // One statement is one transaction: all rows not already present
+            // land, or none do, and `DO NOTHING` skips the ones that were.
+            client
+                .execute(sql.as_str(), &params)
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(())
+        })
+        .await
+    }
+
+    fn append_usage_batch_sync(&self, _: &[UsageAppend]) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "this store has no synchronous usage-index path".into(),
+        ))
     }
 
     async fn summarize_usage(

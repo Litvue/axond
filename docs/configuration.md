@@ -220,6 +220,27 @@ or drop rows whose `period` is no longer billed. See
 SQLite stores `recorded_at` as unix seconds; prune by `period` there, or
 `WHERE recorded_at < strftime('%s','now') - 90*24*60*60`.
 
+### `[storage.usage_index]` — optional
+
+How usage events reach that index. The index is best effort and off the request
+path: a request `try_reserve`s a slot on a bounded queue and never waits, and
+one worker writes what has queued in bounded batches — one Store transaction per
+batch, deduplicated on `request_id`, so a retried or overlapping batch inserts
+each event once. A Store outage therefore costs index rows, counted on
+`axond.usage.index.appends`, rather than latency; a full queue drops the newest
+event (`saturated`) rather than growing. Same vocabulary as the `[[usage_sink]]`
+batching keys. Boot-owned, like the rest of `[storage]`.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `buffer_capacity` | integer | `1024` | Events queued ahead of the worker before the request path drops. Must be ≥ 1 and at most Tokio's semaphore permit limit (`usize::MAX >> 3`). Bounds memory during an outage. |
+| `max_batch` | integer | `256` | Rows per Store transaction. Must be ≥ 1, no greater than `buffer_capacity`, and at most `4096`. Bounds how long SQLite's single connection is held away from admits and charges. |
+| `flush_interval_ms` | integer | `50` | How long a partial batch waits for more events before it is written anyway. `0` writes whatever has queued as soon as the worker is free. At most `86400000` (24h), so the worker deadline cannot overflow. |
+
+`axond.usage.index.batches`, `axond.usage.index.batch_size`, and
+`axond.usage.index.queue_age` show the batch size the deployment achieves and how
+far the index lags ([observability](./observability.md#metrics)).
+
 ## `[shutdown]` — Tier 0
 
 Bounds on the `SIGTERM`/`SIGINT` sequence

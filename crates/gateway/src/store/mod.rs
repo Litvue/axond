@@ -130,6 +130,11 @@ pub const STORE_OUTCOMES: &[&str] = &[
 
 /// Opaque billing-period keys share the namespace id charset and bound.
 pub const MAX_PERIOD_LEN: usize = 128;
+/// Hard ceiling on rows per [`Store::append_usage_batch`] call. Bounds one
+/// transaction's size (and how long SQLite's single connection is held away
+/// from admits and charges) and keeps a Postgres multi-row `INSERT` well under
+/// the wire protocol's 65 535 bind parameters.
+pub const MAX_USAGE_INDEX_BATCH: usize = 4096;
 /// Default timezone used for synthesized fixed policies and omitted settings.
 pub const DEFAULT_TIMEZONE: &str = "UTC";
 
@@ -475,24 +480,46 @@ pub trait Store: Send + Sync {
     }
 
     /// Index one usage event for the management summary. Duplicate
-    /// `request_id` is ignored (at-least-once).
+    /// `request_id` is ignored (at-least-once). The usage-index worker writes
+    /// through [`Self::append_usage_batch`]; this remains the single-row
+    /// contract and the test surface.
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError>;
+
+    /// Index a batch of usage events in one write. Implementations **must** be
+    /// atomic: either every row that was not already present lands, or none
+    /// does, so a repeated batch after a failure inserts each `request_id`
+    /// exactly once. Duplicate `request_id`s are skipped, never rewritten, with
+    /// the same null `cost_microdollars` / `period` semantics as
+    /// [`Self::append_usage`]. There is no sequential-walk default: a per-row
+    /// walk that returns on the first error would leave a committed prefix.
+    /// Callers bound `events.len()` by [`MAX_USAGE_INDEX_BATCH`].
+    async fn append_usage_batch(&self, events: Vec<UsageAppend>) -> Result<(), StoreError>;
 
     /// When true, [`Self::append_usage`] runs blocking I/O inside `spawn_blocking`
     /// and dropping its future cannot cancel the work. The usage-index worker
-    /// then calls [`Self::append_usage_sync`] on one OS thread instead.
+    /// then calls [`Self::append_usage_batch_sync`] on one OS thread instead.
     fn blocking_usage_index(&self) -> bool {
         false
     }
 
     /// Insert one usage-index row on the caller's thread. SQLite only; must
-    /// not schedule `spawn_blocking`.
+    /// not schedule `spawn_blocking`. The usage-index worker writes through
+    /// [`Self::append_usage_batch_sync`].
+    #[cfg_attr(not(test), allow(dead_code))]
     fn append_usage_sync(&self, event: UsageAppend) -> Result<(), StoreError> {
         let _ = event;
         Err(StoreError::Unavailable(
             "this store has no synchronous usage-index path".into(),
         ))
     }
+
+    /// [`Self::append_usage_batch`] on the caller's thread, with the same
+    /// atomicity and deduplication contract (duplicate `request_id` skipped,
+    /// not rewritten). SQLite only; other stores return
+    /// [`StoreError::Unavailable`]. No sequential-walk default: a per-row
+    /// walk that returns on the first error would leave a committed prefix.
+    fn append_usage_batch_sync(&self, events: &[UsageAppend]) -> Result<(), StoreError>;
 
     /// Per-model per-status counts and cost totals for `namespace`+`period`.
     async fn summarize_usage(
@@ -609,6 +636,12 @@ impl Store for UnavailableStore {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn append_usage(&self, _: UsageAppend) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    async fn append_usage_batch(&self, _: Vec<UsageAppend>) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable("down".into()))
+    }
+    fn append_usage_batch_sync(&self, _: &[UsageAppend]) -> Result<(), StoreError> {
         Err(StoreError::Unavailable("down".into()))
     }
     async fn summarize_usage(&self, _: &str, _: &str) -> Result<Vec<UsageSummaryRow>, StoreError> {
@@ -2773,5 +2806,122 @@ mod tests {
                 cost_microdollars: i64::MAX as u64,
             }]
         );
+    }
+
+    /// `n` usage-index rows for `namespace`, ids `{tag}_{i}`, with the null
+    /// shapes a batch has to carry: every third row unpriced, every fourth
+    /// admitted without a period.
+    pub(crate) fn usage_events(namespace: &str, tag: &str, n: usize) -> Vec<UsageAppend> {
+        (0..n)
+            .map(|i| UsageAppend {
+                request_id: format!("{tag}_{i}"),
+                namespace: namespace.to_owned(),
+                period: (i % 4 != 3).then(|| "p".to_owned()),
+                model: if i % 2 == 0 { "gpt-4o" } else { "claude" }.to_owned(),
+                status: "ok".to_owned(),
+                cost_microdollars: (i % 3 != 2).then_some(100 + i as u64),
+            })
+            .collect()
+    }
+
+    /// The summary a batch of [`usage_events`] must produce: rows without a
+    /// period are outside every period summary, and a null cost sums as zero.
+    fn expected_summary(events: &[UsageAppend]) -> Vec<UsageSummaryRow> {
+        let mut grouped = std::collections::BTreeMap::<(String, String), (u64, u64)>::new();
+        for event in events.iter().filter(|event| event.period.is_some()) {
+            let entry = grouped
+                .entry((event.model.clone(), event.status.clone()))
+                .or_default();
+            entry.0 += 1;
+            entry.1 += event.cost_microdollars.unwrap_or(0);
+        }
+        grouped
+            .into_iter()
+            .map(|((model, status), (count, cost))| UsageSummaryRow {
+                model,
+                status,
+                count,
+                cost_microdollars: cost,
+            })
+            .collect()
+    }
+
+    /// The batch contract every backend owes the usage-index worker: a repeated
+    /// batch and a batch that overlaps rows already present insert each
+    /// `request_id` once, and the null cost / period rows summarize exactly as
+    /// their single-row inserts do.
+    async fn usage_batch_contract(store: &dyn Store, namespace: &str) {
+        let first = usage_events(namespace, &format!("{namespace}_a"), 12);
+        store
+            .append_usage_batch(first.clone())
+            .await
+            .expect("first batch");
+        store
+            .append_usage_batch(first.clone())
+            .await
+            .expect("a repeated batch is a no-op");
+        let summary = store
+            .summarize_usage(namespace, "p")
+            .await
+            .expect("summary");
+        assert_eq!(summary, expected_summary(&first));
+
+        // Overlap: half already present, half new. Only the new half lands.
+        let mut overlap = first[6..].to_vec();
+        overlap.extend(usage_events(namespace, &format!("{namespace}_b"), 6));
+        store
+            .append_usage_batch(overlap)
+            .await
+            .expect("overlapping batch");
+        let mut all = first.clone();
+        all.extend(usage_events(namespace, &format!("{namespace}_b"), 6));
+        let summary = store
+            .summarize_usage(namespace, "p")
+            .await
+            .expect("summary");
+        assert_eq!(summary, expected_summary(&all));
+
+        // The same rows written one at a time on a second namespace summarize
+        // identically, so null semantics did not shift between the two paths.
+        let single_ns = format!("{namespace}_single");
+        let mut singles = usage_events(&single_ns, &format!("{namespace}_sa"), 12);
+        singles.extend(usage_events(&single_ns, &format!("{namespace}_sb"), 6));
+        for event in singles {
+            store.append_usage(event).await.expect("single");
+        }
+        let single = store
+            .summarize_usage(&single_ns, "p")
+            .await
+            .expect("summary");
+        assert_eq!(single, summary);
+
+        store
+            .append_usage_batch(Vec::new())
+            .await
+            .expect("an empty batch is a no-op");
+        let oversized = usage_events(namespace, "over", MAX_USAGE_INDEX_BATCH + 1);
+        assert!(
+            matches!(
+                store.append_usage_batch(oversized).await,
+                Err(StoreError::Invalid(_))
+            ),
+            "a batch over the bound is refused, not split"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_batch_deduplicates_and_matches_single_inserts() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        usage_batch_contract(&store, "wsp_x").await;
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_batch_deduplicates_and_matches_single_inserts() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        usage_batch_contract(&store, &ns).await;
     }
 }
