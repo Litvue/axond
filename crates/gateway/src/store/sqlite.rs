@@ -126,6 +126,8 @@ impl SqliteStore {
         let conn = Connection::open(path).map_err(unavailable)?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(unavailable)?;
+        // `PRAGMA journal_mode=WAL` can return another mode (in-memory, `nolock`,
+        // a rollback-journal file). The summary reader is only safe on WAL.
         conn.pragma_update(None, "busy_timeout", 5000)
             .map_err(unavailable)?;
         conn.execute_batch(SCHEMA).map_err(unavailable)?;
@@ -157,6 +159,11 @@ impl SqliteStore {
             .acquire_owned()
             .await
             .expect("dispatch slot")
+    }
+
+    #[cfg(test)]
+    fn has_summary_reader(&self) -> bool {
+        self.reader.is_some()
     }
 
     /// The lane `summarize_usage` runs on: the reader when the file has one.
@@ -382,13 +389,25 @@ fn unavailable(err: rusqlite::Error) -> StoreError {
     StoreError::Unavailable(err.to_string())
 }
 
-/// The read-only lane for summaries, or `None` when the database is in memory.
+/// The read-only lane for summaries, or `None` when a second connection is unsafe.
 ///
 /// Opened after the writer has applied the schema, so the WAL and its shared
 /// memory index exist for the read-only connection to attach to. The writer's
 /// `PRAGMA database_list` reports an empty file for `:memory:` and for
-/// `mode=memory` URIs alike, whichever spelling `path` used.
+/// `mode=memory` URIs alike, whichever spelling `path` used. A URI `nolock=1`
+/// or a non-WAL journal keeps summaries on the writer: SQLite forbids a second
+/// unlocked connection, and WAL is what lets a reader scan while the writer
+/// commits.
 fn open_reader(path: &str, writer: &Connection) -> Result<Option<Lane>, StoreError> {
+    let journal: String = writer
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .map_err(unavailable)?;
+    if !journal.eq_ignore_ascii_case("wal") {
+        return Ok(None);
+    }
+    if sqlite_uri_flag(path, "nolock") {
+        return Ok(None);
+    }
     let file: String = writer
         .query_row(
             "SELECT file FROM pragma_database_list WHERE name = 'main'",
@@ -400,9 +419,9 @@ fn open_reader(path: &str, writer: &Connection) -> Result<Option<Lane>, StoreErr
         return Ok(None);
     }
     // `file` is the WAL's filesystem path. Reopening `path` would keep a URI
-    // `mode=rw` / `mode=rwc` that SQLITE_OPEN_READ_ONLY then refuses. Other URI
-    // keys (vfs, cache, nolock, psow, immutable) stay so the two connections
-    // share a locking protocol.
+    // `mode=rw` / `mode=rwc` that SQLITE_OPEN_READ_ONLY then refuses. Only URI
+    // keys that stay valid on a second connection (`vfs`, `cache`, `psow`,
+    // `immutable`) are forwarded.
     let (filename, flags) = reader_open_target(path, &file);
     let conn = Connection::open_with_flags(&filename, flags)
         .map_err(|error| StoreError::Unavailable(format!("sqlite usage reader: {error}")))?;
@@ -418,20 +437,45 @@ fn reader_open_target(configured: &str, resolved_file: &str) -> (String, OpenFla
     let Some(query) = sqlite_file_uri_query(configured) else {
         return (resolved_file.to_owned(), readonly);
     };
-    let mut uri = sqlite_file_uri(resolved_file);
-    uri.push_str("?mode=ro");
+    let mut extras = Vec::new();
     for pair in query.split('&') {
         if pair.is_empty() {
             continue;
         }
         let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
-        if key.eq_ignore_ascii_case("mode") {
-            continue;
+        if key.eq_ignore_ascii_case("vfs")
+            || key.eq_ignore_ascii_case("cache")
+            || key.eq_ignore_ascii_case("psow")
+            || key.eq_ignore_ascii_case("immutable")
+        {
+            extras.push(pair);
         }
+    }
+    if extras.is_empty() {
+        return (resolved_file.to_owned(), readonly);
+    }
+    let mut uri = sqlite_file_uri(resolved_file);
+    uri.push_str("?mode=ro");
+    for extra in extras {
         uri.push('&');
-        uri.push_str(pair);
+        uri.push_str(extra);
     }
     (uri, readonly | OpenFlags::SQLITE_OPEN_URI)
+}
+
+fn sqlite_uri_flag(path: &str, name: &str) -> bool {
+    let Some(query) = sqlite_file_uri_query(path) else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, "1"));
+        key.eq_ignore_ascii_case(name)
+            && (value.is_empty()
+                || value == "1"
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("yes"))
+    })
 }
 
 fn sqlite_file_uri_query(path: &str) -> Option<&str> {
@@ -2737,14 +2781,20 @@ mod tests {
     }
 
     #[test]
-    fn reader_open_target_replaces_mode_and_keeps_nolock() {
-        let (uri, flags) = super::reader_open_target(
+    fn reader_open_target_drops_mode_and_nolock() {
+        let (filename, flags) = super::reader_open_target(
             "file:/data/store.sqlite?mode=rwc&nolock=1",
             "/data/store.sqlite",
         );
-        assert_eq!(uri, "file:/data/store.sqlite?mode=ro&nolock=1");
-        assert!(flags.contains(OpenFlags::SQLITE_OPEN_URI));
+        assert_eq!(filename, "/data/store.sqlite");
+        assert!(!flags.contains(OpenFlags::SQLITE_OPEN_URI));
         assert!(flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY));
+        let (uri, flags) = super::reader_open_target(
+            "file:/data/store.sqlite?mode=rwc&cache=shared",
+            "/data/store.sqlite",
+        );
+        assert_eq!(uri, "file:/data/store.sqlite?mode=ro&cache=shared");
+        assert!(flags.contains(OpenFlags::SQLITE_OPEN_URI));
     }
 
     #[tokio::test]
@@ -2766,21 +2816,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_uri_with_nolock_still_opens_a_summary_reader() {
+    async fn a_file_uri_with_nolock_keeps_summaries_on_the_writer() {
         let db = TempDb::new("summary-nolock");
         let uri = format!("file:{}?mode=rwc&nolock=1", db.0.display());
         let store = SqliteStore::open(&uri).expect("uri open");
+        assert!(
+            !store.has_summary_reader(),
+            "nolock=1 cannot share the file with a second connection"
+        );
         add_namespace(&store, "wsp_x").await;
         store
             .append_usage_batch(three_rows("wsp_x"))
             .await
             .expect("append");
         let _held = store.hold_dispatch().await;
-        let rows = store
+        let err = store
             .summarize_usage("wsp_x", "p")
             .await
-            .expect("reader keeps the writer's nolock URI option");
-        assert_eq!(rows, summary_rows(&THREE_ROWS_SUMMARY));
+            .expect_err("summaries share the writer when locking is off");
+        assert!(
+            matches!(err, StoreError::Unavailable(ref message) if message.contains("dispatch saturated")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

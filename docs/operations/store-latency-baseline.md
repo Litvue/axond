@@ -334,10 +334,12 @@ What the phases say, on this host:
   breaks that coupling: `summarize_usage` opens a second, read-only connection
   (`SQLITE_OPEN_READ_ONLY` plus `PRAGMA query_only=ON`) to the same WAL file
   and has its own dispatch slot. The reader attaches to the writer's file path
-  from `PRAGMA database_list` as a `mode=ro` URI, so a writer URI `mode=rw` /
-  `mode=rwc` cannot make the reader fail to boot, while other URI keys (`vfs`,
-  `cache`, `nolock`, `psow`, `immutable`) stay so both connections share a
-  locking protocol.
+  from `PRAGMA database_list` as a `mode=ro` URI only when extra keys that stay
+  valid on a second connection (`vfs`, `cache`, `psow`, `immutable`) are
+  present. A writer URI `mode=rw` / `mode=rwc` cannot make the reader fail to
+  boot. `nolock=1` and a non-WAL journal (`PRAGMA journal_mode` after the WAL
+  request) keep summaries on the writer: SQLite forbids a second unlocked
+  connection, and WAL is what lets a reader scan while the writer commits.
   `EXPLAIN QUERY PLAN` of the summary `SELECT` is `SEARCH axond_store_usage USING INDEX axond_store_usage_ns_period (namespace=? AND period=?)`.
   That is the `(namespace, period)` index, not a covering
   `(namespace, period, model, status)` index. A covering index would speed the
