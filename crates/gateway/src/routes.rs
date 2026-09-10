@@ -2969,8 +2969,10 @@ impl BufferedResponseAccounting {
             Ok(Err(error)) => Err(GatewayError::UsageNotDurable {
                 reason: error.reason,
             }),
+            // The settlement was abandoned before it reported: its execution
+            // deadline expired, or the runtime stopped under it.
             Err(_) => Err(GatewayError::UsageNotDurable {
-                reason: "the durable append did not report before the runtime stopped",
+                reason: "the settlement did not report before it was abandoned",
             }),
         }
     }
@@ -8562,6 +8564,155 @@ output_microdollars_per_million = 1000000
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, Status::Ok);
         assert_eq!(records[0].cost_microdollars, Some(15));
+    }
+
+    /// A ledger that stalls every charge until told otherwise, and counts how
+    /// many charges are stalled inside it: the sustained slow-Store scenario.
+    #[derive(Clone, Default)]
+    struct StalledLedger {
+        entered: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::budget::BudgetStore for StalledLedger {
+        fn name(&self) -> &'static str {
+            "stalled-ledger"
+        }
+
+        async fn reserve(&self, _key: &BudgetKey, estimated_microdollars: u64) -> Admission {
+            Admission::Allowed(Reservation {
+                id: "stalled".to_owned(),
+                estimate_microdollars: estimated_microdollars,
+                generation: None,
+                period: None,
+                incarnation: None,
+            })
+        }
+
+        async fn settle(&self, _key: &BudgetKey, _reservation: &Reservation, _actual: u64) {
+            self.entered.fetch_add(1, Ordering::AcqRel);
+            while !self.release.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// The acceptance criterion for #467: with the Store stalled, the process
+    /// carries a bounded number of settlements, refuses further admissions with
+    /// a typed `503` while it is at that bound, and admits again once the
+    /// stalled settlements land — none of which were dropped.
+    #[tokio::test]
+    async fn a_stalled_store_bounds_settlements_and_sheds_new_admissions() {
+        let (base_url, hits) = controllable_upstream(
+            Arc::new(AtomicBool::new(true)),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let captured = CapturingSink::default();
+        let ledger = StalledLedger::default();
+        let state = two_target_state_with_budget(
+            &base_url,
+            &base_url,
+            "[admission]\nmax_in_flight = 2\nmax_in_flight_per_tenant = 0\n\
+             max_pending_settlements = 2\nmax_in_flight_settlements = 1\n",
+            captured.clone(),
+            Box::new(ledger.clone()),
+        );
+        let settlements = state.0.settlements.clone();
+
+        // Two served requests whose charges are now stalled in the Store. The
+        // callers hang up; the settlements carry on, holding the two slots.
+        let mut served = Vec::new();
+        for _ in 0..2 {
+            let state = state.clone();
+            served.push(tokio::spawn(async move {
+                router(state).oneshot(chat_request()).await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // One execution slot: one charge is inside the ledger, the other
+            // is queued behind it.
+            while ledger.entered.load(Ordering::Acquire) < 1 || settlements.backlog().queued < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both settlements are spawned and bounded to one execution");
+        for request in served {
+            request.abort();
+            let _ = request.await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let backlog = settlements.backlog();
+        assert_eq!(
+            (backlog.executing, backlog.queued, backlog.reserved),
+            (1, 1, 0),
+            "at the bound: one executing, one queued, nothing more admitted"
+        );
+
+        // The bound: a third request is refused before it reaches a provider,
+        // with the stable code and retry guidance, rather than admitted with a
+        // charge nowhere to go.
+        let refused = router(state.clone())
+            .oneshot(chat_request())
+            .await
+            .expect("response");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            refused
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(refused.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("json");
+        assert_eq!(body["error"]["type"], "settlement_capacity_exhausted");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the refused request cost nothing upstream"
+        );
+        assert_eq!(
+            settlements.backlog().reserved,
+            0,
+            "a refused request holds no capacity"
+        );
+
+        // The Store recovers: every stalled charge lands, the capacity returns,
+        // and the next request is served.
+        ledger.release.store(true, Ordering::Release);
+        let idle = settlements.await_idle(Duration::from_secs(2)).await;
+        assert_eq!(idle.unsettled(), 0);
+        assert_eq!(
+            ledger.entered.load(Ordering::Acquire),
+            2,
+            "no admitted charge was dropped"
+        );
+        let served = router(state.clone())
+            .oneshot(chat_request())
+            .await
+            .expect("response");
+        assert_eq!(served.status(), StatusCode::OK);
+        settlements.await_idle(Duration::from_secs(2)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(ledger.entered.load(Ordering::Acquire), 3);
+        let records = captured.0.lock().expect("records");
+        assert_eq!(
+            records.len(),
+            3,
+            "every admitted request produced its record"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.cost_microdollars == Some(15))
+        );
     }
 
     impl Middleware for StreamMarkerMiddleware {
