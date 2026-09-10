@@ -604,11 +604,20 @@ impl IndexQueue {
     fn try_enqueue(&self, item: QueuedAppend, depth: &AtomicU64) -> Result<u64, IndexOutcome> {
         match self {
             Self::Blocking(tx) => {
-                tx.try_send(item).map_err(|error| match error {
-                    std::sync::mpsc::TrySendError::Full(_) => IndexOutcome::Saturated,
-                    std::sync::mpsc::TrySendError::Disconnected(_) => IndexOutcome::Closed,
-                })?;
-                Ok(depth.fetch_add(1, Ordering::AcqRel) + 1)
+                // `SyncSender` has no reserve. Increment first so the worker
+                // cannot wrap the counter if it recvs another slot before we
+                // record this send; undo if the channel rejects the item.
+                let occupied = depth.fetch_add(1, Ordering::AcqRel) + 1;
+                match tx.try_send(item) {
+                    Ok(()) => Ok(occupied),
+                    Err(error) => {
+                        take_index_slot(depth);
+                        Err(match error {
+                            std::sync::mpsc::TrySendError::Full(_) => IndexOutcome::Saturated,
+                            std::sync::mpsc::TrySendError::Disconnected(_) => IndexOutcome::Closed,
+                        })
+                    }
+                }
             }
             Self::Async(tx) => match tx.try_reserve() {
                 Ok(permit) => {
