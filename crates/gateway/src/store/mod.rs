@@ -2921,6 +2921,153 @@ mod tests {
         usage_batch_contract(&store, "wsp_x").await;
     }
 
+    /// `request_id` is the primary key across every namespace, so the fixture
+    /// id is scoped by the namespace it belongs to.
+    fn usage_row(
+        namespace: &str,
+        (id, period, model, status, cost): (&str, &str, &str, &str, Option<u64>),
+    ) -> UsageAppend {
+        UsageAppend {
+            request_id: format!("{namespace}_{id}"),
+            namespace: namespace.into(),
+            period: Some(period.into()),
+            model: model.into(),
+            status: status.into(),
+            cost_microdollars: cost,
+        }
+    }
+
+    fn summary(rows: &[(&str, &str, u64, u64)]) -> Vec<UsageSummaryRow> {
+        rows.iter()
+            .map(|(model, status, count, cost)| UsageSummaryRow {
+                model: (*model).into(),
+                status: (*status).into(),
+                count: *count,
+                cost_microdollars: *cost,
+            })
+            .collect()
+    }
+
+    /// The summary every backend owes `GET .../usage` (#464): an empty period
+    /// is an empty list; a null cost counts and sums as zero; a repeated
+    /// request id counts once whether it arrives alone or in a batch; totals
+    /// past `i64::MAX` saturate there, at insert and at the sum, with no float
+    /// on the way; rows group by model then status in byte order; and usage
+    /// outlives the namespace it was recorded under.
+    async fn usage_summary_contract(store: &dyn Store, namespace: &str) {
+        let ns = namespace;
+        assert_eq!(store.summarize_usage(ns, "p").await.expect("empty"), vec![]);
+
+        let half_plus_one = i64::MAX as u64 / 2 + 1;
+        for row in [
+            ("r1", "p", "b/m", "ok", Some(10)),
+            ("r2", "p", "b/m", "ok", Some(15)),
+            ("r3", "p", "b/m", "upstream_error", Some(1)),
+            ("r4", "p", "a/m", "ok", None),
+            ("r5", "p", "a/m", "ok", Some(7)),
+            ("r1", "p", "b/m", "ok", Some(10)),
+            ("r6", "p", "c/m", "ok", Some(half_plus_one)),
+            ("r7", "p", "c/m", "ok", Some(half_plus_one)),
+            ("r8", "p", "d/m", "ok", Some(u64::MAX)),
+            ("r9", "p", "d/m", "ok", Some(1)),
+        ] {
+            store
+                .append_usage(usage_row(ns, row))
+                .await
+                .expect("append");
+        }
+        store
+            .append_usage_batch(vec![
+                usage_row(ns, ("r2", "p", "b/m", "ok", Some(15))),
+                usage_row(ns, ("r5", "p", "a/m", "ok", Some(7))),
+                usage_row(ns, ("r10", "other", "b/m", "ok", Some(99))),
+            ])
+            .await
+            .expect("batch with repeats");
+
+        let mut expected = summary(&[
+            ("a/m", "ok", 2, 7),
+            ("b/m", "ok", 2, 25),
+            ("b/m", "upstream_error", 1, 1),
+            ("c/m", "ok", 2, i64::MAX as u64),
+            ("d/m", "ok", 2, i64::MAX as u64),
+        ]);
+        assert_eq!(store.summarize_usage(ns, "p").await.expect("p"), expected);
+        assert_eq!(
+            store.summarize_usage(ns, "other").await.expect("other"),
+            summary(&[("b/m", "ok", 1, 99)])
+        );
+        assert_eq!(
+            store.summarize_usage(ns, "unused").await.expect("unused"),
+            vec![]
+        );
+
+        assert!(store.delete_namespace(ns).await.expect("delete"));
+        assert_eq!(
+            store.summarize_usage(ns, "p").await.expect("after delete"),
+            expected,
+            "usage outlives its namespace"
+        );
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("recreate");
+        store
+            .append_usage(usage_row(ns, ("r11", "p", "a/m", "ok", Some(1))))
+            .await
+            .expect("append after recreate");
+        expected[0].count = 3;
+        expected[0].cost_microdollars = 8;
+        assert_eq!(
+            store.summarize_usage(ns, "p").await.expect("recreated"),
+            expected,
+            "a recreated namespace summarizes its whole history"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_usage_summary_contract_in_memory() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        seeded(&store).await;
+        usage_summary_contract(&store, "wsp_x").await;
+    }
+
+    /// The file-backed store answers summaries from a second, read-only
+    /// connection; the contract must not depend on which connection reads.
+    #[tokio::test]
+    async fn sqlite_usage_summary_contract_on_a_file() {
+        let path = std::env::temp_dir().join(format!(
+            "axond-store-summary-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let store = SqliteStore::open(path.to_str().expect("utf8 path")).expect("open");
+        seeded(&store).await;
+        usage_summary_contract(&store, "wsp_x").await;
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            let _ = std::fs::remove_file(name);
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_usage_summary_contract() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        usage_summary_contract(&store, &ns).await;
+    }
+
     #[tokio::test]
     async fn postgres_usage_batch_deduplicates_and_matches_single_inserts() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
