@@ -31,7 +31,7 @@ the test database — so nothing carries over between them.
 | `steady-streamed` | Closed-loop paced SSE streams, read to completion. | The same path when the request holds no connection while streaming; TTFT is the number that moves. |
 | `burst` | Waves of simultaneous requests with a 250 ms pause between waves. | What a pool does when demand arrives all at once and goes away: fills, drains to its idle cap, reconnects on the next wave (#465). |
 | `summaries` | The steady buffered loop while management readers loop over `GET /api/v1/namespaces/platform/usage`. | Management reads sharing the connection or pool with inference, over a small index. |
-| `slow-store` | The same, over a usage index pre-seeded with hundreds of thousands of rows. | The slow-Store case without a fault injector: each summary holds the connection for a while, and inference queues behind it (#463, #464). |
+| `slow-store` | The same, over a usage index pre-seeded with hundreds of thousands of rows. | The slow-Store case without a fault injector: each summary holds the connection for a while, and inference queues behind it (#464). #463 bounds how many of those waiters occupy Tokio's blocking pool (one `spawn_blocking` at a time; the rest wait async and then 503). |
 | `large-payload` | Buffered requests carrying a large native prompt and relaying a 256 KiB answer. | The payload the gateway copies and re-encodes, on the same Store path (#466). |
 
 Two tiers offer the same scenarios at different scales:

@@ -195,6 +195,14 @@ until restart — the live `Store` is opened once.
 
 SQLite rejects a set `dsn_env`; Postgres rejects a set `path`.
 
+SQLite has one connection. Async Store calls take a single dispatch slot
+before `spawn_blocking` (2 s wait, then `StoreError::Unavailable`, same
+vocabulary as a saturated Postgres pool). Cancelling the caller before the
+slot is granted skips the work; a statement that has already started is not
+rolled back. The usage-index worker writes on its own thread and does not
+consume the slot. `busy_timeout` still bounds SQLite lock waits inside a
+statement, not this queue.
+
 Postgres Store budget tables are `axond_store_budget`,
 `axond_store_budget_active`, and `axond_store_budget_reservation`
 (`ops/postgres/store_budget_v1.sql`) plus `axond_store_budget_cadence`
