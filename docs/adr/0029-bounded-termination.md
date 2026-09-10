@@ -95,7 +95,7 @@ would present a partial answer as a complete one.
 **One flush budget covers everything after serving, with a reserve the write
 step keeps.** Inside a single `flush_timeout_ms`, measured as one absolute
 deadline: abandoned responses are given a moment to end, their settlements are
-awaited, the buffered usage sinks are flushed in order, and the telemetry
+awaited, the buffered usage sinks are flushed in order, the usage journal and the Store usage-index worker share a drain of whatever remains (a crash still abandons the in-memory index queue without joining), and the telemetry
 exporters flush with whatever remains. Each step waits only for the time left, so
 the budget is the total, not a per-step allowance — except that the two waits for
 in-flight work are capped at *half* the budget, and the flush keeps the rest.

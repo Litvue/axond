@@ -664,6 +664,12 @@ pub const CATALOG: &[MetricSpec] = &[
         labels: &[],
     },
     MetricSpec {
+        name: "axond.shutdown.abandoned_index",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[],
+    },
+    MetricSpec {
         name: "axond.settlement.in_flight",
         kind: InstrumentKind::UpDownCounter,
         unit: None,

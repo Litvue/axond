@@ -25,8 +25,8 @@ mod otlp;
 mod postgres;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -476,8 +476,14 @@ pub struct UsageDelivery {
     store: std::sync::OnceLock<Arc<dyn crate::store::Store>>,
     /// Bounded queue into the usage-index worker. `append_store` only
     /// `try_reserve`s; a full queue drops the event rather than spawning work.
-    index_tx: std::sync::OnceLock<IndexQueue>,
-    /// Set on drop so the worker abandons queued items after the in-flight write.
+    /// Taken on drain so the channel closes and the worker can finish the rest.
+    index_tx: Mutex<Option<IndexQueue>>,
+    /// The running index worker. Joined on a graceful drain; dropped (and not
+    /// joined) on crash or when the shutdown budget is already spent.
+    index_worker: Mutex<Option<IndexWorker>>,
+    /// Set on drop / abandon so the worker exits after the in-flight write
+    /// instead of draining the rest of the queue. Graceful drain leaves this
+    /// unset so queued events are written.
     index_stop: Arc<AtomicBool>,
     /// Counters and rate-limited logs shared with the index worker.
     index: Arc<IndexTelemetry>,
@@ -606,6 +612,106 @@ impl IndexQueue {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(IndexOutcome::Saturated),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(IndexOutcome::Closed),
+        }
+    }
+}
+
+/// Handle on the one index worker `attach_store` started. SQLite runs on an OS
+/// thread whose join is not cancellable; Postgres is a task that can be aborted.
+enum IndexWorker {
+    Blocking(std::thread::JoinHandle<IndexWorkerReport>),
+    Async(tokio::task::JoinHandle<IndexWorkerReport>),
+}
+
+/// What the worker itself observed before it exited. Converted to an
+/// [`IndexDrainReport`] when the join succeeded.
+struct IndexWorkerReport {
+    written: u64,
+    leftover: u64,
+    failed: bool,
+}
+
+/// What one graceful usage-index drain achieved.
+///
+/// Unlike the usage journal, leftovers here are not durable: they live only in
+/// the in-memory queue. A crash still loses them (best effort, as before). A
+/// healthy shutdown with budget left writes what was queued and reports the
+/// rest. `leftover: 0` is a count only when [`reported`](Self::reported) is
+/// true; otherwise the number is unknown, not empty.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct IndexDrainReport {
+    /// Rows the worker committed (or found already present) before it stopped.
+    pub written: u64,
+    /// Events still queued or in a batch that was not written. Meaningful only
+    /// when `reported`.
+    pub leftover: u64,
+    /// At least one Store write failed or timed out while the worker ran.
+    pub failed: bool,
+    /// The worker emptied the queue (channel closed, nothing abandoned).
+    pub drained: bool,
+    /// The worker handed this report back. False when the join timed out, the
+    /// worker panicked, or the caller never waited: then `written` / `leftover`
+    /// are unknown rather than zero.
+    pub reported: bool,
+    /// Stopped without waiting, because there was no honest budget left.
+    pub unwaited: bool,
+}
+
+impl IndexDrainReport {
+    /// Known leftovers to count as abandoned, or `None` when the count would
+    /// be a lie (unknown, or never waited).
+    pub fn abandoned(&self) -> Option<u64> {
+        self.reported.then_some(self.leftover)
+    }
+
+    /// Whether the queue was empty when the worker stopped, or `None` when
+    /// nobody reported.
+    pub fn caught_up(&self) -> Option<bool> {
+        self.reported.then_some(self.drained)
+    }
+
+    pub fn log(&self) {
+        if self.unwaited {
+            tracing::warn!(
+                "usage-index worker was stopped without a drain because the shutdown budget                  was spent; queued management-index rows are in-memory and will not survive                  process exit"
+            );
+            return;
+        }
+        if !self.reported {
+            tracing::error!(
+                "usage-index worker did not stop within the shutdown bound; leftover                  management-index rows are unknown (not zero) and were not counted as index                  appends"
+            );
+            return;
+        }
+        if self.leftover > 0 || self.failed {
+            tracing::error!(
+                written = self.written,
+                leftover = self.leftover,
+                failed = self.failed,
+                drained = self.drained,
+                "usage-index drain finished with leftovers or a Store failure; those rows                  are missing from GET .../usage on this replica, not from billing"
+            );
+            return;
+        }
+        tracing::info!(written = self.written, "usage-index drain caught up");
+    }
+}
+
+fn lock_mutex<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl IndexWorkerReport {
+    fn into_drain(self) -> IndexDrainReport {
+        IndexDrainReport {
+            written: self.written,
+            leftover: self.leftover,
+            failed: self.failed,
+            drained: self.leftover == 0,
+            reported: true,
+            unwaited: false,
         }
     }
 }
@@ -771,7 +877,8 @@ impl UsageDelivery {
             journal: None,
             on_undurable: UndurablePolicy::Serve,
             store: std::sync::OnceLock::new(),
-            index_tx: std::sync::OnceLock::new(),
+            index_tx: Mutex::new(None),
+            index_worker: Mutex::new(None),
             index_stop: Arc::new(AtomicBool::new(false)),
             index: Arc::new(IndexTelemetry::new()),
             #[cfg(test)]
@@ -787,7 +894,8 @@ impl UsageDelivery {
             journal: Some(journal),
             on_undurable,
             store: std::sync::OnceLock::new(),
-            index_tx: std::sync::OnceLock::new(),
+            index_tx: Mutex::new(None),
+            index_worker: Mutex::new(None),
             index_stop: Arc::new(AtomicBool::new(false)),
             index: Arc::new(IndexTelemetry::new()),
             #[cfg(test)]
@@ -816,7 +924,9 @@ impl UsageDelivery {
                 .name("axond-usage-index".into())
                 .spawn(move || sqlite_usage_index_worker(store, rx, stop, settings, telemetry))
             {
-                Ok(handle) => drop(handle),
+                Ok(handle) => {
+                    *lock_mutex(&self.index_worker) = Some(IndexWorker::Blocking(handle));
+                }
                 Err(error) => {
                     tracing::error!(
                         error = %error,
@@ -826,14 +936,15 @@ impl UsageDelivery {
                 }
             }
         } else if tokio::runtime::Handle::try_current().is_ok() {
-            drop(tokio::spawn(async_usage_index_worker(
+            let handle = tokio::spawn(async_usage_index_worker(
                 store, rx, stop, settings, telemetry,
-            )));
+            ));
+            *lock_mutex(&self.index_worker) = Some(IndexWorker::Async(handle));
         } else {
             tracing::error!("store usage-index worker needs a tokio runtime");
             return;
         }
-        let _ = self.index_tx.set(IndexQueue(tx));
+        *lock_mutex(&self.index_tx) = Some(IndexQueue(tx));
     }
 
     /// Best-effort management-index append. Fire-and-forget: `try_send` onto
@@ -853,7 +964,8 @@ impl UsageDelivery {
             status: record.status.as_str().to_owned(),
             cost_microdollars: record.cost_microdollars,
         };
-        let Some(queue) = self.index_tx.get() else {
+        let queue = lock_mutex(&self.index_tx);
+        let Some(queue) = queue.as_ref() else {
             self.index.dropped(IndexOutcome::Closed, &record.request_id);
             return;
         };
@@ -1054,16 +1166,114 @@ impl UsageDelivery {
 
     /// Flush what is buffered. Telemetry-grade only: a journal's backlog is
     /// durable, so it is drained by the worker's own bounded shutdown rather
-    /// than flushed here. The usage-index worker is best-effort: drop the
-    /// sender and do not join it.
+    /// than flushed here. The usage-index worker is drained separately by
+    /// [`drain_index`](Self::drain_index) so a graceful shutdown can land queued
+    /// management-index rows inside the same flush budget.
     pub async fn flush(&self, budget: Duration) -> FlushReport {
         self.fanout.flush(budget).await
+    }
+
+    /// Close the index queue and wait up to `budget` plus [`DRAIN_MARGIN`] for
+    /// the worker to write what remains.
+    ///
+    /// Does not set the crash-stop flag: the worker treats a closed channel as
+    /// "finish the queue". A join that overruns is abandoned rather than
+    /// allowed to hold the runtime on an uninterruptible SQLite write; leftovers
+    /// are then unknown and are not counted as index `appends`.
+    ///
+    /// Crash (`Drop`) and [`abandon_index`](Self::abandon_index) stay
+    /// best-effort: they signal stop, drop the sender, and do not join.
+    pub async fn drain_index(&self, budget: Duration) -> IndexDrainReport {
+        drop(lock_mutex(&self.index_tx).take());
+        let worker = lock_mutex(&self.index_worker).take();
+        self.join_index_worker(worker, budget).await
+    }
+
+    /// Signal the worker to abandon queued events and do not wait. Used when
+    /// the shutdown budget cannot honestly cover a drain.
+    pub fn abandon_index(&self) -> IndexDrainReport {
+        self.index_stop.store(true, Ordering::Release);
+        drop(lock_mutex(&self.index_tx).take());
+        drop(lock_mutex(&self.index_worker).take());
+        IndexDrainReport {
+            unwaited: true,
+            ..IndexDrainReport::default()
+        }
+    }
+
+    async fn join_index_worker(
+        &self,
+        worker: Option<IndexWorker>,
+        budget: Duration,
+    ) -> IndexDrainReport {
+        let Some(worker) = worker else {
+            return IndexDrainReport {
+                drained: true,
+                reported: true,
+                ..IndexDrainReport::default()
+            };
+        };
+        let bound = budget.saturating_add(DRAIN_MARGIN);
+        match worker {
+            IndexWorker::Blocking(handle) => {
+                match tokio::time::timeout(
+                    bound,
+                    tokio::task::spawn_blocking(move || handle.join()),
+                )
+                .await
+                {
+                    Ok(Ok(Ok(report))) => report.into_drain(),
+                    Ok(Ok(Err(_panic))) => {
+                        tracing::error!("usage-index worker panicked");
+                        self.unreported_index()
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(error = %error, "usage-index join task failed");
+                        self.unreported_index()
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "usage-index worker did not stop inside its bound; the SQLite                              thread was not joined"
+                        );
+                        self.index_stop.store(true, Ordering::Release);
+                        self.unreported_index()
+                    }
+                }
+            }
+            IndexWorker::Async(mut handle) => {
+                match tokio::time::timeout(bound, &mut handle).await {
+                    Ok(Ok(report)) => report.into_drain(),
+                    Ok(Err(error)) => {
+                        tracing::error!(error = %error, "usage-index worker panicked");
+                        self.unreported_index()
+                    }
+                    Err(_) => {
+                        tracing::error!("usage-index worker did not stop inside its bound");
+                        handle.abort();
+                        self.index_stop.store(true, Ordering::Release);
+                        self.unreported_index()
+                    }
+                }
+            }
+        }
+    }
+
+    fn unreported_index(&self) -> IndexDrainReport {
+        IndexDrainReport {
+            reported: false,
+            drained: false,
+            ..IndexDrainReport::default()
+        }
     }
 }
 
 impl Drop for UsageDelivery {
     fn drop(&mut self) {
+        // Crash / last-Arc drop: do not join. The in-flight Store write may
+        // finish; queued events are abandoned.
         self.index_stop.store(true, Ordering::Release);
+        drop(lock_mutex(&self.index_tx).take());
+        drop(lock_mutex(&self.index_worker).take());
     }
 }
 
@@ -1083,24 +1293,46 @@ impl QueuedAppend {
     }
 }
 
+/// Drop queued events without writing or counting them as index appends.
+/// Shutdown leftovers belong on `axond.shutdown.abandoned_index`, not on
+/// `saturated` / `closed`.
+fn discard_queued(rx: &mut tokio::sync::mpsc::Receiver<QueuedAppend>) -> u64 {
+    let mut n = 0u64;
+    while rx.try_recv().is_ok() {
+        n = n.saturating_add(1);
+    }
+    n
+}
+
 /// The blocking (SQLite) index worker: block for the first queued event, gather
 /// what else arrives within `flush_interval` up to `max_batch`, write the batch
-/// in one transaction on this thread, repeat. Exits when every sender is gone or
-/// the delivery is dropped; queued events are then abandoned, which is the
-/// crash-loss the index accepts (ADR 0064 keeps the budget charge elsewhere).
+/// in one transaction on this thread, repeat.
+///
+/// A closed channel (graceful drain) writes what remains, then exits. `stop`
+/// (crash / abandon) dumps the queue after the in-flight write without joining
+/// the leftover count into `axond.usage.index.appends`.
 fn sqlite_usage_index_worker(
     store: Arc<dyn crate::store::Store>,
     mut rx: tokio::sync::mpsc::Receiver<QueuedAppend>,
     stop: Arc<AtomicBool>,
     settings: UsageIndexSettings,
     telemetry: Arc<IndexTelemetry>,
-) {
+) -> IndexWorkerReport {
+    let mut written = 0u64;
+    let mut leftover = 0u64;
+    let mut failed = false;
     let mut batch: Vec<QueuedAppend> = Vec::with_capacity(settings.max_batch);
     while let Some(first) = rx.blocking_recv() {
         let first = first.take();
         if stop.load(Ordering::Acquire) {
-            while rx.try_recv().is_ok() {}
-            return;
+            leftover = leftover
+                .saturating_add(1)
+                .saturating_add(discard_queued(&mut rx));
+            return IndexWorkerReport {
+                written,
+                leftover,
+                failed,
+            };
         }
         batch.push(first);
         let deadline = Instant::now()
@@ -1120,22 +1352,39 @@ fn sqlite_usage_index_worker(
             }
         }
         if stop.load(Ordering::Acquire) {
-            while rx.try_recv().is_ok() {}
-            return;
+            leftover = leftover
+                .saturating_add(batch.len() as u64)
+                .saturating_add(discard_queued(&mut rx));
+            return IndexWorkerReport {
+                written,
+                leftover,
+                failed,
+            };
         }
         let events: Vec<crate::store::UsageAppend> =
             batch.iter().map(|item| item.event.clone()).collect();
         let queue_age_ms = oldest_queue_age_ms(&batch);
         match store.append_usage_batch_sync(&events) {
-            Ok(()) => telemetry.wrote(&batch, IndexOutcome::Accepted, None, queue_age_ms),
-            Err(error) => telemetry.wrote(
-                &batch,
-                IndexOutcome::Failed,
-                Some(&error.to_string()),
-                queue_age_ms,
-            ),
+            Ok(()) => {
+                written = written.saturating_add(events.len() as u64);
+                telemetry.wrote(&batch, IndexOutcome::Accepted, None, queue_age_ms);
+            }
+            Err(error) => {
+                failed = true;
+                telemetry.wrote(
+                    &batch,
+                    IndexOutcome::Failed,
+                    Some(&error.to_string()),
+                    queue_age_ms,
+                );
+            }
         }
         batch.clear();
+    }
+    IndexWorkerReport {
+        written,
+        leftover,
+        failed,
     }
 }
 
@@ -1149,13 +1398,22 @@ async fn async_usage_index_worker(
     stop: Arc<AtomicBool>,
     settings: UsageIndexSettings,
     telemetry: Arc<IndexTelemetry>,
-) {
+) -> IndexWorkerReport {
+    let mut written = 0u64;
+    let mut leftover = 0u64;
+    let mut failed = false;
     let mut batch: Vec<QueuedAppend> = Vec::with_capacity(settings.max_batch);
     while let Some(first) = rx.recv().await {
         let first = first.take();
         if stop.load(Ordering::Acquire) {
-            while rx.try_recv().is_ok() {}
-            return;
+            leftover = leftover
+                .saturating_add(1)
+                .saturating_add(discard_queued(&mut rx));
+            return IndexWorkerReport {
+                written,
+                leftover,
+                failed,
+            };
         }
         batch.push(first);
         let deadline = tokio::time::Instant::now()
@@ -1168,23 +1426,43 @@ async fn async_usage_index_worker(
             }
         }
         if stop.load(Ordering::Acquire) {
-            while rx.try_recv().is_ok() {}
-            return;
+            leftover = leftover
+                .saturating_add(batch.len() as u64)
+                .saturating_add(discard_queued(&mut rx));
+            return IndexWorkerReport {
+                written,
+                leftover,
+                failed,
+            };
         }
         let events: Vec<crate::store::UsageAppend> =
             batch.iter().map(|item| item.event.clone()).collect();
         let queue_age_ms = oldest_queue_age_ms(&batch);
         match tokio::time::timeout(settings.write_timeout, store.append_usage_batch(events)).await {
-            Ok(Ok(())) => telemetry.wrote(&batch, IndexOutcome::Accepted, None, queue_age_ms),
-            Ok(Err(error)) => telemetry.wrote(
-                &batch,
-                IndexOutcome::Failed,
-                Some(&error.to_string()),
-                queue_age_ms,
-            ),
-            Err(_) => telemetry.wrote(&batch, IndexOutcome::Timeout, None, queue_age_ms),
+            Ok(Ok(())) => {
+                written = written.saturating_add(events.len() as u64);
+                telemetry.wrote(&batch, IndexOutcome::Accepted, None, queue_age_ms);
+            }
+            Ok(Err(error)) => {
+                failed = true;
+                telemetry.wrote(
+                    &batch,
+                    IndexOutcome::Failed,
+                    Some(&error.to_string()),
+                    queue_age_ms,
+                );
+            }
+            Err(_) => {
+                failed = true;
+                telemetry.wrote(&batch, IndexOutcome::Timeout, None, queue_age_ms);
+            }
         }
         batch.clear();
+    }
+    IndexWorkerReport {
+        written,
+        leftover,
+        failed,
     }
 }
 
@@ -1958,6 +2236,355 @@ mod tests {
             Some(Instant::now() - RateLimitedLog::INTERVAL - Duration::from_millis(1));
         assert_eq!(log.should_emit(), Some(7));
         assert_eq!(log.should_emit(), None);
+    }
+
+    async fn sqlite_for_index() -> (Arc<crate::store::SqliteStore>, UsageDelivery) {
+        let store = Arc::new(crate::store::SqliteStore::open(":memory:").expect("sqlite"));
+        store
+            .put_namespace(crate::store::NamespaceRecord {
+                id: "acme".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("namespace");
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(Arc::clone(&store) as Arc<dyn Store>, fast_index(32, 8));
+        (store, delivery)
+    }
+
+    /// A Recording store for the async (Postgres-shaped) worker: writes succeed
+    /// immediately so a drain can be shown to land every queued event.
+    struct RecordingIndexStore {
+        rows: Mutex<Vec<crate::store::UsageAppend>>,
+    }
+
+    impl RecordingIndexStore {
+        fn new() -> Self {
+            Self {
+                rows: Mutex::new(Vec::new()),
+            }
+        }
+        fn len(&self) -> usize {
+            lock_mutex(&self.rows).len()
+        }
+    }
+
+    #[async_trait]
+    impl crate::store::Store for RecordingIndexStore {
+        async fn put_namespace(
+            &self,
+            _: crate::store::NamespaceRecord,
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
+        }
+        async fn get_namespace(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::store::NamespaceRecord>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn list_namespaces(
+            &self,
+            _: Option<String>,
+            _: u32,
+        ) -> Result<(Vec<crate::store::NamespaceRecord>, Option<String>), crate::store::StoreError>
+        {
+            Ok((Vec::new(), None))
+        }
+        async fn update_namespace(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: Option<Vec<String>>,
+        ) -> Result<Option<crate::store::NamespaceRecord>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn delete_namespace(&self, _: &str) -> Result<bool, crate::store::StoreError> {
+            Ok(false)
+        }
+        fn seed_namespaces_blocking(
+            &self,
+            _: &[crate::config::Namespace],
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
+        }
+        async fn put_budget(
+            &self,
+            _: &str,
+            _: &str,
+            _: u64,
+        ) -> Result<crate::store::BudgetRecord, crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable("unused".into()))
+        }
+        async fn get_budget(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<crate::store::BudgetRecord>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn put_budget_policy(
+            &self,
+            _: &str,
+            _: crate::store::BudgetCadence,
+            _: u64,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<crate::store::BudgetPolicy, crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable("unused".into()))
+        }
+        async fn get_budget_policy(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::store::BudgetPolicy>, crate::store::StoreError> {
+            Ok(None)
+        }
+        async fn admit_budget(
+            &self,
+            _: &str,
+        ) -> Result<crate::store::BudgetAdmit, crate::store::StoreError> {
+            Err(crate::store::StoreError::Unavailable("unused".into()))
+        }
+        async fn charge_budget(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: u64,
+        ) -> Result<(), crate::store::StoreError> {
+            Ok(())
+        }
+        async fn append_usage(
+            &self,
+            event: crate::store::UsageAppend,
+        ) -> Result<(), crate::store::StoreError> {
+            self.append_usage_batch(vec![event]).await
+        }
+        async fn append_usage_batch(
+            &self,
+            events: Vec<crate::store::UsageAppend>,
+        ) -> Result<(), crate::store::StoreError> {
+            lock_mutex(&self.rows).extend(events);
+            Ok(())
+        }
+        fn append_usage_batch_sync(
+            &self,
+            events: &[crate::store::UsageAppend],
+        ) -> Result<(), crate::store::StoreError> {
+            lock_mutex(&self.rows).extend(events.iter().cloned());
+            Ok(())
+        }
+        async fn summarize_usage(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<Vec<crate::store::UsageSummaryRow>, crate::store::StoreError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Graceful drain after a burst of records: every accepted event is
+    /// queryable, including the one that arrived with the drain (final
+    /// settlement). Crash `Drop` is still best-effort and is not this path.
+    #[tokio::test]
+    async fn a_healthy_index_drain_leaves_queued_sqlite_rows_queryable() {
+        let (store, delivery) = sqlite_for_index().await;
+        let record = sample_record();
+        let period = record.period.clone().expect("period");
+        const N: u64 = 7;
+        for _ in 0..N {
+            let event = UsageRecord {
+                request_id: identity::next_request_id().to_string(),
+                ..record.clone()
+            };
+            delivery.record(&event).await.expect("telemetry");
+        }
+        let report = delivery.drain_index(Duration::from_secs(2)).await;
+        assert!(report.reported, "{report:?}");
+        assert_eq!(report.leftover, 0, "{report:?}");
+        assert!(report.drained, "{report:?}");
+        assert!(!report.failed, "{report:?}");
+        let indexed: u64 = store
+            .summarize_usage(&record.namespace, &period)
+            .await
+            .expect("summary")
+            .iter()
+            .map(|row| row.count)
+            .sum();
+        assert_eq!(indexed, N);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Accepted), N);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Saturated), 0);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Closed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_index_drain_lands_queued_async_worker_rows() {
+        let store = Arc::new(RecordingIndexStore::new());
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(Arc::clone(&store) as Arc<dyn Store>, fast_index(32, 8));
+        const N: usize = 5;
+        for _ in 0..N {
+            delivery.record(&sample_record()).await.expect("telemetry");
+        }
+        let report = delivery.drain_index(Duration::from_secs(2)).await;
+        assert_eq!(
+            report,
+            IndexDrainReport {
+                written: N as u64,
+                leftover: 0,
+                failed: false,
+                drained: true,
+                reported: true,
+                unwaited: false,
+            }
+        );
+        assert_eq!(store.len(), N);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Saturated), 0);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Closed), 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_index_queue_drain_reports_caught_up() {
+        let (_store, delivery) = sqlite_for_index().await;
+        let report = delivery.drain_index(Duration::from_secs(1)).await;
+        assert_eq!(
+            report,
+            IndexDrainReport {
+                written: 0,
+                leftover: 0,
+                failed: false,
+                drained: true,
+                reported: true,
+                unwaited: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_store_still_lets_index_drain_exit() {
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(Arc::new(crate::store::UnavailableStore), fast_index(8, 8));
+        delivery.record(&sample_record()).await.expect("telemetry");
+        let report = delivery.drain_index(Duration::from_secs(2)).await;
+        assert!(report.reported, "{report:?}");
+        assert!(report.failed, "{report:?}");
+        assert_eq!(
+            report.leftover, 0,
+            "failed writes are counted as failed appends, not leftovers"
+        );
+        assert_eq!(report.abandoned(), Some(0));
+        assert_eq!(delivery.index_outcome(IndexOutcome::Failed), 1);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Saturated), 0);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Closed), 0);
+    }
+
+    #[tokio::test]
+    async fn draining_the_index_twice_is_idempotent_and_closes_the_channel() {
+        let (_store, delivery) = sqlite_for_index().await;
+        delivery.record(&sample_record()).await.expect("telemetry");
+        let first = delivery.drain_index(Duration::from_secs(2)).await;
+        assert_eq!(first.abandoned(), Some(0), "{first:?}");
+        let second = delivery.drain_index(Duration::from_secs(1)).await;
+        assert_eq!(
+            second,
+            IndexDrainReport {
+                written: 0,
+                leftover: 0,
+                failed: false,
+                drained: true,
+                reported: true,
+                unwaited: false,
+            }
+        );
+        delivery.record(&sample_record()).await.expect("telemetry");
+        assert!(
+            delivery.index_outcome(IndexOutcome::Closed) >= 1,
+            "appends after drain see a closed worker"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_sqlite_index_drain_stays_inside_the_shutdown_budget() {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let store = Arc::new(ParkingIndexStore::parked(Arc::clone(&entered), release_rx));
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(Arc::clone(&store) as Arc<dyn Store>, fast_index(8, 4));
+        delivery.record(&sample_record()).await.expect("telemetry");
+        entered.wait();
+        let started = Instant::now();
+        let report = delivery.drain_index(Duration::from_millis(50)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "drain overran its budget+margin: {:?}",
+            started.elapsed()
+        );
+        assert!(!report.reported, "{report:?}");
+        assert!(!report.unwaited, "{report:?}");
+        assert_eq!(
+            report.abandoned(),
+            None,
+            "unknown leftovers are not counted as zero"
+        );
+        assert_eq!(delivery.index_outcome(IndexOutcome::Saturated), 0);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Closed), 0);
+        drop(release_tx);
+    }
+
+    #[tokio::test]
+    async fn a_slow_async_index_drain_stays_inside_the_shutdown_budget() {
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(
+            Arc::new(SlowIndexStore),
+            UsageIndexSettings {
+                capacity: 8,
+                max_batch: 8,
+                flush_interval: Duration::from_millis(1),
+                // Longer than budget + DRAIN_MARGIN so the join times out rather
+                // than waiting for the worker's own write deadline.
+                write_timeout: Duration::from_secs(30),
+            },
+        );
+        delivery.record(&sample_record()).await.expect("telemetry");
+        let started = Instant::now();
+        let report = delivery.drain_index(Duration::from_millis(20)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "drain overran: {:?}",
+            started.elapsed()
+        );
+        assert!(!report.reported, "{report:?}");
+        assert_eq!(report.abandoned(), None);
+        // The hang is a write timeout (`failed`/`timeout` on appends), not a
+        // queue drop counted as saturated/closed leftovers.
+        assert_eq!(delivery.index_outcome(IndexOutcome::Saturated), 0);
+    }
+
+    #[tokio::test]
+    async fn abandoning_the_index_does_not_wait_and_does_not_count_leftovers_as_appends() {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let store = Arc::new(ParkingIndexStore::parked(Arc::clone(&entered), release_rx));
+        let delivery = UsageDelivery::telemetry(UsageFanout::new(Vec::new()));
+        delivery.attach_store(Arc::clone(&store) as Arc<dyn Store>, fast_index(8, 4));
+        for _ in 0..3 {
+            delivery.record(&sample_record()).await.expect("telemetry");
+        }
+        entered.wait();
+        let started = Instant::now();
+        let report = delivery.abandon_index();
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(report.unwaited);
+        assert!(!report.reported);
+        assert_eq!(report.abandoned(), None);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Saturated), 0);
+        assert_eq!(delivery.index_outcome(IndexOutcome::Closed), 0);
+        drop(release_tx);
     }
 
     /// A worker that is gone is `closed`, not `failed`: nothing about the Store

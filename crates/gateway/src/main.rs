@@ -1069,23 +1069,35 @@ async fn serve() -> anyhow::Result<()> {
     // and leave the telemetry export a deadline already in the past. Under the
     // margin there is no honest wait left to make, so the worker is stopped
     // without one.
-    let journal_drain: Option<usage::DrainReport> = match usage_worker {
-        Some(worker) => Some(
-            match (until(flush_by) / 2).checked_sub(usage::DRAIN_MARGIN) {
-                Some(budget) => worker.drain(budget).await,
-                None => worker.abandon(),
-            },
-        ),
-        None => None,
+    // Journal delivery and the management usage-index share whatever is left of
+    // the flush budget: both cost `budget + DRAIN_MARGIN`, both are abandoned
+    // without a wait when that cannot be paid, and they run together so a long
+    // outbox drain cannot starve index writes (or the reverse). Index leftovers
+    // are in-memory and lost at exit; journal leftovers are durable.
+    let share = (until(flush_by) / 2).checked_sub(usage::DRAIN_MARGIN);
+    let (journal_drain, index_drain) = match (usage_worker, share) {
+        (Some(worker), Some(budget)) => {
+            let (journal, index) =
+                tokio::join!(worker.drain(budget), resources.0.usage.drain_index(budget));
+            (Some(journal), index)
+        }
+        (Some(worker), None) => (Some(worker.abandon()), resources.0.usage.abandon_index()),
+        (None, Some(budget)) => (None, resources.0.usage.drain_index(budget).await),
+        (None, None) => (None, resources.0.usage.abandon_index()),
     };
     if let Some(report) = journal_drain.as_ref() {
         report.log();
+    }
+    index_drain.log();
+    if let Some(leftover) = index_drain.abandoned() {
+        telemetry::metrics::record_shutdown_abandoned_index(leftover);
     }
     let telemetry_failures = telemetry_guard.shutdown(flush_by);
     tracing::info!(
         outcome = outcome.as_str(),
         usage_flushed = flushed.is_complete(),
         usage_journal_drained = journal_drain.as_ref().and_then(|report| report.caught_up()),
+        usage_index_drained = index_drain.caught_up(),
         telemetry_flushed = telemetry_failures.is_empty(),
         "axond stopped"
     );

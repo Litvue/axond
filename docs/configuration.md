@@ -222,14 +222,22 @@ SQLite stores `recorded_at` as unix seconds; prune by `period` there, or
 
 ### `[storage.usage_index]` — optional
 
-How usage events reach that index. The index is best effort and off the request
-path: a request `try_reserve`s a slot on a bounded queue and never waits, and
-one worker writes what has queued in bounded batches — one Store transaction per
-batch, deduplicated on `request_id`, so a retried or overlapping batch inserts
-each event once. A Store outage therefore costs index rows, counted on
+How usage events reach that index. The index is off the request path: a request
+`try_reserve`s a slot on a bounded queue and never waits, and one worker writes
+what has queued in bounded batches — one Store transaction per batch,
+deduplicated on `request_id`, so a retried or overlapping batch inserts each
+event once. A Store outage therefore costs index rows, counted on
 `axond.usage.index.appends`, rather than latency; a full queue drops the newest
 event (`saturated`) rather than growing. Same vocabulary as the `[[usage_sink]]`
 batching keys. Boot-owned, like the rest of `[storage]`.
+
+Graceful shutdown drains the worker inside `shutdown.flush_timeout_ms` (shared
+with sink flush, journal drain, and telemetry). Queued events that land are
+queryable on `GET .../usage`. Leftovers the worker reports are
+`axond.shutdown.abandoned_index` — not a second `saturated`/`closed` on
+`axond.usage.index.appends`. A crash (`SIGKILL`, or a drop with no drain)
+remains best-effort: the in-flight write may finish, the rest of the queue does
+not, and that loss is not this counter.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -252,7 +260,7 @@ termination that follows it.
 | --- | --- | --- | --- |
 | `drain_grace_ms` | integer | `5000` | How long `/readyz` fails while the replica *keeps* admitting work, so a load balancer can remove it before anything is refused. `0` closes admission immediately — only safe when something else already drained the endpoint. |
 | `deadline_ms` | integer | `15000` | How long requests admitted before the close have to finish. Anything still open is cut: its response body ends in an error and a stream settles as `client_cancelled` up to the last relayed token. Rejected at `0`. |
-| `flush_timeout_ms` | integer | `5000` | Bound on the whole post-serving sequence: settling cut responses, flushing buffered usage sinks, and flushing telemetry exporters. Settling gets at most half of it so a request that cannot end cannot starve the flush; anything still unsettled then is counted as abandoned. Records that cannot be written are counted as `shutdown` drops. Rejected at `0`. |
+| `flush_timeout_ms` | integer | `5000` | Bound on the whole post-serving sequence: settling cut responses, flushing buffered usage sinks, draining the usage journal and the Store usage-index worker, and flushing telemetry exporters. Settling gets at most half of it so a request that cannot end cannot starve the flush; anything still unsettled then is counted as abandoned. Journal leftovers stay durable for the next replica; usage-index leftovers are in-memory and counted as `axond.shutdown.abandoned_index` when known. Records a sink cannot write are counted as `shutdown` drops. Rejected at `0`. |
 
 `/healthz` answers `ok` throughout; only `/readyz` reports the drain, because a
 terminating replica is not an unhealthy one. Worst-case termination is the sum
