@@ -223,7 +223,7 @@ SQLite stores `recorded_at` as unix seconds; prune by `period` there, or
 ### `[storage.usage_index]` — optional
 
 How usage events reach that index. The index is best effort and off the request
-path: a request `try_send`s its event onto a bounded queue and never waits, and
+path: a request `try_reserve`s a slot on a bounded queue and never waits, and
 one worker writes what has queued in bounded batches — one Store transaction per
 batch, deduplicated on `request_id`, so a retried or overlapping batch inserts
 each event once. A Store outage therefore costs index rows, counted on
