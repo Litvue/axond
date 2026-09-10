@@ -81,6 +81,7 @@ struct Instruments {
     shutdown_rejections: Counter<u64>,
     shutdown_abandoned: Counter<u64>,
     shutdown_abandoned_settlements: Counter<u64>,
+    shutdown_abandoned_index: Counter<u64>,
     settlement_in_flight: UpDownCounter<i64>,
     settlement_queue_wait: Histogram<f64>,
     /// Held so the collection callback stays registered for the process lifetime.
@@ -337,6 +338,12 @@ impl Instruments {
                 .with_description(
                     "Settlements still queued or executing when the shutdown settle share \
                      expired; their charges may be unrecorded.",
+                )
+                .build(),
+            shutdown_abandoned_index: meter
+                .u64_counter("axond.shutdown.abandoned_index")
+                .with_description(
+                    "Management usage-index events still queued when graceful shutdown ran out of flush budget. Known leftovers only; an unreported drain is a log line, not a zero.",
                 )
                 .build(),
             settlement_in_flight: meter
@@ -992,6 +999,18 @@ pub fn record_shutdown_abandoned_settlements(count: u64) {
     };
     if count > 0 {
         instruments.shutdown_abandoned_settlements.add(count, &[]);
+    }
+}
+
+/// Management-index events left in the in-memory queue when the shutdown drain
+/// reported leftovers. Not incremented when the worker did not report: unknown
+/// is not zero, and those events are not double-counted on index appends.
+pub fn record_shutdown_abandoned_index(count: u64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    if count > 0 {
+        instruments.shutdown_abandoned_index.add(count, &[]);
     }
 }
 

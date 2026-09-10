@@ -520,7 +520,10 @@ is a different cut: the requests ended, but their charges were still queued or
 executing against the Store when the settle share of `flush_timeout_ms` ran out,
 and that spend was never recorded. The shutdown log line breaks the leftovers
 down by stage (`settlements_queued`, `settlements_executing`,
-`settlements_reserved`) and names the oldest one's age.
+`settlements_reserved`) and names the oldest one's age. A rising
+`axond_shutdown_abandoned_index` is a third cut: the Store usage-index worker
+still had queued events when the flush budget ended, so `GET .../usage` on this
+replica is short. Billing is not this counter; crash exit never increments it.
 
 `GET /admin/v1/status` still answers in both phases and reports the phase it is
 in, including `closing`: it authenticates but sits outside admission, and takes
