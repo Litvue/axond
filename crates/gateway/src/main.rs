@@ -872,7 +872,13 @@ mod tests {
     fn the_withdrawn_commands_are_not_parsed() {
         for argv in [
             vec!["axond", "admin", "state", "--config", "/etc/axond.toml"],
-            vec!["axond", "budget", "migrate-redis", "--config", "/etc/axond.toml"],
+            vec![
+                "axond",
+                "budget",
+                "migrate-redis",
+                "--config",
+                "/etc/axond.toml",
+            ],
         ] {
             let error = cli()
                 .try_get_matches_from(&argv)
