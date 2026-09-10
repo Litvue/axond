@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex as OccupancyLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,9 @@ struct PoolStats {
     discarded: AtomicU64,
     live: AtomicUsize,
     idle: AtomicUsize,
+    /// Occupancy gauges load `live` and `idle` under this lock so an older
+    /// checkout cannot publish after a newer one has already recorded.
+    occupancy: OccupancyLock<()>,
 }
 
 impl PostgresStore {
@@ -134,19 +138,25 @@ impl PostgresStore {
                 tracing::warn!(error = %e, "postgres store connection closed");
             }
         });
-        client
+        // The handshake already opened a session. If setup fails or this
+        // future is cancelled, Drop records the discard the Session guard
+        // would have recorded had checkout finished.
+        let mut opened = OpenedClient {
+            stats: Arc::clone(&self.stats),
+            client: Some(client),
+        };
+        opened
+            .client
+            .as_ref()
+            .expect("just opened")
             .batch_execute("SET lock_timeout = '2s'; SET statement_timeout = '5s'")
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        Ok(client)
+        Ok(opened.take())
     }
 
     fn record_occupancy(&self) {
-        metrics::record_store_pool_sessions(
-            STORE_BACKEND_POSTGRES,
-            self.stats.live.load(Ordering::SeqCst) as u64,
-            self.stats.idle.load(Ordering::SeqCst) as u64,
-        );
+        self.stats.record_occupancy();
     }
 
     fn discard_session(&self) {
@@ -321,13 +331,47 @@ impl Drop for Session {
             self.stats.live.fetch_sub(1, Ordering::SeqCst);
             self.stats.discarded.fetch_add(1, Ordering::SeqCst);
             metrics::record_store_connection_discarded(STORE_BACKEND_POSTGRES);
-            metrics::record_store_pool_sessions(
-                STORE_BACKEND_POSTGRES,
-                self.stats.live.load(Ordering::SeqCst) as u64,
-                self.stats.idle.load(Ordering::SeqCst) as u64,
-            );
+            self.stats.record_occupancy();
         }
         self.permit.take();
+    }
+}
+
+/// A client that has been opened but is not yet a pooled [`Session`].
+///
+/// Drop records `discarded` unless [`OpenedClient::take`] disarms it.
+struct OpenedClient {
+    stats: Arc<PoolStats>,
+    client: Option<Client>,
+}
+
+impl OpenedClient {
+    fn take(&mut self) -> Client {
+        self.client.take().expect("opened client")
+    }
+}
+
+impl Drop for OpenedClient {
+    fn drop(&mut self) {
+        if self.client.take().is_some() {
+            self.stats.discarded.fetch_add(1, Ordering::SeqCst);
+            metrics::record_store_connection_discarded(STORE_BACKEND_POSTGRES);
+            self.stats.record_occupancy();
+        }
+    }
+}
+
+impl PoolStats {
+    fn record_occupancy(&self) {
+        let _publish = self
+            .occupancy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        metrics::record_store_pool_sessions(
+            STORE_BACKEND_POSTGRES,
+            self.live.load(Ordering::SeqCst) as u64,
+            self.idle.load(Ordering::SeqCst) as u64,
+        );
     }
 }
 
@@ -339,6 +383,7 @@ impl Default for PoolStats {
             discarded: AtomicU64::new(0),
             live: AtomicUsize::new(0),
             idle: AtomicUsize::new(0),
+            occupancy: OccupancyLock::new(()),
         }
     }
 }
