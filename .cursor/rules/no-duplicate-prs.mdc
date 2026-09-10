@@ -1,0 +1,14 @@
+---
+description: Do not open a second pull request for the same change.
+alwaysApply: true
+---
+
+# One open PR per change
+
+Before creating a pull request:
+
+1. Search this repository's **open** PRs for the same title.
+2. Search for another open PR whose body `Closes` / `Fixes` / `Resolves` the same issue.
+3. If either match exists, push to that branch (or stop). Do not open a sibling.
+
+Two agents that start from the same issue will pick the same Conventional Commit title. A GitHub search at start time is a race. The oldest open PR is the one that lands. CI (`ops/check-duplicate-prs.py`) fails every newer duplicate. Close the newer PR instead of renaming it to sneak past the gate.
