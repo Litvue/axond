@@ -480,7 +480,10 @@ pub trait Store: Send + Sync {
     }
 
     /// Index one usage event for the management summary. Duplicate
-    /// `request_id` is ignored (at-least-once).
+    /// `request_id` is ignored (at-least-once). The usage-index worker writes
+    /// through [`Self::append_usage_batch`]; this remains the single-row
+    /// contract and the test surface.
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError>;
 
     /// Index a batch of usage events in one write. Implementations **must** be
@@ -501,7 +504,9 @@ pub trait Store: Send + Sync {
     }
 
     /// Insert one usage-index row on the caller's thread. SQLite only; must
-    /// not schedule `spawn_blocking`.
+    /// not schedule `spawn_blocking`. The usage-index worker writes through
+    /// [`Self::append_usage_batch_sync`].
+    #[cfg_attr(not(test), allow(dead_code))]
     fn append_usage_sync(&self, event: UsageAppend) -> Result<(), StoreError> {
         let _ = event;
         Err(StoreError::Unavailable(

@@ -303,23 +303,6 @@ const INSERT_USAGE_SQL: &str = "INSERT OR IGNORE INTO axond_store_usage
     (request_id, namespace, period, model, status, cost_microdollars, recorded_at)
  VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s','now') AS INTEGER))";
 
-fn insert_usage(conn: &Connection, event: &UsageAppend) -> Result<(), StoreError> {
-    let cost = event.cost_microdollars.map(sql_amount_saturating);
-    conn.execute(
-        INSERT_USAGE_SQL,
-        params![
-            event.request_id,
-            event.namespace,
-            event.period,
-            event.model,
-            event.status,
-            cost,
-        ],
-    )
-    .map_err(unavailable)?;
-    Ok(())
-}
-
 /// One `IMMEDIATE` transaction around a prepared `INSERT OR IGNORE` per row.
 /// All-or-nothing, so a failed batch leaves nothing for its retry to collide
 /// with, and `OR IGNORE` makes a retry of a committed batch a no-op per row.
@@ -739,12 +722,14 @@ impl Store for SqliteStore {
     }
 
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError> {
-        self.with_conn(StoreOp::UsageAppend, move |conn| insert_usage(conn, &event))
-            .await
+        self.with_conn(StoreOp::UsageAppend, move |conn| {
+            insert_usage_batch(conn, std::slice::from_ref(&event))
+        })
+        .await
     }
 
     async fn append_usage_batch(&self, events: Vec<UsageAppend>) -> Result<(), StoreError> {
-        self.with_conn(move |conn| insert_usage_batch(conn, &events))
+        self.with_conn(StoreOp::UsageAppend, move |conn| insert_usage_batch(conn, &events))
             .await
     }
 
@@ -753,8 +738,12 @@ impl Store for SqliteStore {
     }
 
     fn append_usage_sync(&self, event: UsageAppend) -> Result<(), StoreError> {
+        self.append_usage_batch_sync(std::slice::from_ref(&event))
+    }
+
+    fn append_usage_batch_sync(&self, events: &[UsageAppend]) -> Result<(), StoreError> {
         let called = Instant::now();
-        let conn = match self.conn.lock() {
+        let mut conn = match self.conn.lock() {
             Ok(conn) => conn,
             Err(error) => {
                 metrics::record_store_operation(
@@ -768,7 +757,7 @@ impl Store for SqliteStore {
             }
         };
         let acquired = Instant::now();
-        let result = insert_usage(&conn, &event);
+        let result = insert_usage_batch(&mut conn, events);
         metrics::record_store_operation(
             STORE_BACKEND_SQLITE,
             StoreOp::UsageAppend,
@@ -781,14 +770,6 @@ impl Store for SqliteStore {
             },
         );
         result
-    }
-
-    fn append_usage_batch_sync(&self, events: &[UsageAppend]) -> Result<(), StoreError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        insert_usage_batch(&mut conn, events)
     }
 
     async fn summarize_usage(

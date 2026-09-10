@@ -1224,7 +1224,7 @@ impl Store for PostgresStore {
             params.push(&event.status);
             params.push(cost);
         }
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::UsageAppend, async move |client| {
             // One statement is one transaction: all rows not already present
             // land, or none do, and `DO NOTHING` skips the ones that were.
             client
