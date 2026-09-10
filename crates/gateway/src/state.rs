@@ -1934,7 +1934,13 @@ impl AppState {
             Some(store) => store,
             None => open_store_sync(&snapshot.config)?,
         };
-        usage.attach_store(Arc::clone(&store));
+        let index_settings = snapshot
+            .config
+            .storage
+            .as_ref()
+            .map(|storage| storage.usage_index.settings())
+            .unwrap_or_default();
+        usage.attach_store(Arc::clone(&store), index_settings);
         Ok(AppState(Arc::new(Inner {
             dispatcher: HttpDispatcher::with_limits(
                 build_client(&limits).expect("the upstream HTTP client builds"),

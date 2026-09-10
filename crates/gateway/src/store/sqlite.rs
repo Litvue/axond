@@ -299,12 +299,14 @@ fn namespace_exists(conn: &Connection, id: &str) -> Result<bool, StoreError> {
         .is_some())
 }
 
+const INSERT_USAGE_SQL: &str = "INSERT OR IGNORE INTO axond_store_usage
+    (request_id, namespace, period, model, status, cost_microdollars, recorded_at)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s','now') AS INTEGER))";
+
 fn insert_usage(conn: &Connection, event: &UsageAppend) -> Result<(), StoreError> {
     let cost = event.cost_microdollars.map(sql_amount_saturating);
     conn.execute(
-        "INSERT OR IGNORE INTO axond_store_usage
-            (request_id, namespace, period, model, status, cost_microdollars, recorded_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, CAST(strftime('%s','now') AS INTEGER))",
+        INSERT_USAGE_SQL,
         params![
             event.request_id,
             event.namespace,
@@ -316,6 +318,41 @@ fn insert_usage(conn: &Connection, event: &UsageAppend) -> Result<(), StoreError
     )
     .map_err(unavailable)?;
     Ok(())
+}
+
+/// One `IMMEDIATE` transaction around a prepared `INSERT OR IGNORE` per row.
+/// All-or-nothing, so a failed batch leaves nothing for its retry to collide
+/// with, and `OR IGNORE` makes a retry of a committed batch a no-op per row.
+fn insert_usage_batch(conn: &mut Connection, events: &[UsageAppend]) -> Result<(), StoreError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    if events.len() > super::MAX_USAGE_INDEX_BATCH {
+        return Err(StoreError::Invalid(format!(
+            "usage-index batch of {} rows exceeds the bound of {}",
+            events.len(),
+            super::MAX_USAGE_INDEX_BATCH
+        )));
+    }
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(unavailable)?;
+    {
+        let mut stmt = tx.prepare_cached(INSERT_USAGE_SQL).map_err(unavailable)?;
+        for event in events {
+            let cost = event.cost_microdollars.map(sql_amount_saturating);
+            stmt.execute(params![
+                event.request_id,
+                event.namespace,
+                event.period,
+                event.model,
+                event.status,
+                cost,
+            ])
+            .map_err(unavailable)?;
+        }
+    }
+    tx.commit().map_err(unavailable)
 }
 
 fn row_to_record(
@@ -706,6 +743,11 @@ impl Store for SqliteStore {
             .await
     }
 
+    async fn append_usage_batch(&self, events: Vec<UsageAppend>) -> Result<(), StoreError> {
+        self.with_conn(move |conn| insert_usage_batch(conn, &events))
+            .await
+    }
+
     fn blocking_usage_index(&self) -> bool {
         true
     }
@@ -739,6 +781,14 @@ impl Store for SqliteStore {
             },
         );
         result
+    }
+
+    fn append_usage_batch_sync(&self, events: &[UsageAppend]) -> Result<(), StoreError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        insert_usage_batch(&mut conn, events)
     }
 
     async fn summarize_usage(
@@ -2088,5 +2138,99 @@ mod tests {
             .expect("get")
             .expect("row");
         assert_eq!(got, old);
+    }
+
+    /// `(request_id, namespace, period, model, status, cost_microdollars)` as
+    /// stored.
+    type StoredUsageRow = (String, String, Option<String>, String, String, Option<i64>);
+
+    /// Every stored usage-index column except `recorded_at`, in `request_id`
+    /// order, so two write paths can be compared byte for byte — nulls included.
+    fn usage_rows(store: &SqliteStore) -> Vec<StoredUsageRow> {
+        let conn = store.conn.lock().expect("lock");
+        let mut stmt = conn
+            .prepare(
+                "SELECT request_id, namespace, period, model, status, cost_microdollars
+                 FROM axond_store_usage ORDER BY request_id",
+            )
+            .expect("prepare");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .expect("query");
+        rows.map(|row| row.expect("row")).collect()
+    }
+
+    /// A batch stores exactly what the same events store one at a time: a
+    /// `None` period is `NULL` (not `""`), a `None` cost is `NULL` (not `0`),
+    /// and an oversized cost saturates identically.
+    #[test]
+    fn usage_batch_rows_are_identical_to_single_inserts() {
+        let single = SqliteStore::open(":memory:").expect("memory sqlite");
+        let batched = SqliteStore::open(":memory:").expect("memory sqlite");
+        let mut events = super::super::tests::usage_events("wsp_x", "req", 9);
+        events[0].cost_microdollars = Some(i64::MAX as u64 + 1);
+        for event in &events {
+            single
+                .append_usage_sync(event.clone())
+                .expect("single insert");
+        }
+        batched
+            .append_usage_batch_sync(&events)
+            .expect("batch insert");
+        let rows = usage_rows(&batched);
+        assert_eq!(rows, usage_rows(&single));
+        assert_eq!(rows.len(), events.len());
+        assert!(
+            rows.iter().any(|row| row.2.is_none()),
+            "a null period is kept null"
+        );
+        assert!(
+            rows.iter().any(|row| row.5.is_none()),
+            "a null cost is kept null"
+        );
+        assert_eq!(rows[0].5, Some(i64::MAX), "oversized cost saturates");
+    }
+
+    /// A batch is one transaction: when the write fails nothing lands, so the
+    /// retry that follows inserts every row exactly once rather than colliding
+    /// with a half-written batch — and a second retry is a no-op.
+    #[test]
+    fn usage_batch_failure_is_atomic_and_its_retry_lands_once() {
+        let store = SqliteStore::open(":memory:").expect("memory sqlite");
+        let events = super::super::tests::usage_events("wsp_x", "req", 8);
+        store
+            .conn
+            .lock()
+            .expect("lock")
+            .execute_batch("PRAGMA query_only = ON")
+            .expect("read only");
+        let err = store
+            .append_usage_batch_sync(&events)
+            .expect_err("a read-only store fails the batch");
+        assert!(matches!(err, StoreError::Unavailable(_)), "{err:?}");
+        store
+            .conn
+            .lock()
+            .expect("lock")
+            .execute_batch("PRAGMA query_only = OFF")
+            .expect("writable");
+        assert!(
+            usage_rows(&store).is_empty(),
+            "a failed batch leaves no rows"
+        );
+        store.append_usage_batch_sync(&events).expect("retry");
+        store
+            .append_usage_batch_sync(&events)
+            .expect("repeat after success");
+        assert_eq!(usage_rows(&store).len(), events.len());
     }
 }

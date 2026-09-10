@@ -827,10 +827,69 @@ pub struct StorageConfig {
     /// deployments that migrate out of band set `false`.
     #[serde(default = "default_storage_create_table")]
     pub create_table: bool,
+    /// Batching for the management usage index (`axond_store_usage`).
+    #[serde(default)]
+    pub usage_index: UsageIndexConfig,
 }
 
 fn default_storage_create_table() -> bool {
     true
+}
+
+/// How usage events reach the Store's management index (`GET .../usage`).
+///
+/// The index is best effort and off the request path: the request `try_send`s
+/// onto a bounded queue and one worker writes what has queued in bounded
+/// batches, so a Store outage costs index rows (counted on
+/// `axond.usage.index.appends`) rather than latency. Same vocabulary as the
+/// `[[usage_sink]]` batching keys.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UsageIndexConfig {
+    /// Events queued ahead of the worker before the request path drops rather
+    /// than waits.
+    #[serde(default = "default_usage_index_buffer_capacity")]
+    pub buffer_capacity: usize,
+    /// Rows per Store transaction. Bounds how long SQLite's single connection
+    /// is held away from admits and charges.
+    #[serde(default = "default_usage_index_max_batch")]
+    pub max_batch: usize,
+    /// How long a partial batch waits for company before it is written anyway.
+    /// `0` writes whatever has queued as soon as the worker is free.
+    #[serde(default = "default_usage_index_flush_interval_ms")]
+    pub flush_interval_ms: u64,
+}
+
+fn default_usage_index_buffer_capacity() -> usize {
+    1024
+}
+
+fn default_usage_index_max_batch() -> usize {
+    256
+}
+
+fn default_usage_index_flush_interval_ms() -> u64 {
+    50
+}
+
+impl Default for UsageIndexConfig {
+    fn default() -> Self {
+        Self {
+            buffer_capacity: default_usage_index_buffer_capacity(),
+            max_batch: default_usage_index_max_batch(),
+            flush_interval_ms: default_usage_index_flush_interval_ms(),
+        }
+    }
+}
+
+impl UsageIndexConfig {
+    pub fn settings(&self) -> crate::usage::UsageIndexSettings {
+        crate::usage::UsageIndexSettings {
+            capacity: self.buffer_capacity,
+            max_batch: self.max_batch,
+            flush_interval: Duration::from_millis(self.flush_interval_ms),
+            ..crate::usage::UsageIndexSettings::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2966,6 +3025,30 @@ impl Config {
                 "`[storage]` is required (ADR 0063): set `backend = \"sqlite\"` with `path`, or `backend = \"postgres\"` with `dsn_env`".into(),
             ));
         };
+        let index = &storage.usage_index;
+        if index.buffer_capacity == 0 {
+            return Err(ConfigError::Invalid(
+                "`[storage.usage_index]` buffer_capacity must be at least 1".into(),
+            ));
+        }
+        if index.max_batch == 0 {
+            return Err(ConfigError::Invalid(
+                "`[storage.usage_index]` max_batch must be at least 1".into(),
+            ));
+        }
+        if index.max_batch > crate::store::MAX_USAGE_INDEX_BATCH {
+            return Err(ConfigError::Invalid(format!(
+                "`[storage.usage_index]` max_batch ({}) must not exceed {}",
+                index.max_batch,
+                crate::store::MAX_USAGE_INDEX_BATCH
+            )));
+        }
+        if index.max_batch > index.buffer_capacity {
+            return Err(ConfigError::Invalid(format!(
+                "`[storage.usage_index]` max_batch ({}) must not exceed buffer_capacity ({})",
+                index.max_batch, index.buffer_capacity
+            )));
+        }
         match storage.backend {
             StorageBackend::Sqlite => {
                 if storage
@@ -4874,6 +4957,52 @@ namespace = "platform"
             .expect("parses without storage");
         let err = cfg.validate().expect_err("storage is required");
         assert!(err.to_string().contains("[storage]"), "{err}");
+    }
+
+    #[test]
+    fn usage_index_batching_defaults_and_bounds() {
+        let cfg = Config::from_toml_str(VALID).expect("valid");
+        let index = &cfg.storage.as_ref().expect("storage").usage_index;
+        assert_eq!(*index, UsageIndexConfig::default());
+        let settings = index.settings();
+        assert_eq!(settings.capacity, 1024);
+        assert_eq!(settings.max_batch, 256);
+        assert_eq!(settings.flush_interval, Duration::from_millis(50));
+
+        let tuned = Config::from_toml_str(&VALID.replace(
+            "path = \":memory:\"",
+            "path = \":memory:\"\n[storage.usage_index]\nbuffer_capacity = 64\nmax_batch = 8\nflush_interval_ms = 0",
+        ))
+        .expect("tuned");
+        let index = &tuned.storage.as_ref().expect("storage").usage_index;
+        assert_eq!(
+            *index,
+            UsageIndexConfig {
+                buffer_capacity: 64,
+                max_batch: 8,
+                flush_interval_ms: 0,
+            }
+        );
+
+        for (body, needle) in [
+            ("buffer_capacity = 0", "buffer_capacity must be at least 1"),
+            ("max_batch = 0", "max_batch must be at least 1"),
+            (
+                "buffer_capacity = 8\nmax_batch = 9",
+                "must not exceed buffer_capacity",
+            ),
+            (
+                "buffer_capacity = 100000\nmax_batch = 5000",
+                "must not exceed 4096",
+            ),
+        ] {
+            let err = Config::from_toml_str(&VALID.replace(
+                "path = \":memory:\"",
+                &format!("path = \":memory:\"\n[storage.usage_index]\n{body}"),
+            ))
+            .expect_err(needle);
+            assert!(err.to_string().contains(needle), "{err}");
+        }
     }
 
     #[test]

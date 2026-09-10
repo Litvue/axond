@@ -24,6 +24,7 @@ const ADMISSION_QUEUE_DEPTH_BOUNDARIES: [f64; 11] = [
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
 ];
 
+<<<<<<< HEAD
 /// The usage-index worker queue holds at most
 /// [`crate::usage::UsageDelivery::STORE_INDEX_QUEUE`] events, so the depth
 /// histogram's top bucket is that bound and the buckets below it are exact
@@ -37,6 +38,12 @@ const USAGE_INDEX_QUEUE_DEPTH_BOUNDARIES: [f64; 9] =
 /// acquire wait first becomes visible.
 const STORE_DURATION_BOUNDARIES: [f64; 14] = [
     0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 1000.0, 5000.0,
+=======
+/// Powers of two up to [`crate::store::MAX_USAGE_INDEX_BATCH`], so a batch of
+/// one (the unbatched baseline) and a full batch land in distinct buckets.
+const USAGE_INDEX_BATCH_SIZE_BOUNDARIES: [f64; 13] = [
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0,
+>>>>>>> 7ab96c2 (perf(usage): batch Store usage-index appends and classify queue outcomes)
 ];
 
 struct Instruments {
@@ -59,6 +66,9 @@ struct Instruments {
     usage_flushes: Counter<u64>,
     journal_appends: Counter<u64>,
     usage_index_appends: Counter<u64>,
+    usage_index_batches: Counter<u64>,
+    usage_index_batch_size: Histogram<u64>,
+    usage_index_queue_age: Histogram<f64>,
     journal_deliveries: Counter<u64>,
     journal_quarantined: Counter<u64>,
     journal_undeliverable: Counter<u64>,
@@ -223,8 +233,28 @@ impl Instruments {
             usage_index_appends: meter
                 .u64_counter("axond.usage.index.appends")
                 .with_description(
-                    "Management usage-index appends, by outcome. `accepted` landed; `failed` and \
-                     `timeout` are best-effort losses of the summary index, not of billing.",
+                    "Management usage-index events, by outcome. `accepted` landed; `saturated` \
+                     (queue full), `closed` (worker gone), `failed` (Store error), and `timeout` \
+                     (write deadline) are best-effort losses of the summary index, not of billing.",
+                )
+                .build(),
+            usage_index_batches: meter
+                .u64_counter("axond.usage.index.batches")
+                .with_description(
+                    "Management usage-index Store writes (one transaction each), by outcome.",
+                )
+                .build(),
+            usage_index_batch_size: meter
+                .u64_histogram("axond.usage.index.batch_size")
+                .with_description("Events per management usage-index Store write.")
+                .with_boundaries(USAGE_INDEX_BATCH_SIZE_BOUNDARIES.to_vec())
+                .build(),
+            usage_index_queue_age: meter
+                .f64_histogram("axond.usage.index.queue_age")
+                .with_unit("ms")
+                .with_description(
+                    "Time the oldest event of a management usage-index write spent queued \
+                     before the write began.",
                 )
                 .build(),
             journal_deliveries: meter
@@ -732,16 +762,34 @@ pub fn record_usage_journal_append(journal: &'static str, outcome: &'static str)
     );
 }
 
-/// One management usage-index append's outcome. `outcome` is `accepted`,
-/// `failed`, or `timeout`. Failures are best-effort: they do not refuse the
-/// request and they do not unwind a durable journal append.
-pub fn record_usage_index_append(outcome: &'static str) {
+/// `count` management usage-index events that ended in `outcome` before any
+/// Store write: `saturated` (the bounded queue was full) or `closed` (the worker
+/// is gone). `outcome` is the bounded vocabulary of
+/// [`crate::usage::IndexOutcome`]. Losses are best-effort: they do not refuse
+/// the request and they do not unwind a durable journal append.
+pub fn record_usage_index_append(outcome: &'static str, count: u64) {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;
     };
     instruments
         .usage_index_appends
-        .add(1, &[KeyValue::new("axond.index.outcome", outcome)]);
+        .add(count, &[KeyValue::new("axond.index.outcome", outcome)]);
+}
+
+/// One management usage-index Store write of `rows` events that ended in
+/// `outcome` (`accepted`, `failed`, or `timeout`). Every row is counted on
+/// `axond.usage.index.appends` under the same outcome, the write itself on
+/// `axond.usage.index.batches`, and `queue_age_ms` — how long the oldest row
+/// waited before the write began — is the queue-pressure signal.
+pub fn record_usage_index_batch(outcome: &'static str, rows: u64, queue_age_ms: f64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    let attributes = [KeyValue::new("axond.index.outcome", outcome)];
+    instruments.usage_index_appends.add(rows, &attributes);
+    instruments.usage_index_batches.add(1, &attributes);
+    instruments.usage_index_batch_size.record(rows, &[]);
+    instruments.usage_index_queue_age.record(queue_age_ms, &[]);
 }
 
 /// Deliveries of journaled events. `redelivered` counts attempts after the
