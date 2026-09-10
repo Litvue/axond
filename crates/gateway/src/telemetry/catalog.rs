@@ -334,6 +334,14 @@ const ADMISSION_RESOURCE: Label = Label::closed(
     ],
 );
 
+/// The Store contention dimensions: which backend, and which of the ten kinds of
+/// work ([`crate::store::StoreOp`]). Both closed, so the acquire-wait and
+/// service-time histograms have `2 × 10` series each and never a tenant.
+const STORE_BACKEND: Label = Label::closed("axond.store.backend", crate::store::STORE_BACKENDS);
+const STORE_OPERATION: Label =
+    Label::closed("axond.store.operation", crate::store::STORE_OPERATIONS);
+const STORE_LABELS: &[Label] = &[STORE_BACKEND, STORE_OPERATION];
+
 const REVISION_TRIGGER: Label = Label::closed(
     "axond.revision.trigger",
     &[
@@ -737,6 +745,46 @@ pub const CATALOG: &[MetricSpec] = &[
         labels: &[],
     },
     MetricSpec {
+        name: "axond.store.acquire_wait",
+        kind: InstrumentKind::Histogram,
+        unit: Some("ms"),
+        labels: STORE_LABELS,
+    },
+    MetricSpec {
+        name: "axond.store.query_duration",
+        kind: InstrumentKind::Histogram,
+        unit: Some("ms"),
+        labels: STORE_LABELS,
+    },
+    MetricSpec {
+        name: "axond.store.operations",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[
+            STORE_BACKEND,
+            STORE_OPERATION,
+            Label::closed("axond.store.outcome", crate::store::STORE_OUTCOMES),
+        ],
+    },
+    MetricSpec {
+        name: "axond.store.connections_opened",
+        kind: InstrumentKind::Counter,
+        unit: None,
+        labels: &[STORE_BACKEND],
+    },
+    MetricSpec {
+        name: "axond.usage.index.queue.depth",
+        kind: InstrumentKind::Histogram,
+        unit: None,
+        labels: &[],
+    },
+    MetricSpec {
+        name: "axond.usage.index.queue.wait",
+        kind: InstrumentKind::Histogram,
+        unit: Some("ms"),
+        labels: &[],
+    },
+    MetricSpec {
         name: "axond.admission.in_flight",
         kind: InstrumentKind::UpDownCounter,
         unit: None,
@@ -1125,6 +1173,54 @@ mod tests {
                 rejection.code(),
             )
             .expect("every rejection's error code is catalogued");
+        }
+    }
+
+    /// The Store metrics separate waiting from executing by backend and kind of
+    /// work, and nothing else: every kind the code can record is catalogued,
+    /// and neither histogram accepts a tenant, period, or request dimension.
+    #[test]
+    fn store_metrics_carry_only_backend_and_operation_kind() {
+        for op in crate::store::StoreOp::ALL {
+            assert!(
+                crate::store::STORE_OPERATIONS.contains(&op.as_str()),
+                "{op:?} is recordable but not in STORE_OPERATIONS"
+            );
+            for metric in [
+                "axond.store.acquire_wait",
+                "axond.store.query_duration",
+                "axond.store.operations",
+            ] {
+                validate_label_value(metric, "axond.store.operation", op.as_str())
+                    .expect("every operation kind is catalogued");
+            }
+        }
+        assert_eq!(
+            crate::store::STORE_OPERATIONS.len(),
+            crate::store::StoreOp::ALL.len(),
+            "the label vocabulary and the enum have drifted"
+        );
+        for metric in ["axond.store.acquire_wait", "axond.store.query_duration"] {
+            let spec = spec(metric).expect("catalogued");
+            assert_eq!(spec.kind, InstrumentKind::Histogram);
+            assert_eq!(spec.unit, Some("ms"));
+            for forbidden in [
+                "axond.namespace",
+                "axond.request_id",
+                "axond.subject",
+                "axond.store.period",
+            ] {
+                assert!(
+                    validate_reference(metric, &[forbidden]).is_err(),
+                    "{metric} must not acquire `{forbidden}`"
+                );
+            }
+        }
+        for metric in [
+            "axond.usage.index.queue.depth",
+            "axond.usage.index.queue.wait",
+        ] {
+            assert!(spec(metric).expect("catalogued").labels.is_empty());
         }
     }
 

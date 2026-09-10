@@ -830,16 +830,38 @@ pub fn config_toml(bind: SocketAddr, upstream: &str, tuning: &str, extra: &str) 
         std::process::id(),
         bind.port()
     ));
-    let sqlite = sqlite.display();
+    config_toml_with_storage(bind, upstream, tuning, extra, &sqlite_storage(&sqlite))
+}
+
+/// The `[storage]` section for a SQLite file at `path`.
+pub fn sqlite_storage(path: &Path) -> String {
+    format!(
+        "[storage]\nbackend = \"sqlite\"\npath = \"{}\"\n",
+        path.display()
+    )
+}
+
+/// The `[storage]` section for a Postgres Store whose DSN the process reads
+/// from `dsn_env`.
+pub fn postgres_storage(dsn_env: &str) -> String {
+    format!("[storage]\nbackend = \"postgres\"\ndsn_env = \"{dsn_env}\"\n")
+}
+
+/// [`config_toml`] with the caller's own `[storage]` section, for a harness
+/// whose subject is the Store: which backend, and which file or database.
+pub fn config_toml_with_storage(
+    bind: SocketAddr,
+    upstream: &str,
+    tuning: &str,
+    extra: &str,
+    storage: &str,
+) -> String {
     format!(
         r#"
 [server]
 bind = "{bind}"
 
-[storage]
-backend = "sqlite"
-path = "{sqlite}"
-
+{storage}
 [[namespace]]
 id = "platform"
 default = true
