@@ -1347,7 +1347,7 @@ output_microdollars_per_million = 1
     #[test]
     #[ignore = "ADR 0063: leftover control plane withdrawn"]
     fn compiled_serving_cache_round_trips_opaquely_and_rejects_tampering() {
-        let (snapshot, bootstrap, env) = serving_snapshot();
+        let (snapshot, _, _) = serving_snapshot();
         let cache = cache("compiled-serving");
         let revision = fixtures::revision_id(9);
         let bytes = cache
@@ -1364,12 +1364,7 @@ output_microdollars_per_million = 1
             .load_compiled()
             .expect("compiled cache authenticates")
             .expect("compiled cache exists");
-        let (restored_revision, restored) =
-            ConfigSnapshot::from_cached_serving(bootstrap, &env, loaded)
-                .expect("compiled cache rebuilds a serving snapshot");
-        assert_eq!(restored_revision, revision);
-        assert_eq!(restored.generation, snapshot.generation);
-        assert_eq!(restored.config.model.len(), 1);
+        assert_eq!(loaded.revision, revision.to_string());
 
         let mut tampered = bytes;
         *tampered.last_mut().expect("compiled cache is non-empty") ^= 1;
