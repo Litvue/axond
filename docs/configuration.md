@@ -518,13 +518,16 @@ knowing:
   `503 settlement_capacity_exhausted` and `Retry-After: 1`, having cost nothing
   upstream. A request that *was* admitted always gets its settlement spawned.
 - **A settlement that misses its bound is counted, never retried.** One that
-  outlives `settlement_queue_wait_ms` waiting for a slot, or
-  `settlement_timeout_ms` once running, is abandoned and counted in
-  `axond.settlement.failures{axond.settlement.reason}`, and its spend is not
-  recorded by this replica. It is not retried because a budget charge is not
+  outlives `settlement_queue_wait_ms` waiting for a slot never starts, so this
+  replica does not record its spend. One that outlives `settlement_timeout_ms`
+  once running is counted in
+  `axond.settlement.failures{axond.settlement.reason}` the same way, but the
+  replica keeps the execution slot until the settlement future ends — including
+  SQLite `spawn_blocking` work that dropping the future cannot cancel — so a
+  late budget charge cannot land without its usage append or bypass
+  `max_in_flight_settlements`. It is not retried because a budget charge is not
   idempotent: a retry after a Store that accepted the write but answered late
-  would charge twice. Alert on that counter; it is the spend-loss signal of this
-  mechanism.
+  would charge twice. Alert on that counter.
 
 The default `max_pending_settlements` is four times `max_in_flight` (four times
 the shipped `max_in_flight` when the global ceiling is off), so it only binds

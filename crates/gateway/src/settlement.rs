@@ -20,8 +20,12 @@
 //! * **Queue wait and execution deadline are separate.** A spawned settlement
 //!   waits for one of a bounded number of execution slots for at most the
 //!   configured queue wait, then runs under its own execution deadline. A
-//!   settlement that misses either is *counted and logged*, never retried:
-//!   `charge_budget` is not idempotent, so a retry could double-charge.
+//!   settlement that misses the queue wait is counted and never started. A
+//!   settlement that misses the execution deadline is counted the same way,
+//!   but tracking and the execution slot stay held until the future — including
+//!   non-cancellable `spawn_blocking` Store work — actually ends, so a late
+//!   charge cannot outrun the bound or land without its usage append. Neither
+//!   miss is retried: `charge_budget` is not idempotent.
 //! * **Release exactly once, on every exit.** Tracking is a guard released on
 //!   `Drop`, so normal completion, an execution timeout, a panic inside the
 //!   settlement, and an aborted task all return capacity the same way.
@@ -238,12 +242,22 @@ impl Settlements {
             // Caught here rather than left to the task harness so the reason is
             // known when the guard reports: tokio drops a panicked future after
             // the unwind, where `thread::panicking()` is already false.
-            let run = std::panic::AssertUnwindSafe(future).catch_unwind();
+            //
+            // The execution deadline is a missed-deadline signal, not a
+            // cancellation. SQLite Store calls run in `spawn_blocking`; dropping
+            // this future would release capacity while that closure kept
+            // running, so a late `charge_budget` could land without its usage
+            // append. After the deadline we keep the join (and the slot) until
+            // the future actually ends.
+            let mut run = std::pin::pin!(std::panic::AssertUnwindSafe(future).catch_unwind());
             let outcome = match shared.limits.execution_timeout {
-                Some(deadline) => match tokio::time::timeout(deadline, run).await {
+                Some(deadline) => match tokio::time::timeout(deadline, run.as_mut()).await {
                     Ok(Ok(())) => Outcome::Completed,
                     Ok(Err(_panic)) => Outcome::Panicked,
-                    Err(_) => Outcome::ExecutionTimeout,
+                    Err(_) => match run.await {
+                        Ok(()) => Outcome::ExecutionTimeout,
+                        Err(_panic) => Outcome::Panicked,
+                    },
                 },
                 None => match run.await {
                     Ok(()) => Outcome::Completed,
@@ -647,8 +661,14 @@ mod tests {
             "four settlements hold the whole capacity"
         );
         drop(block_tx);
-        settle_soon(&settlements).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            settlements.backlog().executing,
+            1,
+            "a missed execution deadline keeps the slot until the future ends"
+        );
         drop(never_tx);
+        settle_soon(&settlements).await;
         assert_eq!(settlements.backlog(), Backlog::default());
         for _ in 0..4 {
             settlements
@@ -862,5 +882,42 @@ mod tests {
         );
         drop(hold_tx);
         settle_soon(&settlements).await;
+    }
+
+    #[tokio::test]
+    async fn execution_timeout_keeps_capacity_until_blocking_work_finishes() {
+        let settlements = Settlements::new(SettlementLimits {
+            max_pending: Some(1),
+            max_in_flight: Some(1),
+            queue_wait: None,
+            execution_timeout: Some(Duration::from_millis(50)),
+        });
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
+        settlements.spawn(settlements.reserve().unwrap(), async move {
+            tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = finish_rx.blocking_recv();
+            })
+            .await
+            .expect("blocking settlement work");
+        });
+        started_rx.await.expect("the blocking closure started");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            settlements.backlog().executing,
+            1,
+            "the deadline counted a timeout without releasing the slot"
+        );
+        assert_eq!(
+            settlements.reserve().err(),
+            Some(AdmissionRejection::Settlement),
+            "a late spawn_blocking charge cannot outrun max_in_flight"
+        );
+        drop(finish_tx);
+        settle_soon(&settlements).await;
+        settlements
+            .reserve()
+            .expect("capacity returns only after the blocking work ends");
     }
 }
