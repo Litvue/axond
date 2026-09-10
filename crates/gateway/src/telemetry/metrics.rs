@@ -1391,7 +1391,7 @@ mod tests {
     fn store_and_index_queue_boundaries_are_fixed_and_increasing() {
         assert_eq!(
             USAGE_INDEX_QUEUE_DEPTH_BOUNDARIES.last().copied(),
-            Some(crate::usage::UsageDelivery::STORE_INDEX_QUEUE as f64)
+            Some(crate::usage::UsageIndexSettings::default().capacity as f64)
         );
         assert!(
             USAGE_INDEX_QUEUE_DEPTH_BOUNDARIES
