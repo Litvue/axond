@@ -242,6 +242,15 @@ soak:
 capacity:
     AXOND_CAPACITY=1 cargo test --locked --all-features --test capacity -- --nocapture --test-threads=1
 
+# The full Store latency baseline (#462), writing one artifact per backend to
+# target/store-baseline/full. Release build, because the baseline is what the
+# optimisation issues are compared against. The Postgres arm runs only when
+# AXOND_TEST_POSTGRES_DSN names a database the harness may create schemas in;
+# without it that arm skips and says so. The smoke tier of the same driver runs
+# in `just test`. One tier at a time, for the reason `capacity` gives.
+store-baseline:
+    AXOND_STORE_BASELINE=1 cargo test --release --locked --all-features --test store_baseline -- full_tier --nocapture --test-threads=1
+
 # The twelve-hour mixed-workload endurance soak, writing its result and time
 # series to target/endurance/soak. The smoke tier of the same driver runs in
 # `just test`. Pass a shorter duration in milliseconds to dispatch a shorter run:

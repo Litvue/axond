@@ -127,7 +127,7 @@ pub struct Tenant {
     slow_alias: &'static str,
 }
 
-const PLATFORM: Tenant = Tenant {
+pub const PLATFORM: Tenant = Tenant {
     namespace: "platform",
     inbound_key: GATEWAY_KEY,
     inbound_env: "GW_INBOUND_KEY",
@@ -293,59 +293,95 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One request the driver sends.
 #[derive(Clone, Copy)]
-struct Shape {
-    route: &'static str,
-    alias: &'static str,
-    stream: bool,
+pub struct Shape {
+    pub route: &'static str,
+    pub alias: &'static str,
+    pub stream: bool,
     /// Who sends it, and therefore which inbound key it carries.
-    tenant: Tenant,
+    pub tenant: Tenant,
+    /// Extra bytes of prompt content, for a profile whose subject is the
+    /// payload the gateway carries rather than the answer it relays. Zero
+    /// everywhere else, so the committed profiles' bodies are unchanged.
+    pub padding: usize,
 }
 
 impl Shape {
-    const fn buffered(route: &'static str, alias: &'static str) -> Self {
+    pub const fn buffered(route: &'static str, alias: &'static str) -> Self {
         Self {
             route,
             alias,
             stream: false,
             tenant: PLATFORM,
+            padding: 0,
         }
     }
 
-    const fn streamed(route: &'static str, alias: &'static str) -> Self {
+    pub const fn streamed(route: &'static str, alias: &'static str) -> Self {
         Self {
             route,
             alias,
             stream: true,
             tenant: PLATFORM,
+            padding: 0,
         }
     }
 
-    const fn sent_by(self, tenant: Tenant) -> Self {
+    pub const fn sent_by(self, tenant: Tenant) -> Self {
         Self { tenant, ..self }
     }
 
-    fn body(self) -> Value {
+    /// The same request carrying `bytes` more of prompt content.
+    pub const fn padded(self, bytes: usize) -> Self {
+        Self {
+            padding: bytes,
+            ..self
+        }
+    }
+
+    /// The prompt content: the fixed word every profile sends, plus the
+    /// padding a payload profile asks for.
+    fn content(self) -> String {
+        if self.padding == 0 {
+            return "capacity".to_owned();
+        }
+        let mut content = String::with_capacity(self.padding + 9);
+        content.push_str("capacity ");
+        content.extend(std::iter::repeat_n('x', self.padding));
+        content
+    }
+
+    pub fn body(self) -> Value {
+        let content = self.content();
         match self.route {
-            "/v1/embeddings" => json!({ "model": self.alias, "input": "capacity" }),
+            "/v1/embeddings" => json!({ "model": self.alias, "input": content }),
             "/v1/responses" => {
-                json!({ "model": self.alias, "stream": self.stream, "input": "capacity" })
+                json!({ "model": self.alias, "stream": self.stream, "input": content })
             }
             "/v1/messages" => json!({
                 "model": self.alias,
                 "stream": self.stream,
                 "max_tokens": 1024,
-                "messages": [{ "role": "user", "content": "capacity" }],
+                "messages": [{ "role": "user", "content": content }],
             }),
             _ => json!({
                 "model": self.alias,
                 "stream": self.stream,
-                "messages": [{ "role": "user", "content": "capacity" }],
+                "messages": [{ "role": "user", "content": content }],
             }),
         }
     }
+
+    /// The body as the *provider* receives it: the same request with the alias
+    /// replaced by the upstream model, for a control run that skips the
+    /// gateway and asks the fake upstream directly.
+    pub fn upstream_body(self, model: &str) -> Value {
+        let mut body = self.body();
+        body["model"] = json!(model);
+        body
+    }
 }
 
-const CHAT: &str = "/v1/chat/completions";
+pub const CHAT: &str = "/v1/chat/completions";
 const MESSAGES: &str = "/v1/messages";
 const EMBEDDINGS: &str = "/v1/embeddings";
 const RESPONSES: &str = "/v1/responses";
@@ -431,8 +467,8 @@ pub fn offered_per_tenant(offered: u64, tenant: &Tenant) -> u64 {
 }
 
 /// How one offered request ended.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Outcome {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Outcome {
     /// Served, and read to the end.
     Accepted,
     /// Served, and the driver hung up deliberately.
@@ -445,16 +481,16 @@ enum Outcome {
     TransportFailure,
 }
 
-struct Attempt {
-    outcome: Outcome,
+pub struct Attempt {
+    pub outcome: Outcome,
     /// The namespace that sent it. `platform` unless the profile is
     /// multi-tenant.
-    namespace: &'static str,
-    status: Option<u16>,
-    error_type: Option<String>,
-    latency_ms: f64,
-    ttft_ms: Option<f64>,
-    stream_lifetime_ms: Option<f64>,
+    pub namespace: &'static str,
+    pub status: Option<u16>,
+    pub error_type: Option<String>,
+    pub latency_ms: f64,
+    pub ttft_ms: Option<f64>,
+    pub stream_lifetime_ms: Option<f64>,
 }
 
 /// Whether the driver hangs up on the request at `index`, given a cadence. Every
@@ -475,7 +511,7 @@ pub fn expected_cancellations(offered: u64, every: usize) -> u64 {
 /// contention, and the artifact would still read as an envelope. The libtest
 /// `--test-threads=1` in the `capacity` workflow says the same thing; this makes
 /// it true rather than configured.
-fn load_lock() -> &'static Mutex<()> {
+pub fn load_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(Mutex::default)
 }
@@ -1186,9 +1222,46 @@ pub fn memory_verdict(resources: &ResourceReport, max_growth_kib: u64) -> Option
 }
 
 /// Offer one request and measure it.
-async fn attempt(
+pub async fn attempt(
     client: &reqwest::Client,
     base_url: &str,
+    shape: Shape,
+    cancel_after_output_chunks: Option<usize>,
+    gauges: &Gauges,
+) -> Attempt {
+    let request = client
+        .post(format!(
+            "{base_url}/ns/{}{}",
+            shape.tenant.namespace, shape.route
+        ))
+        .bearer_auth(shape.tenant.inbound_key)
+        .json(&shape.body());
+    send_and_measure(request, shape, cancel_after_output_chunks, gauges).await
+}
+
+/// The same request offered to the fake upstream directly, with no gateway in
+/// between: the control a gateway overhead is measured against. `model` is the
+/// provider-side model the alias would have resolved to.
+pub async fn control_attempt(
+    client: &reqwest::Client,
+    upstream_base_url: &str,
+    shape: Shape,
+    model: &str,
+    gauges: &Gauges,
+) -> Attempt {
+    let path = shape
+        .route
+        .strip_prefix("/v1")
+        .expect("every route the driver sends is under /v1");
+    let request = client
+        .post(format!("{upstream_base_url}{path}"))
+        .bearer_auth(shape.tenant.upstream_key)
+        .json(&shape.upstream_body(model));
+    send_and_measure(request, shape, None, gauges).await
+}
+
+async fn send_and_measure(
+    request: reqwest::RequestBuilder,
     shape: Shape,
     cancel_after_output_chunks: Option<usize>,
     gauges: &Gauges,
@@ -1198,15 +1271,7 @@ async fn attempt(
     // Cleared by the answer's first byte, and unconditionally when the attempt
     // ends, so an attempt that never gets one cannot pin the gauge.
     let waiting = &mut true;
-    let sent = client
-        .post(format!(
-            "{base_url}/ns/{}{}",
-            shape.tenant.namespace, shape.route
-        ))
-        .bearer_auth(shape.tenant.inbound_key)
-        .json(&shape.body())
-        .send()
-        .await;
+    let sent = request.send().await;
     let response = match sent {
         Ok(response) => response,
         Err(_) => {
@@ -1388,15 +1453,15 @@ fn relays_output(event: &str) -> bool {
         })
 }
 
-fn millis(duration: Duration) -> f64 {
+pub fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-fn count(attempts: &[Attempt], predicate: impl Fn(&Attempt) -> bool) -> u64 {
+pub fn count(attempts: &[Attempt], predicate: impl Fn(&Attempt) -> bool) -> u64 {
     attempts.iter().filter(|a| predicate(a)).count() as u64
 }
 
-fn error_types(attempts: &[Attempt], outcome: Outcome) -> BTreeMap<String, u64> {
+pub fn error_types(attempts: &[Attempt], outcome: Outcome) -> BTreeMap<String, u64> {
     tally(
         attempts
             .iter()
@@ -1405,7 +1470,7 @@ fn error_types(attempts: &[Attempt], outcome: Outcome) -> BTreeMap<String, u64> 
     )
 }
 
-fn tally<T: ToString>(values: impl Iterator<Item = T>) -> BTreeMap<String, u64> {
+pub fn tally<T: ToString>(values: impl Iterator<Item = T>) -> BTreeMap<String, u64> {
     let mut counts = BTreeMap::new();
     for value in values {
         *counts.entry(value.to_string()).or_default() += 1;

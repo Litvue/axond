@@ -24,6 +24,21 @@ const ADMISSION_QUEUE_DEPTH_BOUNDARIES: [f64; 11] = [
     1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0,
 ];
 
+/// The usage-index worker queue holds at most
+/// [`crate::usage::UsageDelivery::STORE_INDEX_QUEUE`] events, so the depth
+/// histogram's top bucket is that bound and the buckets below it are exact
+/// powers of two.
+const USAGE_INDEX_QUEUE_DEPTH_BOUNDARIES: [f64; 9] =
+    [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0];
+
+/// Store wait and service time, in milliseconds. Sub-millisecond buckets
+/// because a healthy SQLite read is tens of microseconds and a saturated pool
+/// is seconds: the range has to hold both, and the low end is where an
+/// acquire wait first becomes visible.
+const STORE_DURATION_BOUNDARIES: [f64; 14] = [
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 1000.0, 5000.0,
+];
+
 struct Instruments {
     http_requests: Counter<u64>,
     http_duration: Histogram<f64>,
@@ -77,6 +92,12 @@ struct Instruments {
     middleware_capacity_timeouts: Counter<u64>,
     middleware_buffering_duration: Histogram<f64>,
     admission_queue_depth: Histogram<u64>,
+    store_acquire_wait: Histogram<f64>,
+    store_query_duration: Histogram<f64>,
+    store_operations: Counter<u64>,
+    store_connections_opened: Counter<u64>,
+    usage_index_queue_depth: Histogram<u64>,
+    usage_index_queue_wait: Histogram<f64>,
     admission_in_flight: UpDownCounter<i64>,
     admission_rejections: Counter<u64>,
     rate_limit_denials: Counter<u64>,
@@ -390,6 +411,56 @@ impl Instruments {
                     "Exact bounded admission-queue depth observed when a request enters the queue.",
                 )
                 .with_boundaries(ADMISSION_QUEUE_DEPTH_BOUNDARIES.to_vec())
+                .build(),
+            store_acquire_wait: meter
+                .f64_histogram("axond.store.acquire_wait")
+                .with_unit("ms")
+                .with_description(
+                    "Time a Store call waited for a connection before its query could run: \
+                     the pool semaphore and any fresh connect on Postgres, the blocking-pool \
+                     dispatch and the connection mutex on SQLite. By backend and operation kind.",
+                )
+                .with_boundaries(STORE_DURATION_BOUNDARIES.to_vec())
+                .build(),
+            store_query_duration: meter
+                .f64_histogram("axond.store.query_duration")
+                .with_unit("ms")
+                .with_description(
+                    "Time a Store call spent executing once it held a connection, by backend \
+                     and operation kind. Excludes the acquire wait.",
+                )
+                .with_boundaries(STORE_DURATION_BOUNDARIES.to_vec())
+                .build(),
+            store_operations: meter
+                .u64_counter("axond.store.operations")
+                .with_description(
+                    "Store calls, by backend, operation kind, and outcome. `saturated` never \
+                     held a connection: the pool's wait bound expired first.",
+                )
+                .build(),
+            store_connections_opened: meter
+                .u64_counter("axond.store.connections_opened")
+                .with_description(
+                    "Store connections opened, by backend. On Postgres each one is a fresh \
+                     session because no idle one was available: connection churn under burst.",
+                )
+                .build(),
+            usage_index_queue_depth: meter
+                .u64_histogram("axond.usage.index.queue.depth")
+                .with_description(
+                    "Exact usage-index worker queue depth observed when a usage event is \
+                     enqueued for the management index.",
+                )
+                .with_boundaries(USAGE_INDEX_QUEUE_DEPTH_BOUNDARIES.to_vec())
+                .build(),
+            usage_index_queue_wait: meter
+                .f64_histogram("axond.usage.index.queue.wait")
+                .with_unit("ms")
+                .with_description(
+                    "Age of a usage event when the index worker dequeued it: how far the \
+                     background index trails the requests that produced it.",
+                )
+                .with_boundaries(STORE_DURATION_BOUNDARIES.to_vec())
                 .build(),
             admission_in_flight: meter
                 .i64_up_down_counter("axond.admission.in_flight")
@@ -990,6 +1061,79 @@ pub fn record_admission_queue_acquired(depth: u64) {
     instruments.admission_queue_depth.record(depth, &[]);
 }
 
+/// One Store call, split into the time it waited for a connection and the time
+/// it spent executing. `backend` and `operation` are the closed vocabularies in
+/// [`crate::store`] (`STORE_BACKENDS`, `STORE_OPERATIONS`); `outcome` is one of
+/// `STORE_OUTCOMES`. `execution_ms` is `None` when the call never held a
+/// connection — a saturated pool — so the query histogram counts only queries
+/// that ran and the acquire histogram counts every call.
+///
+/// No namespace, period, or request identity is attached: the question these
+/// answer is "is it the pool or the query", per backend, and that has a fixed
+/// number of series (ADR 0033's cardinality rule applies here as everywhere).
+pub(crate) fn record_store_operation(
+    backend: &'static str,
+    operation: crate::store::StoreOp,
+    acquire_wait_ms: f64,
+    execution_ms: Option<f64>,
+    outcome: &'static str,
+) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    let dimensions = [
+        KeyValue::new("axond.store.backend", backend),
+        KeyValue::new("axond.store.operation", operation.as_str()),
+    ];
+    instruments
+        .store_acquire_wait
+        .record(acquire_wait_ms, &dimensions);
+    if let Some(execution_ms) = execution_ms {
+        instruments
+            .store_query_duration
+            .record(execution_ms, &dimensions);
+    }
+    instruments.store_operations.add(
+        1,
+        &[
+            KeyValue::new("axond.store.backend", backend),
+            KeyValue::new("axond.store.operation", operation.as_str()),
+            KeyValue::new("axond.store.outcome", outcome),
+        ],
+    );
+}
+
+/// One Store connection opened. Counted only after Postgres `connect()`
+/// succeeds: a failed handshake is not a session. A rate that tracks request
+/// bursts is connection churn.
+pub(crate) fn record_store_connection_opened(backend: &'static str) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments
+        .store_connections_opened
+        .add(1, &[KeyValue::new("axond.store.backend", backend)]);
+}
+
+/// One usage event enqueued for the background index worker, with the occupied
+/// slot count after this send (senders and the worker share an atomic). Label-free,
+/// like the admission queue depth: the histogram retains the peak between
+/// exports, and a peak at the bound is a queue about to drop.
+pub(crate) fn record_usage_index_enqueued(depth: u64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.usage_index_queue_depth.record(depth, &[]);
+}
+
+/// One usage event taken off the index queue, `waited_ms` after it was put on.
+pub(crate) fn record_usage_index_dequeued(waited_ms: f64) {
+    let Some(instruments) = INSTRUMENTS.get() else {
+        return;
+    };
+    instruments.usage_index_queue_wait.record(waited_ms, &[]);
+}
+
 /// Admission capacity returned. Called from the permit's `Drop`, so it pairs
 /// with [`record_admission_acquired`] on every exit path.
 pub fn record_admission_released(resource: &'static str) {
@@ -1187,6 +1331,33 @@ mod tests {
         );
         assert!(
             ADMISSION_QUEUE_DEPTH_BOUNDARIES
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+    }
+
+    /// The index queue's depth buckets end exactly at the queue's bound, so a
+    /// full queue lands in the last finite bucket rather than the overflow one,
+    /// and the Store duration buckets are strictly increasing from a bucket a
+    /// healthy SQLite read fits in.
+    #[test]
+    fn store_and_index_queue_boundaries_are_fixed_and_increasing() {
+        assert_eq!(
+            USAGE_INDEX_QUEUE_DEPTH_BOUNDARIES.last().copied(),
+            Some(crate::usage::UsageDelivery::STORE_INDEX_QUEUE as f64)
+        );
+        assert!(
+            USAGE_INDEX_QUEUE_DEPTH_BOUNDARIES
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        assert!(
+            STORE_DURATION_BOUNDARIES
+                .first()
+                .is_some_and(|lowest| *lowest <= 0.05)
+        );
+        assert!(
+            STORE_DURATION_BOUNDARIES
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
         );

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -8,10 +8,11 @@ use serde_json::Value;
 
 use super::{
     BudgetAdmit, BudgetCadence, BudgetClock, BudgetPolicy, BudgetRecord, NamespaceRecord,
-    NamespaceResolve, ProviderModels, Store, StoreError, UsageAppend, UsageSummaryRow,
-    admit_from_ledger, from_sql_amount, monthly_period_key, sql_amount, sql_amount_saturating,
-    validate_timezone,
+    NamespaceResolve, ProviderModels, STORE_BACKEND_SQLITE, STORE_OUTCOME_ERROR, STORE_OUTCOME_OK,
+    Store, StoreError, StoreOp, UsageAppend, UsageSummaryRow, admit_from_ledger, from_sql_amount,
+    monthly_period_key, sql_amount, sql_amount_saturating, validate_timezone,
 };
+use crate::telemetry::metrics;
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
@@ -138,26 +139,73 @@ impl SqliteStore {
         Ok(())
     }
 
-    async fn with_conn<T, F>(&self, f: F) -> Result<T, StoreError>
+    /// Run `f` on the one connection, off the async runtime when there is one.
+    ///
+    /// Two phases are timed and recorded as `axond.store.acquire_wait` and
+    /// `axond.store.query_duration` under `op`: the wait — blocking-pool
+    /// dispatch plus the connection mutex — and the execution once the mutex is
+    /// held. On SQLite the mutex is the pool: a wait that grows with load is
+    /// callers queueing on one connection, which is what #463 bounds.
+    async fn with_conn<T, F>(&self, op: StoreOp, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
     {
         let conn = Arc::clone(&self.conn);
+        let called = Instant::now();
         let run = move || {
             let mut guard = conn
                 .lock()
                 .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-            f(&mut guard)
+            let acquired = Instant::now();
+            let result = f(&mut guard);
+            // Capture execution time before this closure returns and drops the
+            // mutex. Measuring after `spawn_blocking` joins would fold runtime
+            // poll delay into `query_duration`.
+            let finished = Instant::now();
+            Ok::<_, StoreError>((acquired, finished, result))
         };
-        if tokio::runtime::Handle::try_current().is_ok() {
+        let outcome = if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::spawn_blocking(run)
                 .await
-                .map_err(|e| StoreError::Unavailable(e.to_string()))?
+                .map_err(|e| StoreError::Unavailable(e.to_string()))
+                .and_then(|inner| inner)
         } else {
             run()
+        };
+        match outcome {
+            Ok((acquired, finished, result)) => {
+                metrics::record_store_operation(
+                    STORE_BACKEND_SQLITE,
+                    op,
+                    millis(acquired.saturating_duration_since(called)),
+                    Some(millis(finished.saturating_duration_since(acquired))),
+                    if result.is_ok() {
+                        STORE_OUTCOME_OK
+                    } else {
+                        STORE_OUTCOME_ERROR
+                    },
+                );
+                result
+            }
+            // A poisoned mutex or a blocking task that panicked: the call never
+            // executed a query, so only the wait is real.
+            Err(error) => {
+                metrics::record_store_operation(
+                    STORE_BACKEND_SQLITE,
+                    op,
+                    millis(called.elapsed()),
+                    None,
+                    STORE_OUTCOME_ERROR,
+                );
+                Err(error)
+            }
         }
     }
+}
+
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 fn unavailable(err: rusqlite::Error) -> StoreError {
@@ -295,7 +343,7 @@ fn row_to_record(
 #[async_trait]
 impl Store for SqliteStore {
     async fn put_namespace(&self, ns: NamespaceRecord) -> Result<(), StoreError> {
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::NamespaceWrite, move |conn| {
             let attrs = ns.attrs.to_string();
             let blocklist = ns
                 .blocklist
@@ -331,7 +379,7 @@ impl Store for SqliteStore {
 
     async fn get_namespace(&self, id: &str) -> Result<Option<NamespaceRecord>, StoreError> {
         let id = id.to_string();
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::NamespaceRead, move |conn| {
             conn.query_row(
                 "SELECT id, attrs, blocklist FROM axond_namespace WHERE id = ?1",
                 params![id],
@@ -354,8 +402,10 @@ impl Store for SqliteStore {
     async fn resolve_namespace(&self, id: &str) -> Result<Option<NamespaceResolve>, StoreError> {
         let id = id.to_string();
         let clock = Arc::clone(&self.clock);
-        self.with_conn(move |conn| resolve_namespace_on(conn, &id, &clock))
-            .await
+        self.with_conn(StoreOp::NamespaceResolve, move |conn| {
+            resolve_namespace_on(conn, &id, &clock)
+        })
+        .await
     }
 
     async fn list_namespaces(
@@ -364,7 +414,7 @@ impl Store for SqliteStore {
         limit: u32,
     ) -> Result<(Vec<NamespaceRecord>, Option<String>), StoreError> {
         let limit = limit.clamp(1, 1000);
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::NamespaceRead, move |conn| {
             let fetch = i64::from(limit) + 1;
             let mut stmt = conn
                 .prepare(
@@ -412,7 +462,7 @@ impl Store for SqliteStore {
         blocklist: Option<Vec<String>>,
     ) -> Result<Option<NamespaceRecord>, StoreError> {
         let id = id.to_string();
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::NamespaceWrite, move |conn| {
             let blocklist_json = blocklist
                 .as_ref()
                 .map(|list| serde_json::to_string(list).unwrap_or_else(|_| "[]".into()));
@@ -438,7 +488,7 @@ impl Store for SqliteStore {
 
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError> {
         let id = id.to_string();
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::NamespaceWrite, move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(unavailable)?;
@@ -494,7 +544,7 @@ impl Store for SqliteStore {
         let period = period.to_string();
         let limit = sql_amount(limit_microdollars)?;
         let clock = Arc::clone(&self.clock);
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::BudgetWrite, move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(unavailable)?;
@@ -530,8 +580,10 @@ impl Store for SqliteStore {
         let namespace = namespace.to_string();
         let period = period.to_string();
         let clock = Arc::clone(&self.clock);
-        self.with_conn(move |conn| read_budget(conn, &namespace, &period, &clock))
-            .await
+        self.with_conn(StoreOp::BudgetRead, move |conn| {
+            read_budget(conn, &namespace, &period, &clock)
+        })
+        .await
     }
 
     async fn put_budget_policy(
@@ -548,7 +600,7 @@ impl Store for SqliteStore {
         let limit = sql_amount(limit_microdollars)?;
         let tz = validate_timezone(&timezone)?;
         let clock = Arc::clone(&self.clock);
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::BudgetWrite, move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(unavailable)?;
@@ -615,7 +667,7 @@ impl Store for SqliteStore {
     async fn get_budget_policy(&self, namespace: &str) -> Result<Option<BudgetPolicy>, StoreError> {
         let namespace = namespace.to_owned();
         let clock = Arc::clone(&self.clock);
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::BudgetRead, move |conn| {
             if !namespace_exists(conn, &namespace)? {
                 return Err(StoreError::NotFound(namespace));
             }
@@ -627,8 +679,10 @@ impl Store for SqliteStore {
     async fn admit_budget(&self, namespace: &str) -> Result<BudgetAdmit, StoreError> {
         let namespace = namespace.to_string();
         let clock = Arc::clone(&self.clock);
-        self.with_conn(move |conn| admit_budget_on(conn, &namespace, &clock))
-            .await
+        self.with_conn(StoreOp::BudgetAdmit, move |conn| {
+            admit_budget_on(conn, &namespace, &clock)
+        })
+        .await
     }
 
     async fn charge_budget(
@@ -641,12 +695,15 @@ impl Store for SqliteStore {
         let namespace = namespace.to_string();
         let period = period.to_string();
         let actual = sql_amount_saturating(actual_microdollars);
-        self.with_conn(move |conn| charge_budget_on(conn, &namespace, &period, incarnation, actual))
-            .await
+        self.with_conn(StoreOp::BudgetCharge, move |conn| {
+            charge_budget_on(conn, &namespace, &period, incarnation, actual)
+        })
+        .await
     }
 
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError> {
-        self.with_conn(move |conn| insert_usage(conn, &event)).await
+        self.with_conn(StoreOp::UsageAppend, move |conn| insert_usage(conn, &event))
+            .await
     }
 
     fn blocking_usage_index(&self) -> bool {
@@ -654,11 +711,34 @@ impl Store for SqliteStore {
     }
 
     fn append_usage_sync(&self, event: UsageAppend) -> Result<(), StoreError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        insert_usage(&conn, &event)
+        let called = Instant::now();
+        let conn = match self.conn.lock() {
+            Ok(conn) => conn,
+            Err(error) => {
+                metrics::record_store_operation(
+                    STORE_BACKEND_SQLITE,
+                    StoreOp::UsageAppend,
+                    millis(called.elapsed()),
+                    None,
+                    STORE_OUTCOME_ERROR,
+                );
+                return Err(StoreError::Unavailable(error.to_string()));
+            }
+        };
+        let acquired = Instant::now();
+        let result = insert_usage(&conn, &event);
+        metrics::record_store_operation(
+            STORE_BACKEND_SQLITE,
+            StoreOp::UsageAppend,
+            millis(acquired.saturating_duration_since(called)),
+            Some(millis(acquired.elapsed())),
+            if result.is_ok() {
+                STORE_OUTCOME_OK
+            } else {
+                STORE_OUTCOME_ERROR
+            },
+        );
+        result
     }
 
     async fn summarize_usage(
@@ -668,7 +748,7 @@ impl Store for SqliteStore {
     ) -> Result<Vec<UsageSummaryRow>, StoreError> {
         let namespace = namespace.to_string();
         let period = period.to_string();
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::UsageSummary, move |conn| {
             // SQLite SUM overflows INTEGER (and then becomes REAL); fold in Rust.
             let mut stmt = conn
                 .prepare(
@@ -711,7 +791,7 @@ impl Store for SqliteStore {
         provider: &str,
     ) -> Result<Option<ProviderModels>, StoreError> {
         let provider = provider.to_string();
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::ProviderModels, move |conn| {
             conn.query_row(
                 "SELECT provider, fetched_at, stale, models, source
                  FROM axond_store_provider_models WHERE provider = ?1",
@@ -737,7 +817,7 @@ impl Store for SqliteStore {
     }
 
     async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::ProviderModels, move |conn| {
             let mut stmt = conn
                 .prepare(
                     "SELECT provider, fetched_at, stale, models, source
@@ -768,7 +848,7 @@ impl Store for SqliteStore {
     }
 
     async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::ProviderModels, move |conn| {
             let models = serde_json::to_string(&row.data).map_err(|error| {
                 StoreError::Unavailable(format!("provider `{}` models: {error}", row.provider))
             })?;
@@ -803,7 +883,7 @@ impl Store for SqliteStore {
     ) -> Result<(), StoreError> {
         let provider = provider.to_string();
         let source = source.to_string();
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::ProviderModels, move |conn| {
             conn.execute(
                 "UPDATE axond_store_provider_models SET stale = 1
                  WHERE provider = ?1 AND (source IS NULL OR source != ?2)",
@@ -822,7 +902,7 @@ impl Store for SqliteStore {
     ) -> Result<(), StoreError> {
         let provider = provider.to_string();
         let source = source.to_string();
-        self.with_conn(move |conn| {
+        self.with_conn(StoreOp::ProviderModels, move |conn| {
             conn.execute(
                 "UPDATE axond_store_provider_models SET stale = 1
                  WHERE provider = ?1 AND source IS NOT NULL AND source = ?2",

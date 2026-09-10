@@ -9,6 +9,7 @@ pub mod manifest;
 pub mod probe;
 pub mod result;
 pub mod run;
+pub mod store_baseline;
 
 pub use manifest::{Manifest, Profile, Tier, Workload};
 pub use probe::{ResourceReport, Span};

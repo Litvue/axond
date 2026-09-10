@@ -44,6 +44,23 @@ pub struct HistogramPoint {
     pub time_unix_nano: u64,
 }
 
+/// One decoded OTLP point together with the string attributes it was recorded
+/// under, for an instrument whose evidence is *per label value* — a Store
+/// wait histogram is read per operation kind, and reading it without the
+/// labels would sum the admission join with the background index.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabelledPoint<T> {
+    pub labels: BTreeMap<String, String>,
+    pub point: T,
+}
+
+/// One decoded OTLP sum (counter) point.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SumPoint {
+    pub value: f64,
+    pub time_unix_nano: u64,
+}
+
 #[derive(Default)]
 struct CollectorState {
     exports: Mutex<Vec<Export>>,
@@ -290,6 +307,102 @@ impl Collector {
         }
         Ok(found)
     }
+
+    /// Decode every explicit-histogram point exported under `name`, keeping
+    /// the string attributes each was recorded under.
+    pub fn labelled_histogram_points(
+        &self,
+        name: &str,
+    ) -> Result<Vec<LabelledPoint<HistogramPoint>>, String> {
+        let mut found = Vec::new();
+        for export in self.exports().into_iter().filter(|e| e.signal == "metrics") {
+            let request = ExportMetricsServiceRequest::decode(export.bytes)
+                .map_err(|error| format!("invalid OTLP metrics export: {error}"))?;
+            for metric in request
+                .resource_metrics
+                .into_iter()
+                .flat_map(|resource| resource.scope_metrics)
+                .flat_map(|scope| scope.metrics)
+                .filter(|metric| metric.name == name)
+            {
+                let Some(metric::Data::Histogram(histogram)) = metric.data else {
+                    return Err(format!("OTLP metric `{name}` is not an explicit histogram"));
+                };
+                found.extend(
+                    histogram
+                        .data_points
+                        .into_iter()
+                        .map(|point| LabelledPoint {
+                            labels: string_attributes(&point.attributes),
+                            point: HistogramPoint {
+                                count: point.count,
+                                sum: point.sum,
+                                min: point.min,
+                                max: point.max,
+                                explicit_bounds: point.explicit_bounds,
+                                bucket_counts: point.bucket_counts,
+                                attributes: point.attributes.len(),
+                                time_unix_nano: point.time_unix_nano,
+                            },
+                        }),
+                );
+            }
+        }
+        Ok(found)
+    }
+
+    /// Decode every sum (counter) point exported under `name`, with its
+    /// attributes.
+    pub fn labelled_sum_points(&self, name: &str) -> Result<Vec<LabelledPoint<SumPoint>>, String> {
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point;
+        let mut found = Vec::new();
+        for export in self.exports().into_iter().filter(|e| e.signal == "metrics") {
+            let request = ExportMetricsServiceRequest::decode(export.bytes)
+                .map_err(|error| format!("invalid OTLP metrics export: {error}"))?;
+            for metric in request
+                .resource_metrics
+                .into_iter()
+                .flat_map(|resource| resource.scope_metrics)
+                .flat_map(|scope| scope.metrics)
+                .filter(|metric| metric.name == name)
+            {
+                let Some(metric::Data::Sum(sum)) = metric.data else {
+                    return Err(format!("OTLP metric `{name}` is not a sum"));
+                };
+                found.extend(sum.data_points.into_iter().map(|point| LabelledPoint {
+                    labels: string_attributes(&point.attributes),
+                    point: SumPoint {
+                        value: match point.value {
+                            Some(number_data_point::Value::AsInt(value)) => value as f64,
+                            Some(number_data_point::Value::AsDouble(value)) => value,
+                            None => 0.0,
+                        },
+                        time_unix_nano: point.time_unix_nano,
+                    },
+                }));
+            }
+        }
+        Ok(found)
+    }
+}
+
+/// The string-valued attributes of one point, keyed by attribute name. A
+/// non-string value is recorded by its debug form so a label is never silently
+/// dropped from the evidence.
+fn string_attributes(
+    attributes: &[opentelemetry_proto::tonic::common::v1::KeyValue],
+) -> BTreeMap<String, String> {
+    attributes
+        .iter()
+        .map(|attribute| {
+            let value = match attribute.value.as_ref().and_then(|v| v.value.as_ref()) {
+                Some(any_value::Value::StringValue(text)) => text.clone(),
+                Some(other) => format!("{other:?}"),
+                None => String::new(),
+            };
+            (attribute.key.clone(), value)
+        })
+        .collect()
 }
 
 impl Drop for Collector {

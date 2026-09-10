@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -8,11 +8,13 @@ use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
     BudgetAdmit, BudgetCadence, BudgetClock, BudgetPolicy, BudgetRecord, NamespaceRecord,
-    NamespaceResolve, ProviderModels, Store, StoreError, UsageAppend, UsageSummaryRow,
-    admit_from_ledger, from_sql_amount, monthly_period_key, sql_amount, sql_amount_saturating,
-    validate_timezone,
+    NamespaceResolve, ProviderModels, STORE_BACKEND_POSTGRES, STORE_OUTCOME_ERROR,
+    STORE_OUTCOME_OK, STORE_OUTCOME_SATURATED, Store, StoreError, StoreOp, UsageAppend,
+    UsageSummaryRow, admit_from_ledger, from_sql_amount, monthly_period_key, sql_amount,
+    sql_amount_saturating, validate_timezone,
 };
 use crate::backends::health::{BackendHealth, PostgresHealth};
+use crate::telemetry::metrics;
 
 const BUDGET_DDL: &str = include_str!("../../sql/store_budget_v1.sql");
 const INCARNATION_DDL: &str = include_str!("../../sql/store_namespace_incarnation_v1.sql");
@@ -106,6 +108,7 @@ impl PostgresStore {
             .connect(crate::usage::tls_connector())
             .await
             .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+        metrics::record_store_connection_opened(STORE_BACKEND_POSTGRES);
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::warn!(error = %e, "postgres store connection closed");
@@ -118,20 +121,19 @@ impl PostgresStore {
         Ok(client)
     }
 
-    async fn checkout(&self) -> Result<(Client, OwnedSemaphorePermit), StoreError> {
+    /// A pooled session, or why none was had. `Err(Saturated)` is the pool's
+    /// wait bound expiring with every slot taken — the outcome the metrics tell
+    /// apart from a query that ran and failed.
+    async fn checkout(&self) -> Result<(Client, OwnedSemaphorePermit), Checkout> {
         let permit = match tokio::time::timeout(POOL_WAIT, self.slots.clone().acquire_owned()).await
         {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
-                return Err(StoreError::Unavailable(
+                return Err(Checkout::Failed(StoreError::Unavailable(
                     "postgres store pool is closed".into(),
-                ));
+                )));
             }
-            Err(_) => {
-                return Err(StoreError::Unavailable(
-                    "postgres store pool saturated".into(),
-                ));
-            }
+            Err(_) => return Err(Checkout::Saturated),
         };
         {
             let mut idle = self.idle.lock().await;
@@ -143,7 +145,7 @@ impl PostgresStore {
         }
         match self.connect_client().await {
             Ok(client) => Ok((client, permit)),
-            Err(error) => Err(error),
+            Err(error) => Err(Checkout::Failed(error)),
         }
     }
 
@@ -164,12 +166,55 @@ impl PostgresStore {
         )
     }
 
+    /// Run `operation` on a pooled session.
+    ///
+    /// Two phases are timed and recorded as `axond.store.acquire_wait` and
+    /// `axond.store.query_duration` under `op`: the wait for a pool slot plus
+    /// an idle session or a fresh connect, and the execution once a session is
+    /// held. A saturated pool records only the wait, under the `saturated`
+    /// outcome, because no query ran.
     async fn with_client<T>(
         &self,
+        op: StoreOp,
         operation: impl AsyncFnOnce(&mut Client) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let (mut client, permit) = self.checkout().await?;
+        let called = Instant::now();
+        let (mut client, permit) = match self.checkout().await {
+            Ok(checked_out) => checked_out,
+            Err(saturated @ Checkout::Saturated) => {
+                metrics::record_store_operation(
+                    STORE_BACKEND_POSTGRES,
+                    op,
+                    millis(called.elapsed()),
+                    None,
+                    STORE_OUTCOME_SATURATED,
+                );
+                return Err(saturated.into());
+            }
+            Err(Checkout::Failed(error)) => {
+                metrics::record_store_operation(
+                    STORE_BACKEND_POSTGRES,
+                    op,
+                    millis(called.elapsed()),
+                    None,
+                    STORE_OUTCOME_ERROR,
+                );
+                return Err(error);
+            }
+        };
+        let acquired = Instant::now();
         let result = operation(&mut client).await;
+        metrics::record_store_operation(
+            STORE_BACKEND_POSTGRES,
+            op,
+            millis(acquired.saturating_duration_since(called)),
+            Some(millis(acquired.elapsed())),
+            if result.is_ok() {
+                STORE_OUTCOME_OK
+            } else {
+                STORE_OUTCOME_ERROR
+            },
+        );
         let reuse = match &result {
             Ok(_) => !client.is_closed(),
             Err(error) => Self::keep_session(error) && !client.is_closed(),
@@ -180,6 +225,27 @@ impl PostgresStore {
         drop(permit);
         result
     }
+}
+
+/// Why a checkout returned no session.
+enum Checkout {
+    /// Every slot was held for the whole wait bound.
+    Saturated,
+    /// The pool is closed, or a fresh connection could not be made.
+    Failed(StoreError),
+}
+
+impl From<Checkout> for StoreError {
+    fn from(checkout: Checkout) -> Self {
+        match checkout {
+            Checkout::Saturated => StoreError::Unavailable("postgres store pool saturated".into()),
+            Checkout::Failed(error) => error,
+        }
+    }
+}
+
+fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 async fn probe_schema(client: &Client) -> Result<(), StoreError> {
@@ -717,7 +783,7 @@ impl Store for PostgresStore {
     }
 
     async fn put_namespace(&self, ns: NamespaceRecord) -> Result<(), StoreError> {
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::NamespaceWrite, async move |client| {
             let blocklist = ns
                 .blocklist
                 .as_ref()
@@ -760,7 +826,7 @@ impl Store for PostgresStore {
 
     async fn get_namespace(&self, id: &str) -> Result<Option<NamespaceRecord>, StoreError> {
         let id = id.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::NamespaceRead, async move |client| {
             let row = client
                 .query_opt(
                     "SELECT id, attrs, blocklist FROM axond_namespace WHERE id = $1",
@@ -777,7 +843,7 @@ impl Store for PostgresStore {
     async fn resolve_namespace(&self, id: &str) -> Result<Option<NamespaceResolve>, StoreError> {
         let id = id.to_owned();
         let clock = Arc::clone(&self.clock);
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::NamespaceResolve, async move |client| {
             let tx = client
                 .transaction()
                 .await
@@ -798,7 +864,7 @@ impl Store for PostgresStore {
     ) -> Result<(Vec<NamespaceRecord>, Option<String>), StoreError> {
         let limit = i64::from(limit.clamp(1, 1000));
         let fetch = limit + 1;
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::NamespaceRead, async move |client| {
             let rows = client
                 .query(
                     "SELECT id, attrs, blocklist FROM axond_namespace
@@ -836,7 +902,7 @@ impl Store for PostgresStore {
         blocklist: Option<Vec<String>>,
     ) -> Result<Option<NamespaceRecord>, StoreError> {
         let id = id.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::NamespaceWrite, async move |client| {
             let blocklist = blocklist.map(|list| serde_json::to_value(list).unwrap_or(Value::Null));
             let row = client
                 .query_opt(
@@ -854,7 +920,7 @@ impl Store for PostgresStore {
 
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError> {
         let id = id.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::NamespaceWrite, async move |client| {
             let tx = client
                 .transaction()
                 .await
@@ -907,7 +973,7 @@ impl Store for PostgresStore {
         let period = period.to_owned();
         let limit = sql_amount(limit_microdollars)?;
         let clock = Arc::clone(&self.clock);
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetWrite, async move |client| {
             let tx = client
                 .transaction()
                 .await
@@ -929,8 +995,10 @@ impl Store for PostgresStore {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
         let clock = Arc::clone(&self.clock);
-        self.with_client(async move |client| read_budget(client, &namespace, &period, &clock).await)
-            .await
+        self.with_client(StoreOp::BudgetRead, async move |client| {
+            read_budget(client, &namespace, &period, &clock).await
+        })
+        .await
     }
 
     async fn put_budget_policy(
@@ -947,7 +1015,7 @@ impl Store for PostgresStore {
         let limit = sql_amount(limit_microdollars)?;
         let tz = validate_timezone(&timezone)?;
         let clock = Arc::clone(&self.clock);
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetWrite, async move |client| {
             let tx = client
                 .transaction()
                 .await
@@ -1027,7 +1095,7 @@ impl Store for PostgresStore {
     async fn get_budget_policy(&self, namespace: &str) -> Result<Option<BudgetPolicy>, StoreError> {
         let namespace = namespace.to_owned();
         let clock = Arc::clone(&self.clock);
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetRead, async move |client| {
             let exists = client
                 .query_opt("SELECT 1 FROM axond_namespace WHERE id = $1", &[&namespace])
                 .await
@@ -1044,7 +1112,7 @@ impl Store for PostgresStore {
     async fn admit_budget(&self, namespace: &str) -> Result<BudgetAdmit, StoreError> {
         let namespace = namespace.to_owned();
         let clock = Arc::clone(&self.clock);
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetAdmit, async move |client| {
             let tx = client
                 .transaction()
                 .await
@@ -1068,7 +1136,7 @@ impl Store for PostgresStore {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
         let actual = sql_amount_saturating(actual_microdollars);
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetCharge, async move |client| {
             charge_budget_on(client, &namespace, &period, incarnation, actual).await
         })
         .await
@@ -1076,7 +1144,7 @@ impl Store for PostgresStore {
 
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError> {
         let cost = event.cost_microdollars.map(sql_amount_saturating);
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::UsageAppend, async move |client| {
             client
                 .execute(
                     "INSERT INTO axond_store_usage
@@ -1106,7 +1174,7 @@ impl Store for PostgresStore {
     ) -> Result<Vec<UsageSummaryRow>, StoreError> {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::UsageSummary, async move |client| {
             // SUM(bigint) is numeric; clamp before ::bigint so overflow saturates.
             let rows = client
                 .query(
@@ -1138,7 +1206,7 @@ impl Store for PostgresStore {
         provider: &str,
     ) -> Result<Option<ProviderModels>, StoreError> {
         let provider = provider.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::ProviderModels, async move |client| {
             let row = client
                 .query_opt(
                     "SELECT provider, fetched_at, stale, models, source
@@ -1156,7 +1224,7 @@ impl Store for PostgresStore {
     }
 
     async fn list_provider_models(&self) -> Result<Vec<ProviderModels>, StoreError> {
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::ProviderModels, async move |client| {
             let rows = client
                 .query(
                     "SELECT provider, fetched_at, stale, models, source
@@ -1181,7 +1249,7 @@ impl Store for PostgresStore {
     }
 
     async fn put_provider_models(&self, row: ProviderModels) -> Result<(), StoreError> {
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::ProviderModels, async move |client| {
             let models = Value::Array(row.data);
             client
                 .execute(
@@ -1216,7 +1284,7 @@ impl Store for PostgresStore {
     ) -> Result<(), StoreError> {
         let provider = provider.to_owned();
         let source = source.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::ProviderModels, async move |client| {
             client
                 .execute(
                     "UPDATE axond_store_provider_models SET stale = TRUE
@@ -1237,7 +1305,7 @@ impl Store for PostgresStore {
     ) -> Result<(), StoreError> {
         let provider = provider.to_owned();
         let source = source.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::ProviderModels, async move |client| {
             client
                 .execute(
                     "UPDATE axond_store_provider_models SET stale = TRUE
@@ -1562,7 +1630,7 @@ impl PostgresStore {
 
     /// Kill the next idle session so the following Store call must reconnect.
     pub(super) async fn drop_idle_connection(&self) -> Result<(), StoreError> {
-        let (client, permit) = self.checkout().await?;
+        let (client, permit) = self.checkout().await.map_err(StoreError::from)?;
         let _ = client
             .execute("SELECT pg_terminate_backend(pg_backend_pid())", &[])
             .await;
@@ -1573,7 +1641,7 @@ impl PostgresStore {
 
     pub(super) async fn reservation_count(&self, namespace: &str) -> Result<i64, StoreError> {
         let namespace = namespace.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetRead, async move |client| {
             let count: i64 = client
                 .query_one(
                     "SELECT count(*)::bigint FROM axond_store_budget_reservation WHERE namespace = $1",
@@ -1594,7 +1662,7 @@ impl PostgresStore {
     ) -> Result<i64, StoreError> {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetRead, async move |client| {
             client
                 .query_one(
                     "SELECT count(*)::bigint FROM axond_store_budget
@@ -1610,7 +1678,7 @@ impl PostgresStore {
 
     pub(super) async fn cadence_row_count(&self, namespace: &str) -> Result<i64, StoreError> {
         let namespace = namespace.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetRead, async move |client| {
             client
                 .query_one(
                     "SELECT count(*)::bigint FROM axond_store_budget_cadence
@@ -1631,7 +1699,7 @@ impl PostgresStore {
     ) -> Result<(), StoreError> {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetWrite, async move |client| {
             client
                 .execute(
                     "DELETE FROM axond_store_budget
@@ -1653,7 +1721,7 @@ impl PostgresStore {
     ) -> Result<(), StoreError> {
         let id = id.to_owned();
         let namespace = namespace.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetWrite, async move |client| {
             client
                 .execute(
                     "INSERT INTO axond_store_budget_reservation
@@ -1675,7 +1743,7 @@ impl PostgresStore {
         incarnation: i64,
     ) -> Result<(), StoreError> {
         let id = id.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetWrite, async move |client| {
             client
                 .execute(
                     "INSERT INTO axond_store_budget_reservation_tombstone
@@ -1692,7 +1760,7 @@ impl PostgresStore {
 
     pub(super) async fn tombstone_exists(&self, id: &str) -> Result<bool, StoreError> {
         let id = id.to_owned();
-        self.with_client(async move |client| {
+        self.with_client(StoreOp::BudgetRead, async move |client| {
             let exists: bool = client
                 .query_one(
                     "SELECT EXISTS(
@@ -1723,7 +1791,11 @@ mod tests {
             held.push(slots.clone().acquire_owned().await.expect("permit"));
         }
         let store = PostgresStore::test_pool(slots);
-        let err = store.checkout().await.expect_err("saturated");
+        let Err(checkout) = store.checkout().await else {
+            panic!("a full pool must not hand out a session");
+        };
+        assert!(matches!(checkout, Checkout::Saturated));
+        let err = StoreError::from(checkout);
         assert!(
             matches!(err, StoreError::Unavailable(ref message) if message.contains("pool saturated")),
             "{err:?}"

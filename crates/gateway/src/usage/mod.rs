@@ -26,7 +26,7 @@ mod postgres;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
@@ -476,7 +476,11 @@ pub struct UsageDelivery {
     store: std::sync::OnceLock<Arc<dyn crate::store::Store>>,
     /// Bounded queue into the usage-index worker. `append_store` only
     /// `try_send`s; a full queue drops the event rather than spawning work.
-    index_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<crate::store::UsageAppend>>,
+    index_tx: std::sync::OnceLock<tokio::sync::mpsc::Sender<QueuedIndexEvent>>,
+    /// Occupied slots in `index_tx` (reserved permits plus queued events).
+    /// Incremented after `try_reserve` succeeds and decremented when the worker
+    /// receives or drains, so the histogram cannot wrap or exceed the bound.
+    index_depth: Arc<AtomicU64>,
     /// Set on drop so the worker abandons queued items after the in-flight write.
     index_stop: Arc<AtomicBool>,
     /// Test-only witness for [`UsageDelivery::count_unheard_refusal`]: the loss
@@ -503,7 +507,8 @@ impl UsageDelivery {
     /// Bound on one Postgres (cancellable) index write inside the worker.
     const STORE_INDEX_TIMEOUT: Duration = Duration::from_secs(2);
     /// Queued index events before `append_store` drops rather than blocking.
-    const STORE_INDEX_QUEUE: usize = 256;
+    /// The top bucket of `axond.usage.index.queue.depth` is this bound.
+    pub(crate) const STORE_INDEX_QUEUE: usize = 256;
 
     /// Telemetry-grade: best effort, non-blocking, lossy under overload.
     pub fn telemetry(fanout: UsageFanout) -> Self {
@@ -513,6 +518,7 @@ impl UsageDelivery {
             on_undurable: UndurablePolicy::Serve,
             store: std::sync::OnceLock::new(),
             index_tx: std::sync::OnceLock::new(),
+            index_depth: Arc::new(AtomicU64::new(0)),
             index_stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             unheard: std::sync::atomic::AtomicU64::new(0),
@@ -530,6 +536,7 @@ impl UsageDelivery {
             on_undurable,
             store: std::sync::OnceLock::new(),
             index_tx: std::sync::OnceLock::new(),
+            index_depth: Arc::new(AtomicU64::new(0)),
             index_stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             unheard: std::sync::atomic::AtomicU64::new(0),
@@ -545,10 +552,11 @@ impl UsageDelivery {
         }
         let (tx, rx) = tokio::sync::mpsc::channel(Self::STORE_INDEX_QUEUE);
         let stop = Arc::clone(&self.index_stop);
+        let depth = Arc::clone(&self.index_depth);
         if store.blocking_usage_index() {
             match std::thread::Builder::new()
                 .name("axond-usage-index".into())
-                .spawn(move || sqlite_usage_index_worker(store, rx, stop))
+                .spawn(move || sqlite_usage_index_worker(store, rx, stop, depth))
             {
                 Ok(handle) => drop(handle),
                 Err(error) => {
@@ -560,7 +568,9 @@ impl UsageDelivery {
                 }
             }
         } else if tokio::runtime::Handle::try_current().is_ok() {
-            drop(tokio::spawn(async_usage_index_worker(store, rx, stop)));
+            drop(tokio::spawn(async_usage_index_worker(
+                store, rx, stop, depth,
+            )));
         } else {
             tracing::error!("store usage-index worker needs a tokio runtime");
             return;
@@ -593,8 +603,18 @@ impl UsageDelivery {
             crate::telemetry::metrics::record_usage_index_append("failed");
             return;
         };
-        match tx.try_send(event) {
-            Ok(()) => {}
+        match tx.try_reserve() {
+            Ok(permit) => {
+                // The permit occupies a real slot, so the worker cannot recv
+                // this event until `send` below. Depth is then occupied slots,
+                // not in-flight send attempts.
+                let depth = self.index_depth.fetch_add(1, Ordering::AcqRel) + 1;
+                permit.send(QueuedIndexEvent {
+                    enqueued: Instant::now(),
+                    event,
+                });
+                crate::telemetry::metrics::record_usage_index_enqueued(depth);
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 tracing::error!(
                     request_id = %request_id,
@@ -784,15 +804,35 @@ impl Drop for UsageDelivery {
     }
 }
 
+/// One usage event on its way to the index worker, stamped when it was queued
+/// so the worker can report how long the background index trailed the request.
+struct QueuedIndexEvent {
+    enqueued: Instant,
+    event: crate::store::UsageAppend,
+}
+
+impl QueuedIndexEvent {
+    fn dequeue(self) -> crate::store::UsageAppend {
+        crate::telemetry::metrics::record_usage_index_dequeued(
+            self.enqueued.elapsed().as_secs_f64() * 1000.0,
+        );
+        self.event
+    }
+}
+
 fn sqlite_usage_index_worker(
     store: Arc<dyn crate::store::Store>,
-    mut rx: tokio::sync::mpsc::Receiver<crate::store::UsageAppend>,
+    mut rx: tokio::sync::mpsc::Receiver<QueuedIndexEvent>,
     stop: Arc<AtomicBool>,
+    depth: Arc<AtomicU64>,
 ) {
-    while let Some(event) = rx.blocking_recv() {
+    while let Some(queued) = rx.blocking_recv() {
+        take_index_slot(&depth);
         if stop.load(Ordering::Acquire) {
+            drain_index_queue(&mut rx, &depth);
             break;
         }
+        let event = queued.dequeue();
         let request_id = event.request_id.clone();
         let outcome = match store.append_usage_sync(event) {
             Ok(()) => "accepted",
@@ -811,13 +851,17 @@ fn sqlite_usage_index_worker(
 
 async fn async_usage_index_worker(
     store: Arc<dyn crate::store::Store>,
-    mut rx: tokio::sync::mpsc::Receiver<crate::store::UsageAppend>,
+    mut rx: tokio::sync::mpsc::Receiver<QueuedIndexEvent>,
     stop: Arc<AtomicBool>,
+    depth: Arc<AtomicU64>,
 ) {
-    while let Some(event) = rx.recv().await {
+    while let Some(queued) = rx.recv().await {
+        take_index_slot(&depth);
         if stop.load(Ordering::Acquire) {
+            drain_index_queue(&mut rx, &depth);
             break;
         }
+        let event = queued.dequeue();
         let request_id = event.request_id.clone();
         let outcome = match tokio::time::timeout(
             UsageDelivery::STORE_INDEX_TIMEOUT,
@@ -843,6 +887,16 @@ async fn async_usage_index_worker(
             }
         };
         crate::telemetry::metrics::record_usage_index_append(outcome);
+    }
+}
+
+fn take_index_slot(depth: &AtomicU64) {
+    depth.fetch_sub(1, Ordering::AcqRel);
+}
+
+fn drain_index_queue(rx: &mut tokio::sync::mpsc::Receiver<QueuedIndexEvent>, depth: &AtomicU64) {
+    while rx.try_recv().is_ok() {
+        take_index_slot(depth);
     }
 }
 

@@ -31,6 +31,103 @@ pub use sqlite::SqliteStore;
 /// ADR 0063: opaque namespace `attrs` are capped at 4 KiB (serialized JSON).
 pub const MAX_ATTRS_BYTES: usize = 4 * 1024;
 
+/// The kind of work one Store call does, as the `axond.store.*` metrics label it.
+///
+/// A closed vocabulary rather than the method name: the metrics separate the
+/// time a call waits for a connection from the time it spends executing, and
+/// they have to do so with a label set fixed at build time. Ten kinds cover
+/// every method on [`Store`] and group the ones a contention question does not
+/// tell apart (every provider-models read and write is one kind), so the series
+/// count is `kinds × backends × outcomes` and never a namespace or a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOp {
+    /// The one namespace-plus-admission join on the inference path (ADR 0064).
+    NamespaceResolve,
+    /// `get_namespace` and `list_namespaces`: management reads.
+    NamespaceRead,
+    /// `put_namespace`, `update_namespace`, `delete_namespace`.
+    NamespaceWrite,
+    /// `get_budget` and `get_budget_policy`.
+    BudgetRead,
+    /// `put_budget` and `put_budget_policy`.
+    BudgetWrite,
+    /// `admit_budget` taken alone, when the resolver is a different Store.
+    BudgetAdmit,
+    /// The spent increment after the response.
+    BudgetCharge,
+    /// One usage-index row from the background worker.
+    UsageAppend,
+    /// The management usage summary: an aggregate over the index.
+    UsageSummary,
+    /// Every provider-models cache read and write.
+    ProviderModels,
+}
+
+impl StoreOp {
+    /// Every kind, for the catalogue that enumerates the label's vocabulary.
+    pub const ALL: [Self; 10] = [
+        Self::NamespaceResolve,
+        Self::NamespaceRead,
+        Self::NamespaceWrite,
+        Self::BudgetRead,
+        Self::BudgetWrite,
+        Self::BudgetAdmit,
+        Self::BudgetCharge,
+        Self::UsageAppend,
+        Self::UsageSummary,
+        Self::ProviderModels,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NamespaceResolve => "namespace_resolve",
+            Self::NamespaceRead => "namespace_read",
+            Self::NamespaceWrite => "namespace_write",
+            Self::BudgetRead => "budget_read",
+            Self::BudgetWrite => "budget_write",
+            Self::BudgetAdmit => "budget_admit",
+            Self::BudgetCharge => "budget_charge",
+            Self::UsageAppend => "usage_append",
+            Self::UsageSummary => "usage_summary",
+            Self::ProviderModels => "provider_models",
+        }
+    }
+}
+
+const fn store_operation_names() -> [&'static str; StoreOp::ALL.len()] {
+    let mut names = [""; StoreOp::ALL.len()];
+    let mut index = 0;
+    while index < names.len() {
+        names[index] = StoreOp::ALL[index].as_str();
+        index += 1;
+    }
+    names
+}
+
+const STORE_OPERATION_NAMES: [&str; StoreOp::ALL.len()] = store_operation_names();
+
+/// The `axond.store.operation` label values, derived from [`StoreOp::ALL`] so
+/// the catalogue and the recorder cannot drift.
+pub const STORE_OPERATIONS: &[&str] = &STORE_OPERATION_NAMES;
+
+/// The `axond.store.backend` label values.
+pub const STORE_BACKEND_SQLITE: &str = "sqlite";
+pub const STORE_BACKEND_POSTGRES: &str = "postgres";
+pub const STORE_BACKENDS: &[&str] = &[STORE_BACKEND_SQLITE, STORE_BACKEND_POSTGRES];
+
+/// The `axond.store.outcome` label values: the call ran and returned `Ok`, ran
+/// and returned an error, or never got a connection inside the pool's wait
+/// bound — which is the one outcome that says the pool rather than the query is
+/// what a caller waited on.
+pub const STORE_OUTCOME_OK: &str = "ok";
+pub const STORE_OUTCOME_ERROR: &str = "error";
+pub const STORE_OUTCOME_SATURATED: &str = "saturated";
+pub const STORE_OUTCOMES: &[&str] = &[
+    STORE_OUTCOME_OK,
+    STORE_OUTCOME_ERROR,
+    STORE_OUTCOME_SATURATED,
+];
+
 /// Opaque billing-period keys share the namespace id charset and bound.
 pub const MAX_PERIOD_LEN: usize = 128;
 /// Default timezone used for synthesized fixed policies and omitted settings.
