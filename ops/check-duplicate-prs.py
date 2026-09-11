@@ -24,15 +24,14 @@ from typing import Iterable
 
 # Issue numbers are per repository. Capture the repo from a URL or
 # `owner/repo#N`, and resolve a bare `#N` against GITHUB_REPOSITORY.
+KEYWORD = re.compile(r"(?:closes|fixes|resolves)\s+", re.IGNORECASE)
 CLOSE_REF = re.compile(
-    r"(?:closes|fixes|resolves)\s+"
-    r"(?:"
     r"https://github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)"
     r"|([A-Za-z0-9_.-]+)/([\w.-]+)#(\d+)"
-    r"|#(\d+)"
-    r")",
+    r"|#(\d+)",
     re.IGNORECASE,
 )
+LIST_SEP = re.compile(r"^\s*(?:,|,?\s+and\b)\s*", re.IGNORECASE)
 
 IssueRef = tuple[str, str, int]
 
@@ -46,16 +45,30 @@ def split_repo(repo: str) -> tuple[str, str]:
     return owner.lower(), name.lower()
 
 
+def _ref_from_match(match: re.Match[str], owner: str, name: str) -> IssueRef:
+    if match.group(3) is not None:
+        return match.group(1).lower(), match.group(2).lower(), int(match.group(3))
+    if match.group(6) is not None:
+        return match.group(4).lower(), match.group(5).lower(), int(match.group(6))
+    return owner, name, int(match.group(7))
+
+
 def closed_issues(body: str | None, default_repo: str) -> frozenset[IssueRef]:
     owner, name = split_repo(default_repo)
     found: set[IssueRef] = set()
-    for match in CLOSE_REF.finditer(body or ""):
-        if match.group(3) is not None:
-            found.add((match.group(1).lower(), match.group(2).lower(), int(match.group(3))))
-        elif match.group(6) is not None:
-            found.add((match.group(4).lower(), match.group(5).lower(), int(match.group(6))))
-        else:
-            found.add((owner, name, int(match.group(7))))
+    text = body or ""
+    for keyword in KEYWORD.finditer(text):
+        rest = text[keyword.end() :]
+        while True:
+            ref = CLOSE_REF.match(rest)
+            if ref is None:
+                break
+            found.add(_ref_from_match(ref, owner, name))
+            rest = rest[ref.end() :]
+            sep = LIST_SEP.match(rest)
+            if sep is None:
+                break
+            rest = rest[sep.end() :]
     return frozenset(found)
 
 
@@ -221,6 +234,25 @@ def self_test() -> int:
         "body": "Fixes Litvue/custodian#567\n",
     }
     assert conflicts(other_qualified, [older], default_repo) == []
+    grouped = {
+        "number": 578,
+        "title": "grouped closers",
+        "body": "Closes #12, #567\n",
+    }
+    grouped_hit = conflicts(grouped, [older], default_repo)
+    assert any("closes #567" in reason for reason in grouped_hit), grouped_hit
+    anded = {
+        "number": 579,
+        "title": "and closers",
+        "body": "Fixes #1 and #567\n",
+    }
+    assert any("closes #567" in reason for reason in conflicts(anded, [older], default_repo))
+    prose_number = {
+        "number": 580,
+        "title": "prose hash is not a closer",
+        "body": "See #567 for context.\n",
+    }
+    assert conflicts(prose_number, [older], default_repo) == []
     print("ok")
     return 0
 
