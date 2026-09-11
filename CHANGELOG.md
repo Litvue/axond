@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.3](https://github.com/Litvue/axond/compare/v0.6.2...v0.6.3) (2026-09-10)
+
+
+### Performance
+
+* **store:** keep SQLite usage summaries off the inference slot ([#484](https://github.com/Litvue/axond/issues/484)) ([b9fe4c5](https://github.com/Litvue/axond/commit/b9fe4c51d6c30c5a97e16c75159bf708ad033717))
+* **store:** retain Postgres sessions across bursts ([#481](https://github.com/Litvue/axond/issues/481)) ([7a0f4f5](https://github.com/Litvue/axond/commit/7a0f4f5e7349c134dc6e861ad0c3c25e3bb875b7))
+* **transport:** reuse encoded request bodies across credential attempts ([#480](https://github.com/Litvue/axond/issues/480)) ([08f5929](https://github.com/Litvue/axond/commit/08f59297fb70968bc5585ea76da23433f1599a1d)), closes [#466](https://github.com/Litvue/axond/issues/466)
+
+
+### Refactors
+
+* drop the withdrawn admin surface from the production build ([#485](https://github.com/Litvue/axond/issues/485)) ([9ba5ca1](https://github.com/Litvue/axond/commit/9ba5ca1c82f833645816b69748d9bf4aebc54f72))
+
 ## [0.6.2](https://github.com/Litvue/axond/compare/v0.6.1...v0.6.2) (2026-09-10)
 
 
