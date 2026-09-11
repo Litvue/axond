@@ -27,7 +27,7 @@ from typing import Iterable
 # GitHub closes one issue per keyword. Multiple issues need the keyword
 # repeated: `Closes #10, closes #12`. A comma list without a second keyword
 # does not close the later numbers. Optional colon: `Closes: #10`.
-KEYWORD = re.compile(r"(?:closes|fixes|resolves):?\s+", re.IGNORECASE)
+KEYWORD = re.compile(r"\b(?:closes|fixes|resolves):?\s+", re.IGNORECASE)
 CLOSE_REF = re.compile(
     r"https://github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)"
     r"|([A-Za-z0-9_.-]+)/([\w.-]+)#(\d+)"
@@ -256,6 +256,12 @@ def self_test() -> int:
         "body": "See #567 for context.\n",
     }
     assert conflicts(prose_number, [older], default_repo) == []
+    embedded = {
+        "number": 582,
+        "title": "embedded keyword is not a closer",
+        "body": "Bugfixes: #567\n",
+    }
+    assert conflicts(embedded, [older], default_repo) == []
     print("ok")
     return 0
 
