@@ -22,50 +22,75 @@ import urllib.parse
 import urllib.request
 from typing import Iterable
 
-CLOSES = re.compile(
-    r"(?:closes|fixes|resolves)(?:\s+[A-Za-z0-9_.-]+/[\w.-]+)?\s*#(\d+)",
+# Issue numbers are per repository. Capture the repo from a URL or
+# `owner/repo#N`, and resolve a bare `#N` against GITHUB_REPOSITORY.
+CLOSE_REF = re.compile(
+    r"(?:closes|fixes|resolves)\s+"
+    r"(?:"
+    r"https://github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)"
+    r"|([A-Za-z0-9_.-]+)/([\w.-]+)#(\d+)"
+    r"|#(\d+)"
+    r")",
     re.IGNORECASE,
 )
-ISSUE_URL = re.compile(
-    r"(?:closes|fixes|resolves)\s+https://github\.com/[^/\s]+/[^/\s]+/issues/(\d+)",
-    re.IGNORECASE,
-)
+
+IssueRef = tuple[str, str, int]
 
 
 def normalize_title(title: str) -> str:
     return " ".join(title.split())
 
 
-def closed_issues(body: str | None) -> frozenset[int]:
-    text = body or ""
-    found = {int(n) for n in CLOSES.findall(text)}
-    found.update(int(n) for n in ISSUE_URL.findall(text))
+def split_repo(repo: str) -> tuple[str, str]:
+    owner, name = repo.split("/", 1)
+    return owner.lower(), name.lower()
+
+
+def closed_issues(body: str | None, default_repo: str) -> frozenset[IssueRef]:
+    owner, name = split_repo(default_repo)
+    found: set[IssueRef] = set()
+    for match in CLOSE_REF.finditer(body or ""):
+        if match.group(3) is not None:
+            found.add((match.group(1).lower(), match.group(2).lower(), int(match.group(3))))
+        elif match.group(6) is not None:
+            found.add((match.group(4).lower(), match.group(5).lower(), int(match.group(6))))
+        else:
+            found.add((owner, name, int(match.group(7))))
     return frozenset(found)
+
+
+def format_issue(ref: IssueRef, default_repo: str) -> str:
+    owner, name, number = ref
+    if (owner, name) == split_repo(default_repo):
+        return f"#{number}"
+    return f"{owner}/{name}#{number}"
 
 
 def conflicts(
     current: dict,
     others: Iterable[dict],
+    default_repo: str,
 ) -> list[str]:
     """Return reasons the current PR is a newer duplicate of an older open PR."""
     current_number = int(current["number"])
     title = normalize_title(current.get("title") or "")
-    issues = closed_issues(current.get("body"))
+    issues = closed_issues(current.get("body"), default_repo)
     reasons: list[str] = []
     for other in others:
         other_number = int(other["number"])
         if other_number >= current_number:
             continue
         other_title = normalize_title(other.get("title") or "")
-        other_issues = closed_issues(other.get("body"))
+        other_issues = closed_issues(other.get("body"), default_repo)
         if title and title == other_title:
             reasons.append(
                 f"#{current_number} repeats the title of older open #{other_number}: {title!r}"
             )
         shared = issues & other_issues
         for issue in sorted(shared):
+            label = format_issue(issue, default_repo)
             reasons.append(
-                f"#{current_number} closes #{issue}, which older open #{other_number} already closes"
+                f"#{current_number} closes {label}, which older open #{other_number} already closes"
             )
     return reasons
 
@@ -128,7 +153,7 @@ def live_check() -> int:
         return 1
     current = {"number": int(number), "title": title, "body": body}
     others = list_open_pulls(repo, token)
-    problems = conflicts(current, others)
+    problems = conflicts(current, others, repo)
     if not problems:
         return 0
     for reason in problems:
@@ -141,6 +166,7 @@ def live_check() -> int:
 
 
 def self_test() -> int:
+    default_repo = "Litvue/axond"
     older = {
         "number": 570,
         "title": "fix(service): tolerate null other-kind vector algorithm params",
@@ -151,31 +177,50 @@ def self_test() -> int:
         "title": "fix(service): tolerate null other-kind vector algorithm params",
         "body": "Closes #567\n",
     }
-    title_hit = conflicts(newer, [older, newer])
+    title_hit = conflicts(newer, [older, newer], default_repo)
     assert any("repeats the title" in reason for reason in title_hit), title_hit
     assert any("closes #567" in reason for reason in title_hit), title_hit
     # The older PR must stay mergeable while the sibling is open.
-    assert conflicts(older, [older, newer]) == []
+    assert conflicts(older, [older, newer], default_repo) == []
     different = {
         "number": 572,
         "title": "perf(store): retain Postgres sessions across bursts",
         "body": "Closes #465\n",
     }
-    assert conflicts(different, [older, newer]) == []
+    assert conflicts(different, [older, newer], default_repo) == []
     # Fixes #N is the same closer as Closes #N.
     alias = {
         "number": 573,
         "title": "fix(service): a different subject",
         "body": "Fixes #567\n",
     }
-    aliased = conflicts(alias, [older])
+    aliased = conflicts(alias, [older], default_repo)
     assert any("closes #567" in reason for reason in aliased), aliased
-    url_close = {
+    same_repo_url = {
         "number": 574,
         "title": "another spelling",
+        "body": "Resolves https://github.com/Litvue/axond/issues/567\n",
+    }
+    assert any("closes #567" in reason for reason in conflicts(same_repo_url, [older], default_repo))
+    qualified = {
+        "number": 575,
+        "title": "qualified closer",
+        "body": "Closes Litvue/axond#567\n",
+    }
+    assert any("closes #567" in reason for reason in conflicts(qualified, [older], default_repo))
+    # A Closes URL or owner/repo#N for another repository is a different issue.
+    other_repo = {
+        "number": 576,
+        "title": "unrelated closer",
         "body": "Resolves https://github.com/Litvue/custodian/issues/567\n",
     }
-    assert any("closes #567" in reason for reason in conflicts(url_close, [older]))
+    assert conflicts(other_repo, [older], default_repo) == []
+    other_qualified = {
+        "number": 577,
+        "title": "also unrelated",
+        "body": "Fixes Litvue/custodian#567\n",
+    }
+    assert conflicts(other_qualified, [older], default_repo) == []
     print("ok")
     return 0
 
