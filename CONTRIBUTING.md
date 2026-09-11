@@ -133,6 +133,10 @@ in [public API compatibility](./docs/maintainers/releasing.md#public-api-compati
   minor, and they get there through a breaking commit title — everything else,
   features included, ships as a patch. See
   [version classification](./docs/maintainers/releasing.md#version-classification).
+- **One open PR per change.** Before opening a pull request, search open PRs
+  for the same title and for the same `Closes` / `Fixes` issue. If one exists,
+  push onto that branch. Do not open a sibling. CI fails a newer open PR that
+  repeats the title or the closed issue of an older one (`ops/check-duplicate-prs.py`).
 - **Squash-merge pull requests.** release-please reads one Conventional Commit
   per commit on `main`; a merge commit repeats its branch's commit in the release
   notes. See

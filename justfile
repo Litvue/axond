@@ -147,6 +147,7 @@ api-compat-self-test:
 workflow-policy:
     ops/workflow-policy.py --self-test
     ops/workflow-policy.py
+    python3 ops/check-duplicate-prs.py --self-test
     shellcheck ops/install-musl-tools.sh
     bash ops/install-musl-tools.sh --self-test
     ops/dependabot-labels.sh --self-test

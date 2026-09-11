@@ -2,6 +2,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
     tags: ['v*']
@@ -563,6 +564,7 @@ jobs:
           ops/workflow-policy.py --self-test
           python3 ops/ci-success.py --self-test
           python3 ops/ci-changes.py --self-test
+          python3 ops/check-duplicate-prs.py --self-test
       - name: Check Action pins, least privilege, and signer restrictions
         run: ops/workflow-policy.py
       # A label Dependabot cannot find disables its whole configuration, and the
@@ -585,6 +587,14 @@ jobs:
         run: |
           shellcheck ops/install-musl-tools.sh
           bash ops/install-musl-tools.sh --self-test
+      - name: Refuse a newer open PR with the same title or Closes line
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_PR_TITLE: ${{ github.event.pull_request.title }}
+          GITHUB_PR_BODY: ${{ github.event.pull_request.body }}
+        run: python3 ops/check-duplicate-prs.py
 
   static-binary:
     needs: changes
