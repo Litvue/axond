@@ -24,14 +24,16 @@ from typing import Iterable
 
 # Issue numbers are per repository. Capture the repo from a URL or
 # `owner/repo#N`, and resolve a bare `#N` against GITHUB_REPOSITORY.
-KEYWORD = re.compile(r"(?:closes|fixes|resolves)\s+", re.IGNORECASE)
+# GitHub closes one issue per keyword. Multiple issues need the keyword
+# repeated: `Closes #10, closes #12`. A comma list without a second keyword
+# does not close the later numbers. Optional colon: `Closes: #10`.
+KEYWORD = re.compile(r"(?:closes|fixes|resolves):?\s+", re.IGNORECASE)
 CLOSE_REF = re.compile(
     r"https://github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)"
     r"|([A-Za-z0-9_.-]+)/([\w.-]+)#(\d+)"
     r"|#(\d+)",
     re.IGNORECASE,
 )
-LIST_SEP = re.compile(r"^\s*(?:,|,?\s+and\b)\s*", re.IGNORECASE)
 
 IssueRef = tuple[str, str, int]
 
@@ -59,16 +61,9 @@ def closed_issues(body: str | None, default_repo: str) -> frozenset[IssueRef]:
     text = body or ""
     for keyword in KEYWORD.finditer(text):
         rest = text[keyword.end() :]
-        while True:
-            ref = CLOSE_REF.match(rest)
-            if ref is None:
-                break
+        ref = CLOSE_REF.match(rest)
+        if ref is not None:
             found.add(_ref_from_match(ref, owner, name))
-            rest = rest[ref.end() :]
-            sep = LIST_SEP.match(rest)
-            if sep is None:
-                break
-            rest = rest[sep.end() :]
     return frozenset(found)
 
 
@@ -236,19 +231,27 @@ def self_test() -> int:
     assert conflicts(other_qualified, [older], default_repo) == []
     grouped = {
         "number": 578,
-        "title": "grouped closers",
+        "title": "grouped closers without a second keyword",
         "body": "Closes #12, #567\n",
     }
-    grouped_hit = conflicts(grouped, [older], default_repo)
-    assert any("closes #567" in reason for reason in grouped_hit), grouped_hit
-    anded = {
+    assert conflicts(grouped, [older], default_repo) == []
+    repeated_keyword = {
         "number": 579,
-        "title": "and closers",
-        "body": "Fixes #1 and #567\n",
+        "title": "repeated keyword",
+        "body": "Closes #12, closes #567\n",
     }
-    assert any("closes #567" in reason for reason in conflicts(anded, [older], default_repo))
-    prose_number = {
+    assert any(
+        "closes #567" in reason
+        for reason in conflicts(repeated_keyword, [older], default_repo)
+    )
+    colon = {
         "number": 580,
+        "title": "colon after keyword",
+        "body": "Closes: #567\n",
+    }
+    assert any("closes #567" in reason for reason in conflicts(colon, [older], default_repo))
+    prose_number = {
+        "number": 581,
         "title": "prose hash is not a closer",
         "body": "See #567 for context.\n",
     }
