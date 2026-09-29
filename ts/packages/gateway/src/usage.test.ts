@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { emptyUsage, noteSseChunk, usageFromJson } from "./usage.ts";
+import { emptyUsage, noteSseChunk, sseTerminalSeen, usageFromJson } from "./usage.ts";
 
 test("openai cached prompt tokens are billed once", () => {
   const usage = usageFromJson("chat", {
@@ -49,6 +49,19 @@ test("embeddings ignore reported output tokens", () => {
   });
   assert.equal(usage.inputTokens, 8n);
   assert.equal(usage.outputTokens, 0n);
+});
+
+test("a complete terminal frame starts the post-terminal grace", () => {
+  const partial = 'event: response.completed\ndata: {"type":"response.completed"';
+  assert.equal(sseTerminalSeen("responses", partial), false);
+  const completed =
+    'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n';
+  assert.equal(sseTerminalSeen("responses", completed), true);
+  assert.equal(sseTerminalSeen("chat", "data: [DONE]\n\n"), true);
+  assert.equal(
+    sseTerminalSeen("messages", 'event: message_stop\ndata: {"type":"message_stop"}\n\n'),
+    true,
+  );
 });
 
 test("anthropic cache tokens stay disjoint from input", () => {

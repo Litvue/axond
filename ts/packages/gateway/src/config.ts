@@ -93,6 +93,9 @@ const DEFAULT_TRANSPORT: TransportLimits = {
   streamIdleTimeoutMs: 120_000,
   maxResponseBytes: 32 * 1024 * 1024,
   maxErrorBytes: 64 * 1024,
+  connectTimeoutMs: 5_000,
+  streamTerminalGraceMs: 1_000,
+  overallTimeoutMs: 30_000,
 };
 
 /**
@@ -301,11 +304,23 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     );
   }
   const transport: TransportLimits = {
-    responseHeaderTimeoutMs: numberField(transportRaw, "response_header_timeout_ms", DEFAULT_TRANSPORT.responseHeaderTimeoutMs),
-    bufferedBodyTimeoutMs: numberField(transportRaw, "buffered_body_timeout_ms", DEFAULT_TRANSPORT.bufferedBodyTimeoutMs),
-    streamIdleTimeoutMs: numberField(transportRaw, "stream_idle_timeout_ms", DEFAULT_TRANSPORT.streamIdleTimeoutMs),
+    responseHeaderTimeoutMs: boundedMillis(transportRaw, "response_header_timeout_ms", DEFAULT_TRANSPORT.responseHeaderTimeoutMs),
+    bufferedBodyTimeoutMs: boundedMillis(transportRaw, "buffered_body_timeout_ms", DEFAULT_TRANSPORT.bufferedBodyTimeoutMs),
+    streamIdleTimeoutMs: boundedMillis(transportRaw, "stream_idle_timeout_ms", DEFAULT_TRANSPORT.streamIdleTimeoutMs),
+    connectTimeoutMs: boundedMillis(transportRaw, "connect_timeout_ms", DEFAULT_TRANSPORT.connectTimeoutMs ?? 5_000),
+    streamTerminalGraceMs: boundedMillis(
+      transportRaw,
+      "stream_terminal_grace_ms",
+      DEFAULT_TRANSPORT.streamTerminalGraceMs ?? 1_000,
+    ),
     maxResponseBytes,
     maxErrorBytes,
+    overallTimeoutMs: boundedMillis(
+      asRecord(parsed["failover"]) ?? {},
+      "overall_timeout_ms",
+      DEFAULT_TRANSPORT.overallTimeoutMs ?? 30_000,
+      "failover.overall_timeout_ms",
+    ),
   };
   const admissionRaw = asRecord(parsed["admission"]) ?? {};
   const maxRequestBytes = numberField(admissionRaw, "max_request_bytes", 2 * 1024 * 1024);
@@ -515,6 +530,19 @@ function bigField(row: Record<string, unknown>, key: string): bigint {
     return BigInt(value);
   }
   throw configError(`\`${key}\` must be an integer`);
+}
+
+function boundedMillis(
+  row: Record<string, unknown>,
+  key: string,
+  fallback: number,
+  label = `transport.${key}`,
+): number {
+  const value = numberField(row, key, fallback);
+  if (!Number.isInteger(value) || value < 1) {
+    throw configError(`${label} must be at least 1`);
+  }
+  return value;
 }
 
 function numberField(row: Record<string, unknown>, key: string, fallback: number): number {

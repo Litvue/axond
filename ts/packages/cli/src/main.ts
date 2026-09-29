@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
+import { Agent } from "undici";
 
 import { getRequestListener } from "@hono/node-server";
 import pg from "pg";
@@ -68,6 +69,7 @@ async function main(): Promise<void> {
       failureThreshold: config.credentialPool.failureThreshold,
       cooldownMs: config.credentialPool.cooldownSeconds * 1000,
     },
+    upstreamDispatcher: connectDispatcher(config.transport.connectTimeoutMs ?? 5_000),
     extensions,
     rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
     serving: () => serving,
@@ -163,6 +165,17 @@ async function main(): Promise<void> {
 function splitBind(bind: string): [string, string] {
   const index = bind.lastIndexOf(":");
   return [bind.slice(0, index), bind.slice(index + 1)];
+}
+
+/** Node's fetch honors an undici agent. Bun's fetch ignores it, so the binary does not set one. */
+function connectDispatcher(connectTimeoutMs: number): object | undefined {
+  if (process.versions.bun) {
+    return undefined;
+  }
+  return new Agent({
+    connectTimeout: connectTimeoutMs,
+    connect: { autoSelectFamily: false },
+  });
 }
 
 async function openPostgres(dsn: string) {

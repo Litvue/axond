@@ -548,6 +548,8 @@ async function dispatch(
   const stream = Boolean(payload["stream"]);
   const previous = payload["previous_response_id"];
   const continuation = pinned && typeof previous === "string" && previous.length > 0;
+  const clock = opts.clock ?? Date.now;
+  const deadlineAt = clock() + (opts.transport?.overallTimeoutMs ?? 30_000);
   for (let attempt = 0; attempt < planned.length; attempt += 1) {
     const credential = planned[attempt]!;
     if (continuation && credentialState(pools, credential, now, policy.cooldownMs) === "parked") {
@@ -612,6 +614,17 @@ async function dispatch(
         },
         stream,
         route: axond.route,
+        deadlineAt,
+        now: clock,
+        dispatcher: opts.upstreamDispatcher,
+        onTimeout: (kind, bound) => {
+          opts.metrics?.record("axond.upstream.timeouts", 1, {
+            "axond.target.provider": provider.id,
+            "axond.target.model": axond.target?.model ?? "",
+            "axond.timeout": kind,
+            "axond.timeout.bound": bound,
+          });
+        },
         onUsage: (next) => copyUsage(usage, next),
         onStreamDone: () => {
           if (stream && opts.waitUntil) {

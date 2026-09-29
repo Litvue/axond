@@ -1,7 +1,7 @@
 import type { CredentialConfig, ProviderConfig, TransportLimits } from "@axond/sdk";
 
 import { GatewayFailure } from "./errors.ts";
-import { assignUsage, emptyUsage, noteSseChunk, usageFromJson } from "./usage.ts";
+import { assignUsage, emptyUsage, noteSseChunk, sseTerminalSeen, usageFromJson } from "./usage.ts";
 import type { UsageTokens } from "@axond/sdk";
 
 export interface CredentialCircuit {
@@ -213,36 +213,63 @@ export async function callUpstream(input: {
   route: string;
   onUsage: (usage: UsageTokens) => void;
   onStreamDone?: (reason: "end" | "cancel") => void;
+  /** Shared failover deadline. Absent starts a budget of `overallTimeoutMs` at this call. */
+  deadlineAt?: number;
+  now?: () => number;
+  /** Node client that enforces the connect bound. Absent means the runtime owns connect. */
+  dispatcher?: object;
+  onTimeout?: (kind: string, bound: string) => void;
 }): Promise<{ response: Response; usage: UsageTokens }> {
+  const transport = withTransportDefaults(input.transport);
+  const now = input.now ?? Date.now;
   const usage = emptyUsage();
+  const current = now();
+  const deadlineAt = input.deadlineAt ?? current + transport.overallTimeoutMs;
+  if (current >= deadlineAt) {
+    throw timeoutFailure("overall", "walk_budget", 0, input.onTimeout);
+  }
+  const header = phaseBudget(transport.responseHeaderTimeoutMs, deadlineAt, current);
   const controller = new AbortController();
-  const headerTimer = setTimeout(() => controller.abort(), input.transport.responseHeaderTimeoutMs);
+  const headerTimer = setTimeout(() => controller.abort(), header.ms);
   let response: Response;
   try {
-    response = await fetch(input.url, {
+    const init: RequestInit & { dispatcher?: object } = {
       method: "POST",
       headers: input.headers,
       body: input.body,
       signal: controller.signal,
-    });
+    };
+    if (input.dispatcher) {
+      init.dispatcher = input.dispatcher;
+    }
+    response = await fetch(input.url, init);
   } catch (error) {
     if (controller.signal.aborted) {
-      throw timeout("waiting for provider response headers", input.transport.responseHeaderTimeoutMs);
+      throw timeoutFailure("response_headers", header.bound, header.ms, input.onTimeout);
+    }
+    if (isConnectTimeout(error)) {
+      throw timeoutFailure("connect", "phase", transport.connectTimeoutMs, input.onTimeout);
     }
     throw new GatewayFailure("upstream_transport", 502, "upstream transport failure");
   } finally {
     clearTimeout(headerTimer);
   }
   if (!response.ok) {
-    const text = await readErrorBody(
-      response,
-      input.transport.maxErrorBytes ?? 64 * 1024,
-      input.transport.bufferedBodyTimeoutMs,
-    );
+    const errorBudget = phaseBudget(transport.bufferedBodyTimeoutMs, deadlineAt, now());
+    const text = await readErrorBody(response, transport.maxErrorBytes, errorBudget.ms);
     throw classifyUpstream(response.status, text);
   }
   if (!input.stream || response.body === null) {
-    const bytes = await readLimitedBytes(response, input.transport.maxResponseBytes, input.transport.bufferedBodyTimeoutMs);
+    const bodyBudget = phaseBudget(transport.bufferedBodyTimeoutMs, deadlineAt, now());
+    if (bodyBudget.ms <= 0) {
+      throw timeoutFailure("overall", "walk_budget", 0, input.onTimeout);
+    }
+    const bytes = await readLimitedBytes(
+      response,
+      transport.maxResponseBytes,
+      bodyBudget,
+      input.onTimeout,
+    );
     try {
       assignUsage(usage, usageFromJson(input.route, JSON.parse(new TextDecoder().decode(bytes))));
     } catch {
@@ -255,10 +282,10 @@ export async function callUpstream(input: {
       usage,
     };
   }
-  const stream = relayStream(response.body, input.transport, input.route, usage, (reason) => {
+  const stream = relayStream(response.body, transport, input.route, usage, (reason) => {
     input.onUsage(usage);
     input.onStreamDone?.(reason);
-  });
+  }, input.onTimeout);
   const headers = passHeaders(response.headers);
   if (!headers.has("content-type")) {
     headers.set("content-type", "text/event-stream");
@@ -269,18 +296,46 @@ export async function callUpstream(input: {
   };
 }
 
+function withTransportDefaults(transport: TransportLimits): Required<TransportLimits> {
+  return {
+    responseHeaderTimeoutMs: transport.responseHeaderTimeoutMs,
+    bufferedBodyTimeoutMs: transport.bufferedBodyTimeoutMs,
+    streamIdleTimeoutMs: transport.streamIdleTimeoutMs,
+    maxResponseBytes: transport.maxResponseBytes,
+    maxErrorBytes: transport.maxErrorBytes ?? 64 * 1024,
+    connectTimeoutMs: transport.connectTimeoutMs ?? 5_000,
+    streamTerminalGraceMs: transport.streamTerminalGraceMs ?? 1_000,
+    overallTimeoutMs: transport.overallTimeoutMs ?? 30_000,
+  };
+}
+
+/** The phase's own bound, or what is left of the failover budget when that is tighter. */
+export function phaseBudget(
+  ownMs: number,
+  deadlineAt: number,
+  now: number,
+): { ms: number; bound: "phase" | "walk_budget" } {
+  const remaining = deadlineAt - now;
+  if (remaining < ownMs) {
+    return { ms: Math.max(0, remaining), bound: "walk_budget" };
+  }
+  return { ms: ownMs, bound: "phase" };
+}
+
 function relayStream(
   upstream: ReadableStream<Uint8Array>,
-  transport: TransportLimits,
+  transport: Required<TransportLimits>,
   route: string,
   usage: UsageTokens,
   onDone: (reason: "end" | "cancel") => void,
+  onTimeout?: (kind: string, bound: string) => void,
 ): ReadableStream<Uint8Array> {
   const reader = upstream.getReader();
   const decoder = new TextDecoder();
   let pending = "";
   let inflight: Promise<ReadableStreamReadResult<Uint8Array>> | null = null;
   let sawChunkAt = Date.now();
+  let terminalAt: number | null = null;
   let done = false;
   const finish = (reason: "end" | "cancel") => {
     if (done) {
@@ -297,7 +352,9 @@ function relayStream(
     async pull(controller) {
       const value = await readWithIdle(reader, () => inflight, (next) => {
         inflight = next;
-      }, transport.streamIdleTimeoutMs, sawChunkAt, controller);
+      }, transport.streamIdleTimeoutMs, sawChunkAt, controller, () => (
+        terminalAt === null ? null : terminalAt + transport.streamTerminalGraceMs
+      ), onTimeout);
       if (value === "keepalive") {
         return;
       }
@@ -307,9 +364,12 @@ function relayStream(
         return;
       }
       sawChunkAt = Date.now();
-      pending += decoder.decode(value, { stream: true });
-      noteSseChunk(route, usage, pending);
-      pending = tail(pending);
+      const buffered = pending + decoder.decode(value, { stream: true });
+      if (terminalAt === null && sseTerminalSeen(route, buffered)) {
+        terminalAt = Date.now();
+      }
+      noteSseChunk(route, usage, buffered);
+      pending = tail(buffered);
       controller.enqueue(value);
     },
     cancel(reason) {
@@ -336,22 +396,31 @@ async function readWithIdle(
   idleMs: number,
   sawChunkAt: number,
   controller: ReadableStreamDefaultController<Uint8Array>,
+  graceAt: () => number | null,
+  onTimeout?: (kind: string, bound: string) => void,
 ): Promise<Uint8Array | null | "keepalive"> {
   let read = current();
   if (read === null) {
     read = reader.read();
+    read.catch(() => undefined);
     setCurrent(read);
   }
   const started = Date.now();
   let lastKeepalive = sawChunkAt;
   for (;;) {
-    const elapsed = Date.now() - started;
-    if (elapsed >= idleMs) {
-      await reader.cancel();
-      throw timeout("waiting for the next provider stream chunk", idleMs);
+    const idleLeft = idleMs - (Date.now() - started);
+    const terminalAt = graceAt();
+    const graceLeft = terminalAt === null ? Number.POSITIVE_INFINITY : terminalAt - Date.now();
+    const budget = Math.min(idleLeft, graceLeft);
+    if (budget <= 0) {
+      await reader.cancel().catch(() => undefined);
+      if (terminalAt !== null) {
+        return null;
+      }
+      throw timeoutFailure("stream_idle", "phase", idleMs, onTimeout);
     }
-    const untilKeepalive = 15_000 - (Date.now() - lastKeepalive);
-    const wait = Math.max(1, Math.min(idleMs - elapsed, untilKeepalive));
+    const untilKeepalive = terminalAt === null ? 15_000 - (Date.now() - lastKeepalive) : Number.POSITIVE_INFINITY;
+    const wait = Math.max(1, Math.min(budget, untilKeepalive));
     const result = await Promise.race([
       read.then((chunk) => ({ kind: "chunk" as const, chunk })),
       delay(wait).then(() => ({ kind: "wait" as const })),
@@ -360,7 +429,7 @@ async function readWithIdle(
       setCurrent(null);
       return result.chunk.done ? null : result.chunk.value;
     }
-    if (Date.now() - lastKeepalive >= 15_000) {
+    if (terminalAt === null && Date.now() - lastKeepalive >= 15_000) {
       lastKeepalive = Date.now();
       controller.enqueue(KEEPALIVE);
       return "keepalive";
@@ -375,8 +444,37 @@ function delay(ms: number): Promise<void> {
   });
 }
 
-function timeout(phase: string, budgetMs: number): GatewayFailure {
-  return new GatewayFailure("upstream_timeout", 504, `transport: ${phase} exceeded its ${budgetMs}ms bound`);
+function timeoutFailure(
+  kind: "connect" | "response_headers" | "buffered_body" | "stream_idle" | "overall",
+  bound: "phase" | "walk_budget",
+  budgetMs: number,
+  onTimeout?: (kind: string, bound: string) => void,
+): GatewayFailure {
+  onTimeout?.(kind, bound);
+  const phase = {
+    connect: "connecting to the provider",
+    response_headers: "waiting for provider response headers",
+    buffered_body: "reading the provider response body",
+    stream_idle: "waiting for the next provider stream chunk",
+    overall: "the request's failover budget",
+  }[kind];
+  const message = kind === "overall"
+    ? "transport: the request's failover budget was spent before this attempt was dispatched"
+    : bound === "walk_budget"
+      ? `transport: ${phase} exceeded the ${budgetMs}ms left of the request's failover budget`
+      : `transport: ${phase} exceeded its ${budgetMs}ms bound`;
+  const error = new GatewayFailure("upstream_timeout", 504, message);
+  error.timeoutKind = kind;
+  error.timeoutBound = bound;
+  return error;
+}
+
+function isConnectTimeout(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const cause = (error as { cause?: { code?: string } }).cause;
+  return cause?.code === "UND_ERR_CONNECT_TIMEOUT";
 }
 
 function passHeaders(headers: Headers): Headers {
@@ -448,7 +546,12 @@ function concatBytes(chunks: Uint8Array[], total: number): Uint8Array {
   return out;
 }
 
-async function readLimitedBytes(response: Response, limit: number, timeoutMs: number): Promise<Uint8Array> {
+async function readLimitedBytes(
+  response: Response,
+  limit: number,
+  budget: { ms: number; bound: "phase" | "walk_budget" },
+  onTimeout?: (kind: string, bound: string) => void,
+): Promise<Uint8Array> {
   if (response.body === null) {
     return new Uint8Array();
   }
@@ -457,10 +560,21 @@ async function readLimitedBytes(response: Response, limit: number, timeoutMs: nu
   let total = 0;
   const started = Date.now();
   for (;;) {
-    if (Date.now() - started > timeoutMs) {
-      throw timeout("reading the provider response body", timeoutMs);
+    const remaining = budget.ms - (Date.now() - started);
+    if (remaining <= 0) {
+      await reader.cancel().catch(() => undefined);
+      throw timeoutFailure("buffered_body", budget.bound, budget.ms, onTimeout);
     }
-    const chunk = await reader.read();
+    const pending = reader.read();
+    const chunk = await Promise.race([
+      pending,
+      delay(remaining).then(() => "timeout" as const),
+    ]);
+    if (chunk === "timeout") {
+      pending.catch(() => undefined);
+      await reader.cancel().catch(() => undefined);
+      throw timeoutFailure("buffered_body", budget.bound, budget.ms, onTimeout);
+    }
     if (chunk.done) {
       break;
     }

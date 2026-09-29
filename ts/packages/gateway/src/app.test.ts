@@ -375,6 +375,9 @@ namespace = "platform"
   assert.deepEqual(loaded.shutdown, { drainGraceMs: 5_000, deadlineMs: 15_000, flushTimeoutMs: 5_000 });
   assert.equal(loaded.transport.maxResponseBytes, 32 * 1024 * 1024);
   assert.equal(loaded.transport.maxErrorBytes, 64 * 1024);
+  assert.equal(loaded.transport.connectTimeoutMs, 5_000);
+  assert.equal(loaded.transport.streamTerminalGraceMs, 1_000);
+  assert.equal(loaded.transport.overallTimeoutMs, 30_000);
   assert.equal(loaded.maxRequestBytes, 2 * 1024 * 1024);
   assert.equal(loaded.maxPromptTokens, 1_000_000);
   assert.equal(loaded.maxOutputTokens, 200_000);
@@ -404,6 +407,28 @@ namespace = "platform"
       ),
     (error: unknown) => {
       assert.match(error instanceof Error ? error.message : "", /shutdown\.deadline_ms must be at least 1/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${toml}\n[transport]\nconnect_timeout_ms = 0\n`,
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /transport\.connect_timeout_ms must be at least 1/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${toml}\n[failover]\noverall_timeout_ms = 0\n`,
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /failover\.overall_timeout_ms must be at least 1/);
       return true;
     },
   );

@@ -11,6 +11,10 @@ export class GatewayFailure extends Error {
   readonly status: number;
   /** A provider 429. This parks the credential. A 5xx does not. */
   readonly rateLimited: boolean;
+  /** Which wait ran out, when `type` is `upstream_timeout`. */
+  timeoutKind: "connect" | "response_headers" | "buffered_body" | "stream_idle" | "overall" | null = null;
+  /** Whose budget ended that wait. */
+  timeoutBound: "phase" | "walk_budget" | null = null;
 
   constructor(type: string, status: number, message: string, rateLimited = false) {
     super(message);

@@ -299,6 +299,11 @@ export interface AxondOptions {
     failureThreshold?: number;
     cooldownMs?: number;
   };
+  /**
+   * Node HTTP client that enforces `transport.connectTimeoutMs`. Workers and
+   * the Bun binary omit it; their header and failover budgets still bound the attempt.
+   */
+  upstreamDispatcher?: object;
 }
 
 export interface ProviderConfig {
@@ -337,6 +342,18 @@ export interface TransportLimits {
    * A larger body is truncated. Absent uses 65536.
    */
   maxErrorBytes?: number;
+  /** TCP connect bound. Absent uses 5000. Enforced when `upstreamDispatcher` is set. */
+  connectTimeoutMs?: number;
+  /**
+   * How long a byte-faithful stream may stay open after its terminal event.
+   * Absent uses 1000. Trailing bytes inside the grace are relayed.
+   */
+  streamTerminalGraceMs?: number;
+  /**
+   * Failover walk budget from `failover.overall_timeout_ms`. Absent uses 30000.
+   * It tightens the header and buffered-body waits and does not cut an open stream.
+   */
+  overallTimeoutMs?: number;
 }
 
 export interface UsageRecord {

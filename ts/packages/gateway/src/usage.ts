@@ -86,6 +86,56 @@ function pointer(record: Record<string, unknown>, path: readonly string[]): bigi
   return asBig(current);
 }
 
+/**
+ * A complete SSE frame is the provider's semantic end of the answer.
+ * Chat ends at a data-only `[DONE]`. Responses ends at `response.completed`
+ * with `status=completed`. Messages ends at `message_stop`.
+ */
+export function sseTerminalSeen(route: string, text: string): boolean {
+  const parts = text.split(/\n\n|\r\n\r\n/);
+  const ended = text.endsWith("\n\n") || text.endsWith("\r\n\r\n");
+  const frames = (ended ? parts : parts.slice(0, -1)).filter((frame) => frame.length > 0);
+  return frames.some((frame) => frameIsTerminal(route, frame));
+}
+
+function frameIsTerminal(route: string, frame: string): boolean {
+  let event: string | null = null;
+  const dataLines: string[] = [];
+  for (const line of frame.split(/\r?\n/)) {
+    if (line.startsWith("event:")) {
+      event = line.slice(6).replace(/^ /, "");
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).replace(/^ /, ""));
+    }
+  }
+  const data = dataLines.join("\n");
+  if (data.trim() === "[DONE]") {
+    return route !== "responses" || event === null;
+  }
+  if (route === "responses") {
+    if (event !== null && event !== "response.completed") {
+      return false;
+    }
+    try {
+      const parsed = JSON.parse(data) as { type?: string; response?: { status?: string } };
+      return parsed.type === "response.completed" && parsed.response?.status === "completed";
+    } catch {
+      return false;
+    }
+  }
+  if (route === "messages") {
+    if (event !== "message_stop") {
+      return false;
+    }
+    try {
+      return (JSON.parse(data) as { type?: string }).type === "message_stop";
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 /** Fold usage out of an SSE stream without modifying the bytes the caller sees. */
 export function noteSseChunk(route: string, usage: UsageTokens, text: string): void {
   for (const frame of text.split(/\n\n|\r\n\r\n/)) {

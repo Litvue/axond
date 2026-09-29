@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
+import { Agent } from "undici";
 
 import { createAxond } from "./app.ts";
 import { createMemoryStore } from "./memory-store.ts";
+import { createMetrics } from "./metrics.ts";
 import type { Store } from "@axond/sdk";
 
 const KEY = "test-inbound-key";
@@ -486,8 +488,203 @@ test("a header timeout is upstream_timeout", async () => {
   assert.equal(response.status, 504);
   const body = await response.json();
   assert.equal(body.error.type, "upstream_timeout");
-  assert.match(body.error.message, /80ms/);
+  assert.match(body.error.message, /exceeded its 80ms bound/);
   upstream.close();
+});
+
+test("a tighter failover budget ends the header wait", async () => {
+  const store = await seeded();
+  const metrics = createMetrics([]);
+  const upstream = await listen(() => {
+    // Never writes a response.
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    metrics,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 5_000,
+      bufferedBodyTimeoutMs: 5_000,
+      streamIdleTimeoutMs: 5_000,
+      maxResponseBytes: 1024,
+      overallTimeoutMs: 50,
+    },
+  });
+  const started = Date.now();
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(response.status, 504);
+    const body = await response.json();
+    assert.equal(body.error.type, "upstream_timeout");
+    assert.match(body.error.message, /left of the request's failover budget/);
+    assert.ok(Date.now() - started < 1_000);
+    const point = metrics.points?.find((item) => item.name === "axond.upstream.timeouts");
+    assert.equal(point?.attributes["axond.timeout"], "response_headers");
+    assert.equal(point?.attributes["axond.timeout.bound"], "walk_budget");
+  } finally {
+    upstream.close();
+  }
+});
+
+test("a spent failover budget does not open the next credential", async () => {
+  const store = await seeded();
+  let now = 1_000;
+  let hits = 0;
+  const upstream = await listen((_req, res) => {
+    hits += 1;
+    now = 1_050;
+    res.writeHead(429, { "content-type": "application/json" });
+    res.end('{"error":{"message":"slow down"}}');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    clock: () => now,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [
+      { namespace: "platform", provider: "fake-openai", secret: "bad-key", id: "bad" },
+      { namespace: "platform", provider: "fake-openai", secret: "good-key", id: "good" },
+    ],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 5_000,
+      bufferedBodyTimeoutMs: 5_000,
+      streamIdleTimeoutMs: 5_000,
+      maxResponseBytes: 1024,
+      overallTimeoutMs: 40,
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(response.status, 504);
+    const body = await response.json();
+    assert.equal(body.error.type, "upstream_timeout");
+    assert.match(body.error.message, /failover budget was spent before this attempt was dispatched/);
+    assert.equal(hits, 1);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("post-terminal stream grace closes an open body", async () => {
+  const store = await seeded();
+  const completed =
+    'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}\n\n';
+  const tail = 'event: provider.extension\ndata: {"type":"provider.extension"}\n\n';
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(completed);
+    setTimeout(() => {
+      res.write(tail);
+    }, 20).unref?.();
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 1_000,
+      bufferedBodyTimeoutMs: 1_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 80,
+      maxResponseBytes: 4096,
+    },
+  });
+  const started = Date.now();
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, input: "hi" }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), completed + tail);
+    assert.ok(Date.now() - started < 1_000);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("a connect timeout is upstream_timeout and hides the address", async () => {
+  const store = await seeded();
+  const agent = new Agent({ connectTimeout: 50, connect: { autoSelectFamily: false } });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    upstreamDispatcher: agent,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: "http://192.0.2.1:81" }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      connectTimeoutMs: 50,
+      responseHeaderTimeoutMs: 3_000,
+      bufferedBodyTimeoutMs: 1_000,
+      streamIdleTimeoutMs: 1_000,
+      maxResponseBytes: 1024,
+      overallTimeoutMs: 10_000,
+    },
+  });
+  const started = Date.now();
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(response.status, 504);
+    const body = await response.json();
+    assert.equal(body.error.type, "upstream_timeout");
+    assert.match(body.error.message, /connecting to the provider exceeded its 50ms bound/);
+    assert.equal(body.error.message.includes("192.0.2.1"), false);
+    assert.ok(Date.now() - started < 3_000);
+  } finally {
+    await agent.close();
+  }
 });
 
 test("an oversized provider error is truncated and keeps the provider status", async () => {

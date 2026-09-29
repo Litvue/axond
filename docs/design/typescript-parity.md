@@ -17,6 +17,7 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 | A provider `429` rotates to the next credential in the pool and counts toward `credential_pool.failure_threshold` (default 2). A `500` stays on that credential and does not park it. After `cooldown_seconds` (default 30) the status is `probe` and one request is allowed through; handing out that probe rearms the cooldown. A success clears the streak. Responses stay pinned to the first credential. `0` for the threshold or cooldown fails boot. | gateway |
 | Management routes and the OpenAPI 3.1 document match `ops/check-openapi.py`. | `ts/openapi.json` |
 | Withdrawn config sections fail boot by name and do not echo secret values. `transport.max_response_bytes` and `admission.max_request_bytes` load from the file; `0` is rejected. An oversized body is `413` `request_too_large` and is not echoed. `transport.max_error_bytes` (default 65536) truncates a provider error body; the provider status still reaches the caller. `0`, or a value above `max_response_bytes`, fails boot. `admission.max_prompt_tokens` (default `1000000`) and `admission.max_output_tokens` (default `200000`) load from the file; `0` disables that ceiling. Estimated input over the prompt ceiling is `413` `prompt_too_large`. A requested output allowance over the output ceiling is `400` `output_limit_exceeded`. Neither message echoes the request. | config tests |
+| `failover.overall_timeout_ms` (default 30000) tightens the header and buffered-body waits. A budget already spent before the next credential is opened is `504` `upstream_timeout`. An open stream is not cut by that budget. After a terminal SSE event, `transport.stream_terminal_grace_ms` (default 1000) closes the body; bytes that arrive inside the grace are relayed. `transport.connect_timeout_ms` (default 5000) is enforced on Node. `0` fails boot. | gateway |
 
 ## Gaps, on purpose
 
@@ -29,6 +30,7 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 | Redis budget backend | Not an SDK dependency. |
 | Hot reload of config | Withdrawn. Extensions load at process start. |
 | OTLP/HTTP protobuf traces, metrics, and usage logs | OTLP/HTTP JSON traces and metrics when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. `grpc` and `http/protobuf` fail boot. Request logs are one JSON object on stdout and omit prompts, completions, and credentials. |
+| Separate connect timeout on the Bun binary and on Workers | The header and failover budgets still bound the attempt. Node applies `connect_timeout_ms` with its HTTP client. |
 
 ## Distribution
 
