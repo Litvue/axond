@@ -1200,6 +1200,88 @@ test("post-terminal stream grace closes an open body", async () => {
   }
 });
 
+test("post-terminal grace closes a hanging body and releases the stream slot", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const completed =
+    'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}\n\n';
+  let hits = 0;
+  const upstream = await listen((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(completed);
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxInFlight: 4,
+    maxInFlightStreams: 1,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 1_000,
+      bufferedBodyTimeoutMs: 1_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 80,
+      maxResponseBytes: 4096,
+    },
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  const payload = JSON.stringify({ model: "fake-openai/gpt-test", stream: true, input: "hi" });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  try {
+    const started = Date.now();
+    const first = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+      method: "POST",
+      headers,
+      body: payload,
+    });
+    assert.equal(first.status, 200);
+    assert.equal(hits, 1);
+    const shed = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+      method: "POST",
+      headers,
+      body: payload,
+    });
+    assert.equal(shed.status, 503);
+    assert.equal(shed.headers.get("retry-after"), "1");
+    const shedBody = await shed.json() as { error: { type: string } };
+    assert.equal(shedBody.error.type, "stream_capacity_exhausted");
+    assert.equal(hits, 1);
+    const text = await first.text();
+    assert.equal(text, completed);
+    assert.equal(text.includes("upstream_stream_error"), false);
+    assert.ok(Date.now() - started < 1_000);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records[0]?.status, "ok");
+    assert.equal(records[0]?.outputTokens, 1n);
+    const replacement = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+      method: "POST",
+      headers,
+      body: payload,
+    });
+    assert.equal(replacement.status, 200);
+    assert.equal(await replacement.text(), completed);
+    assert.equal(hits, 2);
+    assert.equal(records.at(-1)?.status, "ok");
+  } finally {
+    upstream.close();
+  }
+});
+
 test("a transport error after the terminal event keeps the completed body", async () => {
   const store = await seeded();
   const records: UsageRecord[] = [];
@@ -1428,6 +1510,107 @@ test("an incomplete tail after message_stop is relayed through eof", async () =>
         messages: [],
         max_tokens: 16,
       }),
+    });
+    assert.equal(response.status, 200);
+    const body = Buffer.from(await response.arrayBuffer());
+    assert.deepEqual(body, wire);
+    assert.equal(body.includes(Buffer.from("sk-live-secret")), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.outputTokens, 1n);
+  } finally {
+    upstream.close();
+  }
+});
+
+const CHAT_DONE = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\ndata: [DONE]\n\n';
+
+function chatDoneApp(store: Store, baseUrl: string, records: UsageRecord[], metrics?: ReturnType<typeof createMetrics>) {
+  return createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    metrics,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 1_000,
+      bufferedBodyTimeoutMs: 1_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 1_000,
+      maxResponseBytes: 4096,
+    },
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+}
+
+test("a transport error after [DONE] keeps the completed body", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const metrics = createMetrics();
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(CHAT_DONE, () => {
+      // Next turn: Bun drops the body if the socket resets inside this callback.
+      setTimeout(() => res.destroy(), 0);
+    });
+  });
+  const app = chatDoneApp(store, upstream.url, records, metrics);
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text, CHAT_DONE);
+    assert.equal(text.includes("upstream_stream_error"), false);
+    assert.equal(text.includes("sk-live-secret"), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.outputTokens, 1n);
+    assert.equal(metrics.points.some((point) => point.name === "axond.upstream.errors"), false);
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("an incomplete tail after [DONE] is relayed through eof", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const wire = Buffer.concat([
+    Buffer.from(CHAT_DONE),
+    Buffer.from("data: "),
+    Buffer.from([0xf0]),
+  ]);
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(wire);
+  });
+  const app = chatDoneApp(store, upstream.url, records);
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
     });
     assert.equal(response.status, 200);
     const body = Buffer.from(await response.arrayBuffer());
