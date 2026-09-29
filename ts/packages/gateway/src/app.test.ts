@@ -1141,6 +1141,36 @@ test("closed admission returns draining before authentication", async () => {
   assert.equal(rejected?.value, 2);
 });
 
+test("withdrawn routes stay unmounted", async () => {
+  const { app, upstream } = await gateway();
+  const routes = [
+    ["POST", "/v1/chat/completions"],
+    ["POST", "/v1/messages"],
+    ["POST", "/v1/embeddings"],
+    ["GET", "/v1/models"],
+    ["GET", "/v1/credentials"],
+    ["POST", "/v1/responses"],
+    ["POST", "/v1/tokens"],
+    ["GET", "/admin/v1/status"],
+    ["GET", "/admin/v1/catalogue"],
+    ["POST", "/admin/v1/bindings"],
+  ] as const;
+  try {
+    for (const [method, path] of routes) {
+      const response = await app.request(`http://127.0.0.1${path}`, {
+        method,
+        headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+        body: method === "GET" ? undefined : "{}",
+      });
+      assert.equal(response.status, 404, path);
+      assert.deepEqual(await response.json(), { error: { type: "not_found", message: "not found" } });
+    }
+    assert.equal(upstream.requests.length, 0);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("untrusted_extension_query_without_namespace_is_refused", async () => {
   const rows = [{ id: "platform" }, { id: "tenant" }];
   const store = {

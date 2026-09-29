@@ -242,6 +242,137 @@ namespace = "platform"
   }
 });
 
+test("a second signal closes admission before the drain grace ends", async () => {
+  const child = await bootShutdown({ drainGraceMs: 5_000, deadlineMs: 400, flushTimeoutMs: 400 });
+  try {
+    await waitFor(`${child.base}/healthz`);
+    const signaled = Date.now();
+    child.proc.kill("SIGTERM");
+    let ready: Response | null = null;
+    const readyUntil = Date.now() + 1_000;
+    while (Date.now() < readyUntil) {
+      ready = await fetch(`${child.base}/readyz`);
+      if (ready.status === 503) {
+        break;
+      }
+      await ready.body?.cancel();
+      await new Promise((wake) => setTimeout(wake, 20));
+    }
+    assert.ok(ready);
+    assert.equal(ready.status, 503);
+    assert.equal(await ready.text(), "draining");
+    const admitted = await fetch(`${child.base}/api/v1/namespaces`, {
+      headers: { authorization: "Bearer test-inbound-key" },
+    });
+    assert.equal(admitted.status, 200);
+    await admitted.text();
+    child.proc.kill("SIGTERM");
+    let closedAdmission = false;
+    const closedUntil = Date.now() + 1_000;
+    while (Date.now() < closedUntil) {
+      try {
+        const closed = await fetch(`${child.base}/api/v1/namespaces`, {
+          headers: { authorization: "Bearer test-inbound-key" },
+        });
+        if (closed.status === 503) {
+          assert.equal(closed.headers.get("retry-after"), "0");
+          assert.equal((await closed.json()).error.type, "draining");
+          closedAdmission = true;
+          break;
+        }
+        await closed.body?.cancel();
+      } catch {
+        closedAdmission = true;
+        break;
+      }
+      await new Promise((wake) => setTimeout(wake, 20));
+    }
+    assert.equal(closedAdmission, true);
+    const code = await Promise.race([
+      child.exited,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000)),
+    ]);
+    assert.equal(code, 0, child.log.stderr);
+    assert.ok(Date.now() - signaled < 2_500, "second signal waited out the 5000ms grace");
+  } finally {
+    await child.stop();
+  }
+});
+
+test("drain_grace_ms of 0 closes admission on the first signal", async () => {
+  const child = await bootShutdown({ drainGraceMs: 0, deadlineMs: 400, flushTimeoutMs: 400 });
+  try {
+    await waitFor(`${child.base}/healthz`);
+    const signaled = Date.now();
+    child.proc.kill("SIGTERM");
+    const code = await Promise.race([
+      child.exited,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000)),
+    ]);
+    assert.equal(code, 0, child.log.stderr);
+    assert.ok(Date.now() - signaled < 1_500);
+  } finally {
+    await child.stop();
+  }
+});
+
+async function bootShutdown(shutdown: { drainGraceMs: number; deadlineMs: number; flushTimeoutMs: number }) {
+  const dir = await mkdtemp(join(tmpdir(), "axond-shutdown-"));
+  const port = await freePort();
+  await writeFile(
+    join(dir, "axond.toml"),
+    `
+[server]
+bind = "127.0.0.1:${port}"
+
+[storage]
+backend = "sqlite"
+path = "${join(dir, "axond.sqlite")}"
+
+[shutdown]
+drain_grace_ms = ${shutdown.drainGraceMs}
+deadline_ms = ${shutdown.deadlineMs}
+flush_timeout_ms = ${shutdown.flushTimeoutMs}
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "GW_INBOUND_KEY"
+namespace = "platform"
+`,
+  );
+  const proc = spawn(BIN.pathname, {
+    env: {
+      ...process.env,
+      AXOND_CONFIG: join(dir, "axond.toml"),
+      GW_INBOUND_KEY: "test-inbound-key",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const log = { stderr: "" };
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    log.stderr += chunk.toString();
+  });
+  const exited = new Promise<number | null>((resolve) => {
+    proc.once("exit", (status) => resolve(status));
+  });
+  return {
+    proc,
+    log,
+    exited,
+    base: `http://127.0.0.1:${port}`,
+    stop: async () => {
+      if (proc.exitCode === null) {
+        proc.kill("SIGKILL");
+        await new Promise((done) => proc.once("exit", done));
+      }
+      await rm(dir, { recursive: true, force: true });
+    },
+  };
+}
+
 function freePort(): Promise<number> {
   return new Promise((resolve) => {
     const probe = createServer();
