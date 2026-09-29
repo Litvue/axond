@@ -1,0 +1,17 @@
+name = "axond"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# PlanetScale Postgres is reached through Hyperdrive. Disable Hyperdrive's
+# cache for this config (`wrangler hyperdrive update <id> --caching-disabled`):
+# a cached namespace or budget read can admit a deleted namespace. This
+# template was bundled with `wrangler deploy --dry-run` and was not executed
+# against PlanetScale or Cloudflare. Fill the id from `wrangler hyperdrive create`.
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "00000000000000000000000000000000"
+
+[vars]
+GATEWAY_KEY = "replace-me"
+PROVIDERS_JSON = "[]"

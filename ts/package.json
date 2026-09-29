@@ -1,0 +1,15 @@
+{
+  "name": "axond-typescript",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test $(find packages -name '*.test.ts' -print)",
+    "lint:web": "node --experimental-strip-types scripts/lint-no-node-imports.ts"
+  },
+  "engines": {
+    "node": ">=22.14"
+  }
+}

@@ -12,6 +12,15 @@ def git(*args):
     return subprocess.check_output(['git', *args], stderr=subprocess.PIPE)
 
 
+def rust_path(path):
+    """Website and TypeScript-only paths do not select the Rust lanes."""
+    if path.startswith('website/') or path == '.github/workflows/website.yml':
+        return False
+    if path.startswith('ts/') or path in {'.github/workflows/typescript.yml', 'ops/typescript-compat.sh'}:
+        return False
+    return True
+
+
 def detect(event, payload, ref):
     # Tags and explicit qualification requests always exercise the full suite.
     if event == 'workflow_dispatch' or ref.startswith('refs/tags/'):
@@ -32,7 +41,7 @@ def detect(event, payload, ref):
     # --no-renames includes both sides of a move across the website boundary.
     paths = git('diff', '--name-only', '--no-renames', '-z', base, head).decode().split('\0')
     paths = [path for path in paths if path]
-    rust = any(not (path.startswith('website/') or path == '.github/workflows/website.yml') for path in paths)
+    rust = any(rust_path(path) for path in paths)
     dependency_paths = {'Cargo.lock', 'Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml',
                         'deny.toml', '.github/workflows/ci.yml', 'ops/ci-changes.py'}
     dependencies = rust and (event != 'pull_request' or any(
@@ -94,6 +103,12 @@ def self_test():
                 pass
             else:
                 raise AssertionError('invalid diff must fail closed')
+            previous = git('rev-parse', 'HEAD').decode().strip()
+            typescript = commit('ts/packages/gateway/src/app.ts')
+            assert detect('pull_request', {'pull_request': {'base': {'sha': previous}, 'head': {'sha': typescript}}}, '') == {
+                'rust': 'false', 'dependencies': 'false'}
+            mixed = commit('crates/gateway/src/lib.rs')
+            assert detect('pull_request', {'pull_request': {'base': {'sha': previous}, 'head': {'sha': mixed}}}, '')['rust'] == 'true'
     finally:
         os.chdir(original)
     print('CI change detection passed: PR, multi-commit push, merge queue, rename, deletion, tag, manual, invalid diff')

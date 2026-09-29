@@ -1,0 +1,45 @@
+name: TypeScript
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: typescript-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gateway:
+    name: TypeScript gateway
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@48b55a011bda9f5f231285d2fc94cfd0ca16e4e6 # v6.1.0
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: |
+            ts/package-lock.json
+            tests/compat-ts/package-lock.json
+      - name: Workspace tests
+        working-directory: ts
+        run: |
+          npm ci
+          npm test
+          npm run lint:web
+          node --experimental-strip-types --disable-warning=ExperimentalWarning -e 'import { writeFile } from "node:fs/promises"; import { OPENAPI } from "./packages/gateway/src/openapi.ts"; await writeFile("openapi.json", JSON.stringify(OPENAPI));'
+      - name: OpenAPI document
+        run: python3 ops/check-openapi.py ts/openapi.json
+      - name: Python compat lane
+        run: |
+          python3 -m pip install -r tests/compat/requirements.txt
+          AXOND_BIN=ts/bin/axond python3 -m pytest tests/compat -q
+      - name: Node SDK compat lane
+        working-directory: tests/compat-ts
+        run: |
+          npm ci
+          AXOND_BIN="${{ github.workspace }}/ts/bin/axond" npm test

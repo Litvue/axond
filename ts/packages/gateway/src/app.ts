@@ -1,0 +1,811 @@
+import { Hono, type Context, type MiddlewareHandler } from "hono";
+
+import type {
+  AxondContext,
+  AxondEnv,
+  AxondExtension,
+  AxondOptions,
+  CredentialConfig,
+  ExtensionStore,
+  InferenceRoute,
+  NamespaceWrite,
+  ProviderConfig,
+  Settlement,
+  Store,
+  UsageRecord,
+  UsageTokens,
+} from "@axond/sdk";
+import { API_VERSION } from "@axond/sdk";
+
+import { assertGatewayKey, presentedCredential } from "./auth.ts";
+import { ByteRequestBody } from "./body.ts";
+import { callUpstream, noteCredentialFailure, selectCredential, type CredentialPool } from "./dispatch.ts";
+import { GatewayFailure, badRequest, gatewayError } from "./errors.ts";
+import { globMatch } from "./glob.ts";
+import { budgetJson, money, namespaceJson } from "./memory-store.ts";
+import { monthlyPeriod, namespaceFromCanonicalPath, parseNamespaceId, validatePeriod, validateTimezone } from "./namespace.ts";
+import { OPENAPI } from "./openapi.ts";
+import { costMicrodollars, lookupPrice } from "./pricing.ts";
+import { scopeStore } from "./scoped-store.ts";
+import { emptyUsage } from "./usage.ts";
+
+const DEFAULT_MAX_REQUEST = 2 * 1024 * 1024;
+
+interface MutableContext extends AxondContext {
+  hooks: ((settlement: Settlement) => Promise<void>)[];
+  resolvedIncarnation: bigint;
+  resolvedPeriod: string | null;
+  alias: string;
+}
+
+/**
+ * Mount the gateway on a Hono app. The returned app is itself a Hono app, so
+ * a host can `app.route('/', createAxond(...))`.
+ */
+export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
+  const extensions = opts.extensions ?? [];
+  for (const extension of extensions) {
+    if (extension.apiVersion !== API_VERSION) {
+      throw new Error(
+        `extension ${extension.name} apiVersion ${String(extension.apiVersion)} is not supported (want ${API_VERSION})`,
+      );
+    }
+    validateMigrations(extension);
+  }
+  const pools = new Map<string, CredentialPool>();
+  const app = new Hono<AxondEnv>();
+  app.onError((error) => {
+    if (error instanceof GatewayFailure) {
+      return gatewayError(error);
+    }
+    return gatewayError(new GatewayFailure("internal", 500, "internal error"));
+  });
+  app.notFound(() => gatewayError(new GatewayFailure("not_found", 404, "not found")));
+  app.get("/healthz", (c) => c.text("ok"));
+  app.get("/readyz", (c) => {
+    if (opts.serving && !opts.serving()) {
+      return c.text("draining", 503);
+    }
+    return c.text("ready");
+  });
+  for (const extension of extensions) {
+    if (extension.routes) {
+      app.route("/", extension.routes);
+    }
+  }
+  app.all("/api/v1/*", (c) => pipeline(c, opts, extensions, pools, "management"));
+  app.all("/ns/*", (c) => pipeline(c, opts, extensions, pools, "inference"));
+  app.all("/namespaces/*", (c) => pipeline(c, opts, extensions, pools, "inference"));
+  return app;
+}
+
+function validateMigrations(extension: AxondExtension): void {
+  const prefix = `axond_ext_${extension.name}_`;
+  for (const sql of extension.migrations ?? []) {
+    const tables = sql.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)/gi);
+    for (const match of tables) {
+      const table = match[1]!;
+      if (!table.startsWith(prefix)) {
+        throw new Error(`extension ${extension.name} migration creates \`${table}\` outside \`${prefix}\``);
+      }
+    }
+  }
+}
+
+async function pipeline(
+  c: Context<AxondEnv>,
+  opts: AxondOptions,
+  extensions: readonly AxondExtension[],
+  pools: Map<string, CredentialPool>,
+  kind: "management" | "inference",
+): Promise<Response> {
+  const axond = createContext(c, opts);
+  c.set("axond", axond);
+  try {
+  await runStage(c, "pre-auth", extensions, opts.store, async () => {
+    const key = await resolveKey(opts, c);
+    assertGatewayKey(presentedCredential(c.req.raw.headers), key, axond.authenticated);
+    if (!axond.subject) {
+      axond.subject = "gateway-key";
+    }
+    if (kind === "inference") {
+      const path = opts.rawPath?.(c) ?? new URL(c.req.url).pathname;
+      const namespaceId = namespaceFromCanonicalPath(path);
+      await bindNamespace(axond, opts, namespaceId);
+      axond.route = routeOf(path);
+    }
+    await runStage(c, "post-auth", extensions, opts.store, async () => {
+      if (kind === "management") {
+        await management(c, opts, axond);
+        return;
+      }
+      if (axond.route === "models" || axond.route === "credentials") {
+        await runStage(c, "pre-dispatch", extensions, opts.store, async () => {
+          if (axond.route === "models") {
+            await listModels(c, opts, axond);
+          } else {
+            await listCredentials(c, opts, axond);
+          }
+        });
+        return;
+      }
+      await prepareInference(c, opts, axond);
+      await runStage(c, "pre-dispatch", extensions, opts.store, async () => {
+        enforceAliasGlobs(axond);
+        await dispatch(c, opts, axond, pools);
+      });
+    });
+  });
+  } catch (error) {
+    if (error instanceof StageStop) {
+      return error.response;
+    }
+    throw error;
+  }
+  return c.res;
+}
+
+class StageStop extends Error {
+  readonly response: Response;
+
+  constructor(response: Response) {
+    super("stage stop");
+    this.response = response;
+  }
+}
+
+function createContext(c: Context<AxondEnv>, opts: AxondOptions): MutableContext {
+  const header = c.req.header("x-request-id");
+  const requestId = header && /^[A-Za-z0-9._:-]{1,128}$/.test(header) ? header : crypto.randomUUID();
+  const ctx: MutableContext = {
+    requestId,
+    route: "other",
+    body: new ByteRequestBody(c.req.raw),
+    authenticated: false,
+    hooks: [],
+    resolvedIncarnation: 1n,
+    resolvedPeriod: null,
+    alias: "",
+    store: scopeStore(opts.store, ""),
+    onSettle(fn) {
+      ctx.hooks.push(fn);
+    },
+  };
+  return ctx;
+}
+
+async function resolveKey(opts: AxondOptions, c: Context<AxondEnv>): Promise<string> {
+  return typeof opts.gatewayKey === "function" ? opts.gatewayKey(c) : opts.gatewayKey;
+}
+
+async function bindNamespace(axond: MutableContext, opts: AxondOptions, id: string): Promise<void> {
+  const resolved = await opts.store.resolveNamespace(id, opts.clock?.() ?? Date.now());
+  if (!resolved) {
+    throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+  }
+  axond.namespace = {
+    id: resolved.record.id,
+    attrs: resolved.record.attrs,
+    ...(resolved.record.blocklist === null ? {} : { blocklist: resolved.record.blocklist }),
+  };
+  axond.resolvedIncarnation = resolved.incarnation;
+  axond.resolvedPeriod = resolved.period;
+  (axond as MutableContext & { admitted?: boolean }).admitted = resolved.admitted;
+  (axond as MutableContext & { record?: NamespaceWrite }).record = resolved.record;
+}
+
+function routeOf(path: string): InferenceRoute {
+  if (path.endsWith("/chat/completions")) {
+    return "chat";
+  }
+  if (path.endsWith("/messages")) {
+    return "messages";
+  }
+  if (path.endsWith("/embeddings")) {
+    return "embeddings";
+  }
+  if (path.endsWith("/responses")) {
+    return "responses";
+  }
+  if (path.endsWith("/models")) {
+    return "models";
+  }
+  if (path.endsWith("/credentials")) {
+    return "credentials";
+  }
+  throw new GatewayFailure("not_found", 404, "not found");
+}
+
+async function runStage(
+  c: Context<AxondEnv>,
+  stage: AxondExtension["stage"],
+  extensions: readonly AxondExtension[],
+  store: Store,
+  next: () => Promise<void>,
+): Promise<void> {
+  const list = extensions.filter((extension) => extension.stage === stage);
+  let index = 0;
+  const dispatch: MiddlewareHandler["arguments"] extends never ? never : () => Promise<void> = async () => {
+    const extension = list[index];
+    index += 1;
+    if (!extension) {
+      await next();
+      return;
+    }
+    const axond = c.get("axond");
+    const namespace = axond.namespace?.id ?? "";
+    axond.store = extension.trusted ? store : scopeStore(store, namespace);
+    const result = await extension.middleware(c, dispatch);
+    if (result instanceof Response) {
+      throw new StageStop(result);
+    }
+  };
+  await dispatch();
+}
+
+async function prepareInference(c: Context<AxondEnv>, opts: AxondOptions, axond: MutableContext): Promise<void> {
+  if (c.req.method !== "POST") {
+    throw new GatewayFailure("not_found", 404, "not found");
+  }
+  const contentType = c.req.header("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) {
+    throw new GatewayFailure("unsupported_media_type", 415, "expected a `content-type: application/json` request");
+  }
+  const limit = opts.maxRequestBytes ?? DEFAULT_MAX_REQUEST;
+  const declared = c.req.header("content-length");
+  if (declared && Number(declared) > limit) {
+    throw new GatewayFailure("request_too_large", 413, "request body exceeds the configured inbound limit");
+  }
+  const bytes = await axond.body.raw();
+  if (bytes.length > limit) {
+    throw new GatewayFailure("request_too_large", 413, "request body exceeds the configured inbound limit");
+  }
+  const parsed = await axond.body.json<Record<string, unknown>>();
+  const model = parsed["model"];
+  if (typeof model !== "string" || model.length === 0) {
+    throw badRequest("missing `model`");
+  }
+  if (parsed["stream"] !== undefined && typeof parsed["stream"] !== "boolean") {
+    throw badRequest("`stream` must be a boolean when present");
+  }
+  const slash = model.indexOf("/");
+  if (slash <= 0 || slash === model.length - 1) {
+    throw new GatewayFailure("model_unprefixed", 400, `model \`${model}\` is not prefixed as \`provider-id/model-id\``);
+  }
+  const providerId = model.slice(0, slash);
+  const modelId = model.slice(slash + 1);
+  const providers = await loadProviders(opts);
+  const provider = providers.find((item) => item.id === providerId);
+  if (!provider) {
+    throw new GatewayFailure("unknown_provider", 400, `unknown provider \`${providerId}\``);
+  }
+  const extra = axond.namespace?.blocklist ?? [];
+  const blocked = [...(opts.blocklist ?? []), ...extra];
+  if (blocked.some((pattern) => globMatch(pattern, model) || globMatch(pattern, modelId))) {
+    throw new GatewayFailure("model_blocked", 400, `model \`${model}\` is blocked`);
+  }
+  const wireOk =
+    axond.route === "messages"
+      ? provider.kind === "anthropic"
+      : provider.kind === "openai" || provider.kind === "openai-compatible";
+  if (!wireOk) {
+    throw new GatewayFailure(
+      "unsupported_wire",
+      400,
+      `model \`${model}\` cannot serve ${routeLabel(axond.route)}: provider \`${provider.id}\` does not speak that wire`,
+    );
+  }
+  const price = lookupPrice(opts.prices ?? [], provider.id, modelId);
+  if (!price && provider.unpricedModels !== "allow") {
+    throw new GatewayFailure("unpriced_model", 400, `model \`${model}\` has no price`);
+  }
+  const record = (axond as MutableContext & { record?: NamespaceWrite }).record;
+  const admitted = (axond as MutableContext & { admitted?: boolean }).admitted;
+  if (!admitted) {
+    throw new GatewayFailure("budget_exceeded", 429, `budget exceeded for model \`${model}\``);
+  }
+  axond.alias = model;
+  axond.target = { provider: provider.id, model: modelId };
+  axond.body.setModel(modelId);
+  (axond as MutableContext & { provider?: ProviderConfig; priced?: boolean }).provider = provider;
+  (axond as MutableContext & { priced?: boolean }).priced = Boolean(price);
+  void record;
+}
+
+function routeLabel(route: InferenceRoute | "management" | "other"): string {
+  switch (route) {
+    case "chat":
+      return "/v1/chat/completions";
+    case "messages":
+      return "/v1/messages";
+    case "embeddings":
+      return "/v1/embeddings";
+    case "responses":
+      return "/v1/responses";
+    default:
+      return route;
+  }
+}
+
+function enforceAliasGlobs(axond: MutableContext): void {
+  if (!axond.aliasGlobs) {
+    return;
+  }
+  if (!axond.aliasGlobs.some((pattern) => globMatch(pattern, axond.alias))) {
+    throw new GatewayFailure("token_scope_insufficient", 403, `token scope does not authorize \`${axond.route}\``);
+  }
+}
+
+async function dispatch(
+  c: Context<AxondEnv>,
+  opts: AxondOptions,
+  axond: MutableContext,
+  pools: Map<string, CredentialPool>,
+): Promise<void> {
+  const provider = (axond as MutableContext & { provider: ProviderConfig }).provider;
+  const record = (axond as MutableContext & { record: NamespaceWrite }).record;
+  const fallback =
+    record.allowPlatformFallback || !record.fromConfig ? opts.defaultNamespace : null;
+  const pinned = axond.route === "responses";
+  const now = opts.clock?.() ?? Date.now();
+  const matching = (opts.credentials ?? []).filter(
+    (item) => item.provider === provider.id && (item.namespace === record.id || item.namespace === fallback),
+  );
+  const own = matching.filter((item) => item.namespace === record.id);
+  const poolSize = own.length > 0 || fallback === null ? own.length : matching.length;
+  const attempts = pinned ? 1 : Math.max(poolSize, 1);
+  let upstream: Awaited<ReturnType<typeof callUpstream>> | null = null;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const credential = selectCredential(opts.credentials ?? [], pools, record.id, provider.id, fallback, pinned, now);
+    const stream = Boolean((await axond.body.json<Record<string, unknown>>())["stream"]);
+    const headers = new Headers();
+    headers.set("content-type", "application/json");
+    for (const name of ["anthropic-version", "anthropic-beta", "accept"]) {
+      const value = c.req.header(name);
+      if (value) {
+        headers.set(name, value);
+      }
+    }
+    if (provider.kind === "anthropic") {
+      headers.set("x-api-key", credential.secret);
+    } else {
+      headers.set("authorization", `Bearer ${credential.secret}`);
+    }
+    const path =
+      axond.route === "chat"
+        ? "/chat/completions"
+        : axond.route === "messages"
+          ? "/messages"
+          : axond.route === "embeddings"
+            ? "/embeddings"
+            : "/responses";
+    const url = provider.baseUrl.replace(/\/$/, "") + path;
+    const usage = emptyUsage();
+    let releaseStream: () => void = () => undefined;
+    let skipSettle = false;
+    if (stream && opts.waitUntil) {
+      const finished = new Promise<void>((resolve) => {
+        releaseStream = resolve;
+      });
+      opts.waitUntil(
+        finished.then(async () => {
+          if (!skipSettle) {
+            await settle(opts, axond, usage, "ok");
+          }
+        }),
+      );
+    }
+    try {
+      upstream = await callUpstream({
+        url,
+        headers,
+        body: (axond.body as ByteRequestBody).outgoing(),
+        transport: opts.transport ?? {
+          responseHeaderTimeoutMs: 30_000,
+          bufferedBodyTimeoutMs: 30_000,
+          streamIdleTimeoutMs: 120_000,
+          maxResponseBytes: 32 * 1024 * 1024,
+        },
+        stream,
+        route: axond.route,
+        onUsage: (next) => copyUsage(usage, next),
+        onStreamDone: () => {
+          if (stream && opts.waitUntil) {
+            releaseStream();
+            return;
+          }
+          scheduleSettle(opts, axond, usage, "ok");
+        },
+      });
+      if (!stream) {
+        scheduleSettle(opts, axond, upstream.usage, "ok");
+      }
+      break;
+    } catch (error) {
+      lastError = error;
+      skipSettle = true;
+      releaseStream();
+      const retryable =
+        error instanceof GatewayFailure &&
+        error.type === "provider_dependency_failed" &&
+        !pinned &&
+        attempt + 1 < attempts;
+      if (!retryable) {
+        throw error;
+      }
+      noteCredentialFailure(pools, record.id, provider.id, credential.id, now);
+    }
+  }
+  if (!upstream) {
+    throw lastError instanceof Error ? lastError : new GatewayFailure("no_credential", 502, "no credential");
+  }
+  c.res = upstream.response;
+}
+
+function copyUsage(target: UsageTokens, next: UsageTokens): void {
+  target.inputTokens = next.inputTokens;
+  target.outputTokens = next.outputTokens;
+  target.reasoningTokens = next.reasoningTokens;
+  target.cacheReadTokens = next.cacheReadTokens;
+  target.cacheWriteTokens = next.cacheWriteTokens;
+}
+
+function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): void {
+  const task = settle(opts, axond, usage, status);
+  if (opts.waitUntil) {
+    opts.waitUntil(task);
+  } else {
+    void task;
+  }
+}
+
+async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): Promise<void> {
+  const price = lookupPrice(opts.prices ?? [], axond.target?.provider ?? "", axond.target?.model ?? "");
+  let cost = price ? costMicrodollars(price, usage) : null;
+  if (cost !== null && axond.spendCapMicrodollars !== undefined && cost > axond.spendCapMicrodollars) {
+    cost = axond.spendCapMicrodollars;
+  }
+  const result = await opts.store.settle({
+    requestId: axond.requestId,
+    namespace: axond.namespace?.id ?? "",
+    period: axond.resolvedPeriod,
+    model: axond.alias,
+    status,
+    cost,
+    incarnation: axond.resolvedIncarnation,
+  });
+  const settlement: Settlement = {
+    requestId: axond.requestId,
+    namespace: axond.namespace?.id ?? "",
+    period: axond.resolvedPeriod,
+    model: axond.alias,
+    status,
+    costMicrodollars: cost,
+    charged: result.charged,
+    usage,
+  };
+  const record: UsageRecord = {
+    schemaVersion: 2,
+    requestId: axond.requestId,
+    namespace: settlement.namespace,
+    subject: axond.subject ?? "",
+    model: axond.alias,
+    targetProvider: axond.target?.provider ?? "",
+    targetModel: axond.target?.model ?? "",
+    status,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    reasoningTokens: usage.reasoningTokens,
+    cacheReadTokens: usage.cacheReadTokens,
+    cacheWriteTokens: usage.cacheWriteTokens,
+    costMicrodollars: cost,
+    catalogVersion: 0,
+    priceBook: null,
+    priceBookChecksum: null,
+    signerKid: null,
+  };
+  opts.onUsage?.(record);
+  for (const hook of axond.hooks) {
+    await hook(settlement);
+  }
+}
+
+async function listModels(c: Context<AxondEnv>, opts: AxondOptions, axond: MutableContext): Promise<void> {
+  const providers = await loadProviders(opts);
+  const cached = await opts.store.listProviderModels();
+  const extra = axond.namespace?.blocklist ?? [];
+  const blocked = [...(opts.blocklist ?? []), ...extra];
+  const data: { id: string; object: "model" }[] = [];
+  for (const provider of providers) {
+    const row = cached.find((item) => item.provider === provider.id);
+    const models = row && row.source === provider.baseUrl ? row.data : row?.source == null ? row?.data ?? [] : [];
+    for (const model of models) {
+      const id = model && typeof model === "object" ? (model as { id?: unknown }).id : undefined;
+      if (typeof id !== "string") {
+        continue;
+      }
+      const prefixed = `${provider.id}/${id}`;
+      if (blocked.some((pattern) => globMatch(pattern, prefixed) || globMatch(pattern, id))) {
+        continue;
+      }
+      data.push({ id: prefixed, object: "model" });
+    }
+  }
+  c.res = Response.json({ object: "list", data });
+}
+
+async function listCredentials(c: Context<AxondEnv>, opts: AxondOptions, axond: MutableContext): Promise<void> {
+  const query = new URL(c.req.url).searchParams.get("namespaces");
+  const all = query === "all";
+  if (query !== null && query !== "all") {
+    throw badRequest("invalid `namespaces` value");
+  }
+  if (all && axond.namespace?.id !== opts.defaultNamespace) {
+    throw new GatewayFailure("token_scope_insufficient", 403, "token scope does not authorize `credentials`");
+  }
+  const rows = (opts.credentials ?? []).filter((credential) => all || credential.namespace === axond.namespace?.id);
+  c.res = Response.json({
+    object: "list",
+    observed: "replica",
+    data: rows.map((credential) => ({
+      namespace: credential.namespace,
+      provider: credential.provider,
+      credential_id: credential.id,
+      source: credential.namespace === opts.defaultNamespace ? "platform" : "namespace",
+      state: "healthy",
+    })),
+  });
+}
+
+async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: MutableContext): Promise<Response | void> {
+  const url = new URL(c.req.url);
+  const path = url.pathname;
+  if (c.req.method === "GET" && path === "/api/v1/openapi.json") {
+    c.res = Response.json(OPENAPI);
+    return;
+  }
+  const budget = path.match(/^\/api\/v1\/namespaces\/([^/]+)\/budgets\/([^/]+)$/);
+  if (budget) {
+    const namespace = parseNamespaceId(decodeURIComponent(budget[1]!));
+    const period = decodeURIComponent(budget[2]!);
+    validatePeriod(period);
+    if (c.req.method === "PUT") {
+      const body = await readJson(c);
+      const limit = requiredBig(body, "limit_microdollars");
+      const row = await opts.store.putBudget(namespace, period, limit);
+      c.res = Response.json(budgetJson(row));
+      return;
+    }
+    if (c.req.method === "GET") {
+      const row = await opts.store.getBudget(namespace, period);
+      if (!row) {
+        const known = await opts.store.getNamespace(namespace);
+        throw new GatewayFailure(known ? "unknown_budget" : "unknown_namespace", 404, known ? "unknown budget" : "unknown namespace");
+      }
+      c.res = Response.json(budgetJson(row));
+      return;
+    }
+  }
+  const policy = path.match(/^\/api\/v1\/namespaces\/([^/]+)\/budget$/);
+  if (policy) {
+    const namespace = parseNamespaceId(decodeURIComponent(policy[1]!));
+    if (c.req.method === "PUT") {
+      const body = await readJson(c);
+      const cadence = body["cadence"];
+      if (cadence !== "monthly" && cadence !== "fixed") {
+        throw badRequest('cadence must be "monthly" or "fixed"');
+      }
+      const timezone = typeof body["timezone"] === "string" ? body["timezone"] : "UTC";
+      validateTimezone(timezone);
+      const period = typeof body["period"] === "string" ? body["period"] : null;
+      if (cadence === "monthly" && period) {
+        throw badRequest('period is derived for cadence "monthly"');
+      }
+      if (period) {
+        validatePeriod(period);
+      }
+      const row = await opts.store.putBudgetPolicy({
+        namespace,
+        cadence,
+        limit: requiredBig(body, "limit_microdollars"),
+        timezone,
+        period,
+        nowMs: opts.clock?.() ?? Date.now(),
+      });
+      c.res = Response.json(row);
+      return;
+    }
+    if (c.req.method === "GET") {
+      const row = await opts.store.getBudgetPolicy(namespace);
+      if (!row) {
+        const known = await opts.store.getNamespace(namespace);
+        throw new GatewayFailure(known ? "unknown_budget" : "unknown_namespace", 404, known ? "unknown budget" : "unknown namespace");
+      }
+      c.res = Response.json(row);
+      return;
+    }
+  }
+  const usage = path.match(/^\/api\/v1\/namespaces\/([^/]+)\/usage$/);
+  if (usage && c.req.method === "GET") {
+    const namespace = parseNamespaceId(decodeURIComponent(usage[1]!));
+    const period = url.searchParams.get("period");
+    if (!period) {
+      throw badRequest("`period` is required");
+    }
+    validatePeriod(period);
+    const known = await opts.store.getNamespace(namespace);
+    if (!known) {
+      throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+    }
+    const data = await opts.store.summarizeUsage(namespace, period);
+    c.res = Response.json({ namespace, period, data });
+    return;
+  }
+  if (c.req.method === "GET" && path === "/api/v1/namespaces") {
+    const limit = Number(url.searchParams.get("limit") ?? "100");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      throw badRequest("`limit` must be between 1 and 1000");
+    }
+    const page = await opts.store.listNamespaces(url.searchParams.get("cursor"), limit);
+    c.res = Response.json({
+      data: page.data.map(namespaceJson),
+      ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
+    });
+    return;
+  }
+  if (c.req.method === "POST" && path === "/api/v1/namespaces") {
+    const body = await readJson(c);
+    const id = typeof body["id"] === "string" ? body["id"] : "";
+    parseNamespaceId(id);
+    const attrs = asAttrs(body["attrs"]);
+    const blocklist = asBlocklist(body["blocklist"]);
+    const created = await opts.store.putNamespace({
+      id,
+      attrs,
+      blocklist,
+      allowPlatformFallback: true,
+      fromConfig: false,
+    });
+    if (created === "exists") {
+      throw new GatewayFailure("namespace_conflict", 409, "namespace already exists");
+    }
+    c.res = Response.json(namespaceJson({ id, attrs, blocklist, allowPlatformFallback: true, fromConfig: false }), {
+      status: 201,
+    });
+    return;
+  }
+  const one = path.match(/^\/api\/v1\/namespaces\/([^/]+)$/);
+  if (one) {
+    const id = parseNamespaceId(decodeURIComponent(one[1]!));
+    if (c.req.method === "GET") {
+      const row = await opts.store.getNamespace(id);
+      if (!row) {
+        throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+      }
+      c.res = Response.json(namespaceJson(row));
+      return;
+    }
+    if (c.req.method === "PUT") {
+      const body = await readJson(c);
+      const row = await opts.store.updateNamespace(id, asAttrs(body["attrs"]), asBlocklist(body["blocklist"]));
+      if (!row) {
+        throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+      }
+      c.res = Response.json(namespaceJson(row));
+      return;
+    }
+    if (c.req.method === "DELETE") {
+      if ((opts.configNamespaces ?? []).includes(id)) {
+        throw new GatewayFailure("namespace_conflict", 409, "namespace already exists");
+      }
+      await opts.store.deleteNamespace(id);
+      c.res = new Response(null, { status: 204 });
+      return;
+    }
+  }
+  if (c.req.method === "GET" && path === "/api/v1/providers/models") {
+    const providers = await loadProviders(opts);
+    const cached = await opts.store.listProviderModels();
+    c.res = Response.json({
+      data: providers.map((provider) => providerModelsJson(provider, cached.find((row) => row.provider === provider.id) ?? null)),
+    });
+    return;
+  }
+  const providerModels = path.match(/^\/api\/v1\/providers\/([^/]+)\/models$/);
+  if (providerModels && c.req.method === "GET") {
+    const id = decodeURIComponent(providerModels[1]!);
+    const providers = await loadProviders(opts);
+    const provider = providers.find((item) => item.id === id);
+    if (!provider) {
+      throw new GatewayFailure("unknown_provider", 400, `unknown provider \`${id}\``);
+    }
+    const row = await opts.store.getProviderModels(id);
+    c.res = Response.json(providerModelsJson(provider, row));
+    return;
+  }
+  void axond;
+  throw new GatewayFailure("not_found", 404, "not found");
+}
+
+function providerModelsJson(provider: ProviderConfig, row: { fetchedAt: string | null; stale: boolean; data: unknown[]; source: string | null } | null) {
+  const stale = row === null || row.source !== provider.baseUrl || row.stale;
+  return {
+    provider: provider.id,
+    ...(row?.fetchedAt && !stale ? { fetched_at: row.fetchedAt } : row?.fetchedAt ? { fetched_at: row.fetchedAt } : {}),
+    stale: row === null ? true : row.source !== null && row.source !== provider.baseUrl ? true : row.stale,
+    data: row?.data ?? [],
+  };
+}
+
+async function loadProviders(opts: AxondOptions): Promise<ProviderConfig[]> {
+  return typeof opts.providers === "function" ? opts.providers() : opts.providers;
+}
+
+async function readJson(c: Context<AxondEnv>): Promise<Record<string, unknown>> {
+  const contentType = c.req.header("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) {
+    throw new GatewayFailure("unsupported_media_type", 415, "expected a `content-type: application/json` request");
+  }
+  try {
+    const value = await c.req.json();
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw badRequest("malformed json");
+    }
+    return value as Record<string, unknown>;
+  } catch (error) {
+    if (error instanceof GatewayFailure) {
+      throw error;
+    }
+    throw badRequest("malformed json");
+  }
+}
+
+function requiredBig(body: Record<string, unknown>, key: string): bigint {
+  const value = body[key];
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
+    return BigInt(value);
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value)) {
+    return BigInt(value);
+  }
+  throw badRequest(`\`${key}\` must be an integer`);
+}
+
+function asAttrs(value: unknown): Record<string, unknown> {
+  if (value === undefined) {
+    return {};
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw badRequest("attrs must be an object");
+  }
+  const encoded = JSON.stringify(value);
+  if (encoded.length > 4 * 1024) {
+    throw badRequest("attrs exceeds 4096 byte limit");
+  }
+  return value as Record<string, unknown>;
+}
+
+function asBlocklist(value: unknown): string[] | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw badRequest("blocklist must be a list of strings");
+  }
+  for (const pattern of value) {
+    if (typeof pattern === "string") {
+      // Invalid globs are a request error.
+      if (![...pattern].every((char) => char === "*" || char.trim() !== "" || true)) {
+        throw badRequest("blocklist must be a list of strings");
+      }
+    }
+  }
+  return value as string[];
+}
+
+export function extensionStoreFor(store: Store, extension: AxondExtension, namespace: string): ExtensionStore {
+  return extension.trusted ? store : scopeStore(store, namespace);
+}
+
+void money;

@@ -1,0 +1,482 @@
+import { DatabaseSync } from "node:sqlite";
+
+import type {
+  BudgetLedger,
+  BudgetPolicy,
+  BudgetPolicyWrite,
+  NamespaceWrite,
+  ProviderModelCache,
+  QueryResult,
+  ResolvedNamespace,
+  SettleInput,
+  SqlValue,
+  Store,
+  UsageSummaryRow,
+} from "@axond/sdk";
+
+import { GatewayFailure } from "../../gateway/src/errors.ts";
+import { budgetJson } from "../../gateway/src/memory-store.ts";
+import { monthlyPeriod } from "../../gateway/src/namespace.ts";
+
+const SCHEMA = `
+CREATE TABLE IF NOT EXISTS axond_namespace (
+    id TEXT PRIMARY KEY NOT NULL,
+    attrs TEXT NOT NULL DEFAULT '{}',
+    blocklist TEXT,
+    allow_platform_fallback INTEGER NOT NULL DEFAULT 0,
+    from_config INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS axond_namespace_incarnation (
+    id TEXT PRIMARY KEY NOT NULL,
+    n INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS axond_store_budget (
+    namespace TEXT NOT NULL,
+    period TEXT NOT NULL,
+    limit_microdollars INTEGER NOT NULL,
+    spent_microdollars INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (namespace, period)
+);
+CREATE TABLE IF NOT EXISTS axond_store_budget_active (
+    namespace TEXT PRIMARY KEY NOT NULL,
+    period TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS axond_store_budget_cadence (
+    namespace TEXT PRIMARY KEY NOT NULL,
+    cadence TEXT NOT NULL,
+    limit_microdollars INTEGER NOT NULL,
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    period TEXT
+);
+CREATE TABLE IF NOT EXISTS axond_store_usage (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    namespace TEXT NOT NULL,
+    period TEXT,
+    model TEXT NOT NULL,
+    status TEXT NOT NULL,
+    cost_microdollars INTEGER,
+    recorded_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+);
+CREATE INDEX IF NOT EXISTS axond_store_usage_ns_period
+    ON axond_store_usage (namespace, period);
+CREATE TABLE IF NOT EXISTS axond_store_provider_models (
+    provider TEXT PRIMARY KEY NOT NULL,
+    fetched_at TEXT,
+    stale INTEGER NOT NULL,
+    models TEXT NOT NULL,
+    source TEXT
+);
+CREATE TABLE IF NOT EXISTS axond_schema_migrations (
+    id TEXT PRIMARY KEY NOT NULL,
+    applied_at INTEGER NOT NULL
+);
+`;
+
+const I64_MAX = 9223372036854775807n;
+
+export function openSqliteStore(path: string): Store {
+  const db = new DatabaseSync(path);
+  db.exec("PRAGMA journal_mode=WAL");
+  db.exec("PRAGMA busy_timeout=5000");
+  db.exec(SCHEMA);
+  let chain: Promise<unknown> = Promise.resolve();
+  const lock = <T>(fn: () => T): Promise<T> => {
+    const run = chain.then(() => fn());
+    chain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  };
+
+  const store: Store = {
+    query(sql, params = []) {
+      return lock(() => ({ rows: all(db, sql, params) }));
+    },
+    resolveNamespace(id, nowMs) {
+      return lock(() => {
+        const record = readNamespace(db, id);
+        if (!record) {
+          return null;
+        }
+        const policy = one(db, "SELECT cadence, limit_microdollars, timezone, period FROM axond_store_budget_cadence WHERE namespace = ?", [id]);
+        let period: string | null = null;
+        if (policy && policy["cadence"] === "monthly") {
+          period = monthlyPeriod(nowMs, String(policy["timezone"]));
+          db.prepare(
+            `INSERT INTO axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
+             VALUES (?, ?, ?, 0)
+             ON CONFLICT(namespace, period) DO NOTHING`,
+          ).run(id, period, policy["limit_microdollars"]);
+          db.prepare(
+            `INSERT INTO axond_store_budget_active (namespace, period) VALUES (?, ?)
+             ON CONFLICT(namespace) DO UPDATE SET period = excluded.period`,
+          ).run(id, period);
+        } else {
+          const active = one(db, "SELECT period FROM axond_store_budget_active WHERE namespace = ?", [id]);
+          period = active ? String(active["period"]) : null;
+        }
+        const incarnationRow = one(db, "SELECT n FROM axond_namespace_incarnation WHERE id = ?", [id]);
+        const incarnation = incarnationRow ? BigInt(String(incarnationRow["n"])) : 1n;
+        if (!period) {
+          return { record, period: null, limit: null, spent: null, incarnation, admitted: false } satisfies ResolvedNamespace;
+        }
+        const budget = one(
+          db,
+          "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget WHERE namespace = ? AND period = ?",
+          [id, period],
+        );
+        if (!budget) {
+          return { record, period, limit: null, spent: null, incarnation, admitted: false };
+        }
+        const limit = BigInt(String(budget["limit_microdollars"]));
+        const spent = BigInt(String(budget["spent_microdollars"]));
+        return { record, period, limit, spent, incarnation, admitted: spent < limit };
+      });
+    },
+    putNamespace(record) {
+      return lock(() => {
+        const exists = one(db, "SELECT id FROM axond_namespace WHERE id = ?", [record.id]);
+        if (exists) {
+          return "exists" as const;
+        }
+        db.prepare(
+          "INSERT INTO axond_namespace (id, attrs, blocklist, allow_platform_fallback, from_config) VALUES (?, ?, ?, ?, ?)",
+        ).run(
+          record.id,
+          JSON.stringify(record.attrs),
+          record.blocklist === null ? null : JSON.stringify(record.blocklist),
+          record.allowPlatformFallback ? 1 : 0,
+          record.fromConfig ? 1 : 0,
+        );
+        return "created" as const;
+      });
+    },
+    getNamespace(id) {
+      return lock(() => readNamespace(db, id));
+    },
+    updateNamespace(id, attrs, blocklist) {
+      return lock(() => {
+        const current = readNamespace(db, id);
+        if (!current) {
+          return null;
+        }
+        db.prepare("UPDATE axond_namespace SET attrs = ?, blocklist = ? WHERE id = ?").run(
+          JSON.stringify(attrs),
+          blocklist === null ? null : JSON.stringify(blocklist),
+          id,
+        );
+        return readNamespace(db, id);
+      });
+    },
+    deleteNamespace(id) {
+      return lock(() => {
+        const result = db.prepare("DELETE FROM axond_namespace WHERE id = ?").run(id);
+        if (Number(result.changes) === 0) {
+          return false;
+        }
+        db.prepare("DELETE FROM axond_store_budget WHERE namespace = ?").run(id);
+        db.prepare("DELETE FROM axond_store_budget_active WHERE namespace = ?").run(id);
+        db.prepare("DELETE FROM axond_store_budget_cadence WHERE namespace = ?").run(id);
+        db.prepare(
+          `INSERT INTO axond_namespace_incarnation (id, n) VALUES (?, 2)
+           ON CONFLICT(id) DO UPDATE SET n = n + 1`,
+        ).run(id);
+        return true;
+      });
+    },
+    listNamespaces(cursor, limit) {
+      return lock(() => {
+        const rows = all(
+          db,
+          "SELECT id FROM axond_namespace WHERE (? IS NULL OR id > ?) ORDER BY id LIMIT ?",
+          [cursor, cursor, limit + 1],
+        );
+        const page = rows.slice(0, limit);
+        const nextCursor = rows.length > limit ? String(page[page.length - 1]!["id"]) : null;
+        return {
+          data: page.map((row) => readNamespace(db, String(row["id"]))!),
+          nextCursor,
+        };
+      });
+    },
+    putBudget(namespace, period, limit) {
+      return lock(() => {
+        if (!readNamespace(db, namespace)) {
+          throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+        }
+        db.prepare(
+          `INSERT INTO axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
+           VALUES (?, ?, ?, 0)
+           ON CONFLICT(namespace, period) DO UPDATE SET limit_microdollars = excluded.limit_microdollars`,
+        ).run(namespace, period, limit.toString());
+        db.prepare(
+          `INSERT INTO axond_store_budget_active (namespace, period) VALUES (?, ?)
+           ON CONFLICT(namespace) DO UPDATE SET period = excluded.period`,
+        ).run(namespace, period);
+        return readBudget(db, namespace, period)!;
+      });
+    },
+    getBudget(namespace, period) {
+      return lock(() => {
+        if (!readNamespace(db, namespace)) {
+          throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+        }
+        return readBudget(db, namespace, period);
+      });
+    },
+    putBudgetPolicy(input) {
+      return lock(() => writePolicy(db, input));
+    },
+    getBudgetPolicy(namespace) {
+      return lock(() => {
+        if (!readNamespace(db, namespace)) {
+          throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+        }
+        const policy = one(db, "SELECT * FROM axond_store_budget_cadence WHERE namespace = ?", [namespace]);
+        if (!policy) {
+          return null;
+        }
+        const active = one(db, "SELECT period FROM axond_store_budget_active WHERE namespace = ?", [namespace]);
+        const period = String(active?.["period"] ?? "");
+        const budget = readBudget(db, namespace, period);
+        return policyJson(namespace, policy, budget);
+      });
+    },
+    settle(input) {
+      return lock(() => settleSqlite(db, input));
+    },
+    summarizeUsage(namespace, period) {
+      return lock(() => {
+        if (!readNamespace(db, namespace)) {
+          throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+        }
+        return all(
+          db,
+          `SELECT model, status, COUNT(*) AS count, COALESCE(SUM(cost_microdollars), 0) AS cost
+           FROM axond_store_usage WHERE namespace = ? AND period = ? GROUP BY model, status`,
+          [namespace, period],
+        ).map((row) => ({
+          model: String(row["model"]),
+          status: String(row["status"]),
+          count: Number(row["count"]),
+          cost_microdollars: Number(row["cost"]),
+        })) satisfies UsageSummaryRow[];
+      });
+    },
+    listProviderModels() {
+      return lock(() => all(db, "SELECT * FROM axond_store_provider_models", []).map(modelRow));
+    },
+    getProviderModels(provider) {
+      return lock(() => {
+        const row = one(db, "SELECT * FROM axond_store_provider_models WHERE provider = ?", [provider]);
+        return row ? modelRow(row) : null;
+      });
+    },
+    upsertProviderModels(row) {
+      return lock(() => {
+        db.prepare(
+          `INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models, source)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(provider) DO UPDATE SET fetched_at = excluded.fetched_at, stale = excluded.stale, models = excluded.models, source = excluded.source`,
+        ).run(row.provider, row.fetchedAt, row.stale ? 1 : 0, JSON.stringify(row.data), row.source);
+      });
+    },
+    markProviderModelsStale(provider) {
+      return lock(() => {
+        const current = one(db, "SELECT provider FROM axond_store_provider_models WHERE provider = ?", [provider]);
+        if (!current) {
+          db.prepare(
+            "INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models, source) VALUES (?, NULL, 1, '[]', NULL)",
+          ).run(provider);
+          return;
+        }
+        db.prepare("UPDATE axond_store_provider_models SET stale = 1 WHERE provider = ?").run(provider);
+      });
+    },
+  };
+  return store;
+}
+
+export function applyMigration(dbPath: string, id: string, sql: string): void {
+  const db = new DatabaseSync(dbPath);
+  db.exec(SCHEMA);
+  const existing = db.prepare("SELECT id FROM axond_schema_migrations WHERE id = ?").get(id);
+  if (existing) {
+    db.close();
+    return;
+  }
+  db.exec("BEGIN");
+  try {
+    db.exec(sql);
+    db.prepare("INSERT INTO axond_schema_migrations (id, applied_at) VALUES (?, ?)").run(id, Date.now());
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  } finally {
+    db.close();
+  }
+}
+
+function settleSqlite(db: DatabaseSync, input: SettleInput): { charged: boolean } {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const inserted = db
+      .prepare(
+        `INSERT INTO axond_store_usage (request_id, namespace, period, model, status, cost_microdollars)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(request_id) DO NOTHING`,
+      )
+      .run(
+        input.requestId,
+        input.namespace,
+        input.period,
+        input.model,
+        input.status,
+        input.cost === null ? null : input.cost.toString(),
+      );
+    if (Number(inserted.changes) !== 1 || input.cost === null || input.period === null) {
+      db.exec("COMMIT");
+      return { charged: false };
+    }
+    const result = db
+      .prepare(
+        `UPDATE axond_store_budget
+         SET spent_microdollars = CASE
+           WHEN spent_microdollars >= ? - ? THEN ?
+           ELSE spent_microdollars + ?
+         END
+         WHERE namespace = ? AND period = ?
+           AND EXISTS (SELECT 1 FROM axond_namespace WHERE id = ?)
+           AND COALESCE((SELECT n FROM axond_namespace_incarnation WHERE id = ?), 1) = ?`,
+      )
+      .run(
+        I64_MAX,
+        input.cost,
+        I64_MAX,
+        input.cost,
+        input.namespace,
+        input.period,
+        input.namespace,
+        input.namespace,
+        input.incarnation,
+      );
+    db.exec("COMMIT");
+    return { charged: Number(result.changes) === 1 };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function writePolicy(db: DatabaseSync, input: BudgetPolicyWrite): BudgetPolicy {
+  if (!readNamespace(db, input.namespace)) {
+    throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+  }
+  const period = input.cadence === "monthly" ? monthlyPeriod(input.nowMs, input.timezone) : input.period;
+  if (!period) {
+    throw new GatewayFailure("bad_request", 400, 'period is required for cadence "fixed"');
+  }
+  db.prepare(
+    `INSERT INTO axond_store_budget_cadence (namespace, cadence, limit_microdollars, timezone, period)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(namespace) DO UPDATE SET cadence = excluded.cadence, limit_microdollars = excluded.limit_microdollars, timezone = excluded.timezone, period = excluded.period`,
+  ).run(input.namespace, input.cadence, input.limit.toString(), input.timezone, input.cadence === "fixed" ? period : null);
+  db.prepare(
+    `INSERT INTO axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
+     VALUES (?, ?, ?, 0)
+     ON CONFLICT(namespace, period) DO UPDATE SET limit_microdollars = excluded.limit_microdollars`,
+  ).run(input.namespace, period, input.limit.toString());
+  db.prepare(
+    `INSERT INTO axond_store_budget_active (namespace, period) VALUES (?, ?)
+     ON CONFLICT(namespace) DO UPDATE SET period = excluded.period`,
+  ).run(input.namespace, period);
+  const policy = one(db, "SELECT * FROM axond_store_budget_cadence WHERE namespace = ?", [input.namespace])!;
+  return policyJson(input.namespace, policy, readBudget(db, input.namespace, period));
+}
+
+function policyJson(
+  namespace: string,
+  policy: Record<string, unknown>,
+  budget: BudgetLedger | null,
+): BudgetPolicy {
+  const spent = budget?.spent ?? 0n;
+  const limit = budget?.limit ?? BigInt(String(policy["limit_microdollars"]));
+  const view = budgetJson({
+    namespace,
+    period: budget?.period ?? "",
+    limit,
+    spent,
+    active: true,
+  });
+  return {
+    namespace,
+    cadence: policy["cadence"] === "monthly" ? "monthly" : "fixed",
+    limit_microdollars: view.limit_microdollars,
+    timezone: String(policy["timezone"]),
+    period: budget?.period ?? "",
+    spent_microdollars: view.spent_microdollars,
+    reserved_microdollars: 0,
+    remaining_microdollars: view.remaining_microdollars,
+    active: true,
+  };
+}
+
+function readBudget(db: DatabaseSync, namespace: string, period: string): BudgetLedger | null {
+  const row = one(
+    db,
+    "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget WHERE namespace = ? AND period = ?",
+    [namespace, period],
+  );
+  if (!row) {
+    return null;
+  }
+  const active = one(db, "SELECT period FROM axond_store_budget_active WHERE namespace = ?", [namespace]);
+  return {
+    namespace,
+    period,
+    limit: BigInt(String(row["limit_microdollars"])),
+    spent: BigInt(String(row["spent_microdollars"])),
+    active: active?.["period"] === period,
+  };
+}
+
+function readNamespace(db: DatabaseSync, id: string): NamespaceWrite | null {
+  const row = one(db, "SELECT * FROM axond_namespace WHERE id = ?", [id]);
+  if (!row) {
+    return null;
+  }
+  return {
+    id: String(row["id"]),
+    attrs: JSON.parse(String(row["attrs"])) as Record<string, unknown>,
+    blocklist: row["blocklist"] === null ? null : (JSON.parse(String(row["blocklist"])) as string[]),
+    allowPlatformFallback: Number(row["allow_platform_fallback"]) === 1,
+    fromConfig: Number(row["from_config"]) === 1,
+  };
+}
+
+function modelRow(row: Record<string, unknown>): ProviderModelCache {
+  return {
+    provider: String(row["provider"]),
+    fetchedAt: row["fetched_at"] === null ? null : String(row["fetched_at"]),
+    stale: Number(row["stale"]) === 1,
+    data: JSON.parse(String(row["models"])) as unknown[],
+    source: row["source"] === null ? null : String(row["source"]),
+  };
+}
+
+function one(db: DatabaseSync, sql: string, params: readonly SqlValue[]): Record<string, unknown> | null {
+  const row = db.prepare(sql).get(...params.map(bind));
+  return row ? (row as Record<string, unknown>) : null;
+}
+
+function all(db: DatabaseSync, sql: string, params: readonly SqlValue[]): Record<string, unknown>[] {
+  return db.prepare(sql).all(...params.map(bind)) as Record<string, unknown>[];
+}
+
+function bind(value: SqlValue): string | number | bigint | null {
+  return typeof value === "bigint" ? value.toString() : value;
+}
+
+export type { QueryResult };

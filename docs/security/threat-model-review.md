@@ -52,6 +52,7 @@ unnoticed one.
 | `backends/catalog.rs`, `aliases.rs`, `pricing.rs`, `[[price]]`, `/v1/models`, alias scope, wire families | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `store/`, `usage/`, `telemetry/` | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
+| `ts/packages` extension loading, `AXOND_EXTENSIONS_DIR`, Worker bundling of middleware | [TypeScript extension trust](#8-typescript-extension-trust) |
 
 A change can fire more than one trigger; a credential-delivery change that also
 adds a Postgres table fires two, and owes both sets.
@@ -370,6 +371,28 @@ stateful control plane, its principal directory, `/admin/v1`, breakglass, and
 OIDC administration no longer exist, so this trigger has no mechanism to review.
 Reintroducing an administrative surface or principal model needs a new ADR and a
 new trigger here; `admin_v1_is_unmounted` holds that the old surface stays gone.
+
+## 8. TypeScript extension trust
+
+**Fires on** a change to how `ts/` loads or trusts an extension: the stage
+order, `apiVersion`, migration prefix checks, the untrusted store scope, or
+`AXOND_EXTENSIONS_DIR`.
+
+**Regression tests.** The Rust authentication floor in section 1 still holds
+for the process operators run today. The TypeScript suite rejects an unknown
+gateway key before it reads a namespace, refuses a percent-encoded namespace
+segment without echoing it, and loads an extension file from a directory
+without rebuilding the process. Untrusted queries that omit the request
+namespace are refused. Nested-quantifier redaction patterns are refused.
+
+**Threat model and ADRs.** [ADR 0066](../adr/0066-typescript-hono-extension-contract.md)
+is the decision: extensions are operator and first-party code with no
+third-party isolation boundary. Trusted extensions see the process store.
+Untrusted ones see only the request namespace. The Rust binary's static-key
+boundary is unchanged until a later minor ships the TypeScript artifact.
+
+**Release impact.** None for the Rust release binary. The TypeScript process
+is an additional artifact.
 
 ## Recording the review
 
