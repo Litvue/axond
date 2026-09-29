@@ -285,6 +285,10 @@ export function createMemoryStore(): Store {
     },
     upsertProviderModels(row) {
       return lock(() => {
+        const current = models.get(row.provider);
+        if (current && current.source !== row.source && !current.stale) {
+          return;
+        }
         models.set(row.provider, row);
       });
     },

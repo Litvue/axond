@@ -28,3 +28,46 @@ test("discovery stores provider models and a catalogue document", async () => {
   assert.deepEqual(catalog?.data, [{ id: "openai/gpt-test" }]);
   assert.deepEqual(calls, ["http://upstream/models", "https://example.test/models.json"]);
 });
+
+test("a failed discovery keeps the last catalogue and a fresh row rejects a different source", async () => {
+  const store = createMemoryStore();
+  await store.upsertProviderModels({
+    provider: "fake-openai",
+    fetchedAt: "2026-09-29T00:00:00Z",
+    stale: false,
+    data: [{ id: "gpt-test" }],
+    source: "http://upstream",
+  });
+  await store.upsertProviderModels({
+    provider: "fake-openai",
+    fetchedAt: "2026-09-29T00:01:00Z",
+    stale: false,
+    data: [{ id: "other" }],
+    source: "http://elsewhere",
+  });
+  const kept = await store.getProviderModels("fake-openai");
+  assert.deepEqual(kept?.data, [{ id: "gpt-test" }]);
+  await discoverOnce({
+    store,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: "http://upstream" }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "s", id: "s" }],
+    catalog: { source: "none" },
+    fetchImpl: async () => {
+      throw new Error("upstream down");
+    },
+  });
+  const stale = await store.getProviderModels("fake-openai");
+  assert.equal(stale?.stale, true);
+  assert.deepEqual(stale?.data, [{ id: "gpt-test" }]);
+  assert.equal(stale?.source, "http://upstream");
+  await store.upsertProviderModels({
+    provider: "fake-openai",
+    fetchedAt: "2026-09-29T00:02:00Z",
+    stale: false,
+    data: [{ id: "other" }],
+    source: "http://elsewhere",
+  });
+  const replaced = await store.getProviderModels("fake-openai");
+  assert.deepEqual(replaced?.data, [{ id: "other" }]);
+  assert.equal(replaced?.stale, false);
+});

@@ -74,3 +74,43 @@ test("delete then recreate bumps incarnation so a late settle does not charge", 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("sqlite provider models keep the last payload and reject a different fresh source", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-"));
+  const path = join(directory, "axond.sqlite");
+  try {
+    const store = openSqliteStore(path);
+    await store.upsertProviderModels({
+      provider: "openai",
+      fetchedAt: "2026-09-29T00:00:00Z",
+      stale: false,
+      data: [{ id: "gpt-test" }],
+      source: "https://api.openai.com/v1",
+    });
+    await store.upsertProviderModels({
+      provider: "openai",
+      fetchedAt: "2026-09-29T00:01:00Z",
+      stale: false,
+      data: [{ id: "other" }],
+      source: "https://example.invalid/v1",
+    });
+    const kept = await store.getProviderModels("openai");
+    assert.deepEqual(kept?.data, [{ id: "gpt-test" }]);
+    await store.markProviderModelsStale("openai");
+    const stale = await store.getProviderModels("openai");
+    assert.equal(stale?.stale, true);
+    assert.deepEqual(stale?.data, [{ id: "gpt-test" }]);
+    await store.upsertProviderModels({
+      provider: "openai",
+      fetchedAt: "2026-09-29T00:02:00Z",
+      stale: false,
+      data: [{ id: "other" }],
+      source: "https://example.invalid/v1",
+    });
+    const replaced = await store.getProviderModels("openai");
+    assert.equal(replaced?.stale, false);
+    assert.deepEqual(replaced?.data, [{ id: "other" }]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

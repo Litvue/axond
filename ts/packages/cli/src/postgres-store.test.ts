@@ -146,3 +146,38 @@ test("applying the postgres schema twice is idempotent", { skip: !dsn }, async (
   await opened.client.query(POSTGRES_SCHEMA);
   await opened.release();
 });
+
+test("postgres provider models keep the last payload and reject a different fresh source", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  await db.upsertProviderModels({
+    provider: "openai",
+    fetchedAt: "2026-09-29T00:00:00Z",
+    stale: false,
+    data: [{ id: "gpt-test" }],
+    source: "https://api.openai.com/v1",
+  });
+  await db.upsertProviderModels({
+    provider: "openai",
+    fetchedAt: "2026-09-29T00:01:00Z",
+    stale: false,
+    data: [{ id: "other" }],
+    source: "https://example.invalid/v1",
+  });
+  const kept = await db.getProviderModels("openai");
+  assert.deepEqual(kept?.data, [{ id: "gpt-test" }]);
+  await db.markProviderModelsStale("openai");
+  const stale = await db.getProviderModels("openai");
+  assert.equal(stale?.stale, true);
+  assert.deepEqual(stale?.data, [{ id: "gpt-test" }]);
+  await db.upsertProviderModels({
+    provider: "openai",
+    fetchedAt: "2026-09-29T00:02:00Z",
+    stale: false,
+    data: [{ id: "other" }],
+    source: "https://example.invalid/v1",
+  });
+  const replaced = await db.getProviderModels("openai");
+  assert.equal(replaced?.stale, false);
+  assert.deepEqual(replaced?.data, [{ id: "other" }]);
+});

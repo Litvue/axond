@@ -102,7 +102,9 @@ SQLite inside the container.
 
 `ts/packages/worker` is the Hyperdrive template. Set the Hyperdrive id, keep
 caching disabled, and bundle the Worker with the extensions it imports. A
-compiled Bun binary loads those same extensions from disk instead.
+compiled Bun binary loads those same extensions from disk instead. A cron
+trigger (`*/5 * * * *`) runs provider discovery and catalogue import off the
+request path. A failed fetch marks the row stale and leaves the last payload.
 
 `npm run test:workerd` boots that template under workerd. It reads
 `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE` from

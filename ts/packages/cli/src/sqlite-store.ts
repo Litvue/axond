@@ -278,7 +278,9 @@ export function openSqliteStore(path: string): Store {
         db.prepare(
           `INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models, source)
            VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(provider) DO UPDATE SET fetched_at = excluded.fetched_at, stale = excluded.stale, models = excluded.models, source = excluded.source`,
+           ON CONFLICT(provider) DO UPDATE SET fetched_at = excluded.fetched_at, stale = excluded.stale, models = excluded.models, source = excluded.source
+           WHERE axond_store_provider_models.source IS NOT DISTINCT FROM excluded.source
+              OR axond_store_provider_models.stale = 1`,
         ).run(row.provider, row.fetchedAt, row.stale ? 1 : 0, JSON.stringify(row.data), row.source);
       });
     },

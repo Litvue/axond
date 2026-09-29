@@ -2,8 +2,9 @@ import { Client } from "pg";
 
 import { createAxond, createMetrics, resolveTelemetry } from "@axond/gateway";
 import { rateLimitExtension } from "@axond/rate-limit";
-import type { ProviderConfig } from "@axond/sdk";
+import type { CredentialConfig, ProviderConfig, Store } from "@axond/sdk";
 
+import { discoverOnce } from "../../cli/src/discovery.ts";
 import { createPostgresStore, POSTGRES_SCHEMA } from "../../cli/src/postgres-store.ts";
 
 export interface WorkerEnv {
@@ -13,6 +14,9 @@ export interface WorkerEnv {
   OTEL_EXPORTER_OTLP_ENDPOINT?: string;
   OTEL_EXPORTER_OTLP_PROTOCOL?: string;
   AXOND_INSTANCE_ID?: string;
+  CREDENTIALS_JSON?: string;
+  CATALOG_SOURCE?: string;
+  CATALOG_SOURCE_URL?: string;
 }
 
 interface WaitContext {
@@ -48,12 +52,17 @@ export function createHandler(env: WorkerEnv) {
     };
   });
   const providers = JSON.parse(env.PROVIDERS_JSON) as ProviderConfig[];
+  const credentials = JSON.parse(env.CREDENTIALS_JSON ?? "[]") as CredentialConfig[];
+  const catalog = workerCatalog(env);
   const telemetry = resolveTelemetry({
     endpoint: env.OTEL_EXPORTER_OTLP_ENDPOINT,
     protocol: env.OTEL_EXPORTER_OTLP_PROTOCOL,
     instanceId: env.AXOND_INSTANCE_ID,
   });
   return {
+    scheduled(ctx: WaitContext, fetchImpl?: typeof fetch): void {
+      ctx.waitUntil(discoverOnce({ store, providers, credentials, catalog, fetchImpl }));
+    },
     fetch(request: Request, ctx: WaitContext): Response | Promise<Response> {
       const app = createAxond({
         store,
@@ -75,6 +84,34 @@ export function createHandler(env: WorkerEnv) {
 
 export default {
   fetch(request: Request, env: WorkerEnv, ctx: WaitContext): Promise<Response> {
-    return createHandler(env).fetch(request, ctx);
+    return Promise.resolve(createHandler(env).fetch(request, ctx));
+  },
+  scheduled(_event: unknown, env: WorkerEnv, ctx: WaitContext): void {
+    createHandler(env).scheduled(ctx);
   },
 };
+
+function workerCatalog(env: WorkerEnv): { source: "none" | "models-dev" | "seed"; sourceUrl: string | null } {
+  const source = env.CATALOG_SOURCE === "models-dev" || env.CATALOG_SOURCE === "seed" ? env.CATALOG_SOURCE : "none";
+  return { source, sourceUrl: env.CATALOG_SOURCE_URL ?? null };
+}
+
+/** Run one discovery pass against a store the caller already opened. */
+export function discoverOnSchedule(
+  env: WorkerEnv,
+  store: Store,
+  ctx: WaitContext,
+  fetchImpl?: typeof fetch,
+): void {
+  const providers = JSON.parse(env.PROVIDERS_JSON) as ProviderConfig[];
+  const credentials = JSON.parse(env.CREDENTIALS_JSON ?? "[]") as CredentialConfig[];
+  ctx.waitUntil(
+    discoverOnce({
+      store,
+      providers,
+      credentials,
+      catalog: workerCatalog(env),
+      fetchImpl,
+    }),
+  );
+}

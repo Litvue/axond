@@ -279,7 +279,9 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
         await client.query(
           `INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models, source)
            VALUES ($1, $2, $3, $4::jsonb, $5)
-           ON CONFLICT (provider) DO UPDATE SET fetched_at = EXCLUDED.fetched_at, stale = EXCLUDED.stale, models = EXCLUDED.models, source = EXCLUDED.source`,
+           ON CONFLICT (provider) DO UPDATE SET fetched_at = EXCLUDED.fetched_at, stale = EXCLUDED.stale, models = EXCLUDED.models, source = EXCLUDED.source
+           WHERE axond_store_provider_models.source IS NOT DISTINCT FROM EXCLUDED.source
+              OR axond_store_provider_models.stale = true`,
           [row.provider, row.fetchedAt, row.stale, JSON.stringify(row.data), row.source],
         );
       });
