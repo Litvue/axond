@@ -182,7 +182,6 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
   }
   app.all("/api/v1/*", (c) => pipeline(c, opts, extensions, pools, admission, "management"));
   app.all("/ns/*", (c) => pipeline(c, opts, extensions, pools, admission, "inference"));
-  app.all("/namespaces/*", (c) => pipeline(c, opts, extensions, pools, admission, "inference"));
   return app;
 }
 

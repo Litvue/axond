@@ -1154,6 +1154,13 @@ test("withdrawn routes stay unmounted", async () => {
     ["GET", "/admin/v1/status"],
     ["GET", "/admin/v1/catalogue"],
     ["POST", "/admin/v1/bindings"],
+    ["GET", "/namespaces/platform/v1/models"],
+    ["GET", "/namespaces/platform/v1/credentials"],
+    ["POST", "/namespaces/platform/v1/chat/completions"],
+    ["POST", "/namespaces/platform/v1/messages"],
+    ["POST", "/namespaces/platform/v1/embeddings"],
+    ["POST", "/namespaces/platform/v1/responses"],
+    ["GET", "/namespaces/%70latform/v1/models"],
   ] as const;
   try {
     for (const [method, path] of routes) {

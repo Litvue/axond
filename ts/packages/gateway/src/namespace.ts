@@ -22,14 +22,12 @@ export function parseNamespaceId(input: string): string {
 }
 
 export function namespaceFromCanonicalPath(path: string): string {
-  const rest = path.startsWith("/ns/")
-    ? path.slice("/ns/".length)
-    : path.startsWith("/namespaces/")
-      ? path.slice("/namespaces/".length)
-      : null;
-  if (rest === null) {
+  // `/namespaces/{ns}` is the withdrawn ADR 0062 spelling. It is not a prefix
+  // of `/ns/`, and it is not mounted.
+  if (!path.startsWith("/ns/")) {
     throw new GatewayFailure("invalid_namespace", 400, "namespace identifier is invalid");
   }
+  const rest = path.slice("/ns/".length);
   const slash = rest.indexOf("/");
   if (slash <= 0 || slash === rest.length - 1) {
     throw new GatewayFailure("invalid_namespace", 400, "namespace identifier is invalid");

@@ -30,8 +30,8 @@ Beyond the wire round-trip on each supported route, the black-box lane proves
 several things a unit test cannot see:
 
 - **Provider-native SDK calls through a namespace.** The OpenAI clients use a
-  base URL ending in `/namespaces/platform/v1`; the Anthropic clients use one
-  ending in `/namespaces/platform`, because that SDK appends `/v1/messages`.
+  base URL ending in `/ns/platform/v1`; the Anthropic clients use one
+  ending in `/ns/platform`, because that SDK appends `/v1/messages`.
   Chat Completions, Responses, embeddings, models, messages, and both SDKs'
   streaming helpers remain native calls with their native response types. Each
   contract also runs through the legacy stateless base URL during its documented
