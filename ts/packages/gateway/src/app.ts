@@ -36,6 +36,7 @@ import { beginTrace, childTrace, formatTraceparent, metricPayload, postOtlp, res
 import { sanitizeAttributes } from "./metrics.ts";
 import { OPENAPI } from "./openapi.ts";
 import { costMicrodollars, lookupPrice } from "./pricing.ts";
+import { parseCredentialQuery, rawSearch } from "./query.ts";
 import { scopeStore } from "./scoped-store.ts";
 import { emptyUsage } from "./usage.ts";
 
@@ -982,7 +983,7 @@ async function listCredentials(
   axond: MutableContext,
   pools: Map<string, CredentialPool>,
 ): Promise<void> {
-  const query = new URL(c.req.url).searchParams.get("namespaces");
+  const query = parseCredentialQuery(rawSearch(c.req.url));
   const all = query === "all";
   if (query !== null && query !== "all") {
     throw badRequest("invalid `namespaces` value");

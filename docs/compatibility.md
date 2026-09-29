@@ -45,7 +45,9 @@ not served. Management is `/api/v1`. `/admin/v1` is unmounted.
 The one static `[[gateway_key]]` authenticates every `/api/v1` and `/ns/...`
 route. Minted `axt1.` tokens are `401`. The all-namespaces credential view
 (`?namespaces=all`) is admitted only for that key when its configured
-`namespace` is the file default namespace.
+`namespace` is the file default namespace. A repeated `namespaces` parameter
+is `400` `bad_request`, as is a query component that is not percent-encoded
+UTF-8. Any other value, including an empty one, is the same `400`.
 
 `GET /admin/v1/status` is unmounted in production `serve()` ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md),
 [#438](https://github.com/Litvue/axond/pull/438)). A `diagnostic_router` helper
