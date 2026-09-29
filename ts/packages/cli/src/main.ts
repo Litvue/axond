@@ -49,6 +49,7 @@ async function main(): Promise<void> {
     instanceId: process.env["AXOND_INSTANCE_ID"],
   });
   let serving = true;
+  let admitting = true;
   const app = createAxond({
     store,
     providers: config.providers,
@@ -62,6 +63,7 @@ async function main(): Promise<void> {
     extensions,
     rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
     serving: () => serving,
+    admitting: () => admitting,
     metrics: createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []),
     telemetry: telemetry ?? undefined,
     onLog: (record) => {
@@ -112,18 +114,38 @@ async function main(): Promise<void> {
     catalog: config.catalog,
     intervalSeconds: config.discoveryIntervalSeconds,
   });
-  let stopping = false;
-  const shutdown = () => {
-    if (stopping) {
+  let phase: "serving" | "draining" | "closing" = "serving";
+  const closeAdmission = () => {
+    if (phase === "closing") {
       return;
     }
-    stopping = true;
+    phase = "closing";
+    admitting = false;
+    const deadline = setTimeout(() => {
+      server.closeAllConnections();
+      process.exit(0);
+    }, config.shutdown.deadlineMs);
+    deadline.unref();
+    server.close(() => process.exit(0));
+    server.closeIdleConnections();
+  };
+  const shutdown = () => {
+    if (phase === "closing") {
+      return;
+    }
+    if (phase === "draining") {
+      closeAdmission();
+      return;
+    }
+    phase = "draining";
     stopDiscovery();
     serving = false;
-    const force = setTimeout(() => process.exit(0), 2_000);
-    force.unref();
-    server.close(() => process.exit(0));
-    server.closeAllConnections();
+    if (config.shutdown.drainGraceMs === 0) {
+      closeAdmission();
+      return;
+    }
+    const grace = setTimeout(closeAdmission, config.shutdown.drainGraceMs);
+    grace.unref();
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);

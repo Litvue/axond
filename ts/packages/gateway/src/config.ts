@@ -58,6 +58,7 @@ export interface LoadedConfig {
   blocklist: string[];
   transport: TransportLimits;
   discoveryIntervalSeconds: number;
+  shutdown: { drainGraceMs: number; deadlineMs: number; flushTimeoutMs: number };
   catalog:
     | { source: "none" }
     | { source: "models-dev" | "seed"; sourceUrl: string | null };
@@ -253,6 +254,8 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     throw configError("discovery.refresh_interval_seconds must be at least 1");
   }
 
+  const shutdown = loadShutdown(asRecord(parsed["shutdown"]) ?? {});
+
   const extensions = asRecord(parsed["extensions"]);
   const extensionsDir = typeof extensions?.["dir"] === "string" ? extensions["dir"] : null;
 
@@ -284,9 +287,28 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     blocklist,
     transport,
     discoveryIntervalSeconds,
+    shutdown,
     catalog,
     extensionsDir,
   };
+}
+
+function loadShutdown(row: Record<string, unknown>): LoadedConfig["shutdown"] {
+  const drainGraceMs = numberField(row, "drain_grace_ms", 5_000);
+  const deadlineMs = numberField(row, "deadline_ms", 15_000);
+  const flushTimeoutMs = numberField(row, "flush_timeout_ms", 5_000);
+  if (!Number.isInteger(drainGraceMs) || drainGraceMs < 0) {
+    throw configError("shutdown.drain_grace_ms must be an integer of at least 0");
+  }
+  for (const [field, value] of [
+    ["deadline_ms", deadlineMs],
+    ["flush_timeout_ms", flushTimeoutMs],
+  ] as const) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw configError(`shutdown.${field} must be at least 1: shutdown waits are bounded`);
+    }
+  }
+  return { drainGraceMs, deadlineMs, flushTimeoutMs };
 }
 
 function assertHttpsCatalog(sourceUrl: string): void {

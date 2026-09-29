@@ -156,6 +156,82 @@ namespace = "platform"
   }
 });
 
+test("sigterm fails readiness immediately and exits after the drain window", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "axond-drain-"));
+  const port = await freePort();
+  try {
+    await writeFile(
+      join(dir, "axond.toml"),
+      `
+[server]
+bind = "127.0.0.1:${port}"
+
+[storage]
+backend = "sqlite"
+path = "${join(dir, "axond.sqlite")}"
+
+[shutdown]
+drain_grace_ms = 800
+deadline_ms = 1000
+flush_timeout_ms = 1000
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "GW_INBOUND_KEY"
+namespace = "platform"
+`,
+    );
+    const child = spawn(BIN.pathname, {
+      env: {
+        ...process.env,
+        AXOND_CONFIG: join(dir, "axond.toml"),
+        GW_INBOUND_KEY: "test-inbound-key",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    const exited = new Promise<number | null>((resolve) => {
+      child.once("exit", (status) => resolve(status));
+    });
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      await waitFor(`${base}/healthz`);
+      const signaled = Date.now();
+      child.kill("SIGTERM");
+      const ready = await fetch(`${base}/readyz`);
+      assert.equal(ready.status, 503);
+      assert.equal(await ready.text(), "draining");
+      const health = await fetch(`${base}/healthz`);
+      assert.equal(health.status, 200);
+      assert.equal(await health.text(), "ok");
+      const admitted = await fetch(`${base}/api/v1/namespaces`, {
+        headers: { authorization: "Bearer test-inbound-key" },
+      });
+      assert.equal(admitted.status, 200, stderr);
+      const code = await Promise.race([
+        exited,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 4_000)),
+      ]);
+      const elapsed = Date.now() - signaled;
+      assert.equal(code, 0, stderr);
+      assert.ok(elapsed >= 700, `exited after ${elapsed}ms, before drain_grace_ms`);
+    } finally {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+        await new Promise((done) => child.once("exit", done));
+      }
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function freePort(): Promise<number> {
   return new Promise((resolve) => {
     const probe = createServer();

@@ -6,7 +6,7 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 
 | Behavior | Evidence |
 | --- | --- |
-| `GET /healthz` is `200` `ok`. `GET /readyz` is `ready`, or `503` `draining` after SIGTERM starts shutdown. | CLI |
+| `GET /healthz` is `200` `ok`. `GET /readyz` is `ready`, or `503` `draining` as soon as SIGTERM starts shutdown. New `/api` and `/ns` requests stay admitted for `shutdown.drain_grace_ms`. Admission then closes and a request still accepted is `503` `draining` with `Retry-After: 0` before authentication. | CLI |
 | Exactly one `[[gateway_key]]`. `Authorization: Bearer` wins over `x-api-key`. Missing or wrong key is `401` `unauthorized` before namespace lookup. | compat lanes |
 | Inference is `/ns/{ns}/v1/...`. The raw path is checked before percent-decoding, so `/ns/%70latform/...` is `400` `invalid_namespace` and the identifier is not echoed. | compat lanes |
 | Unknown namespace is `404` `unknown_namespace`. Unprefixed model is `400` `model_unprefixed`. | compat lanes |

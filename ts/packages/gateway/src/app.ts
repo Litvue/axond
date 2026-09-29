@@ -169,6 +169,16 @@ async function pipeline(
   pools: Map<string, CredentialPool>,
   kind: "management" | "inference",
 ): Promise<Response> {
+  if (opts.admitting && !opts.admitting()) {
+    opts.metrics?.record("axond.shutdown.rejected_requests", 1);
+    return gatewayError(
+      new GatewayFailure(
+        "draining",
+        503,
+        "the gateway is shutting down and is no longer accepting requests",
+      ),
+    );
+  }
   const axond = createContext(c, opts);
   c.set("axond", axond);
   try {

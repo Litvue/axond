@@ -11,9 +11,10 @@ export class GatewayFailure extends Error {
 }
 
 export function gatewayError(error: GatewayFailure): Response {
+  const headers = error.type === "draining" ? { "retry-after": "0" } : undefined;
   return Response.json(
     { error: { type: error.type, message: error.message } },
-    { status: error.status },
+    { status: error.status, headers },
   );
 }
 

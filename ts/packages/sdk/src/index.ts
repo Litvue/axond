@@ -235,8 +235,13 @@ export interface AxondOptions {
   rawPath?: (c: Context<AxondEnv>) => string;
   clock?: () => number;
   onUsage?: (record: UsageRecord) => void;
-  /** When false, /readyz reports draining. */
+  /** When false, /readyz reports draining. Liveness stays ok. */
   serving?: () => boolean;
+  /**
+   * When false, new `/api` and `/ns` requests are refused before authentication.
+   * Readiness can fail while this still returns true: that is the drain window.
+   */
+  admitting?: () => boolean;
   /** Catalogue recorder. Absent means the process emits no metrics. */
   metrics?: {
     record(name: string, value: number, attributes?: Record<string, string>): void;

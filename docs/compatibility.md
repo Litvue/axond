@@ -51,7 +51,14 @@ route. Minted `axt1.` tokens are `401`. The all-namespaces credential view
 [#438](https://github.com/Litvue/axond/pull/438)). A `diagnostic_router` helper
 still exists for withdrawn-tree tests; it is not composed into the listening
 app. Ask `/readyz` for load-balancer readiness and logs/metrics for Store
-health.
+health. After `SIGTERM`, `/readyz` answers `503 draining` at once and `/healthz`
+stays `200 ok`. New `/api/v1` and `/ns` requests remain admitted for
+`shutdown.drain_grace_ms`. Admission then closes: a request the process still
+accepts is `503` with `error.type = "draining"`, `Retry-After: 0`, and the
+message `the gateway is shutting down and is no longer accepting requests`,
+before authentication. The listener stops at that point. A second termination
+signal closes admission without waiting out the grace window.
+`shutdown.drain_grace_ms = 0` closes admission on the first signal.
 
 Responses is forwarded natively with only `model` rewritten and streaming is
 byte-faithful. **Every** `/v1/responses` request — initial calls as well as ones

@@ -358,6 +358,86 @@ backend = "redis"
   );
 });
 
+test("shutdown bounds default to the rust values and reject an unbounded wait", async () => {
+  const toml = `
+[storage]
+backend = "sqlite"
+path = "/tmp/axond.sqlite"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`;
+  const loaded = await loadConfig(toml, envSecretReader({ GW_KEY: "k" }, async () => ""));
+  assert.deepEqual(loaded.shutdown, { drainGraceMs: 5_000, deadlineMs: 15_000, flushTimeoutMs: 5_000 });
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${toml}\n[shutdown]\ndeadline_ms = 0\n`,
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /shutdown\.deadline_ms must be at least 1/);
+      return true;
+    },
+  );
+});
+
+test("closed admission returns draining before authentication", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  let serving = true;
+  let admitting = true;
+  const metrics = createMetrics();
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    configNamespaces: ["platform"],
+    providers: [],
+    serving: () => serving,
+    admitting: () => admitting,
+    metrics,
+  });
+  serving = false;
+  const ready = await app.request("http://127.0.0.1/readyz");
+  assert.equal(ready.status, 503);
+  assert.equal(await ready.text(), "draining");
+  const health = await app.request("http://127.0.0.1/healthz");
+  assert.equal(health.status, 200);
+  assert.equal(await health.text(), "ok");
+  const admitted = await app.request("http://127.0.0.1/api/v1/namespaces", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(admitted.status, 200);
+  admitting = false;
+  const refused = await app.request("http://127.0.0.1/api/v1/namespaces");
+  assert.equal(refused.status, 503);
+  assert.equal(refused.headers.get("retry-after"), "0");
+  assert.deepEqual(await refused.json(), {
+    error: {
+      type: "draining",
+      message: "the gateway is shutting down and is no longer accepting requests",
+    },
+  });
+  const inference = await app.request("http://127.0.0.1/ns/platform/v1/models", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(inference.status, 503);
+  const still = await app.request("http://127.0.0.1/healthz");
+  assert.equal(await still.text(), "ok");
+  const rejected = metrics.points.find((point) => point.name === "axond.shutdown.rejected_requests");
+  assert.equal(rejected?.value, 2);
+});
+
 test("untrusted_extension_query_without_namespace_is_refused", async () => {
   const rows = [{ id: "platform" }, { id: "tenant" }];
   const store = {
