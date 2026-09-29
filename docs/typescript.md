@@ -50,8 +50,13 @@ the request namespace. Tables must be named `axond_ext_<name>_...`.
 
 `ts/packages/worker` is the Hyperdrive template. Set the Hyperdrive id, keep
 caching disabled, and bundle the Worker with the extensions it imports. A
-compiled Bun binary loads those same extensions from disk instead. Live
-PlanetScale credentials are not part of this repository's test environment.
+compiled Bun binary loads those same extensions from disk instead.
+
+`npm run test:workerd` boots that template under workerd. It reads
+`CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE` from
+`AXOND_TEST_POSTGRES`, checks `GET /healthz`, and creates a namespace through
+Postgres. That is Hyperdrive's local proxy against Postgres 16. PlanetScale
+and a Cloudflare account are not part of this repository's test environment.
 
 ## Store
 
