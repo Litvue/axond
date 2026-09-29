@@ -375,6 +375,8 @@ namespace = "platform"
   assert.deepEqual(loaded.shutdown, { drainGraceMs: 5_000, deadlineMs: 15_000, flushTimeoutMs: 5_000 });
   assert.equal(loaded.transport.maxResponseBytes, 32 * 1024 * 1024);
   assert.equal(loaded.maxRequestBytes, 2 * 1024 * 1024);
+  assert.equal(loaded.maxPromptTokens, 1_000_000);
+  assert.equal(loaded.maxOutputTokens, 200_000);
   assert.equal(loaded.storage.onUnavailable, "deny");
   const allowed = await loadConfig(
     toml.replace('path = "/tmp/axond.sqlite"', 'path = "/tmp/axond.sqlite"\non_unavailable = "allow"'),
@@ -446,6 +448,34 @@ max_request_bytes = 64
       return true;
     },
   );
+  const disabled = await loadConfig(
+    toml.replace("max_request_bytes = 64", "max_request_bytes = 64\nmax_prompt_tokens = 0\nmax_output_tokens = 0"),
+    envSecretReader({ GW_KEY: "k" }, async () => ""),
+  );
+  assert.equal(disabled.maxPromptTokens, 0);
+  assert.equal(disabled.maxOutputTokens, 0);
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("max_request_bytes = 64", "max_request_bytes = 64\nmax_prompt_tokens = -1"),
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /admission\.max_prompt_tokens must be an integer of at least 0/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("max_request_bytes = 64", "max_request_bytes = 64\nmax_output_tokens = 1.5"),
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /admission\.max_output_tokens must be an integer of at least 0/);
+      return true;
+    },
+  );
 });
 
 test("an oversized request is 413 and the body is not echoed", async () => {
@@ -475,6 +505,156 @@ test("an oversized request is 413 and the body is not echoed", async () => {
   assert.deepEqual(JSON.parse(text), {
     error: { type: "request_too_large", message: "request body exceeds the configured inbound limit" },
   });
+});
+
+test("prompt and output ceilings refuse before dispatch and do not echo the request", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxPromptTokens: 64,
+    maxOutputTokens: 16,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: "http://127.0.0.1:9" }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+  });
+  const chat = (body: unknown) =>
+    app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+  const prompt = await chat({
+    model: "fake-openai/gpt-test",
+    messages: [{ role: "user", content: "sensitive ".repeat(32) }],
+  });
+  assert.equal(prompt.status, 413);
+  const promptText = await prompt.text();
+  assert.equal(promptText.includes("sensitive"), false);
+  assert.deepEqual(JSON.parse(promptText), {
+    error: { type: "prompt_too_large", message: "prompt exceeds the configured limit of 64 tokens" },
+  });
+
+  const output = await chat({
+    model: "fake-openai/gpt-test",
+    messages: [],
+    max_tokens: 8,
+    max_completion_tokens: 4096,
+  });
+  assert.equal(output.status, 400);
+  assert.deepEqual(await output.json(), {
+    error: {
+      type: "output_limit_exceeded",
+      message: "requested output of 4096 tokens exceeds the configured limit of 16 tokens",
+    },
+  });
+
+  const spelled = await chat({
+    model: "fake-openai/gpt-test",
+    messages: [],
+    max_tokens: "many",
+    max_output_tokens: 64,
+  });
+  assert.equal(spelled.status, 400);
+  assert.deepEqual(await spelled.json(), {
+    error: {
+      type: "output_limit_exceeded",
+      message: "requested output of 64 tokens exceeds the configured limit of 16 tokens",
+    },
+  });
+
+  const atCeiling = await chat({
+    model: "fake-openai/gpt-test",
+    messages: [],
+    max_tokens: 16,
+  });
+  assert.equal(atCeiling.status, 429);
+
+  const negative = await chat({
+    model: "fake-openai/gpt-test",
+    messages: [],
+    max_tokens: -1,
+  });
+  assert.equal(negative.status, 429);
+
+  const multibyte = {
+    model: "fake-openai/gpt-test",
+    messages: [{ role: "user", content: "é".repeat(40) }],
+  };
+  const encoded = JSON.stringify(multibyte);
+  const utf8Tokens = Math.floor(new TextEncoder().encode(encoded).length / 4);
+  const utf16Tokens = Math.floor(encoded.length / 4);
+  assert.ok(utf8Tokens > utf16Tokens);
+  const bytes = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxPromptTokens: utf16Tokens,
+    maxOutputTokens: 0,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: "http://127.0.0.1:9" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+  });
+  const wide = await bytes.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: encoded,
+  });
+  assert.equal(wide.status, 413);
+  const wideText = await wide.text();
+  assert.equal(wideText.includes("é"), false);
+  assert.equal(JSON.parse(wideText).error.type, "prompt_too_large");
+
+  const off = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxPromptTokens: 0,
+    maxOutputTokens: 0,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: "http://127.0.0.1:9" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+  });
+  const disabled = await off.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "fake-openai/gpt-test",
+      messages: [{ role: "user", content: "sensitive ".repeat(32) }],
+      max_tokens: 4096,
+    }),
+  });
+  assert.equal(disabled.status, 429);
+  const disabledText = await disabled.text();
+  assert.equal(disabledText.includes("sensitive"), false);
 });
 
 test("a down budget store is budget_unavailable and a down management store is store_unavailable", async () => {

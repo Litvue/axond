@@ -32,6 +32,9 @@ import { scopeStore } from "./scoped-store.ts";
 import { emptyUsage } from "./usage.ts";
 
 const DEFAULT_MAX_REQUEST = 2 * 1024 * 1024;
+const DEFAULT_MAX_PROMPT_TOKENS = 1_000_000;
+const DEFAULT_MAX_OUTPUT_TOKENS = 200_000;
+const OUTPUT_ALLOWANCE_FIELDS = ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const;
 const requestTrace = new WeakMap<Request, TraceContext>();
 const requestAttempts = new WeakMap<Request, ExportedSpan[]>();
 
@@ -424,6 +427,7 @@ async function prepareInference(c: Context<AxondEnv>, opts: AxondOptions, axond:
   if (!price && provider.unpricedModels !== "allow") {
     throw new GatewayFailure("unpriced_model", 400, `model \`${model}\` has no price`);
   }
+  checkEstimateBounds(parsed, opts);
   const record = (axond as MutableContext & { record?: NamespaceWrite }).record;
   const admitted = (axond as MutableContext & { admitted?: boolean }).admitted;
   if (!admitted) {
@@ -435,6 +439,52 @@ async function prepareInference(c: Context<AxondEnv>, opts: AxondOptions, axond:
   (axond as MutableContext & { provider?: ProviderConfig; priced?: boolean }).provider = provider;
   (axond as MutableContext & { priced?: boolean }).priced = Boolean(price);
   void record;
+}
+
+/**
+ * Prompt ceiling compares the UTF-8 length of the parsed JSON, divided by
+ * four, with `admission.max_prompt_tokens`. Output ceiling takes the largest
+ * usable allowance spelling and refuses it rather than clamping. `0` is off.
+ * Neither message includes the request.
+ */
+function checkEstimateBounds(body: Record<string, unknown>, opts: AxondOptions): void {
+  const promptLimit = ceiling(opts.maxPromptTokens, DEFAULT_MAX_PROMPT_TOKENS);
+  if (promptLimit !== null && estimatedInputTokens(body) > promptLimit) {
+    throw new GatewayFailure(
+      "prompt_too_large",
+      413,
+      `prompt exceeds the configured limit of ${promptLimit} tokens`,
+    );
+  }
+  const outputLimit = ceiling(opts.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS);
+  const requested = requestedOutputTokens(body);
+  if (outputLimit !== null && requested !== null && requested > outputLimit) {
+    throw new GatewayFailure(
+      "output_limit_exceeded",
+      400,
+      `requested output of ${requested} tokens exceeds the configured limit of ${outputLimit} tokens`,
+    );
+  }
+}
+
+function ceiling(value: number | undefined, fallback: number): number | null {
+  const limit = value ?? fallback;
+  return limit > 0 ? limit : null;
+}
+
+function estimatedInputTokens(body: Record<string, unknown>): number {
+  return Math.floor(new TextEncoder().encode(JSON.stringify(body)).length / 4);
+}
+
+function requestedOutputTokens(body: Record<string, unknown>): number | null {
+  let largest: number | null = null;
+  for (const field of OUTPUT_ALLOWANCE_FIELDS) {
+    const value = body[field];
+    if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+      largest = largest === null ? value : Math.max(largest, value);
+    }
+  }
+  return largest;
 }
 
 function routeLabel(route: InferenceRoute | "management" | "other"): string {

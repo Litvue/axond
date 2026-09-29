@@ -278,6 +278,18 @@ export interface AxondOptions {
     trace_id: string;
   }) => void;
   maxRequestBytes?: number;
+  /**
+   * Largest estimated input, in tokens, a request may carry. `0` disables.
+   * Absent uses the shipped ceiling of 1_000_000. The estimate is the UTF-8
+   * length of the parsed JSON divided by four.
+   */
+  maxPromptTokens?: number;
+  /**
+   * Largest output allowance a request may ask for. `0` disables. Absent uses
+   * the shipped ceiling of 200_000. A larger `max_tokens`,
+   * `max_completion_tokens`, or `max_output_tokens` is refused.
+   */
+  maxOutputTokens?: number;
 }
 
 export interface ProviderConfig {

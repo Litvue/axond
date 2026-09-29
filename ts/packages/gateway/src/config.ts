@@ -70,6 +70,10 @@ export interface LoadedConfig {
     | { source: "models-dev" | "seed"; sourceUrl: string | null };
   extensionsDir: string | null;
   maxRequestBytes: number;
+  /** `0` disables the ceiling. */
+  maxPromptTokens: number;
+  /** `0` disables the ceiling. */
+  maxOutputTokens: number;
 }
 
 export interface SecretReader {
@@ -269,6 +273,14 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
   if (!Number.isInteger(maxRequestBytes) || maxRequestBytes < 1) {
     throw configError("admission.max_request_bytes must be at least 1");
   }
+  const maxPromptTokens = numberField(admissionRaw, "max_prompt_tokens", 1_000_000);
+  if (!Number.isInteger(maxPromptTokens) || maxPromptTokens < 0) {
+    throw configError("admission.max_prompt_tokens must be an integer of at least 0");
+  }
+  const maxOutputTokens = numberField(admissionRaw, "max_output_tokens", 200_000);
+  if (!Number.isInteger(maxOutputTokens) || maxOutputTokens < 0) {
+    throw configError("admission.max_output_tokens must be an integer of at least 0");
+  }
   const discovery = asRecord(parsed["discovery"]) ?? {};
   const discoveryIntervalSeconds = numberField(discovery, "refresh_interval_seconds", 300);
   if (discoveryIntervalSeconds < 1) {
@@ -312,6 +324,8 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     catalog,
     extensionsDir,
     maxRequestBytes,
+    maxPromptTokens,
+    maxOutputTokens,
   };
 }
 
