@@ -938,6 +938,9 @@ test("a split rate-limit frame before content rotates without leaking the prefix
   assert.equal(body.includes("rate_limit_exceeded"), false);
   assert.equal(body.includes('data: {"error":'), false);
   assert.deepEqual(seen, ["Bearer bad-key", "Bearer good-key"]);
+  const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
+  const rows = (await status.json()).data as { credential_id: string; state: string }[];
+  assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "healthy");
   upstream.close();
 });
 
@@ -949,7 +952,9 @@ test("a rate limit after chat content stays on that stream", async () => {
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.end('data: {"choices":[{"delta":{"content":"a"}}]}\n\ndata: {"error":{"type":"rate_limit_exceeded"}}\n\n');
   });
-  const app = poolApp(store, upstream.url);
+  const app = poolApp(store, upstream.url, {
+    credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
+  });
   const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
     method: "POST",
     headers: CHAT_HEADERS,
@@ -960,6 +965,37 @@ test("a rate limit after chat content stays on that stream", async () => {
   assert.match(body, /"content":"a"/);
   assert.match(body, /rate_limit_exceeded/);
   assert.deepEqual(seen, ["Bearer bad-key"]);
+  const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
+  const rows = (await status.json()).data as { credential_id: string; state: string }[];
+  assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "parked");
+  upstream.close();
+});
+
+test("a rate limit after the chat terminal frame does not park the credential", async () => {
+  const store = await seeded();
+  const seen: string[] = [];
+  const upstream = await listen((req, res) => {
+    seen.push(req.headers.authorization ?? "");
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end('data: {"choices":[{"delta":{"content":"a"}}]}\n\ndata: [DONE]\n\ndata: {"error":{"type":"rate_limit_exceeded"}}\n\n');
+  });
+  const app = poolApp(store, upstream.url, {
+    credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
+  });
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: CHAT_HEADERS,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /"content":"a"/);
+  assert.match(body, /\[DONE\]/);
+  assert.match(body, /rate_limit_exceeded/);
+  assert.deepEqual(seen, ["Bearer bad-key"]);
+  const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
+  const rows = (await status.json()).data as { credential_id: string; state: string }[];
+  assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "healthy");
   upstream.close();
 });
 
@@ -971,7 +1007,9 @@ test("a responses stream does not rotate on a rate-limit event", async () => {
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.end('data: {"type":"error","error":{"type":"rate_limit_exceeded"}}\n\n');
   });
-  const app = poolApp(store, upstream.url);
+  const app = poolApp(store, upstream.url, {
+    credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
+  });
   const response = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
     method: "POST",
     headers: CHAT_HEADERS,
@@ -981,6 +1019,9 @@ test("a responses stream does not rotate on a rate-limit event", async () => {
   const body = await response.text();
   assert.match(body, /rate_limit_exceeded/);
   assert.deepEqual(seen, ["Bearer bad-key"]);
+  const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
+  const rows = (await status.json()).data as { credential_id: string; state: string }[];
+  assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "parked");
   upstream.close();
 });
 
@@ -1002,6 +1043,7 @@ test("a native messages stream does not rotate on a rate-limit event", async () 
       { namespace: "platform", provider: "fake-anthropic", secret: "bad-key", id: "bad" },
       { namespace: "platform", provider: "fake-anthropic", secret: "good-key", id: "good" },
     ],
+    credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
     prices: [
       {
         provider: "fake-anthropic",
@@ -1020,5 +1062,8 @@ test("a native messages stream does not rotate on a rate-limit event", async () 
   const body = await response.text();
   assert.match(body, /rate_limit_error/);
   assert.deepEqual(seen, ["bad-key"]);
+  const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
+  const rows = (await status.json()).data as { credential_id: string; state: string }[];
+  assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "parked");
   upstream.close();
 });

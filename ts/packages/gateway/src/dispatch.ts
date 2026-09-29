@@ -224,6 +224,11 @@ export async function callUpstream(input: {
    * another upstream. Null keeps the held event and ends the stream.
    */
   onBeforeContentRateLimit?: () => Promise<Response | null>;
+  /**
+   * A rate-limit SSE event on this stream, before its terminal frame.
+   * The bytes stay on the wire. The caller records the credential failure.
+   */
+  onCredentialRateLimit?: () => void;
 }): Promise<{ response: Response; usage: UsageTokens }> {
   const transport = withTransportDefaults(input.transport);
   const now = input.now ?? Date.now;
@@ -290,7 +295,7 @@ export async function callUpstream(input: {
   const stream = relayStream(response.body, transport, input.route, usage, (reason) => {
     input.onUsage(usage);
     input.onStreamDone?.(reason);
-  }, input.onTimeout, input.onBeforeContentRateLimit);
+  }, input.onTimeout, input.onBeforeContentRateLimit, input.onCredentialRateLimit);
   const headers = passHeaders(response.headers);
   if (!headers.has("content-type")) {
     headers.set("content-type", "text/event-stream");
@@ -335,6 +340,7 @@ function relayStream(
   onDone: (reason: "end" | "cancel") => void,
   onTimeout?: (kind: string, bound: string) => void,
   onBeforeContentRateLimit?: () => Promise<Response | null>,
+  onCredentialRateLimit?: () => void,
 ): ReadableStream<Uint8Array> {
   let reader = upstream.getReader();
   const decoder = new TextDecoder();
@@ -347,6 +353,31 @@ function relayStream(
   let delegated = false;
   const held: Uint8Array[] = [];
   let heldBytes = 0;
+  let unscanned = "";
+  let rateLimitNoted = false;
+  let stopRateLimitScan = false;
+  const consider = (text: string) => {
+    if (!onCredentialRateLimit || rateLimitNoted || stopRateLimitScan || text.length === 0) {
+      return;
+    }
+    unscanned += text;
+    const parts = unscanned.split(/\n\n|\r\n\r\n/);
+    const ended = unscanned.endsWith("\n\n") || unscanned.endsWith("\r\n\r\n");
+    const complete = (ended ? parts : parts.slice(0, -1)).filter((frame) => frame.length > 0);
+    unscanned = ended ? "" : parts.at(-1) ?? "";
+    for (const frame of complete) {
+      if (sseTerminalSeen(route, `${frame}\n\n`)) {
+        stopRateLimitScan = true;
+        return;
+      }
+      const data = firstCompleteData(`${frame}\n\n`);
+      if (data && isRateLimitPayload(data)) {
+        rateLimitNoted = true;
+        onCredentialRateLimit();
+        return;
+      }
+    }
+  };
   const finish = (reason: "end" | "cancel") => {
     if (done) {
       return;
@@ -361,7 +392,7 @@ function relayStream(
   const releaseHeld = (controller: ReadableStreamDefaultController<Uint8Array>) => {
     if (held.length === 0) {
       committed = true;
-      return;
+      return "";
     }
     const merged = concatBytes(held, heldBytes);
     const text = new TextDecoder().decode(merged);
@@ -374,6 +405,7 @@ function relayStream(
     held.length = 0;
     heldBytes = 0;
     committed = true;
+    return text;
   };
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
@@ -434,10 +466,12 @@ function relayStream(
           controller.close();
           return;
         }
-        releaseHeld(controller);
+        consider(releaseHeld(controller));
         return;
       }
-      const buffered = pending + decoder.decode(value, { stream: true });
+      const piece = decoder.decode(value, { stream: true });
+      const buffered = pending + piece;
+      consider(piece);
       if (terminalAt === null && sseTerminalSeen(route, buffered)) {
         terminalAt = Date.now();
       }

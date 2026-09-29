@@ -612,6 +612,10 @@ async function dispatch(
       maxResponseBytes: 32 * 1024 * 1024,
     };
     let streamServed = true;
+    const penalizeStream = (served: CredentialConfig) => {
+      streamServed = false;
+      noteCredentialFailure(pools, record.id, provider.id, served.id, now, policy.failureThreshold);
+    };
     const finishStream = (served: CredentialConfig, reason: "end" | "cancel") => {
       if (reason === "end" && streamServed) {
         noteCredentialSuccess(pools, record.id, provider.id, served.id);
@@ -649,6 +653,7 @@ async function dispatch(
             onUsage: (next) => copyUsage(usage, next),
             onStreamDone: (reason) => finishStream(nextCredential, reason),
             onBeforeContentRateLimit: () => rotateStream(index),
+            onCredentialRateLimit: () => penalizeStream(nextCredential),
           });
           return opened.response;
         } catch (error) {
@@ -683,6 +688,7 @@ async function dispatch(
         },
         onUsage: (next) => copyUsage(usage, next),
         onStreamDone: (reason) => finishStream(credential, reason),
+        onCredentialRateLimit: stream ? () => penalizeStream(credential) : undefined,
         onBeforeContentRateLimit:
           stream && axond.route === "chat" && !pinned && planned.length > 1
             ? () => rotateStream(attempt)
