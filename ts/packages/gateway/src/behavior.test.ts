@@ -282,6 +282,18 @@ test("a stream that outlives its duration settles upstream_error for the text al
     const after = (await store.getBudget("platform", "compat"))!;
     assert.equal(after.spent - before.spent, record.costMicrodollars);
     assert.equal(metrics.points.some((point) => point.name === "axond.upstream.timeouts"), false);
+    const ttft = metrics.points.find((point) => point.name === "axond.request.time_to_first_token");
+    assert.equal(ttft?.attributes["axond.status"], "upstream_error");
+    assert.ok(ttft && ttft.value >= 0);
+    const providerTtft = metrics.points.find((point) => point.name === "axond.upstream.time_to_first_token");
+    assert.equal(providerTtft?.attributes["axond.target.provider"], "fake-openai");
+    assert.equal(providerTtft?.attributes["axond.target.model"], "gpt-test");
+    assert.equal(providerTtft?.attributes["axond.status"], undefined);
+    const errors = metrics.points.find((point) => point.name === "axond.upstream.errors");
+    assert.equal(errors?.value, 1);
+    assert.equal(errors?.attributes["axond.status"], "upstream_error");
+    assert.equal(errors?.attributes["axond.credential_source"], "platform");
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
   } finally {
     upstream.close();
   }
@@ -564,6 +576,7 @@ test("a provider failure records upstream_error and does not charge", async () =
     res.end('{"error":{"message":"down"}}');
   });
   const records: UsageRecord[] = [];
+  const metrics = createMetrics(["sk-live-secret"]);
   try {
     const app = createAxond({
       store,
@@ -571,6 +584,7 @@ test("a provider failure records upstream_error and does not charge", async () =
       defaultNamespace: "platform",
       providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url, unpricedModels: "allow" }],
       credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "cred-1" }],
+      metrics,
       onUsage: (record) => {
         records.push(record);
       },
@@ -611,10 +625,103 @@ test("a provider failure records upstream_error and does not charge", async () =
     assert.equal(summary.length, 1);
     assert.equal(summary[0]!.status, "upstream_error");
     assert.equal(summary[0]!.cost_microdollars, 0);
+    const errors = metrics.points.find((point) => point.name === "axond.upstream.errors");
+    assert.equal(errors?.value, 1);
+    assert.equal(errors?.attributes["axond.status"], "upstream_error");
+    assert.equal(metrics.points.some((point) => point.name === "axond.request.time_to_first_token"), false);
+    assert.equal(metrics.points.some((point) => point.name === "axond.upstream.time_to_first_token"), false);
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
   } finally {
     upstream.close();
   }
 });
+
+test("a split stream records request ttft before the provider event is decoded", async () => {
+  const store = await seeded();
+  const metrics = createMetrics(["sk-live-secret"]);
+  let releaseRest: () => void = () => undefined;
+  const rest = new Promise<void>((resolve) => {
+    releaseRest = resolve;
+  });
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.flushHeaders();
+    res.write('data: {"choi');
+    void rest.then(() => {
+      res.write('ces":[{"delta":{"content":"Hi"}}]}\n\n');
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1_000_000n,
+        outputMicrodollarsPerMillion: 1_000_000n,
+      },
+    ],
+    metrics,
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    assert.equal(first.done, false);
+    assert.equal(metrics.points.some((point) => point.name === "axond.upstream.time_to_first_token"), false);
+    await new Promise((wake) => setTimeout(wake, 40));
+    releaseRest();
+    const chunks: Uint8Array[] = [first.value!];
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) {
+        break;
+      }
+      chunks.push(next.value!);
+    }
+    const text = new TextDecoder().decode(concatChunks(chunks));
+    assert.equal(text.includes('{"choices":[{"delta":{"content":"Hi"}}]}'), true);
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (metrics.points.some((point) => point.name === "axond.request.time_to_first_token")) {
+        break;
+      }
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    const requestTtft = metrics.points.find((point) => point.name === "axond.request.time_to_first_token");
+    const providerTtft = metrics.points.find((point) => point.name === "axond.upstream.time_to_first_token");
+    assert.equal(requestTtft?.attributes["axond.status"], "ok");
+    assert.equal(providerTtft?.attributes["axond.target.provider"], "fake-openai");
+    assert.equal(providerTtft?.attributes["axond.target.model"], "gpt-test");
+    assert.ok(requestTtft && providerTtft && providerTtft.value >= requestTtft.value + 20);
+    assert.equal(metrics.points.some((point) => point.name === "axond.upstream.errors"), false);
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+  } finally {
+    releaseRest();
+    upstream.close();
+  }
+});
+
+function concatChunks(chunks: Uint8Array[]): Uint8Array {
+  const size = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const merged = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return merged;
+}
 
 test("two rate limits park the credential and a success clears the streak", async () => {
   const store = await seeded();

@@ -61,6 +61,8 @@ interface MutableContext extends AxondContext {
   servedCredentialId: string;
   servedCredentialSource: "platform" | "byok";
   upstreamAttempts: number;
+  /** Milliseconds to the first released provider byte. Null when no token was observed. */
+  ttftMs: number | null;
 }
 
 /**
@@ -367,6 +369,7 @@ function createContext(c: Context<AxondEnv>, opts: AxondOptions): MutableContext
     servedCredentialId: "",
     servedCredentialSource: "platform",
     upstreamAttempts: 0,
+    ttftMs: null,
     store: scopeStore(opts.store, ""),
     onSettle(fn) {
       ctx.hooks.push(fn);
@@ -694,6 +697,24 @@ async function dispatch(
   if (!Number.isInteger(targetCap) || targetCap < 1) {
     throw new GatewayFailure("bad_request", 400, "failover.max_attempts must be an integer of at least 1");
   }
+  const walkStarted = Date.now();
+  let streamClock: number | null = null;
+  let upstreamTtftRecorded = false;
+  const noteDownstreamFirstToken = (elapsedMs: number) => {
+    if (axond.ttftMs === null) {
+      axond.ttftMs = elapsedMs;
+    }
+  };
+  const noteUpstreamFirstToken = (elapsedMs: number) => {
+    if (upstreamTtftRecorded) {
+      return;
+    }
+    upstreamTtftRecorded = true;
+    opts.metrics?.record("axond.upstream.time_to_first_token", elapsedMs, {
+      "axond.target.provider": provider.id,
+      "axond.target.model": axond.target?.model ?? "",
+    });
+  };
   const headersFor = (served: CredentialConfig): Headers => {
     const built = new Headers();
     built.set("content-type", "application/json");
@@ -727,6 +748,10 @@ async function dispatch(
     }
     const headers = headersFor(credential);
     const attemptStarted = Date.now();
+    if (stream && streamClock === null) {
+      streamClock = attemptStarted;
+    }
+    const clockStartedMs = streamClock ?? attemptStarted;
     const path =
       axond.route === "chat"
         ? "/chat/completions"
@@ -802,6 +827,9 @@ async function dispatch(
             },
             onUsage: (next) => copyUsage(usage, next),
             onStreamDone: (reason) => finishStream(nextCredential, reason),
+            onDownstreamFirstToken: noteDownstreamFirstToken,
+            onUpstreamFirstToken: noteUpstreamFirstToken,
+            clockStartedMs,
             onBeforeContentRateLimit: () => rotateStream(index),
             onCredentialRateLimit: () => penalizeStream(nextCredential),
             estimatedInputTokens: estimatedInputTokens(payload),
@@ -841,6 +869,9 @@ async function dispatch(
         },
         onUsage: (next) => copyUsage(usage, next),
         onStreamDone: (reason) => finishStream(credential, reason),
+        onDownstreamFirstToken: stream ? noteDownstreamFirstToken : undefined,
+        onUpstreamFirstToken: stream ? noteUpstreamFirstToken : undefined,
+        clockStartedMs,
         onCredentialRateLimit: stream ? () => penalizeStream(credential) : undefined,
         onBeforeContentRateLimit:
           stream && axond.route === "chat" && !pinned && planned.length > 1
@@ -852,6 +883,7 @@ async function dispatch(
       });
       if (!stream) {
         noteServed(axond, opts, credential);
+        axond.ttftMs = Math.max(0, Date.now() - walkStarted);
         scheduleSettle(opts, axond, upstream.usage, "ok");
       }
       if (!stream) {
@@ -863,6 +895,9 @@ async function dispatch(
       lastError = error;
       skipSettle = true;
       releaseStream();
+      if (axond.ttftMs === null && !upstreamTtftRecorded) {
+        streamClock = null;
+      }
       noteAttempt(
         c,
         opts,
@@ -1002,10 +1037,17 @@ function recordSettlementMetrics(
     "gen_ai.request.model": axond.alias,
     "axond.target.provider": axond.target?.provider ?? "",
     "axond.target.model": axond.target?.model ?? "",
+    "axond.credential_source": axond.servedCredentialSource,
     "axond.status": status,
   };
   opts.metrics.record("axond.request.count", 1, attributes);
   opts.metrics.record("axond.request.duration", Math.max(0, Date.now() - axond.startedMs), attributes);
+  if (axond.ttftMs !== null) {
+    opts.metrics.record("axond.request.time_to_first_token", axond.ttftMs, attributes);
+  }
+  if (status === "upstream_error") {
+    opts.metrics.record("axond.upstream.errors", 1, attributes);
+  }
   opts.metrics.record("axond.tokens.input", metricNumber(usage.inputTokens), attributes);
   opts.metrics.record("axond.tokens.output", metricNumber(usage.outputTokens), attributes);
   opts.metrics.record("axond.tokens.cache_read", metricNumber(usage.cacheReadTokens), attributes);

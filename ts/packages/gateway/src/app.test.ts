@@ -160,6 +160,12 @@ test("a settled chat records request duration without the prompt", async () => {
   assert.equal(count?.attributes["gen_ai.request.model"], "fake-openai/gpt-test");
   const duration = metrics.points.find((point) => point.name === "axond.request.duration");
   assert.ok(duration && duration.value >= 0);
+  const ttft = metrics.points.find((point) => point.name === "axond.request.time_to_first_token");
+  assert.ok(ttft && ttft.value >= 0);
+  assert.equal(ttft?.attributes["axond.status"], "ok");
+  assert.equal(ttft?.attributes["axond.credential_source"], "platform");
+  assert.equal(metrics.points.some((point) => point.name === "axond.upstream.errors"), false);
+  assert.equal(metrics.points.some((point) => point.name === "axond.upstream.time_to_first_token"), false);
   const cost = metrics.points.find((point) => point.name === "axond.cost.microdollars");
   assert.equal(cost?.value, 100);
   const encoded = JSON.stringify(metrics.points);

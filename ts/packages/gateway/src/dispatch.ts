@@ -246,6 +246,15 @@ export async function callUpstream(input: {
   maxStreamDurationMs?: number | null;
   /** Upstream bytes one stream may relay. `null` disables. Absent uses 64 MiB. */
   maxStreamBytes?: number | null;
+  /**
+   * First provider byte released toward the client, measured from `clockStartedMs`.
+   * A held rate-limit frame does not count: those bytes are not released.
+   */
+  onDownstreamFirstToken?: (elapsedMs: number) => void;
+  /** First decoded SSE data event, including one that is later rotated away. */
+  onUpstreamFirstToken?: (elapsedMs: number) => void;
+  /** Start of the attempt that opened this stream. Absent starts at this call. */
+  clockStartedMs?: number;
 }): Promise<{ response: Response; usage: UsageTokens }> {
   const transport = withTransportDefaults(input.transport);
   const now = input.now ?? Date.now;
@@ -324,6 +333,9 @@ export async function callUpstream(input: {
     input.estimatedInputTokens ?? 0,
     input.maxStreamDurationMs === undefined ? 3_600_000 : input.maxStreamDurationMs,
     input.maxStreamBytes === undefined ? 64 * 1024 * 1024 : input.maxStreamBytes,
+    input.onDownstreamFirstToken,
+    input.onUpstreamFirstToken,
+    input.clockStartedMs ?? now(),
   );
   const headers = passHeaders(response.headers);
   headers.set("content-type", "text/event-stream");
@@ -373,6 +385,9 @@ function relayStream(
   estimatedInputTokens = 0,
   maxStreamDurationMs: number | null = 3_600_000,
   maxStreamBytes: number | null = 64 * 1024 * 1024,
+  onDownstreamFirstToken?: (elapsedMs: number) => void,
+  onUpstreamFirstToken?: (elapsedMs: number) => void,
+  clockStartedMs: number = Date.now(),
 ): ReadableStream<Uint8Array> {
   let reader = upstream.getReader();
   const decoder = new TextDecoder();
@@ -395,6 +410,26 @@ function relayStream(
   let rateLimitNoted = false;
   let stopRateLimitScan = false;
   let observedChars = 0;
+  let sawDownstream = false;
+  let sawUpstream = false;
+  const markDownstream = () => {
+    if (sawDownstream) {
+      return;
+    }
+    sawDownstream = true;
+    onDownstreamFirstToken?.(Math.max(0, Date.now() - clockStartedMs));
+  };
+  const markUpstream = (text: string) => {
+    if (sawUpstream) {
+      return;
+    }
+    const data = firstCompleteData(text);
+    if (data === undefined || data.length === 0 || data === "[DONE]") {
+      return;
+    }
+    sawUpstream = true;
+    onUpstreamFirstToken?.(Math.max(0, Date.now() - clockStartedMs));
+  };
   const note = (text: string) => {
     noteSseChunk(route, usage, text);
     observedChars += relayedTextChars(text);
@@ -445,6 +480,7 @@ function relayStream(
     }
     note(pending + text);
     pending = tail(pending + text);
+    markDownstream();
     controller.enqueue(merged);
     held.length = 0;
     heldBytes = 0;
@@ -474,6 +510,7 @@ function relayStream(
           controller.close();
           return;
         }
+        markDownstream();
         controller.enqueue(chunk.value);
         return;
       }
@@ -513,6 +550,7 @@ function relayStream(
         held.push(value);
         heldBytes += value.length;
         const text = new TextDecoder().decode(concatBytes(held, heldBytes));
+        markUpstream(text);
         const first = firstCompleteData(text);
         if (first === undefined && heldBytes < 64 * 1024) {
           return;
@@ -532,6 +570,7 @@ function relayStream(
               controller.close();
               return;
             }
+            markDownstream();
             controller.enqueue(chunk.value);
             return;
           }
@@ -549,8 +588,10 @@ function relayStream(
       if (terminalAt === null && sseTerminalSeen(route, buffered)) {
         terminalAt = Date.now();
       }
+      markUpstream(buffered);
       note(buffered);
       pending = tail(buffered);
+      markDownstream();
       controller.enqueue(value);
     },
     cancel(reason) {
