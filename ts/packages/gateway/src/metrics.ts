@@ -89,6 +89,10 @@ export function sanitizeAttributes(
 const MAX_LABEL = 64;
 const MAX_CARDINALITY = 200;
 
+function nameHidesSecret(name: string, secrets: readonly string[]): boolean {
+  return secrets.some((secret) => secret.length > 0 && name.includes(secret));
+}
+
 /**
  * In-process recorder. Attribute values that contain a secret or a content
  * sentinel are dropped. Extension metrics share the cardinality ceiling.
@@ -99,6 +103,9 @@ export function createMetrics(secrets: readonly string[] = []) {
   return {
     points,
     record(name: string, value: number, attributes: Record<string, string> = {}) {
+      if (nameHidesSecret(name, secrets)) {
+        return;
+      }
       if (!(METRIC_NAMES as readonly string[]).includes(name) && !name.startsWith("axond.ext.")) {
         throw new Error(`metric ${name} is not in the catalogue`);
       }
@@ -125,6 +132,9 @@ export function createMetrics(secrets: readonly string[] = []) {
       points.push(point);
     },
     set(name: string, value: number, attributes: Record<string, string> = {}) {
+      if (nameHidesSecret(name, secrets)) {
+        return;
+      }
       if (!(METRIC_NAMES as readonly string[]).includes(name) && !name.startsWith("axond.ext.")) {
         throw new Error(`metric ${name} is not in the catalogue`);
       }

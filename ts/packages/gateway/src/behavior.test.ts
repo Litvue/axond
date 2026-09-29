@@ -102,6 +102,51 @@ test("extension_migration_outside_its_prefix_is_refused", async () => {
   );
 });
 
+test("extension_metrics_stay_on_the_extension_prefix", async () => {
+  const store = await seeded();
+  const metrics = createMetrics([KEY]);
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    metrics,
+    extensions: [
+      {
+        name: "counter",
+        apiVersion: 1,
+        stage: "pre-auth",
+        async middleware(c) {
+          c.var.axond.metrics.record("axond.ext.counter.hits", 1, { token: KEY });
+          c.var.axond.metrics.set("axond.ext.counter.gauge", 3, { route: "list" });
+          c.var.axond.metrics.record(`axond.ext.counter.${KEY}`, 1);
+          assert.throws(
+            () => c.var.axond.metrics.record("axond.request.count", 1),
+            /axond\.ext\./,
+          );
+          for (let index = 0; index < 250; index += 1) {
+            c.var.axond.metrics.record("axond.ext.counter.bucket", 1, { n: String(index) });
+          }
+          return new Response("ok");
+        },
+      },
+    ],
+  });
+  const response = await app.request("http://127.0.0.1/api/v1/namespaces");
+  assert.equal(await response.text(), "ok");
+  const hit = metrics.points.find((point) => point.name === "axond.ext.counter.hits");
+  assert.ok(hit);
+  assert.equal(hit.attributes.token, undefined);
+  const gauge = metrics.points.find((point) => point.name === "axond.ext.counter.gauge");
+  assert.equal(gauge?.value, 3);
+  assert.equal(metrics.points.some((point) => point.name.includes(KEY)), false);
+  assert.ok(metrics.points.length <= 200);
+  assert.equal(
+    metrics.points.some((point) => point.name === "axond.ext.counter.bucket" && point.attributes.n === "0"),
+    true,
+  );
+  assert.equal(metrics.points.some((point) => point.attributes.n === "249"), false);
+});
+
 test("a cancelled stream still settles the delivered request", async () => {
   const store = await seeded();
   const before = (await store.getBudget("platform", "compat"))!;

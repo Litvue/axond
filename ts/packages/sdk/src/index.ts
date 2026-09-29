@@ -81,6 +81,15 @@ export interface AxondContext {
    * store.
    */
   store: ExtensionStore;
+  /**
+   * Extension-owned series. Names must start with `axond.ext.`. Catalogue
+   * names are refused. The process drops secret attribute values and new
+   * series past its cardinality ceiling.
+   */
+  metrics: {
+    record(name: string, value: number, attributes?: Record<string, string>): void;
+    set(name: string, value: number, attributes?: Record<string, string>): void;
+  };
 }
 
 export interface QueryResult {

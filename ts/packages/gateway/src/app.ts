@@ -352,6 +352,12 @@ class StageStop extends Error {
   }
 }
 
+function assertExtensionMetric(name: string): void {
+  if (!name.startsWith("axond.ext.")) {
+    throw new Error("extension metrics must be named axond.ext.<name>");
+  }
+}
+
 function createContext(c: Context<AxondEnv>, opts: AxondOptions): MutableContext {
   const header = c.req.header("x-request-id");
   const requestId = header && /^[A-Za-z0-9._:-]{1,128}$/.test(header) ? header : crypto.randomUUID();
@@ -371,6 +377,20 @@ function createContext(c: Context<AxondEnv>, opts: AxondOptions): MutableContext
     upstreamAttempts: 0,
     ttftMs: null,
     store: scopeStore(opts.store, ""),
+    metrics: {
+      record(name, value, attributes) {
+        assertExtensionMetric(name);
+        opts.metrics?.record(name, value, attributes);
+      },
+      set(name, value, attributes) {
+        assertExtensionMetric(name);
+        if (opts.metrics?.set) {
+          opts.metrics.set(name, value, attributes);
+          return;
+        }
+        opts.metrics?.record(name, value, attributes);
+      },
+    },
     onSettle(fn) {
       ctx.hooks.push(fn);
     },

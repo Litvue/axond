@@ -91,6 +91,52 @@ That runs the workspace tests, `tests/compat`, and `tests/compat-ts` with
 Trusted extensions may `query` the process store. Untrusted ones are scoped to
 the request namespace. Tables must be named `axond_ext_<name>_...`.
 
+An extension records its own series on `c.var.axond.metrics`. `record` adds to
+a counter and `set` stores a gauge. The name must start with `axond.ext.`.
+A catalogue name is refused. An attribute value that contains a configured
+secret is dropped, and so is a metric name that contains one. A new series
+past the process ceiling of 200 is not stored. `npm run check:docs` runs the
+sample below.
+
+```ts
+import { createAxond, createMemoryStore, createMetrics } from "@axond/gateway";
+
+const metrics = createMetrics(["local-key"]);
+const gateway = createAxond({
+  store: createMemoryStore(),
+  gatewayKey: "local-key",
+  metrics,
+  extensions: [
+    {
+      name: "counter",
+      apiVersion: 1,
+      stage: "pre-auth",
+      async middleware(c) {
+        c.var.axond.metrics.record("axond.ext.counter.hits", 1, { route: "list" });
+        let refused = false;
+        try {
+          c.var.axond.metrics.record("axond.request.count", 1);
+        } catch {
+          refused = true;
+        }
+        if (!refused) {
+          throw new Error("catalogue metric was accepted");
+        }
+        return new Response("counted");
+      },
+    },
+  ],
+});
+const response = await gateway.request("http://127.0.0.1/api/v1/namespaces");
+if ((await response.text()) !== "counted") {
+  throw new Error("extension did not run");
+}
+const point = metrics.points.find((item) => item.name === "axond.ext.counter.hits");
+if (!point || point.value !== 1 || point.attributes.route !== "list") {
+  throw new Error("metric missing");
+}
+```
+
 ## Container
 
 `ts/Dockerfile` is the TypeScript image. The repository-root `Dockerfile` stays
