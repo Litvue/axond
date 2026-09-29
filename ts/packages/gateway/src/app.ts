@@ -427,9 +427,19 @@ async function dispatch(
   const attempts = pinned ? 1 : Math.max(poolSize, 1);
   let upstream: Awaited<ReturnType<typeof callUpstream>> | null = null;
   let lastError: unknown;
+  const payload = await axond.body.json<Record<string, unknown>>();
+  const stream = Boolean(payload["stream"]);
+  const previous = payload["previous_response_id"];
+  const continuation = pinned && typeof previous === "string" && previous.length > 0;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const credential = selectCredential(opts.credentials ?? [], pools, record.id, provider.id, fallback, pinned, now);
-    const stream = Boolean((await axond.body.json<Record<string, unknown>>())["stream"]);
+    if (continuation && credentialState(pools, credential, now) === "parked") {
+      throw new GatewayFailure(
+        "continuation_affinity_unavailable",
+        503,
+        `continuation affinity unavailable for Responses target \`${provider.id}/${axond.target?.model ?? ""}\``,
+      );
+    }
     const headers = new Headers();
     headers.set("content-type", "application/json");
     for (const name of ["anthropic-version", "anthropic-beta", "accept"]) {

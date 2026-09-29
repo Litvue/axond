@@ -234,6 +234,64 @@ test("three provider failures park the credential on the replica status", async 
   upstream.close();
 });
 
+test("a responses continuation refuses a parked first credential", async () => {
+  const store = await seeded();
+  let hits = 0;
+  const upstream = await listen((_req, res) => {
+    hits += 1;
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end('{"error":{"message":"down"}}');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [
+      { namespace: "platform", provider: "fake-openai", secret: "first-secret", id: "first" },
+      { namespace: "platform", provider: "fake-openai", secret: "second-secret", id: "second" },
+    ],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const failed = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "fake-openai/gpt-test", input: "hello" }),
+    });
+    assert.equal(failed.status, 502);
+    await failed.text();
+  }
+  assert.equal(hits, 3);
+  const continued = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", previous_response_id: "resp_prior", input: "again" }),
+  });
+  assert.equal(continued.status, 503);
+  const body = await continued.json();
+  assert.equal(body.error.type, "continuation_affinity_unavailable");
+  assert.equal(body.error.message, "continuation affinity unavailable for Responses target `fake-openai/gpt-test`");
+  assert.equal(hits, 3);
+  const initial = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", input: "fresh" }),
+  });
+  assert.equal(initial.status, 502);
+  await initial.text();
+  assert.equal(hits, 4);
+  upstream.close();
+});
+
 test("a header timeout is upstream_timeout", async () => {
   const store = await seeded();
   const upstream = await listen(() => {
