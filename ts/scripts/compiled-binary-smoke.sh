@@ -170,3 +170,91 @@ if ! grep -q "future.ts apiVersion 2 is not supported (want 1)" "$err"; then
 fi
 echo "api_version_refused"
 rm -rf "$dir"
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+bun_bin="${BUN:-bun}"
+if ! command -v "$bun_bin" >/dev/null 2>&1; then
+  echo "bun is required to bundle an extension that imports a package" >&2
+  exit 1
+fi
+
+dir="$(mktemp -d)"
+cat > "${dir}/dep.ts" <<'EOF'
+import { parse } from "smol-toml";
+const parsed = parse("n = 7") as { n: number };
+export default {
+  name: "dep",
+  apiVersion: 1,
+  stage: "pre-auth",
+  async middleware() {
+    return new Response(String(parsed.n));
+  },
+};
+EOF
+write_config "$dir" 9
+err="${dir}/stderr"
+AXOND_CONFIG="${dir}/axond.toml" AXOND_EXTENSIONS_DIR="$dir" \
+  GW_INBOUND_KEY=test-inbound-key GW_FAKE_OPENAI_KEY=upstream \
+  "$bin" >"${dir}/stdout" 2>"$err" &
+pid=$!
+attempt=0
+while kill -0 "$pid" 2>/dev/null; do
+  attempt=$((attempt + 1))
+  if [[ "$attempt" -gt 50 ]]; then
+    echo "unbundled extension import did not exit" >&2
+    cat "$err" >&2 || true
+    exit 1
+  fi
+  sleep 0.2
+done
+set +e
+wait "$pid"
+code=$?
+set -e
+pid=""
+if [[ "$code" -eq 0 ]]; then
+  echo "unbundled extension import was accepted" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+if ! grep -q "Cannot find package 'smol-toml'" "$err"; then
+  echo "missing unresolved package refusal" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+echo "unbundled_package_refused"
+rm -rf "$dir"
+
+dir="$(mktemp -d)"
+cat > "${dir}/dep.ts" <<'EOF'
+import { parse } from "smol-toml";
+const parsed = parse("n = 7") as { n: number };
+export default {
+  name: "dep",
+  apiVersion: 1,
+  stage: "pre-auth",
+  async middleware() {
+    return new Response(String(parsed.n));
+  },
+};
+EOF
+ln -s "${root}/node_modules" "${dir}/node_modules"
+"$bun_bin" build "${dir}/dep.ts" --outfile "${dir}/dep.js"
+rm -f "${dir}/dep.ts" "${dir}/node_modules"
+port="$(free_port)"
+write_config "$dir" "$port"
+err="${dir}/stderr"
+AXOND_CONFIG="${dir}/axond.toml" AXOND_EXTENSIONS_DIR="$dir" \
+  GW_INBOUND_KEY=test-inbound-key GW_FAKE_OPENAI_KEY=upstream \
+  "$bin" >"${dir}/stdout" 2>"$err" &
+pid=$!
+wait_health "http://127.0.0.1:${port}/healthz" "$err"
+body="$(curl -fsS -H "authorization: Bearer test-inbound-key" "http://127.0.0.1:${port}/ns/platform/v1/models")"
+if [[ "$body" != "7" ]]; then
+  echo "bundled extension response was not 7: ${body}" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+echo "bundled_package_loaded"
+stop_child
+rm -rf "$dir"
