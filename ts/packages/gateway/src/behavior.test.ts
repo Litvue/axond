@@ -185,6 +185,55 @@ test("a provider 500 fails over to the next credential", async () => {
   upstream.close();
 });
 
+test("three provider failures park the credential on the replica status", async () => {
+  const store = await seeded();
+  const upstream = await listen((_req, res) => {
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end('{"error":{"message":"PROMPT_SENTINEL"}}');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [
+      { namespace: "platform", provider: "fake-openai", secret: "sk-park-secret", id: "only" },
+      { namespace: "tenant", provider: "fake-openai", secret: "sk-tenant-secret", id: "tenant-key" },
+    ],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const failed = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "PROMPT_SENTINEL" }] }),
+    });
+    assert.equal(failed.status, 502);
+    await failed.text();
+  }
+  const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers });
+  assert.equal(status.status, 200);
+  const body = await status.json();
+  assert.equal(body.observed, "replica");
+  assert.equal(body.data[0].credential_id, "only");
+  assert.equal(body.data[0].state, "parked");
+  const encoded = JSON.stringify(body);
+  assert.equal(encoded.includes("sk-park-secret"), false);
+  assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+  const denied = await app.request("http://127.0.0.1/ns/tenant/v1/credentials?namespaces=all", { headers });
+  assert.equal(denied.status, 403);
+  assert.equal((await denied.json()).error.type, "token_scope_insufficient");
+  upstream.close();
+});
+
 test("a header timeout is upstream_timeout", async () => {
   const store = await seeded();
   const upstream = await listen(() => {

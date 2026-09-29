@@ -194,7 +194,7 @@ async function pipeline(
           if (axond.route === "models") {
             await listModels(c, opts, axond);
           } else {
-            await listCredentials(c, opts, axond);
+            await listCredentials(c, opts, axond, pools);
           }
         });
         return;
@@ -513,6 +513,9 @@ async function dispatch(
         error instanceof GatewayFailure ? error.type : "error",
         true,
       );
+      if (error instanceof GatewayFailure && error.type === "provider_dependency_failed") {
+        noteCredentialFailure(pools, record.id, provider.id, credential.id, now);
+      }
       const retryable =
         error instanceof GatewayFailure &&
         error.type === "provider_dependency_failed" &&
@@ -521,7 +524,6 @@ async function dispatch(
       if (!retryable) {
         throw error;
       }
-      noteCredentialFailure(pools, record.id, provider.id, credential.id, now);
     }
   }
   if (!upstream) {
@@ -755,7 +757,12 @@ async function listModels(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   c.res = Response.json({ object: "list", data });
 }
 
-async function listCredentials(c: Context<AxondEnv>, opts: AxondOptions, axond: MutableContext): Promise<void> {
+async function listCredentials(
+  c: Context<AxondEnv>,
+  opts: AxondOptions,
+  axond: MutableContext,
+  pools: Map<string, CredentialPool>,
+): Promise<void> {
   const query = new URL(c.req.url).searchParams.get("namespaces");
   const all = query === "all";
   if (query !== null && query !== "all") {
@@ -764,6 +771,7 @@ async function listCredentials(c: Context<AxondEnv>, opts: AxondOptions, axond: 
   if (all && axond.namespace?.id !== opts.defaultNamespace) {
     throw new GatewayFailure("token_scope_insufficient", 403, "token scope does not authorize `credentials`");
   }
+  const now = opts.clock?.() ?? Date.now();
   const rows = (opts.credentials ?? []).filter((credential) => all || credential.namespace === axond.namespace?.id);
   c.res = Response.json({
     object: "list",
@@ -773,9 +781,14 @@ async function listCredentials(c: Context<AxondEnv>, opts: AxondOptions, axond: 
       provider: credential.provider,
       credential_id: credential.id,
       source: credential.namespace === opts.defaultNamespace ? "platform" : "namespace",
-      state: "healthy",
+      state: credentialState(pools, credential, now),
     })),
   });
+}
+
+function credentialState(pools: Map<string, CredentialPool>, credential: CredentialConfig, now: number): "healthy" | "parked" {
+  const health = pools.get(`${credential.namespace}\0${credential.provider}`)?.failures.get(credential.id);
+  return health && health.openUntil > now ? "parked" : "healthy";
 }
 
 async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: MutableContext): Promise<Response | void> {
