@@ -291,6 +291,18 @@ export interface AxondOptions {
    */
   maxOutputTokens?: number;
   /**
+   * Total lifetime of one stream, however productive. `0` disables. Absent
+   * uses 3_600_000. Distinct from `transport.streamIdleTimeoutMs`, which
+   * bounds silence. After a terminal event the bound closes the body
+   * successfully. Before that it ends the stream in band.
+   */
+  maxStreamDurationMs?: number;
+  /**
+   * Upstream bytes one stream may relay. `0` disables. Absent uses 64 MiB.
+   * The chunk that would pass the ceiling is not forwarded.
+   */
+  maxStreamBytes?: number;
+  /**
    * In-memory credential circuit. Absent uses round-robin, a threshold of 2
    * consecutive 429s, and a 30s cooldown before one half-open probe.
    */

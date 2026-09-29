@@ -64,6 +64,8 @@ async function main(): Promise<void> {
     maxRequestBytes: config.maxRequestBytes,
     maxPromptTokens: config.maxPromptTokens,
     maxOutputTokens: config.maxOutputTokens,
+    maxStreamDurationMs: config.maxStreamDurationMs,
+    maxStreamBytes: config.maxStreamBytes,
     credentialPool: {
       strategy: config.credentialPool.strategy,
       failureThreshold: config.credentialPool.failureThreshold,

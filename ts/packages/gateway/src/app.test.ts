@@ -381,6 +381,8 @@ namespace = "platform"
   assert.equal(loaded.maxRequestBytes, 2 * 1024 * 1024);
   assert.equal(loaded.maxPromptTokens, 1_000_000);
   assert.equal(loaded.maxOutputTokens, 200_000);
+  assert.equal(loaded.maxStreamDurationMs, 3_600_000);
+  assert.equal(loaded.maxStreamBytes, 64 * 1024 * 1024);
   assert.deepEqual(loaded.credentialPool, { strategy: "round-robin", failureThreshold: 2, cooldownSeconds: 30 });
   assert.equal(loaded.storage.onUnavailable, "deny");
   const allowed = await loadConfig(
@@ -608,6 +610,43 @@ max_request_bytes = 64
       ),
     (error: unknown) => {
       assert.match(error instanceof Error ? error.message : "", /admission\.max_output_tokens must be an integer of at least 0/);
+      return true;
+    },
+  );
+  const streamsOff = await loadConfig(
+    toml.replace(
+      "max_request_bytes = 64",
+      "max_request_bytes = 64\nmax_stream_duration_ms = 0\nmax_stream_bytes = 0",
+    ),
+    envSecretReader({ GW_KEY: "k" }, async () => ""),
+  );
+  assert.equal(streamsOff.maxStreamDurationMs, 0);
+  assert.equal(streamsOff.maxStreamBytes, 0);
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("max_request_bytes = 64", "max_request_bytes = 64\nmax_stream_duration_ms = -1"),
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(
+        error instanceof Error ? error.message : "",
+        /admission\.max_stream_duration_ms must be an integer of at least 0/,
+      );
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("max_request_bytes = 64", "max_request_bytes = 64\nmax_stream_bytes = 1.5"),
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(
+        error instanceof Error ? error.message : "",
+        /admission\.max_stream_bytes must be an integer of at least 0/,
+      );
       return true;
     },
   );

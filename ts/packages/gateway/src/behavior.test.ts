@@ -218,6 +218,200 @@ test("a stalled stream settles upstream_error for the text already relayed", asy
   }
 });
 
+test("a stream that outlives its duration settles upstream_error for the text already relayed", async () => {
+  const store = await seeded();
+  const before = (await store.getBudget("platform", "compat"))!;
+  const records: UsageRecord[] = [];
+  const metrics = createMetrics();
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxStreamDurationMs: 80,
+    transport: {
+      responseHeaderTimeoutMs: 30_000,
+      bufferedBodyTimeoutMs: 30_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 5_000,
+      maxResponseBytes: 1024 * 1024,
+    },
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 2_500_000n,
+        outputMicrodollarsPerMillion: 10_000_000n,
+      },
+    ],
+    metrics,
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    const prefix = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n';
+    assert.equal(text.startsWith(prefix), true);
+    assert.equal(text.includes("stream exceeded the gateway's maximum stream duration"), true);
+    assert.equal(text.includes('event: error\ndata: {"error":{"type":"upstream_stream_error"'), true);
+    assert.equal(text.includes("data: [DONE]\n\n"), true);
+    assert.equal(text.includes("sk-live-secret"), false);
+    assert.equal(text.includes("waiting for the next provider stream chunk"), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    const record = records[0]!;
+    assert.equal(record.status, "upstream_error");
+    assert.equal(record.credentialId, "one");
+    assert.equal(record.outputTokens, 1n);
+    assert.equal(record.costMicrodollars !== null && record.costMicrodollars > 0n, true);
+    const after = (await store.getBudget("platform", "compat"))!;
+    assert.equal(after.spent - before.spent, record.costMicrodollars);
+    assert.equal(metrics.points.some((point) => point.name === "axond.upstream.timeouts"), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("a stream duration after the terminal event closes as ok", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const metrics = createMetrics();
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n');
+    res.write("data: [DONE]\n\n");
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxStreamDurationMs: 200,
+    transport: {
+      responseHeaderTimeoutMs: 30_000,
+      bufferedBodyTimeoutMs: 30_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 5_000,
+      maxResponseBytes: 1024 * 1024,
+    },
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 2_500_000n,
+        outputMicrodollarsPerMillion: 10_000_000n,
+      },
+    ],
+    metrics,
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  try {
+    const started = Date.now();
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(Date.now() - started < 1_500, true);
+    assert.equal(text.includes('data: {"choices":[{"delta":{"content":"Hi"}}]}'), true);
+    assert.equal(text.includes("data: [DONE]\n\n"), true);
+    assert.equal(text.includes("upstream_stream_error"), false);
+    assert.equal(text.includes("stream exceeded"), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.outputTokens, 1n);
+    assert.equal(metrics.points.some((point) => point.name === "axond.upstream.timeouts"), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("a stream chunk past the byte cap is dropped and does not charge", async () => {
+  const store = await seeded();
+  const before = (await store.getBudget("platform", "compat"))!;
+  const records: UsageRecord[] = [];
+  const payload = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n';
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(payload);
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxStreamBytes: 8,
+    transport: {
+      responseHeaderTimeoutMs: 30_000,
+      bufferedBodyTimeoutMs: 30_000,
+      streamIdleTimeoutMs: 5_000,
+      maxResponseBytes: 1024 * 1024,
+    },
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 2_500_000n,
+        outputMicrodollarsPerMillion: 10_000_000n,
+      },
+    ],
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text.includes("Hi"), false);
+    assert.equal(text.includes(payload), false);
+    assert.equal(text.includes("stream exceeded the gateway's maximum stream size"), true);
+    assert.equal(text.includes('event: error\ndata: {"error":{"type":"upstream_stream_error"'), true);
+    assert.equal(text.includes("data: [DONE]\n\n"), true);
+    assert.equal(text.includes("sk-live-secret"), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    const record = records[0]!;
+    assert.equal(record.status, "upstream_error");
+    assert.equal(record.outputTokens, 0n);
+    assert.equal(record.inputTokens, 0n);
+    assert.equal(record.costMicrodollars, 0n);
+    const after = (await store.getBudget("platform", "compat"))!;
+    assert.equal(after.spent, before.spent);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("a provider 500 stays on that credential and a 429 rotates", async () => {
   const store = await seeded();
   const seen: string[] = [];

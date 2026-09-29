@@ -74,6 +74,10 @@ export interface LoadedConfig {
   maxPromptTokens: number;
   /** `0` disables the ceiling. */
   maxOutputTokens: number;
+  /** `0` disables the total stream lifetime. */
+  maxStreamDurationMs: number;
+  /** `0` disables the relayed-byte ceiling. */
+  maxStreamBytes: number;
   credentialPool: {
     strategy: "round-robin" | "weighted";
     failureThreshold: number;
@@ -337,6 +341,14 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
   if (!Number.isInteger(maxOutputTokens) || maxOutputTokens < 0) {
     throw configError("admission.max_output_tokens must be an integer of at least 0");
   }
+  const maxStreamDurationMs = numberField(admissionRaw, "max_stream_duration_ms", 3_600_000);
+  if (!Number.isInteger(maxStreamDurationMs) || maxStreamDurationMs < 0) {
+    throw configError("admission.max_stream_duration_ms must be an integer of at least 0");
+  }
+  const maxStreamBytes = numberField(admissionRaw, "max_stream_bytes", 64 * 1024 * 1024);
+  if (!Number.isInteger(maxStreamBytes) || maxStreamBytes < 0) {
+    throw configError("admission.max_stream_bytes must be an integer of at least 0");
+  }
   const discovery = asRecord(parsed["discovery"]) ?? {};
   const discoveryIntervalSeconds = numberField(discovery, "refresh_interval_seconds", 300);
   if (discoveryIntervalSeconds < 1) {
@@ -382,6 +394,8 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     maxRequestBytes,
     maxPromptTokens,
     maxOutputTokens,
+    maxStreamDurationMs,
+    maxStreamBytes,
     credentialPool,
   };
 }

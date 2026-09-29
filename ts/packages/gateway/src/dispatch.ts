@@ -231,6 +231,10 @@ export async function callUpstream(input: {
   onCredentialRateLimit?: () => void;
   /** Prompt-token estimate used when a stream ends before the provider reports usage. */
   estimatedInputTokens?: number;
+  /** Total stream lifetime. `null` disables. Absent uses one hour. */
+  maxStreamDurationMs?: number | null;
+  /** Upstream bytes one stream may relay. `null` disables. Absent uses 64 MiB. */
+  maxStreamBytes?: number | null;
 }): Promise<{ response: Response; usage: UsageTokens }> {
   const transport = withTransportDefaults(input.transport);
   const now = input.now ?? Date.now;
@@ -294,10 +298,22 @@ export async function callUpstream(input: {
       usage,
     };
   }
-  const stream = relayStream(response.body, transport, input.route, usage, (reason) => {
-    input.onUsage(usage);
-    input.onStreamDone?.(reason);
-  }, input.onTimeout, input.onBeforeContentRateLimit, input.onCredentialRateLimit, input.estimatedInputTokens ?? 0);
+  const stream = relayStream(
+    response.body,
+    transport,
+    input.route,
+    usage,
+    (reason) => {
+      input.onUsage(usage);
+      input.onStreamDone?.(reason);
+    },
+    input.onTimeout,
+    input.onBeforeContentRateLimit,
+    input.onCredentialRateLimit,
+    input.estimatedInputTokens ?? 0,
+    input.maxStreamDurationMs === undefined ? 3_600_000 : input.maxStreamDurationMs,
+    input.maxStreamBytes === undefined ? 64 * 1024 * 1024 : input.maxStreamBytes,
+  );
   const headers = passHeaders(response.headers);
   headers.set("content-type", "text/event-stream");
   headers.set("cache-control", "no-cache");
@@ -343,6 +359,8 @@ function relayStream(
   onBeforeContentRateLimit?: () => Promise<Response | null>,
   onCredentialRateLimit?: () => void,
   estimatedInputTokens = 0,
+  maxStreamDurationMs: number | null = 3_600_000,
+  maxStreamBytes: number | null = 64 * 1024 * 1024,
 ): ReadableStream<Uint8Array> {
   let reader = upstream.getReader();
   const decoder = new TextDecoder();
@@ -355,6 +373,12 @@ function relayStream(
   let delegated = false;
   const held: Uint8Array[] = [];
   let heldBytes = 0;
+  let relayedBytes = 0;
+  const startedAt = Date.now();
+  const durationAt = maxStreamDurationMs !== null && maxStreamDurationMs > 0
+    ? startedAt + maxStreamDurationMs
+    : null;
+  const byteLimit = maxStreamBytes !== null && maxStreamBytes > 0 ? maxStreamBytes : null;
   let unscanned = "";
   let rateLimitNoted = false;
   let stopRateLimitScan = false;
@@ -415,6 +439,21 @@ function relayStream(
     committed = true;
     return text;
   };
+  const fits = (chunk: Uint8Array): boolean => {
+    if (byteLimit !== null && relayedBytes + chunk.length > byteLimit) {
+      return false;
+    }
+    relayedBytes += chunk.length;
+    return true;
+  };
+  const failBound = (controller: ReadableStreamDefaultController<Uint8Array>, message: string) => {
+    if (!committed) {
+      releaseHeld(controller);
+    }
+    controller.enqueue(streamFailureFrame(route, message));
+    finish("fail");
+    controller.close();
+  };
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       if (delegated) {
@@ -426,21 +465,23 @@ function relayStream(
         controller.enqueue(chunk.value);
         return;
       }
-      let value: Uint8Array | null | "keepalive";
+      let value: Uint8Array | null | "keepalive" | "duration";
       try {
         value = await readWithIdle(reader, () => inflight, (next) => {
           inflight = next;
         }, transport.streamIdleTimeoutMs, sawChunkAt, controller, () => (
           terminalAt === null ? null : terminalAt + transport.streamTerminalGraceMs
-        ), onTimeout);
+        ), durationAt, onTimeout);
       } catch (error) {
         const message = error instanceof GatewayFailure ? error.message : "upstream stream failed";
-        controller.enqueue(streamFailureFrame(route, message));
-        finish("fail");
-        controller.close();
+        failBound(controller, message);
         return;
       }
       if (value === "keepalive") {
+        return;
+      }
+      if (value === "duration") {
+        failBound(controller, "stream exceeded the gateway's maximum stream duration");
         return;
       }
       if (value === null) {
@@ -449,6 +490,10 @@ function relayStream(
         }
         finish("end");
         controller.close();
+        return;
+      }
+      if (!fits(value)) {
+        failBound(controller, "stream exceeded the gateway's maximum stream size");
         return;
       }
       sawChunkAt = Date.now();
@@ -585,8 +630,9 @@ async function readWithIdle(
   sawChunkAt: number,
   controller: ReadableStreamDefaultController<Uint8Array>,
   graceAt: () => number | null,
+  durationAt: number | null,
   onTimeout?: (kind: string, bound: string) => void,
-): Promise<Uint8Array | null | "keepalive"> {
+): Promise<Uint8Array | null | "keepalive" | "duration"> {
   let read = current();
   if (read === null) {
     read = reader.read();
@@ -596,18 +642,28 @@ async function readWithIdle(
   const started = Date.now();
   let lastKeepalive = sawChunkAt;
   for (;;) {
-    const idleLeft = idleMs - (Date.now() - started);
-    const terminalAt = graceAt();
-    const graceLeft = terminalAt === null ? Number.POSITIVE_INFINITY : terminalAt - Date.now();
-    const budget = Math.min(idleLeft, graceLeft);
+    const now = Date.now();
+    const idleLeft = idleMs - (now - started);
+    const terminalDeadline = graceAt();
+    const graceLeft = terminalDeadline === null ? Number.POSITIVE_INFINITY : terminalDeadline - now;
+    const durationLeft = durationAt === null ? Number.POSITIVE_INFINITY : durationAt - now;
+    if (durationLeft <= 0 && terminalDeadline !== null) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    if (durationLeft <= 0 && durationLeft <= idleLeft && durationLeft <= graceLeft) {
+      await reader.cancel().catch(() => undefined);
+      return "duration";
+    }
+    const budget = Math.min(idleLeft, graceLeft, durationLeft);
     if (budget <= 0) {
       await reader.cancel().catch(() => undefined);
-      if (terminalAt !== null) {
+      if (terminalDeadline !== null) {
         return null;
       }
       throw timeoutFailure("stream_idle", "phase", idleMs, onTimeout);
     }
-    const untilKeepalive = terminalAt === null ? 15_000 - (Date.now() - lastKeepalive) : Number.POSITIVE_INFINITY;
+    const untilKeepalive = terminalDeadline === null ? 15_000 - (Date.now() - lastKeepalive) : Number.POSITIVE_INFINITY;
     const wait = Math.max(1, Math.min(budget, untilKeepalive));
     const result = await Promise.race([
       read.then((chunk) => ({ kind: "chunk" as const, chunk })),
@@ -617,7 +673,7 @@ async function readWithIdle(
       setCurrent(null);
       return result.chunk.done ? null : result.chunk.value;
     }
-    if (terminalAt === null && Date.now() - lastKeepalive >= 15_000) {
+    if (terminalDeadline === null && Date.now() - lastKeepalive >= 15_000) {
       lastKeepalive = Date.now();
       controller.enqueue(KEEPALIVE);
       return "keepalive";

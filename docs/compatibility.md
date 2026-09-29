@@ -82,6 +82,7 @@ A streamed response sets `content-type: text/event-stream` and `cache-control: n
 A provider failure after a credential is selected still returns that provider error, and writes one usage record with status `upstream_error`, zero token counts, and cost 0. Spent does not increase.
 A client that cancels a stream records `client_cancelled`. When the provider has not reported usage, the charge is the prompt estimate plus one token per four characters of relayed text. A stream that relayed no text is not charged.
 An open stream that stays silent past `transport.stream_idle_timeout_ms` appends an SSE `upstream_stream_error` on the already-`200` response and records `upstream_error` for the text already relayed. Nothing is retried.
+A stream that outlives `admission.max_stream_duration_ms` before a terminal event, or whose next chunk would pass `admission.max_stream_bytes`, appends an SSE `upstream_stream_error` naming that bound. The overflowing chunk is not forwarded. Text already relayed is charged as `upstream_error`. After a terminal event the duration bound closes the body successfully. `0` disables either bound.
 
 ## Providers
 

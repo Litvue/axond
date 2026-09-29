@@ -43,6 +43,8 @@ import { emptyUsage } from "./usage.ts";
 const DEFAULT_MAX_REQUEST = 2 * 1024 * 1024;
 const DEFAULT_MAX_PROMPT_TOKENS = 1_000_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 200_000;
+const DEFAULT_MAX_STREAM_DURATION_MS = 3_600_000;
+const DEFAULT_MAX_STREAM_BYTES = 64 * 1024 * 1024;
 const OUTPUT_ALLOWANCE_FIELDS = ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const;
 const requestTrace = new WeakMap<Request, TraceContext>();
 const requestAttempts = new WeakMap<Request, ExportedSpan[]>();
@@ -563,6 +565,8 @@ async function dispatch(
     record.allowPlatformFallback || !record.fromConfig ? opts.defaultNamespace : null;
   const pinned = axond.route === "responses";
   const now = opts.clock?.() ?? Date.now();
+  const maxStreamDurationMs = ceiling(opts.maxStreamDurationMs, DEFAULT_MAX_STREAM_DURATION_MS);
+  const maxStreamBytes = ceiling(opts.maxStreamBytes, DEFAULT_MAX_STREAM_BYTES);
   const policy = credentialPolicy(opts.credentialPool);
   const planned = planCredentials(
     opts.credentials ?? [],
@@ -690,6 +694,8 @@ async function dispatch(
             onBeforeContentRateLimit: () => rotateStream(index),
             onCredentialRateLimit: () => penalizeStream(nextCredential),
             estimatedInputTokens: estimatedInputTokens(payload),
+            maxStreamDurationMs,
+            maxStreamBytes,
           });
           return opened.response;
         } catch (error) {
@@ -730,6 +736,8 @@ async function dispatch(
             ? () => rotateStream(attempt)
             : undefined,
         estimatedInputTokens: estimatedInputTokens(payload),
+        maxStreamDurationMs,
+        maxStreamBytes,
       });
       if (!stream) {
         noteServed(axond, opts, credential);
