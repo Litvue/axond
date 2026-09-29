@@ -48,7 +48,7 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 | Node process | `ts/bin/axond` |
 | Container | `ts/Dockerfile`. The repository-root `Dockerfile` remains the Rust release image. |
 | Worker | `ts/packages/worker`. Hyperdrive caching disabled. Not executed against PlanetScale here. |
-| Compiled binary | `bun build --compile` of `ts/packages/cli/src/main.ts`, when Bun is installed. The Node wrapper is the path CI runs. |
+| Compiled binary | `bun build --compile` of `ts/packages/cli/src/main.ts`, when Bun is installed. CI runs the unit suite on Bun and the compat lanes through the Node wrapper. |
 
 ## Shadow
 

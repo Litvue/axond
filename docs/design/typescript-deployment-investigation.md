@@ -72,7 +72,7 @@ No namespace or budget cache exists. Every request reads the Store.
 | P13 | `bun build --compile` of a Hono plus `bun:sqlite` app | 94.7 MiB executable, runs. |
 | P14 | `bun build --compile` of a Hono app that `import()`s a middleware `.ts` file by path at startup. Run it, edit the file, run the same binary again. | Middleware loads from disk. The edit takes effect with no rebuild (header changed from `v1` to `v2-edited-after-compile`). 99.3 MB executable. |
 
-P1 to P4 and P2 to P3 test the WASM route that section 3 no longer pursues. They are kept as evidence. P14's extension imported only Hono types, which are erased at load. An extension that imports npm packages at runtime needs those packages to resolve from disk or be exported by the host. That case is **unverified**.
+P1 to P4 and P2 to P3 test the WASM route that section 3 no longer pursues. They are kept as evidence. P14's extension imported only Hono types, which are erased at load. An extension that imports an npm package must be bundled before the compiled binary loads it. Section 14 records that result.
 
 Limits of these probes. Wrangler's local Hyperdrive is a direct TCP proxy. It does not exercise transaction pooling, query caching, or edge latency. Nothing here ran on Cloudflare's network, and no PlanetScale instance was contacted.
 

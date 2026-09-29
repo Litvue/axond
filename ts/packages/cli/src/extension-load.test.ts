@@ -204,7 +204,17 @@ namespace = "platform"
       await waitFor(`${base}/healthz`);
       const signaled = Date.now();
       child.kill("SIGTERM");
-      const ready = await fetch(`${base}/readyz`);
+      let ready: Response | null = null;
+      const pollUntil = Date.now() + 1_000;
+      while (Date.now() < pollUntil) {
+        ready = await fetch(`${base}/readyz`);
+        if (ready.status === 503) {
+          break;
+        }
+        await ready.body?.cancel();
+        await new Promise((wake) => setTimeout(wake, 20));
+      }
+      assert.ok(ready);
       assert.equal(ready.status, 503);
       assert.equal(await ready.text(), "draining");
       const health = await fetch(`${base}/healthz`);
