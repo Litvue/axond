@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { emptyUsage, noteSseChunk, sseTerminalSeen, usageEvent, usageFromJson } from "./usage.ts";
+import { applyObservedCharge, emptyUsage, noteSseChunk, relayedTextChars, sseTerminalSeen, usageEvent, usageFromJson } from "./usage.ts";
 
 test("openai cached prompt tokens are billed once", () => {
   const usage = usageFromJson("chat", {
@@ -114,4 +114,19 @@ test("usage event names the serving credential and omits an absent trace", () =>
   assert.equal(traced.trace_id, "0123456789abcdef0123456789abcdef");
   const keys = Object.keys(traced);
   assert.equal(keys.indexOf("trace_id"), keys.indexOf("request_id") + 1);
+});
+
+test("observed stream text fills a charge when the provider sent no usage", () => {
+  const frame = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n';
+  assert.equal(relayedTextChars(frame), 2);
+  assert.equal(relayedTextChars('data: {"delta":"é"}\n\n'), 1);
+  const usage = emptyUsage();
+  applyObservedCharge(usage, 2, 11);
+  assert.equal(usage.inputTokens, 11n);
+  assert.equal(usage.outputTokens, 1n);
+  const reported = emptyUsage();
+  reported.inputTokens = 4n;
+  applyObservedCharge(reported, 8, 11);
+  assert.equal(reported.inputTokens, 4n);
+  assert.equal(reported.outputTokens, 0n);
 });

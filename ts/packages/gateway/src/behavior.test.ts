@@ -103,6 +103,8 @@ test("extension_migration_outside_its_prefix_is_refused", async () => {
 
 test("a cancelled stream still settles the delivered request", async () => {
   const store = await seeded();
+  const before = (await store.getBudget("platform", "compat"))!;
+  const records: UsageRecord[] = [];
   const upstream = await listen((_req, res) => {
     res.writeHead(200, { "content-type": "text/event-stream" });
     res.write('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n');
@@ -112,7 +114,7 @@ test("a cancelled stream still settles the delivered request", async () => {
     gatewayKey: KEY,
     defaultNamespace: "platform",
     providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
-    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream", id: "one" }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
     prices: [
       {
         provider: "fake-openai",
@@ -121,26 +123,41 @@ test("a cancelled stream still settles the delivered request", async () => {
         outputMicrodollarsPerMillion: 10_000_000n,
       },
     ],
+    onUsage: (record) => {
+      records.push(record);
+    },
   });
-  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
-    method: "POST",
-    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
-    body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
-  });
-  assert.equal(response.status, 200);
-  const reader = response.body!.getReader();
-  await reader.read();
-  await reader.cancel();
-  let rows: { count: number }[] = [];
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    rows = await store.summarizeUsage("platform", "compat");
-    if (rows.length > 0) {
-      break;
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body!.getReader();
+    await reader.read();
+    await reader.cancel();
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
     }
-    await new Promise((wake) => setTimeout(wake, 10));
+    assert.equal(records.length, 1);
+    const record = records[0]!;
+    assert.equal(record.status, "client_cancelled");
+    assert.equal(record.credentialId, "one");
+    assert.equal(record.outputTokens, 1n);
+    assert.equal(record.inputTokens > 0n, true);
+    assert.equal(record.costMicrodollars !== null && record.costMicrodollars > 0n, true);
+    const event = JSON.stringify(usageEvent(record));
+    assert.equal(event.includes("sk-live-secret"), false);
+    assert.equal(event.includes('"status":"client_cancelled"'), true);
+    const after = (await store.getBudget("platform", "compat"))!;
+    assert.equal(after.spent - before.spent, record.costMicrodollars);
+    const rows = await store.summarizeUsage("platform", "compat");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]!.status, "client_cancelled");
+  } finally {
+    upstream.close();
   }
-  assert.equal(rows.reduce((sum, row) => sum + row.count, 0), 1);
-  upstream.close();
 });
 
 test("a provider 500 stays on that credential and a 429 rotates", async () => {

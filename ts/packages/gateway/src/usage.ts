@@ -177,6 +177,90 @@ export function noteSseChunk(route: string, usage: UsageTokens, text: string): v
   }
 }
 
+/**
+ * Characters of generated text in one SSE buffer. Only complete frames count.
+ * OpenAI chat deltas, Anthropic text deltas, and Responses string deltas contribute.
+ * Anything else contributes nothing.
+ */
+export function relayedTextChars(text: string): number {
+  const parts = text.split(/\n\n|\r\n\r\n/);
+  const ended = text.endsWith("\n\n") || text.endsWith("\r\n\r\n");
+  const frames = (ended ? parts : parts.slice(0, -1)).filter((frame) => frame.length > 0);
+  let chars = 0;
+  for (const frame of frames) {
+    const data = frame
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^ /, ""))
+      .join("\n");
+    if (data.length === 0 || data === "[DONE]") {
+      continue;
+    }
+    try {
+      chars += relayedTextLen(JSON.parse(data));
+    } catch {
+      continue;
+    }
+  }
+  return chars;
+}
+
+/**
+ * When the provider never reported usage, a stream that relayed text is charged
+ * for the admission estimate of the prompt and one token per four observed characters.
+ * Provider token counts win when any of them is non-zero.
+ */
+export function applyObservedCharge(usage: UsageTokens, chars: number, estimatedInput: number): void {
+  if (chars <= 0) {
+    return;
+  }
+  if (
+    usage.inputTokens > 0n
+    || usage.outputTokens > 0n
+    || usage.cacheReadTokens > 0n
+    || usage.cacheWriteTokens > 0n
+  ) {
+    return;
+  }
+  usage.inputTokens = BigInt(Math.max(0, Math.floor(estimatedInput)));
+  usage.outputTokens = BigInt(Math.ceil(chars / 4));
+}
+
+function relayedTextLen(data: unknown): number {
+  if (!data || typeof data !== "object") {
+    return 0;
+  }
+  const record = data as Record<string, unknown>;
+  let chars = 0;
+  const choices = record["choices"];
+  if (Array.isArray(choices)) {
+    for (const choice of choices) {
+      chars += textChars(nestedString(choice, ["delta", "content"]));
+      chars += textChars(nestedString(choice, ["delta", "reasoning_content"]));
+    }
+  }
+  chars += textChars(nestedString(record, ["delta", "text"]));
+  chars += textChars(nestedString(record, ["content_block", "text"]));
+  chars += textChars(nestedString(record, ["delta", "partial_json"]));
+  chars += textChars(typeof record["delta"] === "string" ? record["delta"] : "");
+  return chars;
+}
+
+function nestedString(value: unknown, path: readonly string[]): string {
+  let current = value;
+  for (const key of path) {
+    if (!current || typeof current !== "object") {
+      return "";
+    }
+    current = (current as Record<string, unknown>)[key];
+  }
+  return typeof current === "string" ? current : "";
+}
+
+function textChars(text: string): number {
+  return [...text].length;
+}
+
 /** The stdout usage event. `trace_id` is omitted when the request had no inbound trace. */
 export function usageEvent(record: UsageRecord): Record<string, unknown> {
   const line: Record<string, unknown> = {

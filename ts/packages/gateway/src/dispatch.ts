@@ -1,7 +1,7 @@
 import type { CredentialConfig, ProviderConfig, TransportLimits } from "@axond/sdk";
 
 import { GatewayFailure } from "./errors.ts";
-import { assignUsage, emptyUsage, noteSseChunk, sseTerminalSeen, usageFromJson } from "./usage.ts";
+import { applyObservedCharge, assignUsage, emptyUsage, noteSseChunk, relayedTextChars, sseTerminalSeen, usageFromJson } from "./usage.ts";
 import type { UsageTokens } from "@axond/sdk";
 
 export interface CredentialCircuit {
@@ -229,6 +229,8 @@ export async function callUpstream(input: {
    * The bytes stay on the wire. The caller records the credential failure.
    */
   onCredentialRateLimit?: () => void;
+  /** Prompt-token estimate used when a stream ends before the provider reports usage. */
+  estimatedInputTokens?: number;
 }): Promise<{ response: Response; usage: UsageTokens }> {
   const transport = withTransportDefaults(input.transport);
   const now = input.now ?? Date.now;
@@ -295,7 +297,7 @@ export async function callUpstream(input: {
   const stream = relayStream(response.body, transport, input.route, usage, (reason) => {
     input.onUsage(usage);
     input.onStreamDone?.(reason);
-  }, input.onTimeout, input.onBeforeContentRateLimit, input.onCredentialRateLimit);
+  }, input.onTimeout, input.onBeforeContentRateLimit, input.onCredentialRateLimit, input.estimatedInputTokens ?? 0);
   const headers = passHeaders(response.headers);
   headers.set("content-type", "text/event-stream");
   headers.set("cache-control", "no-cache");
@@ -340,6 +342,7 @@ function relayStream(
   onTimeout?: (kind: string, bound: string) => void,
   onBeforeContentRateLimit?: () => Promise<Response | null>,
   onCredentialRateLimit?: () => void,
+  estimatedInputTokens = 0,
 ): ReadableStream<Uint8Array> {
   let reader = upstream.getReader();
   const decoder = new TextDecoder();
@@ -355,6 +358,11 @@ function relayStream(
   let unscanned = "";
   let rateLimitNoted = false;
   let stopRateLimitScan = false;
+  let observedChars = 0;
+  const note = (text: string) => {
+    noteSseChunk(route, usage, text);
+    observedChars += relayedTextChars(text);
+  };
   const consider = (text: string) => {
     if (!onCredentialRateLimit || rateLimitNoted || stopRateLimitScan || text.length === 0) {
       return;
@@ -383,9 +391,10 @@ function relayStream(
     }
     done = true;
     if (pending.length > 0) {
-      noteSseChunk(route, usage, pending);
+      note(pending);
       pending = "";
     }
+    applyObservedCharge(usage, observedChars, estimatedInputTokens);
     onDone(reason);
   };
   const releaseHeld = (controller: ReadableStreamDefaultController<Uint8Array>) => {
@@ -398,7 +407,7 @@ function relayStream(
     if (terminalAt === null && sseTerminalSeen(route, pending + text)) {
       terminalAt = Date.now();
     }
-    noteSseChunk(route, usage, pending + text);
+    note(pending + text);
     pending = tail(pending + text);
     controller.enqueue(merged);
     held.length = 0;
@@ -474,7 +483,7 @@ function relayStream(
       if (terminalAt === null && sseTerminalSeen(route, buffered)) {
         terminalAt = Date.now();
       }
-      noteSseChunk(route, usage, buffered);
+      note(buffered);
       pending = tail(buffered);
       controller.enqueue(value);
     },

@@ -625,6 +625,7 @@ async function dispatch(
     const usage = emptyUsage();
     let releaseStream: () => void = () => undefined;
     let skipSettle = false;
+    let streamStatus = "ok";
     if (stream && opts.waitUntil) {
       const finished = new Promise<void>((resolve) => {
         releaseStream = resolve;
@@ -632,7 +633,7 @@ async function dispatch(
       opts.waitUntil(
         finished.then(async () => {
           if (!skipSettle) {
-            await settle(opts, axond, usage, "ok");
+            await settle(opts, axond, usage, streamStatus);
           }
         }),
       );
@@ -653,11 +654,12 @@ async function dispatch(
         noteCredentialSuccess(pools, record.id, provider.id, served.id);
       }
       noteServed(axond, opts, served);
+      streamStatus = reason === "cancel" ? "client_cancelled" : "ok";
       if (stream && opts.waitUntil) {
         releaseStream();
         return;
       }
-      scheduleSettle(opts, axond, usage, "ok");
+      scheduleSettle(opts, axond, usage, streamStatus);
     };
     const rotateStream = async (failedIndex: number): Promise<Response | null> => {
       const failed = planned[failedIndex]!;
@@ -687,6 +689,7 @@ async function dispatch(
             onStreamDone: (reason) => finishStream(nextCredential, reason),
             onBeforeContentRateLimit: () => rotateStream(index),
             onCredentialRateLimit: () => penalizeStream(nextCredential),
+            estimatedInputTokens: estimatedInputTokens(payload),
           });
           return opened.response;
         } catch (error) {
@@ -726,6 +729,7 @@ async function dispatch(
           stream && axond.route === "chat" && !pinned && planned.length > 1
             ? () => rotateStream(attempt)
             : undefined,
+        estimatedInputTokens: estimatedInputTokens(payload),
       });
       if (!stream) {
         noteServed(axond, opts, credential);
