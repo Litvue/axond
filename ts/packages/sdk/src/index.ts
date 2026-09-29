@@ -328,6 +328,12 @@ export interface CredentialConfig {
   provider: string;
   secret: string;
   id: string;
+  /**
+   * When false, `id` came from the env var name. A tenant using platform
+   * fallback then sees the credential's state without this label. Absent
+   * means the label was set explicitly and stays visible.
+   */
+  explicitId?: boolean;
   /** Share of traffic when the pool strategy is `weighted`. Absent means 1. */
   weight?: number;
 }

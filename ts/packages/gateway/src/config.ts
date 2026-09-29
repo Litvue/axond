@@ -199,11 +199,13 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     if (!Number.isInteger(weight) || weight < 1) {
       throw configError("credential weight must be at least 1");
     }
+    const explicitId = typeof row["id"] === "string" && row["id"].length > 0;
     credentials.push({
       namespace,
       provider,
       secret,
-      id: typeof row["id"] === "string" && row["id"].length > 0 ? row["id"] : envName,
+      id: explicitId ? String(row["id"]) : envName,
+      ...(explicitId ? {} : { explicitId: false as const }),
       weight,
     });
   }

@@ -472,6 +472,14 @@ cooldown_seconds = 5
     loaded.credentials.map((credential) => credential.weight),
     [1, 3],
   );
+  assert.equal(loaded.credentials[0]?.explicitId, undefined);
+  const derived = await loadConfig(
+    toml.replace('id = "light"\n', ""),
+    envSecretReader({ GW_KEY: "k", OPENAI_KEY: "sk" }, async () => ""),
+  );
+  assert.equal(derived.credentials[0]?.id, "OPENAI_KEY");
+  assert.equal(derived.credentials[0]?.explicitId, false);
+  assert.equal(derived.credentials[1]?.explicitId, undefined);
   await assert.rejects(
     () =>
       loadConfig(

@@ -993,17 +993,61 @@ async function listCredentials(
   }
   const now = opts.clock?.() ?? Date.now();
   const policy = credentialPolicy(opts.credentialPool);
-  const rows = (opts.credentials ?? []).filter((credential) => all || credential.namespace === axond.namespace?.id);
+  const caller = axond.namespace?.id ?? "";
+  const credentials = opts.credentials ?? [];
+  const record = (axond as MutableContext & { record?: NamespaceWrite }).record;
+  const allowFallback =
+    !all &&
+    caller !== opts.defaultNamespace &&
+    record !== undefined &&
+    (record.allowPlatformFallback || !record.fromConfig);
+  const own = credentials.filter((credential) => credential.namespace === caller);
+  const ownProviders = new Set(own.map((credential) => credential.provider));
+  const fallback = allowFallback
+    ? credentials.filter(
+        (credential) => credential.namespace === opts.defaultNamespace && !ownProviders.has(credential.provider),
+      )
+    : [];
+  const visible = all ? credentials : [...own, ...fallback];
+  const hideFallbackId = new Set(fallback);
+  const data = visible
+    .map((credential) => {
+      const source = credential.namespace === opts.defaultNamespace ? "platform" : "byok";
+      const row: {
+        namespace: string;
+        provider: string;
+        credential_id?: string;
+        source: "platform" | "byok";
+        state: ReturnType<typeof credentialState>;
+      } = {
+        namespace: credential.namespace,
+        provider: credential.provider,
+        source,
+        state: credentialState(pools, credential, now, policy.cooldownMs),
+      };
+      if (!(hideFallbackId.has(credential) && credential.explicitId === false)) {
+        row.credential_id = credential.id;
+      }
+      return row;
+    })
+    .sort((left, right) => {
+      if (left.namespace !== right.namespace) {
+        return left.namespace < right.namespace ? -1 : 1;
+      }
+      if (left.provider !== right.provider) {
+        return left.provider < right.provider ? -1 : 1;
+      }
+      const leftId = left.credential_id ?? "";
+      const rightId = right.credential_id ?? "";
+      if (leftId === rightId) {
+        return 0;
+      }
+      return leftId < rightId ? -1 : 1;
+    });
   c.res = Response.json({
     object: "list",
     observed: "replica",
-    data: rows.map((credential) => ({
-      namespace: credential.namespace,
-      provider: credential.provider,
-      credential_id: credential.id,
-      source: credential.namespace === opts.defaultNamespace ? "platform" : "namespace",
-      state: credentialState(pools, credential, now, policy.cooldownMs),
-    })),
+    data,
   });
 }
 

@@ -47,7 +47,10 @@ route. Minted `axt1.` tokens are `401`. The all-namespaces credential view
 (`?namespaces=all`) is admitted only for that key when its configured
 `namespace` is the file default namespace. A repeated `namespaces` parameter
 is `400` `bad_request`, as is a query component that is not percent-encoded
-UTF-8. Any other value, including an empty one, is the same `400`.
+UTF-8. Any other value, including an empty one, is the same `400`. Each row's
+`source` is `platform` or `byok`. The list is sorted by namespace, provider,
+and credential id. A fallback tenant sees a platform pool only when it has no
+pool of its own for that provider, and an env-derived platform label is omitted.
 
 `GET /admin/v1/status` is unmounted in production `serve()` ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md),
 [#438](https://github.com/Litvue/axond/pull/438)). A `diagnostic_router` helper

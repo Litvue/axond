@@ -106,3 +106,100 @@ test("duplicate_namespaces_query_is_rejected", async () => {
   assert.equal(nul.status, 400);
   assert.equal((await nul.json()).error.message, "invalid `namespaces` value");
 });
+
+test("fallback credential status hides an env-derived platform label", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putNamespace({
+    id: "tenant",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: true,
+    fromConfig: true,
+  });
+  await store.putNamespace({
+    id: "closed",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putNamespace({
+    id: "created",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    credentials: [
+      { namespace: "platform", provider: "openai", secret: "sk-derived", id: "OPENAI_KEY", explicitId: false },
+      { namespace: "platform", provider: "openai", secret: "sk-public", id: "public-platform" },
+      { namespace: "platform", provider: "anthropic", secret: "sk-anth", id: "anth" },
+      { namespace: "tenant", provider: "openai", secret: "sk-tenant", id: "tenant-own" },
+    ],
+  });
+  const headers = { authorization: `Bearer ${KEY}` };
+
+  const fallback = await app.request("http://127.0.0.1/ns/created/v1/credentials", { headers });
+  assert.equal(fallback.status, 200);
+  const fallbackBody = await fallback.json();
+  assert.deepEqual(
+    fallbackBody.data.map((row: { namespace: string; provider: string; credential_id?: string; source: string }) => {
+      const projected: { namespace: string; provider: string; credential_id?: string; source: string } = {
+        namespace: row.namespace,
+        provider: row.provider,
+        source: row.source,
+      };
+      if (Object.hasOwn(row, "credential_id")) {
+        projected.credential_id = row.credential_id;
+      }
+      return projected;
+    }),
+    [
+      { namespace: "platform", provider: "anthropic", credential_id: "anth", source: "platform" },
+      { namespace: "platform", provider: "openai", source: "platform" },
+      { namespace: "platform", provider: "openai", credential_id: "public-platform", source: "platform" },
+    ],
+  );
+  assert.equal(JSON.stringify(fallbackBody).includes("sk-"), false);
+  assert.equal(JSON.stringify(fallbackBody).includes("OPENAI_KEY"), false);
+
+  const own = await app.request("http://127.0.0.1/ns/tenant/v1/credentials", { headers });
+  const ownBody = await own.json();
+  assert.deepEqual(
+    ownBody.data.map((row: { provider: string; credential_id?: string; source: string }) => ({
+      provider: row.provider,
+      credential_id: row.credential_id,
+      source: row.source,
+    })),
+    [
+      { provider: "anthropic", credential_id: "anth", source: "platform" },
+      { provider: "openai", credential_id: "tenant-own", source: "byok" },
+    ],
+  );
+
+  const closed = await app.request("http://127.0.0.1/ns/closed/v1/credentials", { headers });
+  assert.deepEqual((await closed.json()).data, []);
+
+  const operator = await app.request("http://127.0.0.1/ns/platform/v1/credentials?namespaces=all", { headers });
+  const operatorIds = (await operator.json()).data.map(
+    (row: { namespace: string; credential_id?: string; source: string }) =>
+      `${row.namespace}:${row.source}:${row.credential_id}`,
+  );
+  assert.deepEqual(operatorIds, [
+    "platform:platform:anth",
+    "platform:platform:OPENAI_KEY",
+    "platform:platform:public-platform",
+    "tenant:byok:tenant-own",
+  ]);
+});
