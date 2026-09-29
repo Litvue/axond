@@ -60,6 +60,7 @@ async function main(): Promise<void> {
     defaultNamespace: config.defaultNamespace,
     configNamespaces: config.namespaces.map((namespace) => namespace.id),
     transport: config.transport,
+    maxRequestBytes: config.maxRequestBytes,
     extensions,
     rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
     serving: () => serving,

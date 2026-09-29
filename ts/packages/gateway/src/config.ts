@@ -69,6 +69,7 @@ export interface LoadedConfig {
     | { source: "none" }
     | { source: "models-dev" | "seed"; sourceUrl: string | null };
   extensionsDir: string | null;
+  maxRequestBytes: number;
 }
 
 export interface SecretReader {
@@ -253,12 +254,21 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
   });
 
   const transportRaw = asRecord(parsed["transport"]) ?? {};
+  const maxResponseBytes = numberField(transportRaw, "max_response_bytes", DEFAULT_TRANSPORT.maxResponseBytes);
+  if (!Number.isInteger(maxResponseBytes) || maxResponseBytes < 1) {
+    throw configError("transport.max_response_bytes must be at least 1");
+  }
   const transport: TransportLimits = {
     responseHeaderTimeoutMs: numberField(transportRaw, "response_header_timeout_ms", DEFAULT_TRANSPORT.responseHeaderTimeoutMs),
     bufferedBodyTimeoutMs: numberField(transportRaw, "buffered_body_timeout_ms", DEFAULT_TRANSPORT.bufferedBodyTimeoutMs),
     streamIdleTimeoutMs: numberField(transportRaw, "stream_idle_timeout_ms", DEFAULT_TRANSPORT.streamIdleTimeoutMs),
-    maxResponseBytes: DEFAULT_TRANSPORT.maxResponseBytes,
+    maxResponseBytes,
   };
+  const admissionRaw = asRecord(parsed["admission"]) ?? {};
+  const maxRequestBytes = numberField(admissionRaw, "max_request_bytes", 2 * 1024 * 1024);
+  if (!Number.isInteger(maxRequestBytes) || maxRequestBytes < 1) {
+    throw configError("admission.max_request_bytes must be at least 1");
+  }
   const discovery = asRecord(parsed["discovery"]) ?? {};
   const discoveryIntervalSeconds = numberField(discovery, "refresh_interval_seconds", 300);
   if (discoveryIntervalSeconds < 1) {
@@ -301,6 +311,7 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     shutdown,
     catalog,
     extensionsDir,
+    maxRequestBytes,
   };
 }
 

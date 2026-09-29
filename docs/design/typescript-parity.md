@@ -15,7 +15,7 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 | No budget row, or `spent >= limit`, is `429` `budget_exceeded`. A failed budget read is `503` `budget_unavailable` unless `[storage] on_unavailable = "allow"`, which serves the request and does not charge. Other Store failures are `503` `store_unavailable`. The driver message is not returned. Charge is one usage row per `request_id`. Delete bumps incarnation so a late settle does not charge. | store tests |
 | File namespaces do not inherit platform credentials unless `allow_platform_fallback`. API-created namespaces do. Config namespaces cannot be deleted (`409`). | gateway |
 | Management routes and the OpenAPI 3.1 document match `ops/check-openapi.py`. | `ts/openapi.json` |
-| Withdrawn config sections fail boot by name and do not echo secret values. | config tests |
+| Withdrawn config sections fail boot by name and do not echo secret values. `transport.max_response_bytes` and `admission.max_request_bytes` load from the file; `0` is rejected. An oversized body is `413` `request_too_large` and is not echoed. | config tests |
 
 ## Gaps, on purpose
 

@@ -373,6 +373,8 @@ namespace = "platform"
 `;
   const loaded = await loadConfig(toml, envSecretReader({ GW_KEY: "k" }, async () => ""));
   assert.deepEqual(loaded.shutdown, { drainGraceMs: 5_000, deadlineMs: 15_000, flushTimeoutMs: 5_000 });
+  assert.equal(loaded.transport.maxResponseBytes, 32 * 1024 * 1024);
+  assert.equal(loaded.maxRequestBytes, 2 * 1024 * 1024);
   assert.equal(loaded.storage.onUnavailable, "deny");
   const allowed = await loadConfig(
     toml.replace('path = "/tmp/axond.sqlite"', 'path = "/tmp/axond.sqlite"\non_unavailable = "allow"'),
@@ -401,6 +403,78 @@ namespace = "platform"
       return true;
     },
   );
+});
+
+test("transport and admission byte limits load from toml", async () => {
+  const toml = `
+[storage]
+backend = "sqlite"
+path = "/tmp/axond.sqlite"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[transport]
+max_response_bytes = 4096
+[admission]
+max_request_bytes = 64
+`;
+  const loaded = await loadConfig(toml, envSecretReader({ GW_KEY: "k" }, async () => ""));
+  assert.equal(loaded.transport.maxResponseBytes, 4096);
+  assert.equal(loaded.maxRequestBytes, 64);
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("max_response_bytes = 4096", "max_response_bytes = 0"),
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /transport\.max_response_bytes must be at least 1/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("max_request_bytes = 64", "max_request_bytes = 0"),
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /admission\.max_request_bytes must be at least 1/);
+      return true;
+    },
+  );
+});
+
+test("an oversized request is 413 and the body is not echoed", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxRequestBytes: 32,
+    providers: [],
+  });
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "fake-openai/gpt-test", note: "BODY_SENTINEL" }),
+  });
+  assert.equal(response.status, 413);
+  const text = await response.text();
+  assert.equal(text.includes("BODY_SENTINEL"), false);
+  assert.deepEqual(JSON.parse(text), {
+    error: { type: "request_too_large", message: "request body exceeds the configured inbound limit" },
+  });
 });
 
 test("a down budget store is budget_unavailable and a down management store is store_unavailable", async () => {
