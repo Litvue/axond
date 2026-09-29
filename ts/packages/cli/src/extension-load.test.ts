@@ -9,7 +9,7 @@ import type { AddressInfo } from "node:net";
 
 const BIN = new URL("../../../bin/axond", import.meta.url);
 
-test("a .ts extension loads from AXOND_EXTENSIONS_DIR without a rebuild", async () => {
+test("extension_file_loads_from_a_directory_without_a_rebuild", async () => {
   const dir = await mkdtemp(join(tmpdir(), "axond-ext-"));
   const port = await freePort();
   try {

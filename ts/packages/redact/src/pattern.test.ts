@@ -3,7 +3,7 @@ import test from "node:test";
 
 import { compilePattern } from "./pattern.ts";
 
-test("a nested quantifier is rejected", () => {
+test("nested_quantifier_redaction_pattern_is_rejected", () => {
   assert.throws(() => compilePattern("(a+)+"), /nested quantifiers/);
 });
 

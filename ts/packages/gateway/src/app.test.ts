@@ -130,7 +130,7 @@ test("a buffered chat completion rewrites the model and forwards the provider cr
   upstream.close();
 });
 
-test("an unknown gateway key is rejected before namespace lookup", async () => {
+test("unknown_gateway_key_is_rejected_before_namespace_lookup", async () => {
   const { app, upstream } = await gateway();
   const response = await app.request("http://127.0.0.1/ns/ghost/v1/models", {
     headers: { authorization: "Bearer nope" },
@@ -141,7 +141,7 @@ test("an unknown gateway key is rejected before namespace lookup", async () => {
   upstream.close();
 });
 
-test("a noncanonical namespace path is invalid after authentication", async () => {
+test("noncanonical_namespace_path_is_invalid_after_authentication", async () => {
   const { app, upstream } = await gateway();
   const response = await app.request("http://127.0.0.1/ns/%70latform/v1/models", {
     headers: {
@@ -241,7 +241,7 @@ backend = "redis"
   );
 });
 
-test("an untrusted extension cannot query another namespace", async () => {
+test("untrusted_extension_query_without_namespace_is_refused", async () => {
   const rows = [{ id: "platform" }, { id: "tenant" }];
   const store = {
     async query(sql: string, params: readonly unknown[] = []) {

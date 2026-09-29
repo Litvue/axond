@@ -379,11 +379,20 @@ order, `apiVersion`, migration prefix checks, the untrusted store scope, or
 `AXOND_EXTENSIONS_DIR`.
 
 **Regression tests.** The Rust authentication floor in section 1 still holds
-for the process operators run today. The TypeScript suite rejects an unknown
-gateway key before it reads a namespace, refuses a percent-encoded namespace
-segment without echoing it, and loads an extension file from a directory
-without rebuilding the process. Untrusted queries that omit the request
-namespace are refused. Nested-quantifier redaction patterns are refused.
+for the process operators run today. The TypeScript suite names the same
+floor: `unknown_gateway_key_is_rejected_before_namespace_lookup` rejects an
+unknown gateway key before it reads a namespace;
+`noncanonical_namespace_path_is_invalid_after_authentication` refuses a
+percent-encoded namespace segment without echoing it;
+`extension_file_loads_from_a_directory_without_a_rebuild` loads an extension
+file from a directory without rebuilding the process;
+`untrusted_extension_query_without_namespace_is_refused` refuses an untrusted
+query that omits the request namespace;
+`nested_quantifier_redaction_pattern_is_rejected` refuses a nested-quantifier
+redaction pattern; `unsupported_extension_api_version_is_refused_at_mount`
+refuses an extension whose apiVersion is not 1;
+`extension_migration_outside_its_prefix_is_refused` refuses a migration that
+creates a table outside that extension's table prefix.
 
 **Threat model and ADRs.** [ADR 0066](../adr/0066-typescript-hono-extension-contract.md)
 is the decision: extensions are operator and first-party code with no

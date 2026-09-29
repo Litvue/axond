@@ -48,7 +48,7 @@ function listen(handler: (req: import("node:http").IncomingMessage, res: import(
   });
 }
 
-test("an unsupported extension apiVersion is refused at mount", async () => {
+test("unsupported_extension_api_version_is_refused_at_mount", async () => {
   const store = await seeded();
   assert.throws(
     () =>
@@ -69,6 +69,31 @@ test("an unsupported extension apiVersion is refused at mount", async () => {
         ],
       }),
     /apiVersion 2 is not supported/,
+  );
+});
+
+test("extension_migration_outside_its_prefix_is_refused", async () => {
+  const store = await seeded();
+  assert.throws(
+    () =>
+      createAxond({
+        store,
+        gatewayKey: KEY,
+        defaultNamespace: "platform",
+        providers: [],
+        extensions: [
+          {
+            name: "probe",
+            apiVersion: 1,
+            stage: "pre-auth",
+            migrations: ["CREATE TABLE axond_namespace_shadow (id TEXT)"],
+            async middleware(_c, next) {
+              await next();
+            },
+          },
+        ],
+      }),
+    /outside `axond_ext_probe_`/,
   );
 });
 
