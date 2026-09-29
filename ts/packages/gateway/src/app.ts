@@ -19,7 +19,15 @@ import { API_VERSION } from "@axond/sdk";
 
 import { assertGatewayKey, presentedCredential } from "./auth.ts";
 import { ByteRequestBody } from "./body.ts";
-import { callUpstream, noteCredentialFailure, selectCredential, type CredentialPool } from "./dispatch.ts";
+import {
+  callUpstream,
+  credentialPolicy,
+  credentialState,
+  noteCredentialFailure,
+  noteCredentialSuccess,
+  planCredentials,
+  type CredentialPool,
+} from "./dispatch.ts";
 import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors.ts";
 import { globMatch } from "./glob.ts";
 import { budgetJson, money, namespaceJson } from "./memory-store.ts";
@@ -523,21 +531,26 @@ async function dispatch(
     record.allowPlatformFallback || !record.fromConfig ? opts.defaultNamespace : null;
   const pinned = axond.route === "responses";
   const now = opts.clock?.() ?? Date.now();
-  const matching = (opts.credentials ?? []).filter(
-    (item) => item.provider === provider.id && (item.namespace === record.id || item.namespace === fallback),
+  const policy = credentialPolicy(opts.credentialPool);
+  const planned = planCredentials(
+    opts.credentials ?? [],
+    pools,
+    record.id,
+    provider.id,
+    fallback,
+    pinned,
+    now,
+    policy,
   );
-  const own = matching.filter((item) => item.namespace === record.id);
-  const poolSize = own.length > 0 || fallback === null ? own.length : matching.length;
-  const attempts = pinned ? 1 : Math.max(poolSize, 1);
   let upstream: Awaited<ReturnType<typeof callUpstream>> | null = null;
   let lastError: unknown;
   const payload = await axond.body.json<Record<string, unknown>>();
   const stream = Boolean(payload["stream"]);
   const previous = payload["previous_response_id"];
   const continuation = pinned && typeof previous === "string" && previous.length > 0;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const credential = selectCredential(opts.credentials ?? [], pools, record.id, provider.id, fallback, pinned, now);
-    if (continuation && credentialState(pools, credential, now) === "parked") {
+  for (let attempt = 0; attempt < planned.length; attempt += 1) {
+    const credential = planned[attempt]!;
+    if (continuation && credentialState(pools, credential, now, policy.cooldownMs) === "parked") {
       throw new GatewayFailure(
         "continuation_affinity_unavailable",
         503,
@@ -611,6 +624,7 @@ async function dispatch(
       if (!stream) {
         scheduleSettle(opts, axond, upstream.usage, "ok");
       }
+      noteCredentialSuccess(pools, record.id, provider.id, credential.id);
       noteAttempt(c, opts, axond, credential, attempt, attemptStarted, "ok", false);
       break;
     } catch (error) {
@@ -627,15 +641,11 @@ async function dispatch(
         error instanceof GatewayFailure ? error.type : "error",
         true,
       );
-      if (error instanceof GatewayFailure && error.type === "provider_dependency_failed") {
-        noteCredentialFailure(pools, record.id, provider.id, credential.id, now);
+      const rateLimited = error instanceof GatewayFailure && error.rateLimited;
+      if (rateLimited) {
+        noteCredentialFailure(pools, record.id, provider.id, credential.id, now, policy.failureThreshold);
       }
-      const retryable =
-        error instanceof GatewayFailure &&
-        error.type === "provider_dependency_failed" &&
-        !pinned &&
-        attempt + 1 < attempts;
-      if (!retryable) {
+      if (!(rateLimited && !pinned && attempt + 1 < planned.length)) {
         throw error;
       }
     }
@@ -886,6 +896,7 @@ async function listCredentials(
     throw new GatewayFailure("token_scope_insufficient", 403, "token scope does not authorize `credentials`");
   }
   const now = opts.clock?.() ?? Date.now();
+  const policy = credentialPolicy(opts.credentialPool);
   const rows = (opts.credentials ?? []).filter((credential) => all || credential.namespace === axond.namespace?.id);
   c.res = Response.json({
     object: "list",
@@ -895,14 +906,9 @@ async function listCredentials(
       provider: credential.provider,
       credential_id: credential.id,
       source: credential.namespace === opts.defaultNamespace ? "platform" : "namespace",
-      state: credentialState(pools, credential, now),
+      state: credentialState(pools, credential, now, policy.cooldownMs),
     })),
   });
-}
-
-function credentialState(pools: Map<string, CredentialPool>, credential: CredentialConfig, now: number): "healthy" | "parked" {
-  const health = pools.get(`${credential.namespace}\0${credential.provider}`)?.failures.get(credential.id);
-  return health && health.openUntil > now ? "parked" : "healthy";
 }
 
 async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: MutableContext): Promise<Response | void> {

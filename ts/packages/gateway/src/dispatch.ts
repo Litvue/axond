@@ -4,14 +4,49 @@ import { GatewayFailure } from "./errors.ts";
 import { assignUsage, emptyUsage, noteSseChunk, usageFromJson } from "./usage.ts";
 import type { UsageTokens } from "@axond/sdk";
 
-export interface CredentialPool {
-  cursor: number;
-  failures: Map<string, { count: number; openUntil: number }>;
+export interface CredentialCircuit {
+  failures: number;
+  parkedAt: number | null;
 }
+
+export interface CredentialPool {
+  tick: number;
+  circuits: Map<string, CredentialCircuit>;
+}
+
+export interface CredentialPoolPolicy {
+  strategy: "round-robin" | "weighted";
+  failureThreshold: number;
+  cooldownMs: number;
+}
+
+export const DEFAULT_CREDENTIAL_POLICY: CredentialPoolPolicy = {
+  strategy: "round-robin",
+  failureThreshold: 2,
+  cooldownMs: 30_000,
+};
 
 const KEEPALIVE = new TextEncoder().encode(": keepalive\n\n");
 
-export function selectCredential(
+export function credentialPolicy(input?: {
+  strategy?: "round-robin" | "weighted";
+  failureThreshold?: number;
+  cooldownMs?: number;
+}): CredentialPoolPolicy {
+  return {
+    strategy: input?.strategy ?? DEFAULT_CREDENTIAL_POLICY.strategy,
+    failureThreshold: input?.failureThreshold ?? DEFAULT_CREDENTIAL_POLICY.failureThreshold,
+    cooldownMs: input?.cooldownMs ?? DEFAULT_CREDENTIAL_POLICY.cooldownMs,
+  };
+}
+
+/**
+ * One request's credential walk. A pinned route returns the first credential
+ * and does not read or advance health. Otherwise the rotation cursor moves
+ * once, a cooldown-elapsed credential is taken as the single half-open probe,
+ * and parked credentials are skipped unless every key is parked.
+ */
+export function planCredentials(
   credentials: readonly CredentialConfig[],
   pools: Map<string, CredentialPool>,
   namespace: string,
@@ -19,7 +54,86 @@ export function selectCredential(
   fallbackNamespace: string | null,
   pinned: boolean,
   now: number,
-): CredentialConfig {
+  policy: CredentialPoolPolicy,
+): CredentialConfig[] {
+  const pool = credentialPool(credentials, namespace, provider, fallbackNamespace);
+  if (pinned) {
+    return [pool[0]!];
+  }
+  const state = poolState(pools, namespace, provider);
+  const start = rotationStart(pool, state.tick, policy.strategy);
+  state.tick += 1;
+  const order = pool.map((_, index) => pool[(start + index) % pool.length]!);
+  let probe: CredentialConfig | null = null;
+  const healthy: CredentialConfig[] = [];
+  const parked: CredentialConfig[] = [];
+  for (const candidate of order) {
+    const circuit = state.circuits.get(candidate.id);
+    if (!circuit || circuit.parkedAt === null) {
+      healthy.push(candidate);
+      continue;
+    }
+    if (now - circuit.parkedAt >= policy.cooldownMs) {
+      circuit.parkedAt = now;
+      probe = candidate;
+      continue;
+    }
+    parked.push(candidate);
+  }
+  if (probe) {
+    return [probe, ...healthy];
+  }
+  if (healthy.length > 0) {
+    return healthy;
+  }
+  return [parked[0]!];
+}
+
+export function noteCredentialFailure(
+  pools: Map<string, CredentialPool>,
+  namespace: string,
+  provider: string,
+  credentialId: string,
+  now: number,
+  threshold: number,
+): void {
+  const state = poolState(pools, namespace, provider);
+  const circuit = state.circuits.get(credentialId) ?? { failures: 0, parkedAt: null };
+  circuit.failures += 1;
+  if (circuit.failures >= threshold) {
+    circuit.parkedAt = now;
+  }
+  state.circuits.set(credentialId, circuit);
+}
+
+export function noteCredentialSuccess(
+  pools: Map<string, CredentialPool>,
+  namespace: string,
+  provider: string,
+  credentialId: string,
+): void {
+  poolState(pools, namespace, provider).circuits.delete(credentialId);
+}
+
+export function credentialState(
+  pools: Map<string, CredentialPool>,
+  credential: CredentialConfig,
+  now: number,
+  cooldownMs: number,
+): "healthy" | "parked" | "probe" {
+  const circuit = pools.get(`${credential.namespace}\0${credential.provider}`)?.circuits.get(credential.id);
+  if (!circuit || circuit.parkedAt === null) {
+    return "healthy";
+  }
+  return now - circuit.parkedAt < cooldownMs ? "parked" : "probe";
+}
+
+function credentialPool(
+  credentials: readonly CredentialConfig[],
+  namespace: string,
+  provider: string,
+  fallbackNamespace: string | null,
+): CredentialConfig[] {
   const own = credentials.filter((credential) => credential.namespace === namespace && credential.provider === provider);
   const fallback =
     own.length === 0 && fallbackNamespace !== null
@@ -33,44 +147,31 @@ export function selectCredential(
       `no credential for provider \`${provider}\` in namespace \`${namespace}\``,
     );
   }
-  if (pinned) {
-    return pool[0]!;
-  }
-  const key = `${namespace}\0${provider}`;
-  const state = pools.get(key) ?? { cursor: 0, failures: new Map() };
-  pools.set(key, state);
-  for (let offset = 0; offset < pool.length; offset += 1) {
-    const index = (state.cursor + offset) % pool.length;
-    const candidate = pool[index]!;
-    const health = state.failures.get(candidate.id);
-    if (health && health.openUntil > now) {
-      continue;
-    }
-    state.cursor = (index + 1) % pool.length;
-    return candidate;
-  }
-  return pool[0]!;
+  return pool;
 }
 
-export function noteCredentialFailure(
-  pools: Map<string, CredentialPool>,
-  namespace: string,
-  provider: string,
-  credentialId: string,
-  now: number,
-  threshold = 3,
-  cooldownMs = 30_000,
-): void {
+function poolState(pools: Map<string, CredentialPool>, namespace: string, provider: string): CredentialPool {
   const key = `${namespace}\0${provider}`;
-  const state = pools.get(key) ?? { cursor: 0, failures: new Map() };
+  const state = pools.get(key) ?? { tick: 0, circuits: new Map() };
   pools.set(key, state);
-  const current = state.failures.get(credentialId) ?? { count: 0, openUntil: 0 };
-  current.count += 1;
-  if (current.count >= threshold) {
-    current.openUntil = now + cooldownMs;
-    current.count = 0;
+  return state;
+}
+
+function rotationStart(pool: readonly CredentialConfig[], tick: number, strategy: CredentialPoolPolicy["strategy"]): number {
+  const count = pool.length;
+  if (strategy === "round-robin") {
+    return tick % count;
   }
-  state.failures.set(credentialId, current);
+  const total = pool.reduce((sum, credential) => sum + (credential.weight ?? 1), 0);
+  let offset = tick % total;
+  for (let index = 0; index < count; index += 1) {
+    const weight = pool[index]!.weight ?? 1;
+    if (offset < weight) {
+      return index;
+    }
+    offset -= weight;
+  }
+  return count - 1;
 }
 
 export function classifyUpstream(status: number, body: string): GatewayFailure {
@@ -91,7 +192,10 @@ export function classifyUpstream(status: number, body: string): GatewayFailure {
   if (status === 404) {
     return new GatewayFailure("model_unavailable", 502, message);
   }
-  if (status === 429 || status >= 500) {
+  if (status === 429) {
+    return new GatewayFailure("provider_dependency_failed", 502, message, true);
+  }
+  if (status >= 500) {
     return new GatewayFailure("provider_dependency_failed", 502, message);
   }
   if (message.toLowerCase().includes("context window")) {

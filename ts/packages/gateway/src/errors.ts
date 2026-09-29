@@ -9,12 +9,15 @@ export class StoreFailure extends Error {
 export class GatewayFailure extends Error {
   readonly type: string;
   readonly status: number;
+  /** A provider 429. This parks the credential. A 5xx does not. */
+  readonly rateLimited: boolean;
 
-  constructor(type: string, status: number, message: string) {
+  constructor(type: string, status: number, message: string, rateLimited = false) {
     super(message);
     this.name = "GatewayFailure";
     this.type = type;
     this.status = status;
+    this.rateLimited = rateLimited;
   }
 }
 

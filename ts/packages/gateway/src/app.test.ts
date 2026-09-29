@@ -377,6 +377,7 @@ namespace = "platform"
   assert.equal(loaded.maxRequestBytes, 2 * 1024 * 1024);
   assert.equal(loaded.maxPromptTokens, 1_000_000);
   assert.equal(loaded.maxOutputTokens, 200_000);
+  assert.deepEqual(loaded.credentialPool, { strategy: "round-robin", failureThreshold: 2, cooldownSeconds: 30 });
   assert.equal(loaded.storage.onUnavailable, "deny");
   const allowed = await loadConfig(
     toml.replace('path = "/tmp/axond.sqlite"', 'path = "/tmp/axond.sqlite"\non_unavailable = "allow"'),
@@ -402,6 +403,79 @@ namespace = "platform"
       ),
     (error: unknown) => {
       assert.match(error instanceof Error ? error.message : "", /shutdown\.deadline_ms must be at least 1/);
+      return true;
+    },
+  );
+});
+
+test("credential pool threshold, cooldown, and weight load from toml", async () => {
+  const toml = `
+[storage]
+backend = "sqlite"
+path = "/tmp/axond.sqlite"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[[provider]]
+id = "fake-openai"
+kind = "openai"
+base_url = "http://127.0.0.1:9"
+[[credential]]
+namespace = "platform"
+provider = "fake-openai"
+env = "OPENAI_KEY"
+id = "light"
+weight = 1
+[[credential]]
+namespace = "platform"
+provider = "fake-openai"
+env = "OPENAI_KEY"
+id = "heavy"
+weight = 3
+[credential_pool]
+strategy = "weighted"
+failure_threshold = 1
+cooldown_seconds = 5
+`;
+  const loaded = await loadConfig(toml, envSecretReader({ GW_KEY: "k", OPENAI_KEY: "sk" }, async () => ""));
+  assert.deepEqual(loaded.credentialPool, { strategy: "weighted", failureThreshold: 1, cooldownSeconds: 5 });
+  assert.deepEqual(
+    loaded.credentials.map((credential) => credential.weight),
+    [1, 3],
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("failure_threshold = 1", "failure_threshold = 0"),
+        envSecretReader({ GW_KEY: "k", OPENAI_KEY: "sk" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /credential_pool\.failure_threshold must be at least 1/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("cooldown_seconds = 5", "cooldown_seconds = 0"),
+        envSecretReader({ GW_KEY: "k", OPENAI_KEY: "sk" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /credential_pool\.cooldown_seconds must be at least 1/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("weight = 3", "weight = 0"),
+        envSecretReader({ GW_KEY: "k", OPENAI_KEY: "sk" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /credential weight must be at least 1/);
       return true;
     },
   );

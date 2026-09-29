@@ -74,6 +74,11 @@ export interface LoadedConfig {
   maxPromptTokens: number;
   /** `0` disables the ceiling. */
   maxOutputTokens: number;
+  credentialPool: {
+    strategy: "round-robin" | "weighted";
+    failureThreshold: number;
+    cooldownSeconds: number;
+  };
 }
 
 export interface SecretReader {
@@ -186,13 +191,36 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     if (secret === undefined || secret.length === 0) {
       throw configError(`credential env \`${envName}\` is unset`);
     }
+    const weight = numberField(row, "weight", 1);
+    if (!Number.isInteger(weight) || weight < 1) {
+      throw configError("credential weight must be at least 1");
+    }
     credentials.push({
       namespace,
       provider,
       secret,
       id: typeof row["id"] === "string" && row["id"].length > 0 ? row["id"] : envName,
+      weight,
     });
   }
+  const poolRaw = asRecord(parsed["credential_pool"]) ?? {};
+  const strategyRaw = poolRaw["strategy"];
+  if (strategyRaw !== undefined && strategyRaw !== "round-robin" && strategyRaw !== "weighted") {
+    throw configError("`[credential_pool] strategy` must be `round-robin` or `weighted`");
+  }
+  const failureThreshold = numberField(poolRaw, "failure_threshold", 2);
+  if (!Number.isInteger(failureThreshold) || failureThreshold < 1) {
+    throw configError("credential_pool.failure_threshold must be at least 1");
+  }
+  const cooldownSeconds = numberField(poolRaw, "cooldown_seconds", 30);
+  if (!Number.isInteger(cooldownSeconds) || cooldownSeconds < 1) {
+    throw configError("credential_pool.cooldown_seconds must be at least 1");
+  }
+  const credentialPool: LoadedConfig["credentialPool"] = {
+    strategy: strategyRaw === "weighted" ? "weighted" : "round-robin",
+    failureThreshold,
+    cooldownSeconds,
+  };
 
   const keys = asArray(parsed["gateway_key"]);
   if (keys.length === 0) {
@@ -326,6 +354,7 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     maxRequestBytes,
     maxPromptTokens,
     maxOutputTokens,
+    credentialPool,
   };
 }
 

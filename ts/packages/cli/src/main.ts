@@ -63,6 +63,11 @@ async function main(): Promise<void> {
     maxRequestBytes: config.maxRequestBytes,
     maxPromptTokens: config.maxPromptTokens,
     maxOutputTokens: config.maxOutputTokens,
+    credentialPool: {
+      strategy: config.credentialPool.strategy,
+      failureThreshold: config.credentialPool.failureThreshold,
+      cooldownMs: config.credentialPool.cooldownSeconds * 1000,
+    },
     extensions,
     rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
     serving: () => serving,

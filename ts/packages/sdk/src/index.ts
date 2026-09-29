@@ -290,6 +290,15 @@ export interface AxondOptions {
    * `max_completion_tokens`, or `max_output_tokens` is refused.
    */
   maxOutputTokens?: number;
+  /**
+   * In-memory credential circuit. Absent uses round-robin, a threshold of 2
+   * consecutive 429s, and a 30s cooldown before one half-open probe.
+   */
+  credentialPool?: {
+    strategy?: "round-robin" | "weighted";
+    failureThreshold?: number;
+    cooldownMs?: number;
+  };
 }
 
 export interface ProviderConfig {
@@ -314,6 +323,8 @@ export interface CredentialConfig {
   provider: string;
   secret: string;
   id: string;
+  /** Share of traffic when the pool strategy is `weighted`. Absent means 1. */
+  weight?: number;
 }
 
 export interface TransportLimits {
