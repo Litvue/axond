@@ -24,7 +24,7 @@ import { GatewayFailure, badRequest, gatewayError } from "./errors.ts";
 import { globMatch } from "./glob.ts";
 import { budgetJson, money, namespaceJson } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, parseNamespaceId, validatePeriod, validateTimezone } from "./namespace.ts";
-import { beginTrace, formatTraceparent, metricPayload, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
+import { beginTrace, childTrace, formatTraceparent, metricPayload, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
 import { sanitizeAttributes } from "./metrics.ts";
 import { OPENAPI } from "./openapi.ts";
 import { costMicrodollars, lookupPrice } from "./pricing.ts";
@@ -33,6 +33,7 @@ import { emptyUsage } from "./usage.ts";
 
 const DEFAULT_MAX_REQUEST = 2 * 1024 * 1024;
 const requestTrace = new WeakMap<Request, TraceContext>();
+const requestAttempts = new WeakMap<Request, ExportedSpan[]>();
 
 interface MutableContext extends AxondContext {
   hooks: ((settlement: Settlement) => Promise<void>)[];
@@ -102,14 +103,18 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
             },
             secretValues(opts),
           );
-          const task = publishTelemetry(opts, {
-            name: "http.server.request",
-            trace,
-            startMs: started,
-            endMs: ended,
-            attributes,
-            error: status >= 500,
-          });
+          const attempts = requestAttempts.get(c.req.raw) ?? [];
+          const task = publishTelemetry(opts, [
+            {
+              name: "http.server.request",
+              trace,
+              startMs: started,
+              endMs: ended,
+              attributes,
+              error: status >= 500,
+            },
+            ...attempts,
+          ]);
           if (opts.waitUntil) {
             opts.waitUntil(task);
           } else {
@@ -442,6 +447,7 @@ async function dispatch(
     if (trace) {
       headers.set("traceparent", formatTraceparent(trace));
     }
+    const attemptStarted = Date.now();
     const path =
       axond.route === "chat"
         ? "/chat/completions"
@@ -491,11 +497,22 @@ async function dispatch(
       if (!stream) {
         scheduleSettle(opts, axond, upstream.usage, "ok");
       }
+      noteAttempt(c, opts, axond, credential, attempt, attemptStarted, "ok", false);
       break;
     } catch (error) {
       lastError = error;
       skipSettle = true;
       releaseStream();
+      noteAttempt(
+        c,
+        opts,
+        axond,
+        credential,
+        attempt,
+        attemptStarted,
+        error instanceof GatewayFailure ? error.type : "error",
+        true,
+      );
       const retryable =
         error instanceof GatewayFailure &&
         error.type === "provider_dependency_failed" &&
@@ -540,18 +557,56 @@ function secretValues(opts: AxondOptions): string[] {
   return secrets;
 }
 
-async function publishTelemetry(opts: AxondOptions, span: ExportedSpan): Promise<void> {
+function noteAttempt(
+  c: Context<AxondEnv>,
+  opts: AxondOptions,
+  axond: MutableContext,
+  credential: CredentialConfig,
+  attempt: number,
+  startedMs: number,
+  status: string,
+  error: boolean,
+): void {
+  const parent = requestTrace.get(c.req.raw);
+  if (!parent || !opts.telemetry) {
+    return;
+  }
+  const spans = requestAttempts.get(c.req.raw) ?? [];
+  spans.push({
+    name: "axond.upstream.attempt",
+    trace: childTrace(parent),
+    startMs: startedMs,
+    endMs: Date.now(),
+    kind: 1,
+    error,
+    attributes: sanitizeAttributes(
+      {
+        "axond.attempt": String(attempt),
+        "axond.target.provider": axond.target?.provider ?? "",
+        "axond.target.model": axond.target?.model ?? "",
+        "axond.status": status,
+        "axond.credential.id": credential.id,
+        "axond.credential_source": credential.namespace === opts.defaultNamespace ? "platform" : "byok",
+        "axond.latency_ms": String(Date.now() - startedMs),
+      },
+      secretValues(opts),
+    ),
+  });
+  requestAttempts.set(c.req.raw, spans);
+}
+
+async function publishTelemetry(opts: AxondOptions, spans: readonly ExportedSpan[]): Promise<void> {
   const target = opts.telemetry;
-  if (!target) {
+  if (!target || spans.length === 0) {
     return;
   }
   const resource = resourceAttributes(target.instanceId);
   const fetchImpl = target.fetch ?? fetch;
   try {
-    await postOtlp(target.endpoint, "traces", tracePayload([span], resource), fetchImpl);
+    await postOtlp(target.endpoint, "traces", tracePayload(spans, resource), fetchImpl);
     const points = opts.metrics?.points;
     if (points && points.length > 0) {
-      await postOtlp(target.endpoint, "metrics", metricPayload(points, resource, span.endMs), fetchImpl);
+      await postOtlp(target.endpoint, "metrics", metricPayload(points, resource, spans[0]!.endMs), fetchImpl);
     }
   } catch {
     // A collector that is down does not fail the caller.

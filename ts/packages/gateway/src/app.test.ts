@@ -213,10 +213,24 @@ test("otlp json joins traceparent and omits the prompt", async () => {
     const metricsBody = received.find((item) => item.url === "/v1/metrics");
     assert.ok(traces);
     assert.ok(metricsBody);
-    const span = JSON.parse(traces.body).resourceSpans[0].scopeSpans[0].spans[0];
+    const spans = JSON.parse(traces.body).resourceSpans[0].scopeSpans[0].spans as {
+      name: string;
+      traceId: string;
+      spanId: string;
+      parentSpanId?: string;
+      attributes: { key: string; value: { stringValue: string } }[];
+    }[];
+    const span = spans.find((item) => item.name === "http.server.request");
+    const attempt = spans.find((item) => item.name === "axond.upstream.attempt");
+    assert.ok(span);
+    assert.ok(attempt);
     assert.equal(span.traceId, "4bf92f3577b34da6a3ce929d0e0e4736");
     assert.equal(span.parentSpanId, "00f067aa0ba902b7");
     assert.equal(span.name, "http.server.request");
+    assert.equal(attempt.traceId, span.traceId);
+    assert.equal(attempt.parentSpanId, span.spanId);
+    assert.equal(attempt.attributes.find((item) => item.key === "axond.target.provider")?.value.stringValue, "fake-openai");
+    assert.equal(attempt.attributes.find((item) => item.key === "axond.status")?.value.stringValue, "ok");
     assert.equal(upstream.requests[0]!.traceparent, `00-${span.traceId}-${span.spanId}-01`);
     const exported = `${traces.body}\n${metricsBody.body}`;
     assert.equal(exported.includes(KEY), false);

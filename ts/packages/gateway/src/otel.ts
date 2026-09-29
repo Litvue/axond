@@ -59,6 +59,10 @@ export function beginTrace(header: string | undefined): TraceContext {
   return { traceId: parent.traceId, spanId: randomHex(8), parentSpanId: parent.spanId };
 }
 
+export function childTrace(parent: TraceContext): TraceContext {
+  return { traceId: parent.traceId, spanId: randomHex(8), parentSpanId: parent.spanId };
+}
+
 export function formatTraceparent(trace: TraceContext): string {
   return `00-${trace.traceId}-${trace.spanId}-01`;
 }
@@ -86,6 +90,8 @@ export interface ExportedSpan {
   endMs: number;
   attributes: Record<string, string>;
   error: boolean;
+  /** OpenTelemetry span kind. 2 is server, 1 is internal. */
+  kind?: number;
 }
 
 export function tracePayload(spans: readonly ExportedSpan[], resource: Record<string, string>): unknown {
@@ -101,7 +107,7 @@ export function tracePayload(spans: readonly ExportedSpan[], resource: Record<st
               spanId: span.trace.spanId,
               ...(span.trace.parentSpanId ? { parentSpanId: span.trace.parentSpanId } : {}),
               name: span.name,
-              kind: 2,
+              kind: span.kind ?? 2,
               startTimeUnixNano: unixNano(span.startMs),
               endTimeUnixNano: unixNano(span.endMs),
               attributes: keyValues(span.attributes),
