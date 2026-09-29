@@ -17,6 +17,7 @@ import type {
 } from "@axond/sdk";
 import { API_VERSION } from "@axond/sdk";
 
+import { admissionFromOptions, createAdmission, type AdmissionHold } from "./admission.ts";
 import { assertGatewayKey, presentedCredential } from "./auth.ts";
 import { ByteRequestBody } from "./body.ts";
 import {
@@ -77,6 +78,17 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
     validateMigrations(extension);
   }
   const pools = new Map<string, CredentialPool>();
+  const admission =
+    opts.admissionControl ??
+    createAdmission(
+      admissionFromOptions({
+        maxInFlight: opts.maxInFlight,
+        maxInFlightStreams: opts.maxInFlightStreams,
+        queueCapacity: opts.admissionQueueCapacity,
+        queueWaitMs: opts.admissionQueueWaitMs,
+        maxPendingSettlements: opts.maxPendingSettlements,
+      }),
+    );
   const app = new Hono<AxondEnv>();
   if (opts.metrics || opts.telemetry || opts.onLog) {
     app.use("*", async (c, next) => {
@@ -162,9 +174,9 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
       app.route("/", extension.routes);
     }
   }
-  app.all("/api/v1/*", (c) => pipeline(c, opts, extensions, pools, "management"));
-  app.all("/ns/*", (c) => pipeline(c, opts, extensions, pools, "inference"));
-  app.all("/namespaces/*", (c) => pipeline(c, opts, extensions, pools, "inference"));
+  app.all("/api/v1/*", (c) => pipeline(c, opts, extensions, pools, admission, "management"));
+  app.all("/ns/*", (c) => pipeline(c, opts, extensions, pools, admission, "inference"));
+  app.all("/namespaces/*", (c) => pipeline(c, opts, extensions, pools, admission, "inference"));
   return app;
 }
 
@@ -181,11 +193,14 @@ function validateMigrations(extension: AxondExtension): void {
   }
 }
 
+const admissionHolds = new WeakMap<MutableContext, AdmissionHold>();
+
 async function pipeline(
   c: Context<AxondEnv>,
   opts: AxondOptions,
   extensions: readonly AxondExtension[],
   pools: Map<string, CredentialPool>,
+  admission: { admit(kind: "buffered" | "streamed", metrics?: AxondOptions["metrics"]): Promise<AdmissionHold> },
   kind: "management" | "inference",
 ): Promise<Response> {
   if (opts.admitting && !opts.admitting()) {
@@ -228,14 +243,16 @@ async function pipeline(
         });
         return;
       }
-      await prepareInference(c, opts, axond);
+      await prepareInference(c, opts, axond, admission);
       await runStage(c, "pre-dispatch", extensions, opts.store, async () => {
         enforceAliasGlobs(axond);
         await dispatch(c, opts, axond, pools);
       });
     });
   });
+    finishAdmission(c, axond);
   } catch (error) {
+    abandonAdmission(axond);
     if (error instanceof StageStop) {
       return error.response;
     }
@@ -245,6 +262,79 @@ async function pipeline(
     throw error;
   }
   return c.res;
+}
+
+function finishAdmission(c: Context<AxondEnv>, axond: MutableContext): void {
+  const hold = admissionHolds.get(axond);
+  if (!hold) {
+    return;
+  }
+  const type = c.res.headers.get("content-type") ?? "";
+  if (type.includes("text/event-stream") && c.res.body) {
+    c.res = holdUntilConsumed(c.res, () => {
+      hold.releaseAdmission();
+      if (!hold.settlementClaimed) {
+        hold.releaseSettlement();
+      }
+    });
+    return;
+  }
+  hold.releaseAdmission();
+  if (!hold.settlementClaimed) {
+    hold.releaseSettlement();
+  }
+}
+
+function abandonAdmission(axond: MutableContext): void {
+  const hold = admissionHolds.get(axond);
+  if (!hold) {
+    return;
+  }
+  hold.releaseAdmission();
+  if (!hold.settlementClaimed) {
+    hold.releaseSettlement();
+  }
+}
+
+function holdUntilConsumed(response: Response, release: () => void): Response {
+  const body = response.body;
+  if (!body) {
+    release();
+    return response;
+  }
+  let released = false;
+  const finish = () => {
+    if (released) {
+      return;
+    }
+    released = true;
+    release();
+  };
+  const reader = body.getReader();
+  const stream = new ReadableStream({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) {
+          finish();
+          controller.close();
+          return;
+        }
+        controller.enqueue(next.value);
+      } catch (error) {
+        finish();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        finish();
+      }
+    },
+  });
+  return new Response(stream, { status: response.status, headers: response.headers });
 }
 
 class StageStop extends Error {
@@ -391,7 +481,12 @@ async function runStage(
   await dispatch();
 }
 
-async function prepareInference(c: Context<AxondEnv>, opts: AxondOptions, axond: MutableContext): Promise<void> {
+async function prepareInference(
+  c: Context<AxondEnv>,
+  opts: AxondOptions,
+  axond: MutableContext,
+  admission: { admit(kind: "buffered" | "streamed", metrics?: AxondOptions["metrics"]): Promise<AdmissionHold> },
+): Promise<void> {
   if (c.req.method !== "POST") {
     throw new GatewayFailure("not_found", 404, "not found");
   }
@@ -448,6 +543,10 @@ async function prepareInference(c: Context<AxondEnv>, opts: AxondOptions, axond:
     throw new GatewayFailure("unpriced_model", 400, `model \`${model}\` has no price`);
   }
   checkEstimateBounds(parsed, opts);
+  const streamed =
+    parsed["stream"] === true &&
+    (axond.route === "chat" || axond.route === "messages" || axond.route === "responses");
+  admissionHolds.set(axond, await admission.admit(streamed ? "streamed" : "buffered", opts.metrics));
   const estimated = estimatedRequestCost(axond.route, parsed, price);
   if (axond.spendCapMicrodollars !== undefined && estimated > axond.spendCapMicrodollars) {
     throw new GatewayFailure(
@@ -661,6 +760,7 @@ async function dispatch(
       noteCredentialFailure(pools, record.id, provider.id, served.id, now, policy.failureThreshold);
     };
     const finishStream = (served: CredentialConfig, reason: "end" | "cancel" | "fail") => {
+      admissionHolds.get(axond)?.claimSettlement();
       if (reason === "end" && streamServed) {
         noteCredentialSuccess(pools, record.id, provider.id, served.id);
       }
@@ -942,6 +1042,9 @@ function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageT
 }
 
 async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): Promise<void> {
+  const hold = admissionHolds.get(axond);
+  hold?.claimSettlement();
+  try {
   const price = lookupPrice(opts.prices ?? [], axond.target?.provider ?? "", axond.target?.model ?? "");
   const priced = price ? costMicrodollars(price, usage) : null;
   const measured =
@@ -1002,6 +1105,9 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
   recordSettlementMetrics(opts, axond, usage, status, cost);
   for (const hook of axond.hooks) {
     await hook(settlement);
+  }
+  } finally {
+    hold?.releaseSettlement();
   }
 }
 

@@ -66,6 +66,11 @@ async function main(): Promise<void> {
     maxOutputTokens: config.maxOutputTokens,
     maxStreamDurationMs: config.maxStreamDurationMs,
     maxStreamBytes: config.maxStreamBytes,
+    maxInFlight: config.admission.maxInFlight,
+    maxInFlightStreams: config.admission.maxInFlightStreams,
+    admissionQueueCapacity: config.admission.queueCapacity,
+    admissionQueueWaitMs: config.admission.queueWaitMs,
+    maxPendingSettlements: config.admission.maxPendingSettlements,
     credentialPool: {
       strategy: config.credentialPool.strategy,
       failureThreshold: config.credentialPool.failureThreshold,

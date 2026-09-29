@@ -379,6 +379,11 @@ namespace = "platform"
   assert.equal(loaded.transport.streamTerminalGraceMs, 1_000);
   assert.equal(loaded.transport.overallTimeoutMs, 30_000);
   assert.equal(loaded.transport.maxAttempts, 3);
+  assert.equal(loaded.admission.maxInFlight, 1024);
+  assert.equal(loaded.admission.maxInFlightStreams, 512);
+  assert.equal(loaded.admission.queueCapacity, 0);
+  assert.equal(loaded.admission.queueWaitMs, 0);
+  assert.equal(loaded.admission.maxPendingSettlements, 4096);
   assert.equal(loaded.maxRequestBytes, 2 * 1024 * 1024);
   assert.equal(loaded.maxPromptTokens, 1_000_000);
   assert.equal(loaded.maxOutputTokens, 200_000);
@@ -454,6 +459,87 @@ namespace = "platform"
       ),
     (error: unknown) => {
       assert.match(error instanceof Error ? error.message : "", /failover\.max_attempts must be an integer of at least 1/);
+      return true;
+    },
+  );
+});
+
+test("admission ceilings load from toml and reject a contradictory queue", async () => {
+  const toml = `
+[storage]
+backend = "sqlite"
+path = "/tmp/axond.sqlite"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[admission]
+max_in_flight = 16
+`;
+  const loaded = await loadConfig(toml, envSecretReader({ GW_KEY: "k" }, async () => ""));
+  assert.equal(loaded.admission.maxInFlight, 16);
+  assert.equal(loaded.admission.maxInFlightStreams, 16);
+  assert.equal(loaded.admission.streamsExplicit, false);
+  assert.equal(loaded.admission.maxPendingSettlements, 64);
+  assert.equal(loaded.admission.pendingExplicit, false);
+  const written = await loadConfig(
+    `${toml}max_in_flight_streams = 4\nqueue_capacity = 2\nqueue_wait_ms = 50\nmax_pending_settlements = 16\n`,
+    envSecretReader({ GW_KEY: "k" }, async () => ""),
+  );
+  assert.equal(written.admission.maxInFlightStreams, 4);
+  assert.equal(written.admission.streamsExplicit, true);
+  assert.equal(written.admission.queueCapacity, 2);
+  assert.equal(written.admission.queueWaitMs, 50);
+  assert.equal(written.admission.maxPendingSettlements, 16);
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${toml}max_in_flight_streams = 32\n`,
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(
+        error instanceof Error ? error.message : "",
+        /admission\.max_in_flight_streams \(32\) must not exceed admission\.max_in_flight \(16\)/,
+      );
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${toml}queue_capacity = 2\n`,
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /must be set together/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("max_in_flight = 16", "max_in_flight = 0\nqueue_capacity = 1\nqueue_wait_ms = 10"),
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /queue_capacity requires admission\.max_in_flight/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${toml}max_pending_settlements = 4\n`,
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(
+        error instanceof Error ? error.message : "",
+        /max_pending_settlements \(4\) must be at least admission\.max_in_flight \(16\)/,
+      );
       return true;
     },
   );

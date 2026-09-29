@@ -1,6 +1,6 @@
 import { Client } from "pg";
 
-import { createAxond, createMetrics, resolveTelemetry } from "@axond/gateway";
+import { createAdmission, createAxond, createMetrics, defaultAdmission, resolveTelemetry } from "@axond/gateway";
 import { rateLimitExtension } from "@axond/rate-limit";
 import type { CredentialConfig, ProviderConfig, Store } from "@axond/sdk";
 
@@ -30,6 +30,7 @@ interface WaitContext {
  * each call opens one client and closes it, with no session-level SET.
  */
 let metrics: ReturnType<typeof createMetrics> | undefined;
+let admission = createAdmission(defaultAdmission());
 
 export function createHandler(env: WorkerEnv) {
   metrics ??= createMetrics([env.GATEWAY_KEY]);
@@ -71,6 +72,7 @@ export function createHandler(env: WorkerEnv) {
         providers,
         extensions: [rateLimitExtension({ limit: 60, windowMs: 60_000, mode: "isolate" })],
         waitUntil: (promise) => ctx.waitUntil(promise),
+        admissionControl: admission,
         metrics,
         telemetry: telemetry ?? undefined,
         onLog: (record) => {

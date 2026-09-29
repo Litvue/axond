@@ -15,6 +15,8 @@ export class GatewayFailure extends Error {
   timeoutKind: "connect" | "response_headers" | "buffered_body" | "stream_idle" | "overall" | null = null;
   /** Whose budget ended that wait. */
   timeoutBound: "phase" | "walk_budget" | null = null;
+  /** Seconds for `Retry-After`, when this refusal advertises a retry. */
+  retryAfter: string | null = null;
 
   constructor(type: string, status: number, message: string, rateLimited = false) {
     super(message);
@@ -26,7 +28,8 @@ export class GatewayFailure extends Error {
 }
 
 export function gatewayError(error: GatewayFailure): Response {
-  const headers = error.type === "draining" ? { "retry-after": "0" } : undefined;
+  const retry = error.retryAfter ?? (error.type === "draining" ? "0" : null);
+  const headers = retry !== null ? { "retry-after": retry } : undefined;
   return Response.json(
     { error: { type: error.type, message: error.message } },
     { status: error.status, headers },

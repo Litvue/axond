@@ -316,6 +316,48 @@ export interface AxondOptions {
    * the Bun binary omit it; their header and failover budgets still bound the attempt.
    */
   upstreamDispatcher?: object;
+  /**
+   * Concurrent requests this replica admits. `0` disables. Absent uses 1024.
+   * Saturation is `503` `gateway_overloaded`.
+   */
+  maxInFlight?: number;
+  /**
+   * Concurrent open streams. `0` disables. Absent is 512, clamped down to
+   * `maxInFlight` when that ceiling is finite and this one was omitted.
+   * Saturation is `503` `stream_capacity_exhausted`.
+   */
+  maxInFlightStreams?: number;
+  /**
+   * Requests that may wait for `maxInFlight`. `0` disables. Must be set
+   * together with `admissionQueueWaitMs`, and only when `maxInFlight` is finite.
+   */
+  admissionQueueCapacity?: number;
+  /** How long a queued request waits, in milliseconds. `0` disables. */
+  admissionQueueWaitMs?: number;
+  /**
+   * Unsettled charges this replica will carry. `0` disables. Absent is four
+   * times `maxInFlight`. Saturation is `503` `settlement_capacity_exhausted`.
+   */
+  maxPendingSettlements?: number;
+  /**
+   * Counters shared across apps in one isolate. Absent means this app keeps
+   * its own. A Worker passes one gate so a new app per request still sheds.
+   */
+  admissionControl?: AdmissionControl;
+}
+
+export interface AdmissionPermit {
+  readonly settlementClaimed: boolean;
+  claimSettlement(): void;
+  releaseAdmission(): void;
+  releaseSettlement(): void;
+}
+
+export interface AdmissionControl {
+  admit(
+    kind: "buffered" | "streamed",
+    metrics?: { record(name: string, value: number, attributes?: Record<string, string>): void },
+  ): Promise<AdmissionPermit>;
 }
 
 export interface ProviderConfig {

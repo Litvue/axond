@@ -2,6 +2,8 @@ import { parse } from "smol-toml";
 
 import type { CredentialConfig, PriceRule, ProviderConfig, TransportLimits } from "@axond/sdk";
 
+import { clampStreams, defaultPending, validateAdmission, type AdmissionLimits } from "./admission.ts";
+
 import { GatewayFailure } from "./errors.ts";
 import { validateGlob } from "./glob.ts";
 import { parseNamespaceId } from "./namespace.ts";
@@ -78,6 +80,7 @@ export interface LoadedConfig {
   maxStreamDurationMs: number;
   /** `0` disables the relayed-byte ceiling. */
   maxStreamBytes: number;
+  admission: AdmissionLimits;
   credentialPool: {
     strategy: "round-robin" | "weighted";
     failureThreshold: number;
@@ -357,6 +360,12 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
   if (!Number.isInteger(maxStreamBytes) || maxStreamBytes < 0) {
     throw configError("admission.max_stream_bytes must be an integer of at least 0");
   }
+  const admission = loadAdmission(admissionRaw);
+  try {
+    validateAdmission(admission);
+  } catch (error) {
+    throw configError(error instanceof Error ? error.message : "invalid admission");
+  }
   const discovery = asRecord(parsed["discovery"]) ?? {};
   const discoveryIntervalSeconds = numberField(discovery, "refresh_interval_seconds", 300);
   if (discoveryIntervalSeconds < 1) {
@@ -404,8 +413,42 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     maxOutputTokens,
     maxStreamDurationMs,
     maxStreamBytes,
+    admission,
     credentialPool,
   };
+}
+
+function loadAdmission(row: Record<string, unknown>): AdmissionLimits {
+  const maxInFlight = nonNegative(row, "max_in_flight", 1024, "admission.max_in_flight");
+  const streams = clampStreams(
+    maxInFlight,
+    Object.hasOwn(row, "max_in_flight_streams")
+      ? nonNegative(row, "max_in_flight_streams", 512, "admission.max_in_flight_streams")
+      : undefined,
+  );
+  const queueCapacity = nonNegative(row, "queue_capacity", 0, "admission.queue_capacity");
+  const queueWaitMs = nonNegative(row, "queue_wait_ms", 0, "admission.queue_wait_ms");
+  const pendingExplicit = Object.hasOwn(row, "max_pending_settlements");
+  const maxPendingSettlements = pendingExplicit
+    ? nonNegative(row, "max_pending_settlements", 0, "admission.max_pending_settlements")
+    : defaultPending(maxInFlight);
+  return {
+    maxInFlight,
+    maxInFlightStreams: streams.value,
+    streamsExplicit: streams.explicit,
+    queueCapacity,
+    queueWaitMs,
+    maxPendingSettlements,
+    pendingExplicit,
+  };
+}
+
+function nonNegative(row: Record<string, unknown>, key: string, fallback: number, label: string): number {
+  const value = numberField(row, key, fallback);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw configError(`${label} must be an integer of at least 0`);
+  }
+  return value;
 }
 
 function loadShutdown(row: Record<string, unknown>): LoadedConfig["shutdown"] {
