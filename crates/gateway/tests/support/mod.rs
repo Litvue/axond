@@ -11,7 +11,6 @@ pub mod capacity;
 pub mod endurance;
 pub mod fault;
 pub mod gateway;
-pub mod oidc;
 pub mod packet;
 pub mod schema;
 pub mod upstream;
