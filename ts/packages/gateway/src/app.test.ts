@@ -384,6 +384,9 @@ namespace = "platform"
   assert.equal(loaded.admission.queueCapacity, 0);
   assert.equal(loaded.admission.queueWaitMs, 0);
   assert.equal(loaded.admission.maxPendingSettlements, 4096);
+  assert.equal(loaded.admission.maxInFlightSettlements, 64);
+  assert.equal(loaded.admission.settlementQueueWaitMs, 10_000);
+  assert.equal(loaded.admission.settlementTimeoutMs, 10_000);
   assert.equal(loaded.maxRequestBytes, 2 * 1024 * 1024);
   assert.equal(loaded.maxPromptTokens, 1_000_000);
   assert.equal(loaded.maxOutputTokens, 200_000);
@@ -484,6 +487,9 @@ max_in_flight = 16
   assert.equal(loaded.admission.streamsExplicit, false);
   assert.equal(loaded.admission.maxPendingSettlements, 64);
   assert.equal(loaded.admission.pendingExplicit, false);
+  assert.equal(loaded.admission.maxInFlightSettlements, 64);
+  assert.equal(loaded.admission.settlementQueueWaitMs, 10_000);
+  assert.equal(loaded.admission.settlementTimeoutMs, 10_000);
   const written = await loadConfig(
     `${toml}max_in_flight_streams = 4\nqueue_capacity = 2\nqueue_wait_ms = 50\nmax_pending_settlements = 16\n`,
     envSecretReader({ GW_KEY: "k" }, async () => ""),
@@ -539,6 +545,27 @@ max_in_flight = 16
       assert.match(
         error instanceof Error ? error.message : "",
         /max_pending_settlements \(4\) must be at least admission\.max_in_flight \(16\)/,
+      );
+      return true;
+    },
+  );
+  const disabled = await loadConfig(
+    `${toml}max_in_flight_settlements = 0\nsettlement_queue_wait_ms = 0\nsettlement_timeout_ms = 0\n`,
+    envSecretReader({ GW_KEY: "k" }, async () => ""),
+  );
+  assert.equal(disabled.admission.maxInFlightSettlements, 0);
+  assert.equal(disabled.admission.settlementQueueWaitMs, 0);
+  assert.equal(disabled.admission.settlementTimeoutMs, 0);
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${toml}max_in_flight_settlements = 1.5\n`,
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(
+        error instanceof Error ? error.message : "",
+        /admission\.max_in_flight_settlements must be an integer of at least 0/,
       );
       return true;
     },

@@ -340,6 +340,19 @@ export interface AxondOptions {
    */
   maxPendingSettlements?: number;
   /**
+   * Settlements executing against the Store at once. `0` disables. Absent
+   * uses 64. A charge waits `settlementQueueWaitMs` for a slot. A wait that
+   * expires drops the charge.
+   */
+  maxInFlightSettlements?: number;
+  /** How long a charge waits for an execution slot. `0` waits without a bound. Absent uses 10000. */
+  settlementQueueWaitMs?: number;
+  /**
+   * How long one settlement may run once it holds a slot. `0` disables.
+   * Absent uses 10000. The Store call still finishes; the miss is counted.
+   */
+  settlementTimeoutMs?: number;
+  /**
    * Counters shared across apps in one isolate. Absent means this app keeps
    * its own. A Worker passes one gate so a new app per request still sheds.
    */
@@ -348,9 +361,18 @@ export interface AxondOptions {
 
 export interface AdmissionPermit {
   readonly settlementClaimed: boolean;
+  /** `0` means a running settlement is not timed. */
+  readonly settlementTimeoutMs: number;
   claimSettlement(): void;
   releaseAdmission(): void;
   releaseSettlement(): void;
+  /** `false` means the execution-slot wait expired and the charge must not run. */
+  acquireExecution(metrics?: {
+    record(name: string, value: number, attributes?: Record<string, string>): void;
+  }): Promise<boolean>;
+  releaseExecution(metrics?: {
+    record(name: string, value: number, attributes?: Record<string, string>): void;
+  }): void;
 }
 
 export interface AdmissionControl {

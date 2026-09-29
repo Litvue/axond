@@ -1877,3 +1877,166 @@ test("unsettled charges shed the next request before the provider", async () => 
     upstream.close();
   }
 });
+
+test("a charge that misses the settlement execution queue is dropped", async () => {
+  const store = await seeded();
+  const before = (await store.getBudget("platform", "compat"))!;
+  let entered = 0;
+  let releaseSettle: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    releaseSettle = resolve;
+  });
+  const original = store.settle.bind(store);
+  store.settle = async (input) => {
+    entered += 1;
+    await gate;
+    return original(input);
+  };
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":4,"completion_tokens":4}}');
+  });
+  const metrics = createMetrics(["sk-live-secret"]);
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxInFlight: 4,
+    maxPendingSettlements: 4,
+    maxInFlightSettlements: 1,
+    settlementQueueWaitMs: 80,
+    settlementTimeoutMs: 0,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1_000_000n,
+        outputMicrodollarsPerMillion: 1_000_000n,
+      },
+    ],
+    metrics,
+  });
+  const payload = JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "hi" }] });
+  try {
+    const first = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: CHAT_HEADERS,
+      body: payload,
+    });
+    assert.equal(first.status, 200);
+    await first.text();
+    for (let attempt = 0; attempt < 50 && entered === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(entered, 1);
+    const second = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: CHAT_HEADERS,
+      body: payload,
+    });
+    assert.equal(second.status, 200);
+    await second.text();
+    await new Promise((wake) => setTimeout(wake, 150));
+    assert.equal(entered, 1);
+    const mid = (await store.getBudget("platform", "compat"))!;
+    assert.equal(mid.spent, before.spent);
+    assert.equal((await store.summarizeUsage("platform", "compat")).length, 0);
+    const dropped = metrics.points.find(
+      (point) =>
+        point.name === "axond.settlement.failures" && point.attributes["axond.settlement.reason"] === "queue_timeout",
+    );
+    assert.equal(dropped?.value, 1);
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+    releaseSettle();
+    let after = mid;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      after = (await store.getBudget("platform", "compat"))!;
+      if (after.spent !== before.spent) {
+        break;
+      }
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(after.spent - before.spent, 8n);
+    assert.equal(entered, 1);
+    const rows = await store.summarizeUsage("platform", "compat");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0]?.count, 1);
+    const held = metrics.points.find(
+      (point) =>
+        point.name === "axond.admission.in_flight" && point.attributes["axond.admission.resource"] === "settlement",
+    );
+    assert.equal(held?.value, 0);
+  } finally {
+    releaseSettle();
+    upstream.close();
+  }
+});
+
+test("a settlement that outlives its deadline still records the charge", async () => {
+  const store = await seeded();
+  const before = (await store.getBudget("platform", "compat"))!;
+  const original = store.settle.bind(store);
+  store.settle = async (input) => {
+    await new Promise((wake) => setTimeout(wake, 80));
+    return original(input);
+  };
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":4,"completion_tokens":4}}');
+  });
+  const metrics = createMetrics(["sk-live-secret"]);
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxInFlight: 4,
+    maxInFlightSettlements: 1,
+    settlementTimeoutMs: 30,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1_000_000n,
+        outputMicrodollarsPerMillion: 1_000_000n,
+      },
+    ],
+    metrics,
+  });
+  const payload = JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "hi" }] });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: CHAT_HEADERS,
+      body: payload,
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    let after = before;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      after = (await store.getBudget("platform", "compat"))!;
+      if (after.spent !== before.spent) {
+        break;
+      }
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(after.spent - before.spent, 8n);
+    const timed = metrics.points.find(
+      (point) =>
+        point.name === "axond.settlement.failures" &&
+        point.attributes["axond.settlement.reason"] === "execution_timeout",
+    );
+    assert.equal(timed?.value, 1);
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+    const executing = metrics.points.find(
+      (point) =>
+        point.name === "axond.settlement.in_flight" && point.attributes["axond.settlement.stage"] === "executing",
+    );
+    assert.equal(executing?.value, 0);
+  } finally {
+    upstream.close();
+  }
+});

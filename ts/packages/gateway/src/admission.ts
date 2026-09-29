@@ -18,14 +18,28 @@ export interface AdmissionLimits {
   /** `0` disables the unsettled-charge ceiling. */
   maxPendingSettlements: number;
   pendingExplicit: boolean;
+  /** `0` disables the cap on settlements executing at once. Default 64. */
+  maxInFlightSettlements: number;
+  /** `0` waits without a bound. Default 10000. */
+  settlementQueueWaitMs: number;
+  /** `0` disables the execution deadline. Default 10000. The charge still finishes. */
+  settlementTimeoutMs: number;
 }
 
 export interface AdmissionHold {
   /** True once `settle` has taken responsibility for the settlement slot. */
   readonly settlementClaimed: boolean;
+  /** `0` means a running settlement is not timed. */
+  readonly settlementTimeoutMs: number;
   claimSettlement(): void;
   releaseAdmission(): void;
   releaseSettlement(): void;
+  /**
+   * Wait for a settlement execution slot. `false` means the queue wait
+   * expired and the charge must not run.
+   */
+  acquireExecution(metrics?: MetricSink): Promise<boolean>;
+  releaseExecution(metrics?: MetricSink): void;
 }
 
 interface MetricSink {
@@ -47,11 +61,15 @@ export function createAdmission(limits: AdmissionLimits) {
   const streamLimit = limits.maxInFlightStreams > 0 ? limits.maxInFlightStreams : null;
   const queueCapacity = limits.queueCapacity > 0 ? limits.queueCapacity : null;
   const settlementLimit = limits.maxPendingSettlements > 0 ? limits.maxPendingSettlements : null;
+  const executionLimit = limits.maxInFlightSettlements > 0 ? limits.maxInFlightSettlements : null;
+  const executionWaitMs = limits.settlementQueueWaitMs > 0 ? limits.settlementQueueWaitMs : null;
   let requests = 0;
   let streams = 0;
   let pending = 0;
   let queueDepth = 0;
+  let executing = 0;
   const waiters: Waiter[] = [];
+  const executionWaiters: { grant: () => void }[] = [];
 
   const record = (metrics: MetricSink | undefined, name: string, value: number, attributes?: Record<string, string>) => {
     metrics?.record(name, value, attributes);
@@ -82,6 +100,71 @@ export function createAdmission(limits: AdmissionLimits) {
     }
     requests -= 1;
     released(metrics, "request");
+  };
+
+  const stage = (metrics: MetricSink | undefined, name: "queued" | "executing", delta: number) => {
+    record(metrics, "axond.settlement.in_flight", delta, { "axond.settlement.stage": name });
+  };
+
+  const acquireExecution = (metrics: MetricSink | undefined): Promise<boolean> => {
+    if (executionLimit === null) {
+      return Promise.resolve(true);
+    }
+    if (executing < executionLimit) {
+      executing += 1;
+      stage(metrics, "executing", 1);
+      return Promise.resolve(true);
+    }
+    const started = Date.now();
+    stage(metrics, "queued", 1);
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (granted: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+        }
+        stage(metrics, "queued", -1);
+        record(metrics, "axond.settlement.queue_wait", Date.now() - started);
+        if (granted) {
+          executing += 1;
+          stage(metrics, "executing", 1);
+        }
+        resolve(granted);
+      };
+      const waiter = { grant: () => finish(true) };
+      executionWaiters.push(waiter);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      if (executionWaitMs !== null) {
+        timer = setTimeout(() => {
+          const index = executionWaiters.indexOf(waiter);
+          if (index >= 0) {
+            executionWaiters.splice(index, 1);
+          }
+          finish(false);
+        }, executionWaitMs);
+        const unref = timer as { unref?: () => void };
+        unref.unref?.();
+      }
+    });
+  };
+
+  const releaseExecutionSlot = (metrics: MetricSink | undefined) => {
+    if (executionLimit === null) {
+      return;
+    }
+    const waiter = executionWaiters.shift();
+    if (waiter) {
+      executing -= 1;
+      stage(metrics, "executing", -1);
+      waiter.grant();
+      return;
+    }
+    executing -= 1;
+    stage(metrics, "executing", -1);
   };
 
   const acquireRequest = (metrics: MetricSink | undefined): Promise<boolean> => {
@@ -166,6 +249,7 @@ export function createAdmission(limits: AdmissionLimits) {
         throw error;
       }
       let admissionReleased = false;
+      let executionState: "idle" | "waiting" | "held" = "idle";
       return {
         get settlementClaimed() {
           return settlementState === "claimed" || settlementState === "released";
@@ -193,6 +277,30 @@ export function createAdmission(limits: AdmissionLimits) {
           pending -= 1;
           released(metrics, "settlement");
         },
+        settlementTimeoutMs: limits.settlementTimeoutMs,
+        async acquireExecution(callMetrics) {
+          if (executionState === "held") {
+            return true;
+          }
+          if (executionState !== "idle") {
+            return false;
+          }
+          executionState = "waiting";
+          const granted = await acquireExecution(callMetrics ?? metrics);
+          if (granted && executionLimit !== null) {
+            executionState = "held";
+            return true;
+          }
+          executionState = "idle";
+          return granted;
+        },
+        releaseExecution(callMetrics) {
+          if (executionState !== "held") {
+            return;
+          }
+          executionState = "idle";
+          releaseExecutionSlot(callMetrics ?? metrics);
+        },
       };
     },
   };
@@ -209,6 +317,9 @@ export function defaultAdmission(): AdmissionLimits {
     queueWaitMs: 0,
     maxPendingSettlements: DEFAULT_MAX_IN_FLIGHT * 4,
     pendingExplicit: false,
+    maxInFlightSettlements: 64,
+    settlementQueueWaitMs: 10_000,
+    settlementTimeoutMs: 10_000,
   };
 }
 
@@ -237,6 +348,7 @@ export function validateAdmission(limits: AdmissionLimits): void {
     ["admission.max_in_flight_streams", limits.maxInFlightStreams],
     ["admission.queue_capacity", limits.queueCapacity],
     ["admission.max_pending_settlements", limits.maxPendingSettlements],
+    ["admission.max_in_flight_settlements", limits.maxInFlightSettlements],
   ] as const) {
     if (!Number.isSafeInteger(value) || value < 0) {
       if (typeof value === "number" && value > Number.MAX_SAFE_INTEGER) {
@@ -249,6 +361,12 @@ export function validateAdmission(limits: AdmissionLimits): void {
   }
   if (!Number.isSafeInteger(limits.queueWaitMs) || limits.queueWaitMs < 0) {
     throw new Error("admission.queue_wait_ms must be an integer of at least 0");
+  }
+  if (!Number.isSafeInteger(limits.settlementQueueWaitMs) || limits.settlementQueueWaitMs < 0) {
+    throw new Error("admission.settlement_queue_wait_ms must be an integer of at least 0");
+  }
+  if (!Number.isSafeInteger(limits.settlementTimeoutMs) || limits.settlementTimeoutMs < 0) {
+    throw new Error("admission.settlement_timeout_ms must be an integer of at least 0");
   }
   if (
     limits.maxInFlight > 0 &&
@@ -288,6 +406,9 @@ export function admissionFromOptions(options: {
   queueCapacity?: number;
   queueWaitMs?: number;
   maxPendingSettlements?: number;
+  maxInFlightSettlements?: number;
+  settlementQueueWaitMs?: number;
+  settlementTimeoutMs?: number;
 }): AdmissionLimits {
   const maxInFlight = options.maxInFlight ?? DEFAULT_MAX_IN_FLIGHT;
   const streams = clampStreams(maxInFlight, options.maxInFlightStreams);
@@ -302,6 +423,9 @@ export function admissionFromOptions(options: {
     queueWaitMs,
     maxPendingSettlements: pendingExplicit ? options.maxPendingSettlements! : defaultPending(maxInFlight),
     pendingExplicit,
+    maxInFlightSettlements: options.maxInFlightSettlements ?? 64,
+    settlementQueueWaitMs: options.settlementQueueWaitMs ?? 10_000,
+    settlementTimeoutMs: options.settlementTimeoutMs ?? 10_000,
   };
 }
 

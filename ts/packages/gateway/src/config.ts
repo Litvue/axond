@@ -432,6 +432,19 @@ function loadAdmission(row: Record<string, unknown>): AdmissionLimits {
   const maxPendingSettlements = pendingExplicit
     ? nonNegative(row, "max_pending_settlements", 0, "admission.max_pending_settlements")
     : defaultPending(maxInFlight);
+  const maxInFlightSettlements = nonNegative(
+    row,
+    "max_in_flight_settlements",
+    64,
+    "admission.max_in_flight_settlements",
+  );
+  const settlementQueueWaitMs = nonNegative(
+    row,
+    "settlement_queue_wait_ms",
+    10_000,
+    "admission.settlement_queue_wait_ms",
+  );
+  const settlementTimeoutMs = nonNegative(row, "settlement_timeout_ms", 10_000, "admission.settlement_timeout_ms");
   return {
     maxInFlight,
     maxInFlightStreams: streams.value,
@@ -440,6 +453,9 @@ function loadAdmission(row: Record<string, unknown>): AdmissionLimits {
     queueWaitMs,
     maxPendingSettlements,
     pendingExplicit,
+    maxInFlightSettlements,
+    settlementQueueWaitMs,
+    settlementTimeoutMs,
   };
 }
 

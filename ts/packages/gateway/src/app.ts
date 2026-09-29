@@ -87,6 +87,9 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
         queueCapacity: opts.admissionQueueCapacity,
         queueWaitMs: opts.admissionQueueWaitMs,
         maxPendingSettlements: opts.maxPendingSettlements,
+        maxInFlightSettlements: opts.maxInFlightSettlements,
+        settlementQueueWaitMs: opts.settlementQueueWaitMs,
+        settlementTimeoutMs: opts.settlementTimeoutMs,
       }),
     );
   const app = new Hono<AxondEnv>();
@@ -1044,6 +1047,21 @@ function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageT
 async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): Promise<void> {
   const hold = admissionHolds.get(axond);
   hold?.claimSettlement();
+  const granted = hold ? await hold.acquireExecution(opts.metrics) : true;
+  if (!granted) {
+    opts.metrics?.record("axond.settlement.failures", 1, { "axond.settlement.reason": "queue_timeout" });
+    hold?.releaseSettlement();
+    return;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutMs = hold?.settlementTimeoutMs ?? 0;
+  if (timeoutMs > 0) {
+    timer = setTimeout(() => {
+      opts.metrics?.record("axond.settlement.failures", 1, { "axond.settlement.reason": "execution_timeout" });
+    }, timeoutMs);
+    const unref = timer as { unref?: () => void };
+    unref.unref?.();
+  }
   try {
   const price = lookupPrice(opts.prices ?? [], axond.target?.provider ?? "", axond.target?.model ?? "");
   const priced = price ? costMicrodollars(price, usage) : null;
@@ -1107,6 +1125,10 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
     await hook(settlement);
   }
   } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+    hold?.releaseExecution(opts.metrics);
     hold?.releaseSettlement();
   }
 }

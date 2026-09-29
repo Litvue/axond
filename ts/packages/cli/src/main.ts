@@ -71,6 +71,9 @@ async function main(): Promise<void> {
     admissionQueueCapacity: config.admission.queueCapacity,
     admissionQueueWaitMs: config.admission.queueWaitMs,
     maxPendingSettlements: config.admission.maxPendingSettlements,
+    maxInFlightSettlements: config.admission.maxInFlightSettlements,
+    settlementQueueWaitMs: config.admission.settlementQueueWaitMs,
+    settlementTimeoutMs: config.admission.settlementTimeoutMs,
     credentialPool: {
       strategy: config.credentialPool.strategy,
       failureThreshold: config.credentialPool.failureThreshold,
