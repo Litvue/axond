@@ -219,6 +219,11 @@ export async function callUpstream(input: {
   /** Node client that enforces the connect bound. Absent means the runtime owns connect. */
   dispatcher?: object;
   onTimeout?: (kind: string, bound: string) => void;
+  /**
+   * OpenAI chat only. A rate-limit event before any byte is released asks for
+   * another upstream. Null keeps the held event and ends the stream.
+   */
+  onBeforeContentRateLimit?: () => Promise<Response | null>;
 }): Promise<{ response: Response; usage: UsageTokens }> {
   const transport = withTransportDefaults(input.transport);
   const now = input.now ?? Date.now;
@@ -285,7 +290,7 @@ export async function callUpstream(input: {
   const stream = relayStream(response.body, transport, input.route, usage, (reason) => {
     input.onUsage(usage);
     input.onStreamDone?.(reason);
-  }, input.onTimeout);
+  }, input.onTimeout, input.onBeforeContentRateLimit);
   const headers = passHeaders(response.headers);
   if (!headers.has("content-type")) {
     headers.set("content-type", "text/event-stream");
@@ -329,14 +334,19 @@ function relayStream(
   usage: UsageTokens,
   onDone: (reason: "end" | "cancel") => void,
   onTimeout?: (kind: string, bound: string) => void,
+  onBeforeContentRateLimit?: () => Promise<Response | null>,
 ): ReadableStream<Uint8Array> {
-  const reader = upstream.getReader();
+  let reader = upstream.getReader();
   const decoder = new TextDecoder();
   let pending = "";
   let inflight: Promise<ReadableStreamReadResult<Uint8Array>> | null = null;
   let sawChunkAt = Date.now();
   let terminalAt: number | null = null;
   let done = false;
+  let committed = onBeforeContentRateLimit === undefined;
+  let delegated = false;
+  const held: Uint8Array[] = [];
+  let heldBytes = 0;
   const finish = (reason: "end" | "cancel") => {
     if (done) {
       return;
@@ -348,8 +358,34 @@ function relayStream(
     }
     onDone(reason);
   };
+  const releaseHeld = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+    if (held.length === 0) {
+      committed = true;
+      return;
+    }
+    const merged = concatBytes(held, heldBytes);
+    const text = new TextDecoder().decode(merged);
+    if (terminalAt === null && sseTerminalSeen(route, pending + text)) {
+      terminalAt = Date.now();
+    }
+    noteSseChunk(route, usage, pending + text);
+    pending = tail(pending + text);
+    controller.enqueue(merged);
+    held.length = 0;
+    heldBytes = 0;
+    committed = true;
+  };
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
+      if (delegated) {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(chunk.value);
+        return;
+      }
       const value = await readWithIdle(reader, () => inflight, (next) => {
         inflight = next;
       }, transport.streamIdleTimeoutMs, sawChunkAt, controller, () => (
@@ -359,11 +395,48 @@ function relayStream(
         return;
       }
       if (value === null) {
+        if (!committed) {
+          releaseHeld(controller);
+        }
         finish("end");
         controller.close();
         return;
       }
       sawChunkAt = Date.now();
+      if (!committed && onBeforeContentRateLimit) {
+        held.push(value);
+        heldBytes += value.length;
+        const text = new TextDecoder().decode(concatBytes(held, heldBytes));
+        const first = firstCompleteData(text);
+        if (first === undefined && heldBytes < 64 * 1024) {
+          return;
+        }
+        if (first && isRateLimitPayload(first)) {
+          await reader.cancel().catch(() => undefined);
+          inflight = null;
+          const next = await onBeforeContentRateLimit();
+          if (next?.body) {
+            held.length = 0;
+            heldBytes = 0;
+            delegated = true;
+            done = true;
+            reader = next.body.getReader();
+            const chunk = await reader.read();
+            if (chunk.done) {
+              controller.close();
+              return;
+            }
+            controller.enqueue(chunk.value);
+            return;
+          }
+          releaseHeld(controller);
+          finish("end");
+          controller.close();
+          return;
+        }
+        releaseHeld(controller);
+        return;
+      }
       const buffered = pending + decoder.decode(value, { stream: true });
       if (terminalAt === null && sseTerminalSeen(route, buffered)) {
         terminalAt = Date.now();
@@ -373,10 +446,60 @@ function relayStream(
       controller.enqueue(value);
     },
     cancel(reason) {
-      finish("cancel");
+      if (!delegated) {
+        finish("cancel");
+      }
       return reader.cancel(reason);
     },
   });
+}
+
+/** The first complete SSE data payload, or undefined while the event is still open. */
+function firstCompleteData(text: string): string | undefined {
+  const parts = text.split(/\n\n|\r\n\r\n/);
+  const ended = text.endsWith("\n\n") || text.endsWith("\r\n\r\n");
+  const frames = (ended ? parts : parts.slice(0, -1)).filter((frame) => frame.length > 0);
+  for (const frame of frames) {
+    const data = frame
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).replace(/^ /, ""))
+      .join("\n");
+    if (data.length > 0) {
+      return data;
+    }
+  }
+  return frames.length > 0 && ended ? "" : undefined;
+}
+
+/** Explicit provider rate-limit markers in one SSE JSON payload. */
+export function isRateLimitPayload(data: string): boolean {
+  let value: unknown;
+  try {
+    value = JSON.parse(data);
+  } catch {
+    return false;
+  }
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  const error = record["error"];
+  const errorShaped = error !== undefined || record["type"] === "error";
+  if (!errorShaped) {
+    return false;
+  }
+  const statuses = [record["status"], error && typeof error === "object" ? (error as Record<string, unknown>)["status"] : undefined];
+  if (statuses.some((status) => status === 429 || status === "429")) {
+    return true;
+  }
+  const signals: unknown[] = [];
+  if (error && typeof error === "object") {
+    const body = error as Record<string, unknown>;
+    signals.push(body["type"], body["code"]);
+  }
+  signals.push(record["type"], record["code"]);
+  return signals.some((signal) => signal === 429 || signal === "429" || (typeof signal === "string" && signal.includes("rate_limit")));
 }
 
 function tail(text: string): string {

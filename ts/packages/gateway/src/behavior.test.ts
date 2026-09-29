@@ -4,9 +4,10 @@ import test from "node:test";
 import { Agent } from "undici";
 
 import { createAxond } from "./app.ts";
+import { isRateLimitPayload } from "./dispatch.ts";
 import { createMemoryStore } from "./memory-store.ts";
 import { createMetrics } from "./metrics.ts";
-import type { Store } from "@axond/sdk";
+import type { AxondOptions, Store } from "@axond/sdk";
 
 const KEY = "test-inbound-key";
 
@@ -834,4 +835,190 @@ test("management routes match the compatibility contract", async () => {
   assert.equal(again.status, 204);
   const configRow = await app.request("http://127.0.0.1/api/v1/namespaces/platform", { method: "DELETE", headers: auth });
   assert.equal(configRow.status, 409);
+});
+
+test("isRateLimitPayload matches explicit provider markers", () => {
+  assert.equal(isRateLimitPayload('{"error":{"type":"rate_limit_exceeded"}}'), true);
+  assert.equal(isRateLimitPayload('{"error":{"code":"rate_limit"}}'), true);
+  assert.equal(isRateLimitPayload('{"type":"error","status":429}'), true);
+  assert.equal(isRateLimitPayload('{"error":{"code":429}}'), true);
+  assert.equal(isRateLimitPayload('{"choices":[{"delta":{"content":"a"}}]}'), false);
+  assert.equal(isRateLimitPayload('{"error":{"message":"other"}}'), false);
+  assert.equal(isRateLimitPayload("not json"), false);
+});
+
+function poolApp(store: Store, url: string, extra: Partial<AxondOptions> = {}) {
+  return createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: url }],
+    credentials: [
+      { namespace: "platform", provider: "fake-openai", secret: "bad-key", id: "bad" },
+      { namespace: "platform", provider: "fake-openai", secret: "good-key", id: "good" },
+    ],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    ...extra,
+  });
+}
+
+const CHAT_HEADERS = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+
+test("an openai chat rate limit before content rotates and is not forwarded", async () => {
+  const store = await seeded();
+  const seen: string[] = [];
+  let settlements = 0;
+  const upstream = await listen((req, res) => {
+    const authorization = req.headers.authorization ?? "";
+    seen.push(authorization);
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    if (authorization.includes("bad-key")) {
+      res.end('data: {"error":{"type":"rate_limit_exceeded"}}\n\n');
+      return;
+    }
+    res.end('data: {"choices":[{"delta":{"content":"b"}}]}\n\ndata: [DONE]\n\n');
+  });
+  const app = poolApp(store, upstream.url, {
+    credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
+    onUsage: () => {
+      settlements += 1;
+    },
+  });
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: CHAT_HEADERS,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /"content":"b"/);
+  assert.match(body, /\[DONE\]/);
+  assert.equal(body.includes("rate_limit_exceeded"), false);
+  assert.deepEqual(seen, ["Bearer bad-key", "Bearer good-key"]);
+  assert.equal(settlements, 1);
+  const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
+  const rows = (await status.json()).data as { credential_id: string; state: string }[];
+  assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "parked");
+  assert.equal(rows.find((row) => row.credential_id === "good")?.state, "healthy");
+  upstream.close();
+});
+
+test("a split rate-limit frame before content rotates without leaking the prefix", async () => {
+  const store = await seeded();
+  const seen: string[] = [];
+  const upstream = await listen((req, res) => {
+    const authorization = req.headers.authorization ?? "";
+    seen.push(authorization);
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    if (authorization.includes("bad-key")) {
+      res.write('data: {"error":');
+      setTimeout(() => {
+        res.end('{"type":"rate_limit_exceeded"}}\n\n');
+      }, 40);
+      return;
+    }
+    res.end('data: {"choices":[{"delta":{"content":"b"}}]}\n\ndata: [DONE]\n\n');
+  });
+  const app = poolApp(store, upstream.url);
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: CHAT_HEADERS,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /"content":"b"/);
+  assert.equal(body.includes("rate_limit_exceeded"), false);
+  assert.equal(body.includes('data: {"error":'), false);
+  assert.deepEqual(seen, ["Bearer bad-key", "Bearer good-key"]);
+  upstream.close();
+});
+
+test("a rate limit after chat content stays on that stream", async () => {
+  const store = await seeded();
+  const seen: string[] = [];
+  const upstream = await listen((req, res) => {
+    seen.push(req.headers.authorization ?? "");
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end('data: {"choices":[{"delta":{"content":"a"}}]}\n\ndata: {"error":{"type":"rate_limit_exceeded"}}\n\n');
+  });
+  const app = poolApp(store, upstream.url);
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: CHAT_HEADERS,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /"content":"a"/);
+  assert.match(body, /rate_limit_exceeded/);
+  assert.deepEqual(seen, ["Bearer bad-key"]);
+  upstream.close();
+});
+
+test("a responses stream does not rotate on a rate-limit event", async () => {
+  const store = await seeded();
+  const seen: string[] = [];
+  const upstream = await listen((req, res) => {
+    seen.push(req.headers.authorization ?? "");
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end('data: {"type":"error","error":{"type":"rate_limit_exceeded"}}\n\n');
+  });
+  const app = poolApp(store, upstream.url);
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+    method: "POST",
+    headers: CHAT_HEADERS,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, input: "hi" }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /rate_limit_exceeded/);
+  assert.deepEqual(seen, ["Bearer bad-key"]);
+  upstream.close();
+});
+
+test("a native messages stream does not rotate on a rate-limit event", async () => {
+  const store = await seeded();
+  const seen: string[] = [];
+  const upstream = await listen((req, res) => {
+    const key = req.headers["x-api-key"];
+    seen.push(typeof key === "string" ? key : "");
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end('event: error\ndata: {"type":"error","error":{"type":"rate_limit_error"}}\n\n');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-anthropic", kind: "anthropic", baseUrl: upstream.url }],
+    credentials: [
+      { namespace: "platform", provider: "fake-anthropic", secret: "bad-key", id: "bad" },
+      { namespace: "platform", provider: "fake-anthropic", secret: "good-key", id: "good" },
+    ],
+    prices: [
+      {
+        provider: "fake-anthropic",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+  });
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
+    method: "POST",
+    headers: CHAT_HEADERS,
+    body: JSON.stringify({ model: "fake-anthropic/claude-test", stream: true, messages: [], max_tokens: 16 }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.match(body, /rate_limit_error/);
+  assert.deepEqual(seen, ["bad-key"]);
+  upstream.close();
 });

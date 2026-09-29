@@ -550,6 +550,26 @@ async function dispatch(
   const continuation = pinned && typeof previous === "string" && previous.length > 0;
   const clock = opts.clock ?? Date.now;
   const deadlineAt = clock() + (opts.transport?.overallTimeoutMs ?? 30_000);
+  const headersFor = (served: CredentialConfig): Headers => {
+    const built = new Headers();
+    built.set("content-type", "application/json");
+    for (const name of ["anthropic-version", "anthropic-beta", "accept"]) {
+      const value = c.req.header(name);
+      if (value) {
+        built.set(name, value);
+      }
+    }
+    if (provider.kind === "anthropic") {
+      built.set("x-api-key", served.secret);
+    } else {
+      built.set("authorization", `Bearer ${served.secret}`);
+    }
+    const trace = requestTrace.get(c.req.raw);
+    if (trace) {
+      built.set("traceparent", formatTraceparent(trace));
+    }
+    return built;
+  };
   for (let attempt = 0; attempt < planned.length; attempt += 1) {
     const credential = planned[attempt]!;
     if (continuation && credentialState(pools, credential, now, policy.cooldownMs) === "parked") {
@@ -559,23 +579,7 @@ async function dispatch(
         `continuation affinity unavailable for Responses target \`${provider.id}/${axond.target?.model ?? ""}\``,
       );
     }
-    const headers = new Headers();
-    headers.set("content-type", "application/json");
-    for (const name of ["anthropic-version", "anthropic-beta", "accept"]) {
-      const value = c.req.header(name);
-      if (value) {
-        headers.set(name, value);
-      }
-    }
-    if (provider.kind === "anthropic") {
-      headers.set("x-api-key", credential.secret);
-    } else {
-      headers.set("authorization", `Bearer ${credential.secret}`);
-    }
-    const trace = requestTrace.get(c.req.raw);
-    if (trace) {
-      headers.set("traceparent", formatTraceparent(trace));
-    }
+    const headers = headersFor(credential);
     const attemptStarted = Date.now();
     const path =
       axond.route === "chat"
@@ -601,17 +605,69 @@ async function dispatch(
         }),
       );
     }
+    const transport = opts.transport ?? {
+      responseHeaderTimeoutMs: 30_000,
+      bufferedBodyTimeoutMs: 30_000,
+      streamIdleTimeoutMs: 120_000,
+      maxResponseBytes: 32 * 1024 * 1024,
+    };
+    let streamServed = true;
+    const finishStream = (served: CredentialConfig, reason: "end" | "cancel") => {
+      if (reason === "end" && streamServed) {
+        noteCredentialSuccess(pools, record.id, provider.id, served.id);
+      }
+      if (stream && opts.waitUntil) {
+        releaseStream();
+        return;
+      }
+      scheduleSettle(opts, axond, usage, "ok");
+    };
+    const rotateStream = async (failedIndex: number): Promise<Response | null> => {
+      const failed = planned[failedIndex]!;
+      noteCredentialFailure(pools, record.id, provider.id, failed.id, now, policy.failureThreshold);
+      for (let index = failedIndex + 1; index < planned.length; index += 1) {
+        const nextCredential = planned[index]!;
+        try {
+          const opened = await callUpstream({
+            url,
+            headers: headersFor(nextCredential),
+            body: (axond.body as ByteRequestBody).outgoing(),
+            transport,
+            stream: true,
+            route: axond.route,
+            deadlineAt,
+            now: clock,
+            dispatcher: opts.upstreamDispatcher,
+            onTimeout: (kind, bound) => {
+              opts.metrics?.record("axond.upstream.timeouts", 1, {
+                "axond.target.provider": provider.id,
+                "axond.target.model": axond.target?.model ?? "",
+                "axond.timeout": kind,
+                "axond.timeout.bound": bound,
+              });
+            },
+            onUsage: (next) => copyUsage(usage, next),
+            onStreamDone: (reason) => finishStream(nextCredential, reason),
+            onBeforeContentRateLimit: () => rotateStream(index),
+          });
+          return opened.response;
+        } catch (error) {
+          if (error instanceof GatewayFailure && error.rateLimited) {
+            noteCredentialFailure(pools, record.id, provider.id, nextCredential.id, now, policy.failureThreshold);
+            continue;
+          }
+          throw error;
+        }
+      }
+      streamServed = false;
+      return null;
+    };
     try {
       upstream = await callUpstream({
         url,
         headers,
         body: (axond.body as ByteRequestBody).outgoing(),
-        transport: opts.transport ?? {
-          responseHeaderTimeoutMs: 30_000,
-          bufferedBodyTimeoutMs: 30_000,
-          streamIdleTimeoutMs: 120_000,
-          maxResponseBytes: 32 * 1024 * 1024,
-        },
+        transport,
         stream,
         route: axond.route,
         deadlineAt,
@@ -626,18 +682,18 @@ async function dispatch(
           });
         },
         onUsage: (next) => copyUsage(usage, next),
-        onStreamDone: () => {
-          if (stream && opts.waitUntil) {
-            releaseStream();
-            return;
-          }
-          scheduleSettle(opts, axond, usage, "ok");
-        },
+        onStreamDone: (reason) => finishStream(credential, reason),
+        onBeforeContentRateLimit:
+          stream && axond.route === "chat" && !pinned && planned.length > 1
+            ? () => rotateStream(attempt)
+            : undefined,
       });
       if (!stream) {
         scheduleSettle(opts, axond, upstream.usage, "ok");
       }
-      noteCredentialSuccess(pools, record.id, provider.id, credential.id);
+      if (!stream) {
+        noteCredentialSuccess(pools, record.id, provider.id, credential.id);
+      }
       noteAttempt(c, opts, axond, credential, attempt, attemptStarted, "ok", false);
       break;
     } catch (error) {
