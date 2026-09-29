@@ -24,7 +24,10 @@ A compiled `bun build --compile` binary loads those files, but it does not
 resolve packages from the extension's `node_modules`. Bundle an extension that
 imports a package first (`bun build extension.ts --outfile extension.js`) and
 point the directory at the bundle. The Node wrapper resolves packages from the
-extension file.
+extension file. `ts/scripts/sign-artifact.sh` signs that binary with cosign
+2.5.2 and verifies the signature. Pull requests use an ephemeral key that is
+not uploaded to the transparency log. A `v*` tag signs keyless with GitHub
+OIDC.
 
 ## Mount it in a Hono app
 

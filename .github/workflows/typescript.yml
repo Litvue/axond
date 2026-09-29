@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
 
 permissions:
   contents: read
@@ -88,3 +89,79 @@ jobs:
       - name: Compare fixture responses and charges
         working-directory: ts
         run: node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/shadow-compare.ts --rust "${{ github.workspace }}/target/debug/axond" --ts "${{ github.workspace }}/ts/bin/axond"
+
+  binary:
+    name: Signed compiled binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Bun 1.4.2 and cosign 2.5.2
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.2
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          curl -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.5.2/cosign-linux-amd64
+          chmod +x /tmp/cosign
+          sudo mv /tmp/cosign /usr/local/bin/cosign
+          bun --version
+          cosign version
+      - name: Compile, sign, verify, and boot
+        working-directory: ts
+        run: |
+          set -euo pipefail
+          bun build packages/cli/src/main.ts --compile --outfile "$RUNNER_TEMP/axond"
+          bash scripts/sign-artifact.sh "$RUNNER_TEMP/axond" "$RUNNER_TEMP/sign"
+          dir="$RUNNER_TEMP/smoke"
+          mkdir -p "$dir"
+          printf '%s\n' \
+            '[server]' \
+            'bind = "127.0.0.1:18081"' \
+            '' \
+            '[storage]' \
+            'backend = "sqlite"' \
+            "path = \"$dir/axond.sqlite\"" \
+            '' \
+            '[[namespace]]' \
+            'id = "platform"' \
+            'default = true' \
+            '' \
+            '[[gateway_key]]' \
+            'env = "GW_INBOUND_KEY"' \
+            'namespace = "platform"' \
+            > "$dir/axond.toml"
+          AXOND_CONFIG="$dir/axond.toml" GW_INBOUND_KEY=test-inbound-key "$RUNNER_TEMP/axond" &
+          pid=$!
+          trap 'kill "$pid"' EXIT
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS http://127.0.0.1:18081/healthz; then
+              echo
+              exit 0
+            fi
+            sleep 0.3
+          done
+          echo "compiled binary did not become healthy" >&2
+          exit 1
+
+  release-sign:
+    name: Keyless signature for a tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Bun 1.4.2 and cosign 2.5.2
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.2
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          curl -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.5.2/cosign-linux-amd64
+          chmod +x /tmp/cosign
+          sudo mv /tmp/cosign /usr/local/bin/cosign
+      - name: Sign the tag binary with GitHub OIDC
+        working-directory: ts
+        env:
+          COSIGN_MODE: keyless
+          COSIGN_IDENTITY_REGEXP: "(?i)https://github.com/litvue/axond/.github/workflows/typescript.yml@refs/tags/v.*"
+        run: |
+          bun build packages/cli/src/main.ts --compile --outfile "$RUNNER_TEMP/axond"
+          bash scripts/sign-artifact.sh "$RUNNER_TEMP/axond" "$RUNNER_TEMP/sign"
