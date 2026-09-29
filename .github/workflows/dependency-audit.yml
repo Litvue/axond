@@ -30,3 +30,19 @@ jobs:
           tool: cargo-deny@0.20.2
       - name: Check advisories, licenses, bans, and sources
         run: cargo deny --locked --all-features check
+
+  npm:
+    name: TypeScript advisory and license audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@48b55a011bda9f5f231285d2fc94cfd0ca16e4e6 # v6.1.0
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - name: Check npm advisories and production licenses
+        working-directory: ts
+        run: |
+          npm ci
+          npm run check:npm
