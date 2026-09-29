@@ -59,6 +59,7 @@ impl AliasScope {
         })
     }
 
+    #[cfg(test)]
     pub fn subsumes(&self, pattern: &AliasPattern) -> bool {
         self.patterns
             .iter()
@@ -75,22 +76,11 @@ impl AliasScope {
             })
     }
 
+    #[cfg(test)]
     pub fn is_subset_of(&self, ceiling: &Self) -> bool {
         self.patterns
             .iter()
             .all(|pattern| ceiling.subsumes(pattern))
-    }
-
-    pub fn patterns_for_claim(&self) -> Vec<String> {
-        self.patterns
-            .iter()
-            .map(|pattern| match pattern {
-                AliasPattern::Exact(value) => value.clone(),
-                AliasPattern::Prefix(value) => format!("{value}*"),
-                AliasPattern::Suffix(value) => format!("*{value}"),
-                AliasPattern::Any => "*".to_owned(),
-            })
-            .collect()
     }
 }
 

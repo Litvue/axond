@@ -134,6 +134,7 @@ enum GrantKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[cfg(test)]
 pub enum InvalidNamespaceGrant {
     #[error("a namespace grant must name at least one namespace")]
     Empty,
@@ -142,12 +143,14 @@ pub enum InvalidNamespaceGrant {
 }
 
 impl NamespaceGrant {
+    #[cfg(test)]
     pub const MAX_NAMESPACES: usize = 64;
 
     pub fn one(namespace: NamespaceId) -> Self {
         Self(GrantKind::Set(BTreeSet::from([namespace])))
     }
 
+    #[cfg(test)]
     pub fn set(
         namespaces: impl IntoIterator<Item = NamespaceId>,
     ) -> Result<Self, InvalidNamespaceGrant> {
@@ -168,10 +171,6 @@ impl NamespaceGrant {
         Self(GrantKind::All)
     }
 
-    pub const fn is_all(&self) -> bool {
-        matches!(self.0, GrantKind::All)
-    }
-
     pub fn permits(&self, namespace: &NamespaceId) -> bool {
         match &self.0 {
             GrantKind::All => true,
@@ -179,6 +178,7 @@ impl NamespaceGrant {
         }
     }
 
+    #[cfg(test)]
     pub fn namespaces(&self) -> Option<&BTreeSet<NamespaceId>> {
         match &self.0 {
             GrantKind::All => None,

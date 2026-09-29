@@ -89,6 +89,7 @@ use super::catalog::{
     ProviderOffering, RawPayload, Refusable, Refusal, RefusalReason, SchemaVersion,
     SourceValidators, excerpt, excerpt_list, excerpt_located, source_snapshot,
 };
+#[cfg(test)]
 use super::{Capabilities, Capability};
 use crate::desired_state::canonical::{CanonicalError, CanonicalValue};
 
@@ -474,7 +475,10 @@ struct WireModel {
 #[serde(untagged)]
 enum WireFlag {
     Stated(bool),
-    Configured(BTreeMap<String, serde_json::Value>),
+    Configured(
+        #[allow(dead_code, reason = "matched for its shape; only presence is read")]
+        BTreeMap<String, serde_json::Value>,
+    ),
 }
 
 impl WireFlag {
@@ -1436,6 +1440,7 @@ impl CatalogSource for SeedCatalogSource {
         "models.dev-seed"
     }
 
+    #[cfg(test)]
     fn capabilities(&self) -> Capabilities {
         Capabilities::new(&[Capability::IncrementalRefresh, Capability::PriceMetadata])
     }
@@ -1761,6 +1766,7 @@ impl<F: CatalogFetch> CatalogSource for ModelsDevSource<F> {
         BACKEND
     }
 
+    #[cfg(test)]
     fn capabilities(&self) -> Capabilities {
         Capabilities::new(&[Capability::IncrementalRefresh, Capability::PriceMetadata])
     }

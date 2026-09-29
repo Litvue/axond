@@ -14,9 +14,7 @@
 
 // The canonical metric catalogue (#199): data, plus the validation the
 // dashboards, alert rules, and documentation tables are checked against. Nothing
-// in the request path reads it, so it carries `allow(dead_code)` for the same
-// reason the other contract modules do.
-#[allow(dead_code)]
+// in the request path reads it, so its specs compile only under `cfg(test)`.
 pub mod catalog;
 // The drift gate for `ops/observability/`: the shipped dashboards and alert rules
 // are checked against the catalogue by `cargo test`, so a renamed instrument
@@ -34,16 +32,11 @@ mod spans;
 pub(crate) mod testing;
 
 pub use http::TelemetryLayer;
-pub use metrics::{record_last_known_good, record_revision_rejection};
-#[allow(unused_imports)]
 pub use spans::{
-    ATTEMPT_ERROR, ATTEMPT_OK, CONVERGENCE_BOOT, CONVERGENCE_NOTIFIED, CONVERGENCE_POLLED,
-    CONVERGENCE_PRICING_BOUNDARY, LEASE_ERROR, LEASE_PARKED, LEASE_RATE_LIMITED, LEASE_SERVED,
-    RELOAD_APPLIED, RELOAD_REJECTED, config_reload_span, credential_lease_span,
-    finish_config_reload, finish_credential_lease, finish_revision_convergence,
-    finish_upstream_attempt, record_attempt_failure, record_attempt_timeout, record_request,
-    record_routing, record_streamed, request_trace_id, revision_convergence_span, trace_id,
-    upstream_attempt_span,
+    ATTEMPT_ERROR, ATTEMPT_OK, LEASE_ERROR, LEASE_PARKED, LEASE_RATE_LIMITED, LEASE_SERVED,
+    credential_lease_span, finish_credential_lease, finish_upstream_attempt,
+    record_attempt_failure, record_attempt_timeout, record_request, record_routing,
+    record_streamed, request_trace_id, upstream_attempt_span,
 };
 
 use std::sync::OnceLock;

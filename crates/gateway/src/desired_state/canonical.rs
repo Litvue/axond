@@ -24,7 +24,7 @@
 //!   delimited or escaped (so no escaping choice can vary), and refused if they
 //!   carry control characters or a byte-order mark. Unicode-equivalence
 //!   normalization is *not* attempted here: everything identity-bearing is an
-//!   ASCII [`Slug`](super::ids::Slug) or a UUID, and human-facing prose is
+//!   ASCII slug or a UUID, and human-facing prose is
 //!   normalized at the admin edge before it ever reaches a checksum.
 //! - **Explicit versioning.** [`SerializerVersion`] is written into the byte
 //!   stream. A future encoding change is a new variant, which means old
@@ -54,13 +54,6 @@ impl SerializerVersion {
     /// The domain separator written before any value, so canonical bytes cannot
     /// be confused with another format's bytes that happen to collide.
     const MAGIC: &'static [u8] = b"axond.desired-state\0";
-
-    /// What every version of this encoding is named after.
-    ///
-    /// A stored name this build does not know but that belongs to this family is
-    /// a version it has not learned yet — a skew — while any other text is
-    /// something no release ever wrote.
-    pub const FAMILY: &'static str = "axond.desired-state.v";
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -95,6 +88,7 @@ impl SerializerVersion {
     /// enough. Unsorted set members and unsorted or duplicated map keys are
     /// therefore rejected, which is what stops two byte strings from decoding to
     /// one state.
+    #[cfg(test)]
     pub fn decode(self, bytes: &[u8]) -> Result<CanonicalValue, CanonicalDecodeError> {
         let rest = bytes
             .strip_prefix(Self::MAGIC)
@@ -123,6 +117,7 @@ impl SerializerVersion {
 /// them can be repaired by retrying, and a caller that meets one is looking at
 /// storage that no longer holds what it was given.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[cfg(test)]
 pub enum CanonicalDecodeError {
     #[error("canonical bytes do not begin with the domain separator")]
     Magic,
@@ -147,16 +142,20 @@ pub enum CanonicalDecodeError {
 }
 
 /// A decoding position: the bytes still to read, and how deep reading has gone.
+#[cfg(test)]
 struct Cursor<'a> {
     rest: &'a [u8],
     depth: usize,
 }
 
+#[cfg(test)]
 impl<'a> Cursor<'a> {
     /// Deep enough for any resource envelope, shallow enough that hostile input
     /// cannot exhaust the stack.
+    #[cfg(test)]
     const MAX_DEPTH: usize = 32;
 
+    #[cfg(test)]
     fn take(&mut self, count: usize) -> Result<&'a [u8], CanonicalDecodeError> {
         if self.rest.len() < count {
             return Err(CanonicalDecodeError::Truncated);
@@ -166,6 +165,7 @@ impl<'a> Cursor<'a> {
         Ok(taken)
     }
 
+    #[cfg(test)]
     fn byte(&mut self) -> Result<u8, CanonicalDecodeError> {
         Ok(self.take(1)?[0])
     }
@@ -174,6 +174,7 @@ impl<'a> Cursor<'a> {
     /// encoded value is at least one byte, so a count larger than the remaining
     /// bytes is unsatisfiable — checking it here is what keeps a corrupt length
     /// from becoming a multi-gigabyte allocation.
+    #[cfg(test)]
     fn length(&mut self) -> Result<usize, CanonicalDecodeError> {
         let length = u64::from_be_bytes(self.take(8)?.try_into().expect("eight bytes were taken"));
         let remaining = self.rest.len();
@@ -183,6 +184,7 @@ impl<'a> Cursor<'a> {
             .ok_or(CanonicalDecodeError::Length { length, remaining })
     }
 
+    #[cfg(test)]
     fn nested<T>(
         &mut self,
         read: impl FnOnce(&mut Self) -> Result<T, CanonicalDecodeError>,
@@ -198,6 +200,7 @@ impl<'a> Cursor<'a> {
         value
     }
 
+    #[cfg(test)]
     fn string(&mut self) -> Result<String, CanonicalDecodeError> {
         let length = self.length()?;
         let bytes = self.take(length)?;
@@ -206,6 +209,7 @@ impl<'a> Cursor<'a> {
             .map_err(|_| CanonicalDecodeError::Utf8)
     }
 
+    #[cfg(test)]
     fn value(&mut self) -> Result<CanonicalValue, CanonicalDecodeError> {
         let tag = self.byte()?;
         match tag {
@@ -263,6 +267,7 @@ impl fmt::Display for SerializerVersion {
 /// absent from the map; there is no second way to spell it.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CanonicalValue {
+    #[cfg(test)]
     Bool(bool),
     /// Any integer, normalized to one width and signedness.
     Integer(i128),
@@ -294,7 +299,9 @@ pub enum CanonicalError {
         "floating-point values have no canonical form and cannot be checksummed; \
          use an integer (micro-dollars for money)"
     )]
+    #[cfg(test)]
     FloatingPoint,
+    #[cfg(test)]
     #[error("JSON null has no canonical form; omit the field instead")]
     Null,
 }
@@ -357,6 +364,7 @@ impl CanonicalValue {
     /// a request body carrying `1.5` is rejected with
     /// [`CanonicalError::FloatingPoint`], not silently truncated, and `null` is
     /// rejected rather than becoming a second spelling of "absent".
+    #[cfg(test)]
     pub fn try_from_json(value: &serde_json::Value) -> Result<Self, CanonicalError> {
         match value {
             serde_json::Value::Null => Err(CanonicalError::Null),
@@ -403,6 +411,7 @@ impl CanonicalValue {
 
     fn tag(&self) -> u8 {
         match self {
+            #[cfg(test)]
             Self::Bool(_) => 0x01,
             Self::Integer(_) => 0x02,
             Self::String(_) => 0x03,
@@ -416,6 +425,7 @@ impl CanonicalValue {
     fn write(&self, out: &mut Vec<u8>) -> Result<(), CanonicalError> {
         out.push(self.tag());
         match self {
+            #[cfg(test)]
             Self::Bool(value) => out.push(u8::from(*value)),
             Self::Integer(value) => out.extend_from_slice(&value.to_be_bytes()),
             Self::String(value) => {
@@ -512,6 +522,7 @@ pub trait Canonical {
     fn canonical(&self) -> CanonicalValue;
 
     /// The checksum of this value's canonical bytes.
+    #[cfg(test)]
     fn checksum(&self) -> Result<Checksum, CanonicalError> {
         self.canonical().checksum()
     }
@@ -553,6 +564,7 @@ impl Checksum {
         Self(digest)
     }
 
+    #[cfg(test)]
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }

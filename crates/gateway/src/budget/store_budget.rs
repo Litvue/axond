@@ -9,7 +9,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::{Admission, BudgetKey, BudgetStore, Denial, Reservation, UnavailablePolicy};
-use crate::backends::health::BackendHealth;
 use crate::config::StoreUnavailable;
 use crate::store::{Store, StoreError};
 
@@ -27,7 +26,7 @@ impl StoreBudget {
     }
 
     fn on_unavailable(&self, error: &StoreError) -> Admission {
-        self.unavailable.admission("store", error, None)
+        self.unavailable.admission("store", error)
     }
 }
 
@@ -35,10 +34,6 @@ impl StoreBudget {
 impl BudgetStore for StoreBudget {
     fn name(&self) -> &'static str {
         "store"
-    }
-
-    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
-        self.store.health()
     }
 
     fn store_ledger(&self) -> Option<&Arc<dyn Store>> {

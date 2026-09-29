@@ -8,17 +8,15 @@
 //! capacity is [`crate::settlement`]; this module only spends a reservation
 //! taken at admission.
 
-use gateway_core::{Usage, serialized_json_len};
+use gateway_core::Usage;
 use serde_json::Value;
 
 use crate::admission::AdmissionPermit;
 use crate::budget::{BudgetKey, Reservation};
+use crate::core_accounting::CoreBudgetHold;
 use crate::credentials::CredentialSource;
 use crate::error::GatewayError;
-use crate::middleware::CoreBudgetHold;
-use crate::pricing::RequestPrice;
-use crate::rate_limit::RateLimitPermit;
-use crate::settlement::{SettlementReservation, SettlementSlot};
+use crate::settlement::SettlementReservation;
 use crate::state::{AppState, InboundKey};
 use crate::telemetry;
 use crate::usage::identity::EventIdentity;
@@ -51,9 +49,17 @@ impl std::io::Write for BoundedJsonCounter {
     }
 }
 
-pub(super) fn json_fits_response_limit(body: &Value, limit: u64) -> bool {
-    serde_json::to_writer(BoundedJsonCounter { bytes: 0, limit }, body).is_ok()
+/// The exact length of `body` as serialized JSON, counted without allocating a
+/// copy of it.
+pub(super) fn serialized_json_len(body: &Value) -> Option<usize> {
+    let mut counter = BoundedJsonCounter {
+        bytes: 0,
+        limit: u64::MAX,
+    };
+    serde_json::to_writer(&mut counter, body).ok()?;
+    usize::try_from(counter.bytes).ok()
 }
+
 /// The budget reservation a request is dispatched under, plus the input-token
 /// estimate it was priced from. The streaming relay needs both: the hold to
 /// settle, and the estimate to price a stream that ends before the provider
@@ -62,95 +68,11 @@ pub(super) struct BudgetHold {
     pub(super) key: BudgetKey,
     pub(super) reservation: Reservation,
     pub(super) estimated_input_tokens: u64,
-    pub(super) permit: Option<RateLimitPermit>,
     /// The admission capacity the request was let in under. Moved into the
     /// stream context that ends up owning the relay, so an open stream keeps
     /// occupying a slot for exactly as long as it is open — and a walk that
     /// never opens one drops it here.
     pub(super) admission: Option<AdmissionPermit>,
-}
-
-/// A buffered request's reservation must be reconciled even when its handler is
-/// dropped while the upstream request is in flight. Streaming `Accounting`
-/// covers cancellation once the relay exists; this guard covers the buffered path.
-pub(super) struct BudgetReservation {
-    state: AppState,
-    key: BudgetKey,
-    reservation: Option<Reservation>,
-    settlement: SettlementSlot,
-}
-
-impl BudgetReservation {
-    pub(super) fn new(
-        state: AppState,
-        key: BudgetKey,
-        reservation: Reservation,
-        settlement: SettlementSlot,
-    ) -> Self {
-        Self {
-            state,
-            key,
-            reservation: Some(reservation),
-            settlement,
-        }
-    }
-
-    /// Disarm before awaiting so the explicit release and the drop fallback
-    /// cannot both reconcile the same hold.
-    pub(super) async fn release(mut self) {
-        let reservation = self
-            .reservation
-            .take()
-            .expect("budget reservation guard must be armed");
-        self.state.0.budget.release(&self.key, &reservation).await;
-    }
-
-    pub(super) fn disarm(mut self) {
-        self.reservation.take();
-    }
-
-    pub(super) fn into_response_accounting(
-        mut self,
-        record: UsageRecord,
-        ttft_ms: Option<u64>,
-        attempts: u32,
-        settlement: Option<SettlementReservation>,
-    ) -> BufferedResponseAccounting {
-        BufferedResponseAccounting {
-            state: self.state.clone(),
-            hold: Some(BufferedBudgetHold::Legacy {
-                key: self.key.clone(),
-                reservation: self
-                    .reservation
-                    .take()
-                    .expect("budget reservation guard must be armed"),
-            }),
-            record: Some(record),
-            ttft_ms,
-            attempts,
-            settlement,
-        }
-    }
-}
-
-impl Drop for BudgetReservation {
-    fn drop(&mut self) {
-        let Some(reservation) = self.reservation.take() else {
-            return;
-        };
-        let state = self.state.clone();
-        let key = self.key.clone();
-        // Same transfer as `CoreBudgetHold`: consume the request's reserved slot
-        // so a zero-charge release is not refused because that slot still
-        // occupies capacity.
-        self.state.0.settlements.spawn_reserved(
-            self.settlement.take(),
-            async move {
-                state.0.budget.release(&key, &reservation).await;
-            },
-            "zero-charge budget release",
-        );
-    }
 }
 
 /// Owns known provider spend while buffered response middleware runs.
@@ -163,21 +85,13 @@ impl Drop for BudgetReservation {
 /// conflict with the immutable event under the same request identity.
 pub(super) struct BufferedResponseAccounting {
     state: AppState,
-    hold: Option<BufferedBudgetHold>,
+    hold: Option<CoreBudgetHold>,
     record: Option<UsageRecord>,
     ttft_ms: Option<u64>,
     attempts: u32,
     /// The settlement capacity reserved at admission, spent by whichever of
     /// `finish` and `Drop` spawns the one settlement.
     settlement: Option<SettlementReservation>,
-}
-
-pub(super) enum BufferedBudgetHold {
-    Legacy {
-        key: BudgetKey,
-        reservation: Reservation,
-    },
-    Core(CoreBudgetHold),
 }
 
 impl BufferedResponseAccounting {
@@ -191,7 +105,7 @@ impl BufferedResponseAccounting {
     ) -> Self {
         Self {
             state,
-            hold: Some(BufferedBudgetHold::Core(hold)),
+            hold: Some(hold),
             record: Some(record),
             ttft_ms,
             attempts,
@@ -254,7 +168,7 @@ impl Drop for BufferedResponseAccounting {
 
 pub(super) fn spawn_buffered_response_accounting(
     state: AppState,
-    hold: BufferedBudgetHold,
+    hold: CoreBudgetHold,
     record: UsageRecord,
     ttft_ms: Option<u64>,
     attempts: u32,
@@ -263,18 +177,7 @@ pub(super) fn spawn_buffered_response_accounting(
     let (verdict, decided) = tokio::sync::oneshot::channel();
     let settlements = state.0.settlements.clone();
     let accounting = async move {
-        match hold {
-            BufferedBudgetHold::Legacy { key, reservation } => {
-                state
-                    .0
-                    .budget
-                    .settle(&key, &reservation, record.settle_cost())
-                    .await;
-            }
-            BufferedBudgetHold::Core(hold) => {
-                hold.settle(record.settle_cost()).await;
-            }
-        }
+        hold.settle(record.settle_cost()).await;
         telemetry::record_request(&record, ttft_ms, attempts);
         let result = state.0.usage.record(&record).await;
         if let Err(Err(unheard)) = verdict.send(result) {
@@ -383,9 +286,6 @@ pub(super) struct RecordArgs<'a> {
     pub(super) cache_write_tokens: u64,
     pub(super) output_tokens: u64,
     pub(super) cost_microdollars: Option<u64>,
-    /// The pricing the cost was computed at, so the row names the immutable
-    /// state it was charged against rather than "whatever is approved now".
-    pub(super) price: RequestPrice,
     pub(super) latency_ms: u64,
     /// Time to the first token, when one was produced.
     pub(super) ttft_ms: Option<u64>,
@@ -458,10 +358,10 @@ pub(super) fn build_record(args: RecordArgs<'_>) -> (UsageRecord, Option<u64>, u
         cache_write_tokens: args.cache_write_tokens,
         output_tokens: args.output_tokens,
         cost_microdollars: args.cost_microdollars,
-        catalog_version: args.price.catalog_version(),
-        price_book: args.price.identity().map(|id| id.book()),
-        price_book_checksum: args.price.identity().map(|id| id.checksum()),
-        price_catalog: args.price.identity().map(|id| id.catalog()),
+        catalog_version: 0,
+        price_book: None,
+        price_book_checksum: None,
+        price_catalog: None,
         latency_ms: args.latency_ms,
         attempts,
     };

@@ -239,7 +239,7 @@ impl UsageEvent {
     // Contract surface: the conformance suite and the in-memory oracle are the
     // only callers, because a store answers the same question in its own terms
     // (the Postgres one compares the stored `jsonb`).
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_same_fact_as(&self, other: &Self) -> bool {
         self.record == other.record
     }
@@ -397,7 +397,7 @@ impl Appended {
     /// Where the event sits in the journal, whether this append wrote it or
     /// recognised it. Contract surface: the suite asserts a retried append
     /// reports the *first* position.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn position(&self) -> u64 {
         match self {
             Self::Accepted { position } | Self::AlreadyPresent { position } => *position,
@@ -429,6 +429,7 @@ pub enum PoisonReason {
 }
 
 /// Every value [`PoisonReason::as_str`] can produce, for the metric catalogue.
+#[cfg(test)]
 pub const POISON_REASONS: &[&str] = &["malformed", "rejected", "attempts_exhausted"];
 
 impl PoisonReason {

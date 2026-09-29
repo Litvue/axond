@@ -17,11 +17,13 @@
 //! ([`LabelClass::Configured`]) are refused as *default* labels, where nobody
 //! chose them per instrument: see [`validate_default_label_key`].
 
+#[cfg(test)]
 use std::collections::BTreeSet;
 
 /// The instrument type a metric is recorded through. Part of the contract
 /// because an alert that assumes a counter (`rate()`) reads a gauge as noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum InstrumentKind {
     Counter,
     UpDownCounter,
@@ -29,16 +31,8 @@ pub enum InstrumentKind {
     Histogram,
 }
 
-impl InstrumentKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Counter => "counter",
-            Self::UpDownCounter => "up_down_counter",
-            Self::Gauge => "gauge",
-            Self::Histogram => "histogram",
-        }
-    }
-}
+#[cfg(test)]
+impl InstrumentKind {}
 
 /// What bounds a label's cardinality.
 ///
@@ -49,6 +43,7 @@ impl InstrumentKind {
 /// former may be applied by default, because a default label is one nobody chose
 /// for a specific instrument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum LabelClass {
     /// A closed vocabulary enumerated in [`Label::values`].
     Closed,
@@ -62,8 +57,10 @@ pub enum LabelClass {
     Configured,
 }
 
+#[cfg(test)]
 impl LabelClass {
     /// Whether a label of this class may be attached to every metric by default.
+    #[cfg(test)]
     const fn is_default_safe(self) -> bool {
         !matches!(self, Self::Configured)
     }
@@ -71,6 +68,7 @@ impl LabelClass {
 
 /// One label key on one instrument, with the vocabulary it is allowed to carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub struct Label {
     pub key: &'static str,
     pub class: LabelClass,
@@ -79,7 +77,9 @@ pub struct Label {
     pub values: &'static [&'static str],
 }
 
+#[cfg(test)]
 impl Label {
+    #[cfg(test)]
     const fn closed(key: &'static str, values: &'static [&'static str]) -> Self {
         Self {
             key,
@@ -88,6 +88,7 @@ impl Label {
         }
     }
 
+    #[cfg(test)]
     const fn open(key: &'static str, class: LabelClass) -> Self {
         Self {
             key,
@@ -99,6 +100,7 @@ impl Label {
 
 /// One catalogued instrument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub struct MetricSpec {
     pub name: &'static str,
     pub kind: InstrumentKind,
@@ -107,7 +109,9 @@ pub struct MetricSpec {
     pub labels: &'static [Label],
 }
 
+#[cfg(test)]
 impl MetricSpec {
+    #[cfg(test)]
     pub fn label(&self, key: &str) -> Option<&'static Label> {
         self.labels.iter().find(|label| label.key == key)
     }
@@ -118,14 +122,17 @@ impl MetricSpec {
 /// `service.instance.id` attribute into `service_instance_id`; it is a
 /// deployment-scoped identity for finding one replica, never a tenant/model
 /// dimension.
+#[cfg(test)]
 const RESOURCE_LABELS: &[Label] = &[Label::open("service.instance.id", LabelClass::Configured)];
 
+#[cfg(test)]
 pub fn resource_label(key: &str) -> Option<&'static Label> {
     RESOURCE_LABELS.iter().find(|label| label.key == key)
 }
 
 /// Why a metric name, label key, or asset reference was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[cfg(test)]
 pub enum CatalogError {
     #[error("metric `{name}` is not in the canonical catalogue")]
     UnknownMetric { name: String },
@@ -167,6 +174,7 @@ pub enum CatalogError {
 ///
 /// These identities are not lost — they are on the usage record and on spans,
 /// which are per-event and sampled rather than multiplied into a stored series.
+#[cfg(test)]
 pub const FORBIDDEN_LABEL_KEYS: &[(&str, &str)] = &[
     ("tenant", "a tenant dimension is per-customer and unbounded"),
     (
@@ -243,8 +251,10 @@ pub const FORBIDDEN_LABEL_KEYS: &[(&str, &str)] = &[
 ];
 
 /// `axond.credential_source`: whose key paid for the attempt.
+#[cfg(test)]
 const CREDENTIAL_SOURCE: Label = Label::closed("axond.credential_source", &["platform", "byok"]);
 /// `axond.status`: the settled outcome vocabulary shared with the usage record.
+#[cfg(test)]
 const REQUEST_STATUS: Label = Label::closed(
     "axond.status",
     &[
@@ -255,11 +265,13 @@ const REQUEST_STATUS: Label = Label::closed(
         "rejected",
     ],
 );
+#[cfg(test)]
 const TARGET_PROVIDER: Label = Label::open("axond.target.provider", LabelClass::Configured);
+#[cfg(test)]
 const TARGET_MODEL: Label = Label::open("axond.target.model", LabelClass::Configured);
-const STATUS_COMPONENT: Label = Label::closed("axond.status.component", crate::status::COMPONENTS);
 /// `axond.catalog.reason`: why an import was refused, bounded by
 /// [`RefusalReason`](crate::backends::catalog::RefusalReason).
+#[cfg(test)]
 const CATALOG_REFUSAL_REASON: Label = Label::closed(
     "axond.catalog.reason",
     crate::backends::catalog::REFUSAL_REASONS,
@@ -272,6 +284,7 @@ const CATALOG_REFUSAL_REASON: Label = Label::closed(
 ///
 /// A test asserts this is exactly [`super::http::METHODS`] plus
 /// [`super::http::OTHER_METHOD`], since a slice cannot be extended in a const.
+#[cfg(test)]
 const HTTP_METHODS: &[&str] = &[
     "GET",
     "HEAD",
@@ -288,6 +301,7 @@ const HTTP_METHODS: &[&str] = &[
 /// Every HTTP request, including the ones that never reach a provider: an
 /// unroutable request is still counted, which is why the method vocabulary is
 /// the protocol's rather than the route table's.
+#[cfg(test)]
 const HTTP_LABELS: &[Label] = &[
     Label::closed("http.request.method", HTTP_METHODS),
     Label::open("http.route", LabelClass::Route),
@@ -299,6 +313,7 @@ const HTTP_LABELS: &[Label] = &[
 /// operator who declares a thousand aliases gets a thousand series, which is the
 /// documented cost of per-alias attribution and the reason these keys may not be
 /// applied by default.
+#[cfg(test)]
 const REQUEST_LABELS: &[Label] = &[
     Label::open("axond.namespace", LabelClass::Configured),
     Label::open("gen_ai.request.model", LabelClass::Configured),
@@ -308,18 +323,23 @@ const REQUEST_LABELS: &[Label] = &[
     REQUEST_STATUS,
 ];
 
+#[cfg(test)]
 const TARGET_LABELS: &[Label] = &[TARGET_PROVIDER, TARGET_MODEL];
 
+#[cfg(test)]
 const USAGE_SINK: Label = Label::closed("axond.usage_sink", &["stdout", "otlp", "postgres"]);
 
 /// Which durable outbox the billing-grade path is using. `none` appears when an
 /// event could not be journaled before one was constructed.
+#[cfg(test)]
 const USAGE_JOURNAL: Label = Label::closed("axond.usage_journal", &["none", "postgres"]);
 
 /// Configured rather than closed: the consumer name is an operator's string, and
 /// one deployment's is one series.
+#[cfg(test)]
 const JOURNAL_CONSUMER: Label = Label::open("axond.usage_journal.consumer", LabelClass::Configured);
 
+#[cfg(test)]
 const POISON_REASONS: &[&str] = crate::usage::journal::POISON_REASONS;
 
 /// `axond.index.outcome`: how a management usage-index event ended, bounded by
@@ -327,8 +347,10 @@ const POISON_REASONS: &[&str] = crate::usage::journal::POISON_REASONS;
 /// added alongside the original three; before them a full queue was counted as
 /// `timeout` and a missing worker as `failed`, so `timeout` now means only an
 /// elapsed write deadline and `failed` only a Store error.
+#[cfg(test)]
 const INDEX_OUTCOME: Label = Label::closed("axond.index.outcome", crate::usage::INDEX_OUTCOMES);
 
+#[cfg(test)]
 const ADMISSION_RESOURCE: Label = Label::closed(
     "axond.admission.resource",
     &[
@@ -336,12 +358,11 @@ const ADMISSION_RESOURCE: Label = Label::closed(
         crate::admission::RESOURCE_STREAM,
         crate::admission::RESOURCE_TENANT,
         crate::admission::RESOURCE_QUEUE,
-        crate::admission::RESOURCE_DIAGNOSTIC,
-        crate::admission::RESOURCE_DIAGNOSTIC_AUTH,
         crate::admission::RESOURCE_SETTLEMENT,
     ],
 );
 
+#[cfg(test)]
 const SETTLEMENT_STAGE: Label = Label::closed(
     "axond.settlement.stage",
     &[
@@ -351,6 +372,7 @@ const SETTLEMENT_STAGE: Label = Label::closed(
     ],
 );
 
+#[cfg(test)]
 const SETTLEMENT_REASON: Label = Label::closed(
     "axond.settlement.reason",
     &[
@@ -365,26 +387,21 @@ const SETTLEMENT_REASON: Label = Label::closed(
 /// The Store contention dimensions: which backend, and which of the ten kinds of
 /// work ([`crate::store::StoreOp`]). Both closed, so the acquire-wait and
 /// service-time histograms have `2 × 10` series each and never a tenant.
+#[cfg(test)]
 const STORE_BACKEND: Label = Label::closed("axond.store.backend", crate::store::STORE_BACKENDS);
+#[cfg(test)]
 const STORE_OPERATION: Label =
     Label::closed("axond.store.operation", crate::store::STORE_OPERATIONS);
+#[cfg(test)]
 const STORE_LABELS: &[Label] = &[STORE_BACKEND, STORE_OPERATION];
+#[cfg(test)]
 const STORE_POOL_STATE: Label =
     Label::closed("axond.store.pool.state", crate::store::STORE_POOL_STATES);
-
-const REVISION_TRIGGER: Label = Label::closed(
-    "axond.revision.trigger",
-    &[
-        super::CONVERGENCE_BOOT,
-        super::CONVERGENCE_POLLED,
-        super::CONVERGENCE_NOTIFIED,
-        super::CONVERGENCE_PRICING_BOUNDARY,
-    ],
-);
 
 /// The canonical catalogue. Adding an instrument means adding it here: the
 /// catalogue is checked against [`metrics`](super::metrics) rather than the
 /// other way round, so an uncatalogued instrument fails the build's tests.
+#[cfg(test)]
 pub const CATALOG: &[MetricSpec] = &[
     MetricSpec {
         name: "axond.http.server.requests",
@@ -696,134 +713,6 @@ pub const CATALOG: &[MetricSpec] = &[
         labels: &[SETTLEMENT_REASON],
     },
     MetricSpec {
-        name: "axond.config.reloads",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[
-            Label::closed(
-                "axond.reload.trigger",
-                &[crate::reload::TRIGGER_SIGNAL, crate::reload::TRIGGER_WATCH],
-            ),
-            Label::closed(
-                "axond.reload.outcome",
-                &[super::RELOAD_APPLIED, super::RELOAD_REJECTED],
-            ),
-        ],
-    },
-    MetricSpec {
-        name: "axond.config.generation",
-        kind: InstrumentKind::Gauge,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.revision.attempts",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[
-            REVISION_TRIGGER,
-            Label::closed(
-                "axond.revision.outcome",
-                &["published", "converged", "empty", "rejected"],
-            ),
-        ],
-    },
-    MetricSpec {
-        name: "axond.revision.rejections",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[Label::closed(
-            "axond.revision.reason",
-            crate::convergence::reconciler::REVISION_REASONS,
-        )],
-    },
-    MetricSpec {
-        name: "axond.revision.lag",
-        kind: InstrumentKind::Gauge,
-        unit: Some("ms"),
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.revision.converged",
-        kind: InstrumentKind::Gauge,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.revision.desired_at",
-        kind: InstrumentKind::Gauge,
-        unit: Some("ms"),
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.revision.active_at",
-        kind: InstrumentKind::Gauge,
-        unit: Some("ms"),
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.revision.convergence_duration",
-        kind: InstrumentKind::Histogram,
-        unit: Some("ms"),
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.revision.consecutive_failures",
-        kind: InstrumentKind::Gauge,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.revision.last_known_good",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[Label::closed(
-            "axond.revision.outcome",
-            &[
-                "exported",
-                "export_failed",
-                "restored",
-                crate::convergence::reconciler::INCOMPATIBLE_REASON,
-            ],
-        )],
-    },
-    MetricSpec {
-        name: "axond.budget.capacity_denials",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.budget.namespace_denials",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.budget.retained_subjects",
-        kind: InstrumentKind::Gauge,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.middleware.capacity_wait",
-        kind: InstrumentKind::Histogram,
-        unit: Some("ms"),
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.middleware.capacity_timeouts",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.middleware.response_buffering_duration",
-        kind: InstrumentKind::Histogram,
-        unit: Some("ms"),
-        labels: &[],
-    },
-    MetricSpec {
         name: "axond.admission.queue.depth",
         kind: InstrumentKind::Histogram,
         unit: None,
@@ -914,80 +803,6 @@ pub const CATALOG: &[MetricSpec] = &[
             ),
         ],
     },
-    MetricSpec {
-        name: "axond.rate_limit.denials",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.rate_limit.capacity_denials",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.rate_limit.unavailable_denials",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.policy.unenforceable_denials",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[
-            Label::closed("axond.policy.condition", &["ungoverned", "layout"]),
-            // Responsibility first: the spend store and the concurrency store
-            // are usually the same backend, and the two denials are separate
-            // operator problems.
-            Label::closed(
-                "axond.policy.store",
-                &[
-                    "budget:in_memory",
-                    "budget:redis",
-                    "budget:postgres",
-                    "rate_limit:redis",
-                ],
-            ),
-        ],
-    },
-    MetricSpec {
-        name: "axond.revocation.denials",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[],
-    },
-    MetricSpec {
-        name: "axond.revocation.unavailable_denials",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[],
-    },
-    // The status registry's own instruments. Component-scoped and nothing else:
-    // a status metric that carried the namespace it was observed for would leak
-    // the tenancy the redacted status response is careful not to.
-    MetricSpec {
-        name: "axond.status.component_state",
-        kind: InstrumentKind::Gauge,
-        unit: None,
-        labels: &[STATUS_COMPONENT],
-    },
-    MetricSpec {
-        name: "axond.status.observation_age",
-        kind: InstrumentKind::Gauge,
-        unit: Some("ms"),
-        labels: &[STATUS_COMPONENT],
-    },
-    MetricSpec {
-        name: "axond.status.refreshes",
-        kind: InstrumentKind::Counter,
-        unit: None,
-        labels: &[
-            STATUS_COMPONENT,
-            Label::closed("axond.status.outcome", &["observed", "failed", "disabled"]),
-        ],
-    },
     // The catalogue's import health. A refused import leaves the previous
     // catalogue active, so the refusal is invisible in every other series: these
     // three are what make "metadata has stopped advancing" observable. The
@@ -1015,12 +830,14 @@ pub const CATALOG: &[MetricSpec] = &[
 ];
 
 /// The catalogued spec for `name`.
+#[cfg(test)]
 pub fn spec(name: &str) -> Option<&'static MetricSpec> {
     CATALOG.iter().find(|spec| spec.name == name)
 }
 
 /// A metric name is `axond.` plus dot-separated lower-case segments. Bounded in
 /// length because a name is a series key in every backend downstream.
+#[cfg(test)]
 pub fn validate_metric_name(name: &str) -> Result<(), CatalogError> {
     let malformed = |reason| {
         Err(CatalogError::MalformedName {
@@ -1050,6 +867,7 @@ pub fn validate_metric_name(name: &str) -> Result<(), CatalogError> {
 
 /// A label key is well-formed and is not one of the identities that must never
 /// become a metric dimension.
+#[cfg(test)]
 pub fn validate_label_key(key: &str) -> Result<(), CatalogError> {
     if key.is_empty() || key.len() > 64 {
         return Err(CatalogError::MalformedLabel {
@@ -1093,6 +911,7 @@ pub fn validate_label_key(key: &str) -> Result<(), CatalogError> {
 /// This is the stricter of the two rules, and it is what refuses the tempting
 /// ones: a default `axond.namespace` would multiply every instrument in the
 /// catalogue, including the process-wide gauges, by the tenant count.
+#[cfg(test)]
 pub fn validate_default_label_key(key: &str) -> Result<(), CatalogError> {
     validate_label_key(key)?;
     let class = CATALOG
@@ -1114,6 +933,7 @@ pub fn validate_default_label_key(key: &str) -> Result<(), CatalogError> {
 /// Validate one asset's reference to a metric: the name exists and every label
 /// it selects on is declared for that metric. This is what a dashboard, an alert
 /// rule, or a documentation table is checked with.
+#[cfg(test)]
 pub fn validate_reference(name: &str, labels: &[&str]) -> Result<(), CatalogError> {
     let spec = spec(name).ok_or_else(|| CatalogError::UnknownMetric {
         name: name.to_owned(),
@@ -1133,6 +953,7 @@ pub fn validate_reference(name: &str, labels: &[&str]) -> Result<(), CatalogErro
 /// Validate one recorded label value against the metric's vocabulary. Only
 /// closed labels have one; every other class accepts what the deployment or the
 /// protocol produces.
+#[cfg(test)]
 pub fn validate_label_value(name: &str, key: &str, value: &str) -> Result<(), CatalogError> {
     let spec = spec(name).ok_or_else(|| CatalogError::UnknownMetric {
         name: name.to_owned(),
@@ -1155,6 +976,7 @@ pub fn validate_label_value(name: &str, key: &str, value: &str) -> Result<(), Ca
 
 /// Check the catalogue against its own rules. Every error is collected rather
 /// than the first returned, so one run names everything that has to be fixed.
+#[cfg(test)]
 pub fn validate_catalog() -> Vec<CatalogError> {
     let mut failures = Vec::new();
     let mut seen = BTreeSet::new();
@@ -1351,85 +1173,6 @@ mod tests {
         }
     }
 
-    /// Two ceilings guard one status read — authenticating it, then answering
-    /// it — and a reader holds a slot in each at once. They therefore have to
-    /// publish on separate resources, or the gauge would report twice the
-    /// readers against a denominator that is neither ceiling.
-    #[test]
-    fn each_diagnostic_ceiling_holds_capacity_under_its_own_resource() {
-        assert_ne!(
-            crate::admission::RESOURCE_DIAGNOSTIC,
-            crate::admission::RESOURCE_DIAGNOSTIC_AUTH
-        );
-        for resource in [
-            crate::admission::RESOURCE_DIAGNOSTIC,
-            crate::admission::RESOURCE_DIAGNOSTIC_AUTH,
-        ] {
-            validate_label_value(
-                "axond.admission.in_flight",
-                "axond.admission.resource",
-                resource,
-            )
-            .expect("both diagnostic ceilings are catalogued");
-        }
-    }
-
-    /// The reconciler labels a rejection with a store category or a compile
-    /// reason, and every one of those has to be a value the catalogue accepts —
-    /// otherwise an alert on a real rejection is refused as invalid.
-    #[test]
-    fn every_revision_rejection_reason_is_catalogued() {
-        for reason in crate::convergence::reconciler::REVISION_REASONS {
-            validate_label_value("axond.revision.rejections", "axond.revision.reason", reason)
-                .expect("every emitted rejection reason is catalogued");
-        }
-        // Read from the compiler rather than from `REVISION_REASONS`, which the
-        // loop above cannot notice a compile label going missing from.
-        for reason in crate::convergence::CompileError::REASONS {
-            assert!(
-                crate::convergence::reconciler::REVISION_REASONS.contains(reason),
-                "`{reason}` is a compile refusal an alert has to be able to select"
-            );
-            validate_label_value("axond.revision.rejections", "axond.revision.reason", reason)
-                .expect("every compile refusal reason is catalogued");
-        }
-        // A label the reconciler produces without asking a category for it: read
-        // from the reconciler rather than from the list above, which the loop
-        // over the catalogue's own constant cannot notice going missing.
-        assert!(
-            crate::convergence::reconciler::REVISION_REASONS
-                .contains(&crate::convergence::reconciler::INCOMPATIBLE_REASON),
-            "a revision this build cannot read is labelled ahead of its category"
-        );
-        for outcome in [
-            "exported",
-            "export_failed",
-            "restored",
-            crate::convergence::reconciler::INCOMPATIBLE_REASON,
-        ] {
-            validate_label_value(
-                "axond.revision.last_known_good",
-                "axond.revision.outcome",
-                outcome,
-            )
-            .expect("every last-known-good outcome is catalogued");
-        }
-        for category in [
-            crate::backends::FailureCategory::Unavailable,
-            crate::backends::FailureCategory::Conflict,
-            crate::backends::FailureCategory::NotFound,
-            crate::backends::FailureCategory::Invalid,
-            crate::backends::FailureCategory::Denied,
-            crate::backends::FailureCategory::Corrupt,
-        ] {
-            let reason = crate::convergence::reconciler::category_reason(category);
-            assert!(
-                crate::convergence::reconciler::REVISION_REASONS.contains(&reason),
-                "`{reason}` is a label a store failure produces"
-            );
-        }
-    }
-
     /// Every instrument built in `metrics.rs`, read from the source itself: the
     /// catalogue is only a contract if drift between it and the instruments is a
     /// test failure rather than a missing dashboard panel.
@@ -1533,7 +1276,7 @@ mod tests {
             Err(CatalogError::UnboundedDefaultLabel { .. })
         ));
         for key in [
-            "axond.status.component",
+            "axond.store.backend",
             "axond.admission.resource",
             "http.route",
             "http.response.status_code",
@@ -1708,15 +1451,6 @@ mod tests {
         }
         for legacy in ["accepted", "failed", "timeout"] {
             assert!(outcomes.contains(&legacy), "`{legacy}` must keep existing");
-        }
-    }
-
-    #[test]
-    fn every_component_is_a_status_label_value() {
-        let spec = spec("axond.status.component_state").expect("catalogued");
-        let label = spec.label("axond.status.component").expect("declared");
-        for component in crate::status::Component::ALL {
-            assert!(label.values.contains(&component.as_str()));
         }
     }
 }
