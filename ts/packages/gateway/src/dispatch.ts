@@ -212,7 +212,7 @@ export async function callUpstream(input: {
   stream: boolean;
   route: string;
   onUsage: (usage: UsageTokens) => void;
-  onStreamDone?: (reason: "end" | "cancel") => void;
+  onStreamDone?: (reason: "end" | "cancel" | "fail") => void;
   /** Shared failover deadline. Absent starts a budget of `overallTimeoutMs` at this call. */
   deadlineAt?: number;
   now?: () => number;
@@ -338,7 +338,7 @@ function relayStream(
   transport: Required<TransportLimits>,
   route: string,
   usage: UsageTokens,
-  onDone: (reason: "end" | "cancel") => void,
+  onDone: (reason: "end" | "cancel" | "fail") => void,
   onTimeout?: (kind: string, bound: string) => void,
   onBeforeContentRateLimit?: () => Promise<Response | null>,
   onCredentialRateLimit?: () => void,
@@ -385,7 +385,7 @@ function relayStream(
       }
     }
   };
-  const finish = (reason: "end" | "cancel") => {
+  const finish = (reason: "end" | "cancel" | "fail") => {
     if (done) {
       return;
     }
@@ -426,11 +426,20 @@ function relayStream(
         controller.enqueue(chunk.value);
         return;
       }
-      const value = await readWithIdle(reader, () => inflight, (next) => {
-        inflight = next;
-      }, transport.streamIdleTimeoutMs, sawChunkAt, controller, () => (
-        terminalAt === null ? null : terminalAt + transport.streamTerminalGraceMs
-      ), onTimeout);
+      let value: Uint8Array | null | "keepalive";
+      try {
+        value = await readWithIdle(reader, () => inflight, (next) => {
+          inflight = next;
+        }, transport.streamIdleTimeoutMs, sawChunkAt, controller, () => (
+          terminalAt === null ? null : terminalAt + transport.streamTerminalGraceMs
+        ), onTimeout);
+      } catch (error) {
+        const message = error instanceof GatewayFailure ? error.message : "upstream stream failed";
+        controller.enqueue(streamFailureFrame(route, message));
+        finish("fail");
+        controller.close();
+        return;
+      }
       if (value === "keepalive") {
         return;
       }
@@ -542,6 +551,20 @@ export function isRateLimitPayload(data: string): boolean {
   }
   signals.push(record["type"], record["code"]);
   return signals.some((signal) => signal === 429 || signal === "429" || (typeof signal === "string" && signal.includes("rate_limit")));
+}
+
+/** A terminal SSE error on a response whose status is already 200. Chat also ends with [DONE]. */
+function streamFailureFrame(route: string, message: string): Uint8Array {
+  const payload = route === "messages"
+    ? { type: "error", error: { type: "upstream_stream_error", message } }
+    : route === "responses"
+      ? { type: "error", code: "upstream_stream_error", message }
+      : { error: { type: "upstream_stream_error", message } };
+  let text = `event: error\ndata: ${JSON.stringify(payload)}\n\n`;
+  if (route === "chat") {
+    text += "data: [DONE]\n\n";
+  }
+  return new TextEncoder().encode(text);
 }
 
 function tail(text: string): string {

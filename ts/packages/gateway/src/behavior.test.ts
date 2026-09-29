@@ -160,6 +160,64 @@ test("a cancelled stream still settles the delivered request", async () => {
   }
 });
 
+test("a stalled stream settles upstream_error for the text already relayed", async () => {
+  const store = await seeded();
+  const before = (await store.getBudget("platform", "compat"))!;
+  const records: UsageRecord[] = [];
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    transport: { responseHeaderTimeoutMs: 30_000, bufferedBodyTimeoutMs: 30_000, streamIdleTimeoutMs: 80, maxResponseBytes: 1024 * 1024 },
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 2_500_000n,
+        outputMicrodollarsPerMillion: 10_000_000n,
+      },
+    ],
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    const prefix = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n';
+    assert.equal(text.startsWith(prefix), true);
+    assert.equal(text.includes('event: error\ndata: {"error":{"type":"upstream_stream_error"'), true);
+    assert.equal(text.includes("data: [DONE]\n\n"), true);
+    assert.equal(text.includes("sk-live-secret"), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    const record = records[0]!;
+    assert.equal(record.status, "upstream_error");
+    assert.equal(record.credentialId, "one");
+    assert.equal(record.outputTokens, 1n);
+    assert.equal(record.inputTokens > 0n, true);
+    assert.equal(record.costMicrodollars !== null && record.costMicrodollars > 0n, true);
+    assert.equal(JSON.stringify(usageEvent(record)).includes("sk-live-secret"), false);
+    const after = (await store.getBudget("platform", "compat"))!;
+    assert.equal(after.spent - before.spent, record.costMicrodollars);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("a provider 500 stays on that credential and a 429 rotates", async () => {
   const store = await seeded();
   const seen: string[] = [];

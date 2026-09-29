@@ -649,12 +649,12 @@ async function dispatch(
       streamServed = false;
       noteCredentialFailure(pools, record.id, provider.id, served.id, now, policy.failureThreshold);
     };
-    const finishStream = (served: CredentialConfig, reason: "end" | "cancel") => {
+    const finishStream = (served: CredentialConfig, reason: "end" | "cancel" | "fail") => {
       if (reason === "end" && streamServed) {
         noteCredentialSuccess(pools, record.id, provider.id, served.id);
       }
       noteServed(axond, opts, served);
-      streamStatus = reason === "cancel" ? "client_cancelled" : "ok";
+      streamStatus = reason === "cancel" ? "client_cancelled" : reason === "fail" ? "upstream_error" : "ok";
       if (stream && opts.waitUntil) {
         releaseStream();
         return;
@@ -929,9 +929,14 @@ function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageT
 async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): Promise<void> {
   const price = lookupPrice(opts.prices ?? [], axond.target?.provider ?? "", axond.target?.model ?? "");
   const priced = price ? costMicrodollars(price, usage) : null;
-  // A provider failure has no measured usage. Cost 0 matches the usage event
-  // and adds nothing to spent; null would omit the cost the record requires.
-  const cost = status === "upstream_error" ? 0n : priced;
+  const measured =
+    usage.inputTokens > 0n
+    || usage.outputTokens > 0n
+    || usage.cacheReadTokens > 0n
+    || usage.cacheWriteTokens > 0n;
+  // A provider failure with no measured usage records cost 0 and adds nothing
+  // to spent. A stream that already relayed text keeps that measured cost.
+  const cost = status === "upstream_error" && !measured ? 0n : priced;
   const result = await opts.store.settle({
     requestId: axond.requestId,
     namespace: axond.namespace?.id ?? "",
