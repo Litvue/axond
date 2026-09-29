@@ -179,7 +179,7 @@ request
 | Target | How extensions load | Status |
 | --- | --- | --- |
 | Cloudflare Worker | Bundled at build time. Workers cannot import arbitrary files at runtime. | Follows from Workers' model (**unverified** for this codebase) |
-| Compiled binary (`bun build --compile`) | The binary `import()`s `.ts` files from a configured directory at startup. Editing a file needs a restart, not a rebuild (P14). | **Verified** for a type-only import. Extensions with npm dependencies are **unverified**. |
+| Compiled binary (`bun build --compile`) | The binary `import()`s `.ts` files from a configured directory at startup. Editing a file needs a restart, not a rebuild (P14). | **Verified.** A `.ts` file with no imports loads from disk. An extension that imports an npm package must be bundled first; section 14 records the `smol-toml` result. |
 | Container or Node process | Same as the binary, or bundled. | Not tested |
 | Library inside an existing Hono app | The host app passes `extensions: [...]` as ordinary imports. | Follows from the API |
 

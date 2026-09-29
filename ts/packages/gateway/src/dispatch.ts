@@ -522,6 +522,12 @@ function relayStream(
           terminalAt === null ? null : terminalAt + transport.streamTerminalGraceMs
         ), durationAt, onTimeout);
       } catch (error) {
+        if (terminalAt !== null) {
+          await reader.cancel().catch(() => undefined);
+          finish("end");
+          controller.close();
+          return;
+        }
         const message = error instanceof GatewayFailure ? error.message : "upstream stream failed";
         failBound(controller, message);
         return;

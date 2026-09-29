@@ -1155,6 +1155,128 @@ test("post-terminal stream grace closes an open body", async () => {
   }
 });
 
+test("a transport error after the terminal event keeps the completed body", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const metrics = createMetrics();
+  const completed =
+    'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}\n\n';
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(completed, () => {
+      res.destroy();
+    });
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    metrics,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 1_000,
+      bufferedBodyTimeoutMs: 1_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 1_000,
+      maxResponseBytes: 4096,
+    },
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, input: "hi" }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text, completed);
+    assert.equal(text.includes("upstream_stream_error"), false);
+    assert.equal(text.includes("sk-live-secret"), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.outputTokens, 1n);
+    assert.equal(metrics.points.some((point) => point.name === "axond.upstream.errors"), false);
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("an incomplete tail after the terminal event is relayed through eof", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const terminal =
+    'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}\n\n';
+  const wire = Buffer.concat([
+    Buffer.from(terminal),
+    Buffer.from("event: provider.extension\ndata: "),
+    Buffer.from([0xf0]),
+  ]);
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(wire);
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 1_000,
+      bufferedBodyTimeoutMs: 1_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 1_000,
+      maxResponseBytes: 4096,
+    },
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, input: "hi" }),
+    });
+    assert.equal(response.status, 200);
+    const body = Buffer.from(await response.arrayBuffer());
+    assert.deepEqual(body, wire);
+    assert.equal(body.includes(Buffer.from("sk-live-secret")), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.outputTokens, 1n);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("a connect timeout is upstream_timeout and hides the address", async () => {
   const store = await seeded();
   const agent = new Agent({ connectTimeout: 50, connect: { autoSelectFamily: false } });
