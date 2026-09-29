@@ -117,4 +117,9 @@ and a Cloudflare account are not part of this repository's test environment.
 SQLite is the default. Postgres uses `dsn_env` and the schema in
 `createPostgresStore`. The two extra namespace columns
 `allow_platform_fallback` and `from_config` are applied by the TypeScript
-process; they are not in the Rust `ops/postgres` scripts.
+process; they are not in the Rust `ops/postgres` scripts. Catalogue refusal
+counts live in `axond_catalog_streak`. The Rust process does not read that
+table.
+
+Operators moving a process between the two binaries should follow the
+[migration guide](./migration-typescript.md).
