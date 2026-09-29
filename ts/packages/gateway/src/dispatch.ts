@@ -1,7 +1,7 @@
 import type { CredentialConfig, ProviderConfig, TransportLimits } from "@axond/sdk";
 
 import { GatewayFailure } from "./errors.ts";
-import { emptyUsage, noteSseChunk, usageFromJson } from "./usage.ts";
+import { assignUsage, emptyUsage, noteSseChunk, usageFromJson } from "./usage.ts";
 import type { UsageTokens } from "@axond/sdk";
 
 export interface CredentialPool {
@@ -136,10 +136,11 @@ export async function callUpstream(input: {
   if (!input.stream || response.body === null) {
     const bytes = await readLimitedBytes(response, input.transport.maxResponseBytes, input.transport.bufferedBodyTimeoutMs);
     try {
-      input.onUsage(usageFromJson(input.route, JSON.parse(new TextDecoder().decode(bytes))));
+      assignUsage(usage, usageFromJson(input.route, JSON.parse(new TextDecoder().decode(bytes))));
     } catch {
-      input.onUsage(usage);
+      assignUsage(usage, emptyUsage());
     }
+    input.onUsage(usage);
     const headers = passHeaders(response.headers);
     return {
       response: new Response(bytes, { status: response.status, headers }),

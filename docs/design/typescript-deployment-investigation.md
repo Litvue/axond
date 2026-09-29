@@ -338,6 +338,7 @@ Recorded while landing the TypeScript gateway. [ADR 0066](../adr/0066-typescript
 | Compiled binary | **Go.** Bun 1.4.2 `bun build --compile` produced an 81,679,840-byte executable. A successful boot reached `/healthz` in 137 ms and loaded a `.ts` extension from `AXOND_EXTENSIONS_DIR` without a rebuild. An unsupported `apiVersion` is refused at mount. |
 | Extension npm dependency | **Bundle the extension.** A compiled binary that `import()`s a `.ts` file cannot resolve that file's `node_modules` (`Cannot find package 'smol-toml'`). `bun build probe.ts --outfile probe.js` embeds the dependency, and the same binary then served the parsed value `7`. The Node wrapper still resolves packages from the extension directory. |
 | Extension seam | Promoted. Stages are `pre-auth`, `post-auth`, `pre-dispatch`, with response transforms after `await next()` and `onSettle` after the charge. Reference packages: `@axond/rate-limit`, `@axond/redact`, `@axond/tokens`. |
+| Shadow against the Rust binary | **Go for the fixture suite.** `ts/scripts/shadow-compare.ts` compared status, parsed bodies, and charged `(model, status, cost)` for health, models, chat, embeddings, responses, and messages, buffered and streamed, plus the unprefixed, unknown-namespace, and encoded-namespace errors. Seven usage rows matched. Rust re-encodes some JSON; TypeScript keeps the fixture bytes. Request ids are minted per process. This is not a production traffic sample, and rollback was not exercised. |
 
 ## Open questions
 

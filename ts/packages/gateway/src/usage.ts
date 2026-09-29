@@ -11,34 +11,79 @@ export function emptyUsage(): UsageTokens {
 }
 
 export function usageFromJson(route: string, value: unknown): UsageTokens {
-  const usage = emptyUsage();
   if (!value || typeof value !== "object") {
-    return usage;
+    return emptyUsage();
   }
   const record = value as Record<string, unknown>;
+  const block = usageBlock(route, record);
+  if (!block) {
+    return emptyUsage();
+  }
+  if (route === "messages") {
+    return {
+      inputTokens: asBig(block["input_tokens"]),
+      outputTokens: asBig(block["output_tokens"]),
+      reasoningTokens: asBig(block["reasoning_tokens"]),
+      cacheReadTokens: asBig(block["cache_read_input_tokens"]),
+      cacheWriteTokens: asBig(block["cache_creation_input_tokens"]),
+    };
+  }
+  const parsed = openaiUsage(block);
+  if (route === "embeddings") {
+    parsed.outputTokens = 0n;
+    parsed.reasoningTokens = 0n;
+  }
+  return parsed;
+}
+
+/** OpenAI reports cached input inside the prompt total. Split it out so it is billed once. */
+function openaiUsage(tokens: Record<string, unknown>): UsageTokens {
+  const cached = pointer(tokens, ["prompt_tokens_details", "cached_tokens"])
+    ?? pointer(tokens, ["input_tokens_details", "cached_tokens"]);
+  const prompt = asBig(tokens["prompt_tokens"] ?? tokens["input_tokens"]);
+  const cacheRead = cached ?? asBig(tokens["cache_read_input_tokens"]);
+  const inputTokens = cached === null ? prompt : prompt > cached ? prompt - cached : 0n;
+  return {
+    inputTokens,
+    outputTokens: asBig(tokens["completion_tokens"] ?? tokens["output_tokens"]),
+    reasoningTokens:
+      pointer(tokens, ["completion_tokens_details", "reasoning_tokens"])
+      ?? pointer(tokens, ["output_tokens_details", "reasoning_tokens"])
+      ?? 0n,
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: asBig(tokens["cache_creation_input_tokens"]),
+  };
+}
+
+function usageBlock(route: string, record: Record<string, unknown>): Record<string, unknown> | null {
+  if (route === "responses") {
+    const response = record["response"];
+    if (response && typeof response === "object") {
+      const nested = (response as Record<string, unknown>)["usage"];
+      if (nested && typeof nested === "object") {
+        return nested as Record<string, unknown>;
+      }
+    }
+  }
   const block = record["usage"];
   if (!block || typeof block !== "object") {
-    return usage;
+    return null;
   }
-  const tokens = block as Record<string, unknown>;
-  if (route === "messages") {
-    usage.inputTokens = asBig(tokens["input_tokens"]);
-    usage.outputTokens = asBig(tokens["output_tokens"]);
-    usage.cacheReadTokens = asBig(tokens["cache_read_input_tokens"]);
-    usage.cacheWriteTokens = asBig(tokens["cache_creation_input_tokens"]);
-    return usage;
+  return block as Record<string, unknown>;
+}
+
+function pointer(record: Record<string, unknown>, path: readonly string[]): bigint | null {
+  let current: unknown = record;
+  for (const key of path) {
+    if (!current || typeof current !== "object") {
+      return null;
+    }
+    current = (current as Record<string, unknown>)[key];
   }
-  usage.inputTokens = asBig(tokens["prompt_tokens"] ?? tokens["input_tokens"]);
-  usage.outputTokens = asBig(tokens["completion_tokens"] ?? tokens["output_tokens"]);
-  const completion = tokens["completion_tokens_details"];
-  if (completion && typeof completion === "object") {
-    usage.reasoningTokens = asBig((completion as Record<string, unknown>)["reasoning_tokens"]);
+  if (current === undefined || current === null) {
+    return null;
   }
-  const prompt = tokens["prompt_tokens_details"];
-  if (prompt && typeof prompt === "object") {
-    usage.cacheReadTokens = asBig((prompt as Record<string, unknown>)["cached_tokens"]);
-  }
-  return usage;
+  return asBig(current);
 }
 
 /** Fold usage out of an SSE stream without modifying the bytes the caller sees. */
@@ -76,11 +121,18 @@ export function noteSseChunk(route: string, usage: UsageTokens, text: string): v
       }
       continue;
     }
-    const next = usageFromJson(route, record);
-    if (next.inputTokens > 0n || next.outputTokens > 0n) {
-      copyPresent(usage, next);
+    if (usageBlock(route, record)) {
+      assignUsage(usage, usageFromJson(route, record));
     }
   }
+}
+
+export function assignUsage(target: UsageTokens, next: UsageTokens): void {
+  target.inputTokens = next.inputTokens;
+  target.outputTokens = next.outputTokens;
+  target.reasoningTokens = next.reasoningTokens;
+  target.cacheReadTokens = next.cacheReadTokens;
+  target.cacheWriteTokens = next.cacheWriteTokens;
 }
 
 function copyPresent(target: UsageTokens, next: UsageTokens): void {

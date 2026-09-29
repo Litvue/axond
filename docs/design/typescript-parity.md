@@ -36,3 +36,7 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 | Container | `ts/Dockerfile`. The repository-root `Dockerfile` remains the Rust release image. |
 | Worker | `ts/packages/worker`. Hyperdrive caching disabled. Not executed against PlanetScale here. |
 | Compiled binary | `bun build --compile` of `ts/packages/cli/src/main.ts`, when Bun is installed. The Node wrapper is the path CI runs. |
+
+## Shadow
+
+`ts/scripts/shadow-compare.ts` sends the fixture suite through the Rust binary and `ts/bin/axond`. Status, parsed JSON, and the charged `(model, status, cost)` rows match. Rust re-encodes some JSON objects with sorted keys. TypeScript relays the upstream bytes, which is what the streaming fixtures require. Each process mints its own `request_id`.

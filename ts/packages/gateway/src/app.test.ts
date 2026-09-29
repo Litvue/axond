@@ -96,6 +96,7 @@ test("a buffered chat completion rewrites the model and forwards the provider cr
   const summary = await store.summarizeUsage("platform", "compat");
   assert.equal(summary.length, 1);
   assert.equal(summary[0]!.count, 1);
+  assert.equal(summary[0]!.cost_microdollars, 100);
   upstream.close();
 });
 
