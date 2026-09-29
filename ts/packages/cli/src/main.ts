@@ -5,7 +5,7 @@ import { pathToFileURL } from "node:url";
 import { getRequestListener } from "@hono/node-server";
 import pg from "pg";
 
-import { createAxond, envSecretReader, loadConfig } from "../../gateway/src/index.ts";
+import { createAxond, createMetrics, envSecretReader, loadConfig } from "../../gateway/src/index.ts";
 import type { AxondExtension } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
@@ -57,6 +57,7 @@ async function main(): Promise<void> {
     extensions,
     rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
     serving: () => serving,
+    metrics: createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []),
     onUsage: (record) => {
       const line = {
         schema_version: record.schemaVersion,

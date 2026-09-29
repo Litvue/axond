@@ -54,6 +54,23 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
   }
   const pools = new Map<string, CredentialPool>();
   const app = new Hono<AxondEnv>();
+  if (opts.metrics) {
+    const metrics = opts.metrics;
+    app.use("*", async (c, next) => {
+      const started = Date.now();
+      try {
+        await next();
+      } finally {
+        const attributes = {
+          "http.request.method": methodLabel(c.req.method),
+          "http.route": httpRoute(c.req.path),
+          "http.response.status_code": String(c.res.status || 500),
+        };
+        metrics.record("axond.http.server.requests", 1, attributes);
+        metrics.record("axond.http.server.duration", Date.now() - started, attributes);
+      }
+    });
+  }
   app.onError((error) => {
     if (error instanceof GatewayFailure) {
       return gatewayError(error);
@@ -443,6 +460,60 @@ async function dispatch(
   c.res = upstream.response;
 }
 
+const HTTP_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE", "CONNECT"]);
+
+function methodLabel(method: string): string {
+  return HTTP_METHODS.has(method) ? method : "_OTHER";
+}
+
+function httpRoute(path: string): string {
+  if (path === "/healthz" || path === "/readyz") {
+    return path;
+  }
+  if (path.startsWith("/api/")) {
+    return "/api/*";
+  }
+  const namespaced = path.match(/^\/ns\/[^/]+\/v1\/([^/]+(?:\/[^/]+)?)/);
+  if (namespaced) {
+    return `/ns/{namespace}/v1/${namespaced[1]}`;
+  }
+  return "/other";
+}
+
+function recordSettlementMetrics(
+  opts: AxondOptions,
+  axond: MutableContext,
+  usage: UsageTokens,
+  status: string,
+  cost: bigint | null,
+): void {
+  if (!opts.metrics) {
+    return;
+  }
+  const attributes: Record<string, string> = {
+    "axond.namespace": axond.namespace?.id ?? "",
+    "gen_ai.request.model": axond.alias,
+    "axond.target.provider": axond.target?.provider ?? "",
+    "axond.target.model": axond.target?.model ?? "",
+    "axond.status": status,
+  };
+  opts.metrics.record("axond.request.count", 1, attributes);
+  opts.metrics.record("axond.tokens.input", metricNumber(usage.inputTokens), attributes);
+  opts.metrics.record("axond.tokens.output", metricNumber(usage.outputTokens), attributes);
+  opts.metrics.record("axond.tokens.cache_read", metricNumber(usage.cacheReadTokens), attributes);
+  opts.metrics.record("axond.tokens.cache_write", metricNumber(usage.cacheWriteTokens), attributes);
+  if (cost !== null) {
+    opts.metrics.record("axond.cost.microdollars", metricNumber(cost), attributes);
+  }
+}
+
+function metricNumber(value: bigint): number {
+  if (value < 0n || value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    return 0;
+  }
+  return Number(value);
+}
+
 function copyUsage(target: UsageTokens, next: UsageTokens): void {
   target.inputTokens = next.inputTokens;
   target.outputTokens = next.outputTokens;
@@ -506,6 +577,7 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
     signerKid: null,
   };
   opts.onUsage?.(record);
+  recordSettlementMetrics(opts, axond, usage, status, cost);
   for (const hook of axond.hooks) {
     await hook(settlement);
   }

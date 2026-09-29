@@ -1,6 +1,6 @@
 import { Client } from "pg";
 
-import { createAxond } from "@axond/gateway";
+import { createAxond, createMetrics } from "@axond/gateway";
 import { rateLimitExtension } from "@axond/rate-limit";
 import type { ProviderConfig } from "@axond/sdk";
 
@@ -22,7 +22,10 @@ interface WaitContext {
  * at startup instead. Hyperdrive supplies the Postgres connection string;
  * each call opens one client and closes it, with no session-level SET.
  */
+let metrics: ReturnType<typeof createMetrics> | undefined;
+
 export function createHandler(env: WorkerEnv) {
+  metrics ??= createMetrics([env.GATEWAY_KEY]);
   let schema: Promise<void> | null = null;
   const store = createPostgresStore(async () => {
     const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
@@ -51,6 +54,7 @@ export function createHandler(env: WorkerEnv) {
         providers,
         extensions: [rateLimitExtension({ limit: 60, windowMs: 60_000, mode: "isolate" })],
         waitUntil: (promise) => ctx.waitUntil(promise),
+        metrics,
       });
       return app.fetch(request);
     },

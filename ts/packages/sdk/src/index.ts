@@ -237,6 +237,10 @@ export interface AxondOptions {
   onUsage?: (record: UsageRecord) => void;
   /** When false, /readyz reports draining. */
   serving?: () => boolean;
+  /** Catalogue recorder. Absent means the process emits no metrics. */
+  metrics?: {
+    record(name: string, value: number, attributes?: Record<string, string>): void;
+  };
   maxRequestBytes?: number;
 }
 

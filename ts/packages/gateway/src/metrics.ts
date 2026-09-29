@@ -73,7 +73,7 @@ const MAX_CARDINALITY = 200;
  */
 export function createMetrics(secrets: readonly string[] = []) {
   const points: MetricPoint[] = [];
-  const seen = new Set<string>();
+  const series = new Map<string, MetricPoint>();
   return {
     points,
     record(name: string, value: number, attributes: Record<string, string> = {}) {
@@ -91,11 +91,17 @@ export function createMetrics(secrets: readonly string[] = []) {
         safe[key] = raw;
       }
       const signature = `${name}\0${JSON.stringify(safe)}`;
-      if (!seen.has(signature) && seen.size >= MAX_CARDINALITY) {
+      const existing = series.get(signature);
+      if (existing) {
+        existing.value += value;
         return;
       }
-      seen.add(signature);
-      points.push({ name, value, attributes: safe });
+      if (series.size >= MAX_CARDINALITY) {
+        return;
+      }
+      const point = { name, value, attributes: safe };
+      series.set(signature, point);
+      points.push(point);
     },
   };
 }

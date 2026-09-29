@@ -258,6 +258,35 @@ test("an untrusted extension cannot query another namespace", async () => {
   assert.deepEqual(visible.rows, [{ id: "platform" }]);
 });
 
+test("a request records catalogue metrics without the gateway key", async () => {
+  const store = createMemoryStore();
+  const metrics = createMetrics(["sk-test-secret"]);
+  const app = createAxond({
+    store,
+    gatewayKey: "sk-test-secret",
+    defaultNamespace: "platform",
+    providers: [],
+    metrics,
+  });
+  const health = await app.request("http://127.0.0.1/healthz");
+  assert.equal(health.status, 200);
+  const secretPath = await app.request("http://127.0.0.1/sk-test-secret");
+  assert.equal(secretPath.status, 404);
+  const requests = metrics.points.filter((point) => point.name === "axond.http.server.requests");
+  assert.deepEqual(
+    requests.map((point) => point.attributes),
+    [
+      { "http.request.method": "GET", "http.route": "/healthz", "http.response.status_code": "200" },
+      { "http.request.method": "GET", "http.route": "/other", "http.response.status_code": "404" },
+    ],
+  );
+  assert.equal(JSON.stringify(metrics.points).includes("sk-test-secret"), false);
+  assert.ok(metrics.points.some((point) => point.name === "axond.http.server.duration"));
+  const again = await app.request("http://127.0.0.1/healthz");
+  assert.equal(again.status, 200);
+  assert.equal(requests[0]!.value, 2);
+});
+
 test("metrics drop secret and content sentinels", () => {
   const metrics = createMetrics(["sk-test-secret", "PROMPT_SENTINEL"]);
   metrics.record("axond.request.count", 1, {
