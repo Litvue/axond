@@ -5,7 +5,8 @@ export { createMemoryStore, budgetJson, money, namespaceJson } from "./memory-st
 export { GatewayFailure, gatewayError } from "./errors.ts";
 export { constantTimeEqual } from "./auth.ts";
 export { rewriteTopLevelModel } from "./body.ts";
-export { createMetrics, METRIC_NAMES } from "./metrics.ts";
+export { createMetrics, METRIC_NAMES, sanitizeAttributes } from "./metrics.ts";
+export { resolveTelemetry } from "./otel.ts";
 export { OPENAPI } from "./openapi.ts";
 export { scopeStore } from "./scoped-store.ts";
 export { costMicrodollars, lookupPrice } from "./pricing.ts";

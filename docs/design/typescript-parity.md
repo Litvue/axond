@@ -27,6 +27,7 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 | Billing-grade usage journal (ADR 0049) | Not built. The usage insert is the charge key. |
 | Redis budget backend | Not an SDK dependency. |
 | Hot reload of config | Withdrawn. Extensions load at process start. |
+| OTLP/HTTP protobuf traces, metrics, and usage logs | OTLP/HTTP JSON traces and metrics when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. `grpc` and `http/protobuf` fail boot. Request logs are one JSON object on stdout and omit prompts, completions, and credentials. |
 
 ## Distribution
 

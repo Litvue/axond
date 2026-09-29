@@ -24,12 +24,15 @@ import { GatewayFailure, badRequest, gatewayError } from "./errors.ts";
 import { globMatch } from "./glob.ts";
 import { budgetJson, money, namespaceJson } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, parseNamespaceId, validatePeriod, validateTimezone } from "./namespace.ts";
+import { beginTrace, formatTraceparent, metricPayload, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
+import { sanitizeAttributes } from "./metrics.ts";
 import { OPENAPI } from "./openapi.ts";
 import { costMicrodollars, lookupPrice } from "./pricing.ts";
 import { scopeStore } from "./scoped-store.ts";
 import { emptyUsage } from "./usage.ts";
 
 const DEFAULT_MAX_REQUEST = 2 * 1024 * 1024;
+const requestTrace = new WeakMap<Request, TraceContext>();
 
 interface MutableContext extends AxondContext {
   hooks: ((settlement: Settlement) => Promise<void>)[];
@@ -55,20 +58,64 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
   }
   const pools = new Map<string, CredentialPool>();
   const app = new Hono<AxondEnv>();
-  if (opts.metrics) {
-    const metrics = opts.metrics;
+  if (opts.metrics || opts.telemetry || opts.onLog) {
     app.use("*", async (c, next) => {
       const started = Date.now();
+      const trace = opts.telemetry || opts.onLog ? beginTrace(c.req.header("traceparent")) : undefined;
+      if (trace && opts.telemetry) {
+        requestTrace.set(c.req.raw, trace);
+      }
       try {
         await next();
       } finally {
-        const attributes = {
-          "http.request.method": methodLabel(c.req.method),
-          "http.route": httpRoute(c.req.path),
-          "http.response.status_code": String(c.res.status || 500),
-        };
-        metrics.record("axond.http.server.requests", 1, attributes);
-        metrics.record("axond.http.server.duration", Date.now() - started, attributes);
+        const status = c.res.status || 500;
+        const httpAttributes = sanitizeAttributes(
+          {
+            "http.request.method": methodLabel(c.req.method),
+            "http.route": httpRoute(c.req.path),
+            "http.response.status_code": String(status),
+          },
+          secretValues(opts),
+        );
+        opts.metrics?.record("axond.http.server.requests", 1, httpAttributes);
+        opts.metrics?.record("axond.http.server.duration", Date.now() - started, httpAttributes);
+        const axond = readAxond(c);
+        const ended = Date.now();
+        opts.onLog?.({
+          msg: "request",
+          request_id: axond?.requestId ?? "",
+          http_method: httpAttributes["http.request.method"] ?? "",
+          http_route: httpAttributes["http.route"] ?? "",
+          status_code: status,
+          duration_ms: ended - started,
+          namespace: axond?.namespace?.id ?? "",
+          model: axond?.alias ?? "",
+          trace_id: trace?.traceId ?? "",
+        });
+        if (opts.telemetry && trace) {
+          const attributes = sanitizeAttributes(
+            {
+              ...httpAttributes,
+              "axond.request_id": axond?.requestId ?? "",
+              "axond.namespace": axond?.namespace?.id ?? "",
+              "gen_ai.request.model": axond?.alias ?? "",
+            },
+            secretValues(opts),
+          );
+          const task = publishTelemetry(opts, {
+            name: "http.server.request",
+            trace,
+            startMs: started,
+            endMs: ended,
+            attributes,
+            error: status >= 500,
+          });
+          if (opts.waitUntil) {
+            opts.waitUntil(task);
+          } else {
+            void task;
+          }
+        }
       }
     });
   }
@@ -391,6 +438,10 @@ async function dispatch(
     } else {
       headers.set("authorization", `Bearer ${credential.secret}`);
     }
+    const trace = requestTrace.get(c.req.raw);
+    if (trace) {
+      headers.set("traceparent", formatTraceparent(trace));
+    }
     const path =
       axond.route === "chat"
         ? "/chat/completions"
@@ -466,6 +517,45 @@ const HTTP_METHODS = new Set(["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "
 
 function methodLabel(method: string): string {
   return HTTP_METHODS.has(method) ? method : "_OTHER";
+}
+
+function readAxond(c: Context<AxondEnv>): MutableContext | undefined {
+  try {
+    return c.get("axond");
+  } catch {
+    return undefined;
+  }
+}
+
+function secretValues(opts: AxondOptions): string[] {
+  const secrets: string[] = [];
+  if (typeof opts.gatewayKey === "string" && opts.gatewayKey.length > 0) {
+    secrets.push(opts.gatewayKey);
+  }
+  for (const credential of opts.credentials ?? []) {
+    if (credential.secret.length > 0) {
+      secrets.push(credential.secret);
+    }
+  }
+  return secrets;
+}
+
+async function publishTelemetry(opts: AxondOptions, span: ExportedSpan): Promise<void> {
+  const target = opts.telemetry;
+  if (!target) {
+    return;
+  }
+  const resource = resourceAttributes(target.instanceId);
+  const fetchImpl = target.fetch ?? fetch;
+  try {
+    await postOtlp(target.endpoint, "traces", tracePayload([span], resource), fetchImpl);
+    const points = opts.metrics?.points;
+    if (points && points.length > 0) {
+      await postOtlp(target.endpoint, "metrics", metricPayload(points, resource, span.endMs), fetchImpl);
+    }
+  } catch {
+    // A collector that is down does not fail the caller.
+  }
 }
 
 function httpRoute(path: string): string {

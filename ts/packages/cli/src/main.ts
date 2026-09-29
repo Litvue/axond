@@ -5,7 +5,7 @@ import { pathToFileURL } from "node:url";
 import { getRequestListener } from "@hono/node-server";
 import pg from "pg";
 
-import { createAxond, createMetrics, envSecretReader, loadConfig } from "../../gateway/src/index.ts";
+import { createAxond, createMetrics, envSecretReader, loadConfig, resolveTelemetry } from "../../gateway/src/index.ts";
 import type { AxondExtension } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
@@ -43,6 +43,11 @@ async function main(): Promise<void> {
       }
     }
   }
+  const telemetry = resolveTelemetry({
+    endpoint: process.env["OTEL_EXPORTER_OTLP_ENDPOINT"],
+    protocol: process.env["OTEL_EXPORTER_OTLP_PROTOCOL"],
+    instanceId: process.env["AXOND_INSTANCE_ID"],
+  });
   let serving = true;
   const app = createAxond({
     store,
@@ -58,6 +63,10 @@ async function main(): Promise<void> {
     rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
     serving: () => serving,
     metrics: createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []),
+    telemetry: telemetry ?? undefined,
+    onLog: (record) => {
+      process.stdout.write(`${JSON.stringify(record)}\n`);
+    },
     onUsage: (record) => {
       const line = {
         schema_version: record.schemaVersion,

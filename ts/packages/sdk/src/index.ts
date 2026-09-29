@@ -240,7 +240,33 @@ export interface AxondOptions {
   /** Catalogue recorder. Absent means the process emits no metrics. */
   metrics?: {
     record(name: string, value: number, attributes?: Record<string, string>): void;
+    points?: readonly {
+      name: string;
+      value: number;
+      attributes: Record<string, string>;
+      observations?: number;
+      min?: number;
+      max?: number;
+    }[];
   };
+  /** OTLP/HTTP JSON target. Absent means the process exports nothing. */
+  telemetry?: {
+    endpoint: string;
+    instanceId?: string;
+    fetch?: typeof fetch;
+  };
+  /** One JSON object per request. The gateway never puts a body or credential in it. */
+  onLog?: (record: {
+    msg: "request";
+    request_id: string;
+    http_method: string;
+    http_route: string;
+    status_code: number;
+    duration_ms: number;
+    namespace: string;
+    model: string;
+    trace_id: string;
+  }) => void;
   maxRequestBytes?: number;
 }
 

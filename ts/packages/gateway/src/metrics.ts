@@ -62,6 +62,28 @@ export interface MetricPoint {
   name: string;
   value: number;
   attributes: Record<string, string>;
+  observations?: number;
+  min?: number;
+  max?: number;
+}
+
+const HISTOGRAM = /\.duration$|time_to_first_token|_wait$|\.wait$/;
+
+export function sanitizeAttributes(
+  attributes: Record<string, string>,
+  secrets: readonly string[],
+): Record<string, string> {
+  const safe: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(attributes)) {
+    if (raw.length > MAX_LABEL) {
+      continue;
+    }
+    if (secrets.some((secret) => secret.length > 0 && raw.includes(secret))) {
+      continue;
+    }
+    safe[key] = raw;
+  }
+  return safe;
 }
 
 const MAX_LABEL = 64;
@@ -80,26 +102,25 @@ export function createMetrics(secrets: readonly string[] = []) {
       if (!(METRIC_NAMES as readonly string[]).includes(name) && !name.startsWith("axond.ext.")) {
         throw new Error(`metric ${name} is not in the catalogue`);
       }
-      const safe: Record<string, string> = {};
-      for (const [key, raw] of Object.entries(attributes)) {
-        if (raw.length > MAX_LABEL) {
-          continue;
-        }
-        if (secrets.some((secret) => secret.length > 0 && raw.includes(secret))) {
-          continue;
-        }
-        safe[key] = raw;
-      }
+      const safe = sanitizeAttributes(attributes, secrets);
       const signature = `${name}\0${JSON.stringify(safe)}`;
+      const histogram = HISTOGRAM.test(name);
       const existing = series.get(signature);
       if (existing) {
+        if (histogram) {
+          existing.min = Math.min(existing.min ?? existing.value, value);
+          existing.max = Math.max(existing.max ?? existing.value, value);
+          existing.observations = (existing.observations ?? 1) + 1;
+        }
         existing.value += value;
         return;
       }
       if (series.size >= MAX_CARDINALITY) {
         return;
       }
-      const point = { name, value, attributes: safe };
+      const point: MetricPoint = histogram
+        ? { name, value, attributes: safe, observations: 1, min: value, max: value }
+        : { name, value, attributes: safe };
       series.set(signature, point);
       points.push(point);
     },

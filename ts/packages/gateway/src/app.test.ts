@@ -15,7 +15,10 @@ import type { Store } from "@axond/sdk";
 
 const KEY = "test-inbound-key";
 
-async function gateway(metrics?: ReturnType<typeof createMetrics>) {
+async function gateway(
+  metrics?: ReturnType<typeof createMetrics>,
+  telemetry?: { endpoint: string; instanceId?: string },
+) {
   const store = createMemoryStore();
   await store.putNamespace({
     id: "platform",
@@ -63,6 +66,7 @@ async function gateway(metrics?: ReturnType<typeof createMetrics>) {
     ],
     rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
     metrics,
+    telemetry,
   });
   return { app, store, upstream };
 }
@@ -161,6 +165,72 @@ test("a settled chat records request duration without the prompt", async () => {
   assert.equal(encoded.includes(KEY), false);
   assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
   upstream.close();
+});
+
+test("otlp json joins traceparent and omits the prompt", async () => {
+  const received: { url: string; body: string }[] = [];
+  const collector = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    received.push({ url: req.url ?? "", body: Buffer.concat(chunks).toString("utf8") });
+    res.writeHead(200);
+    res.end();
+  });
+  collector.listen(0, "127.0.0.1");
+  await once(collector, "listening");
+  const address = collector.address();
+  if (!address || typeof address === "string") {
+    throw new Error("no collector port");
+  }
+  const metrics = createMetrics([KEY, "upstream-openai"]);
+  const { app, upstream } = await gateway(metrics, {
+    endpoint: `http://127.0.0.1:${address.port}`,
+    instanceId: "axond-replica-a",
+  });
+  const inbound = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${KEY}`,
+        "content-type": "application/json",
+        traceparent: inbound,
+      },
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    const deadline = Date.now() + 2_000;
+    while (received.length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const traces = received.find((item) => item.url === "/v1/traces");
+    const metricsBody = received.find((item) => item.url === "/v1/metrics");
+    assert.ok(traces);
+    assert.ok(metricsBody);
+    const span = JSON.parse(traces.body).resourceSpans[0].scopeSpans[0].spans[0];
+    assert.equal(span.traceId, "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert.equal(span.parentSpanId, "00f067aa0ba902b7");
+    assert.equal(span.name, "http.server.request");
+    assert.equal(upstream.requests[0]!.traceparent, `00-${span.traceId}-${span.spanId}-01`);
+    const exported = `${traces.body}\n${metricsBody.body}`;
+    assert.equal(exported.includes(KEY), false);
+    assert.equal(exported.includes("PROMPT_SENTINEL"), false);
+    assert.equal(exported.includes("upstream-openai"), false);
+    assert.equal(exported.includes("axond-replica-a"), true);
+    assert.equal(JSON.parse(metricsBody.body).resourceMetrics[0].scopeMetrics[0].metrics.some(
+      (metric: { name: string }) => metric.name === "axond.http.server.requests",
+    ), true);
+  } finally {
+    upstream.close();
+    collector.closeAllConnections();
+    collector.close();
+  }
 });
 
 test("unknown_gateway_key_is_rejected_before_namespace_lookup", async () => {
@@ -342,8 +412,12 @@ test("openapi is 3.1 and lists the management routes", async () => {
   upstream.close();
 });
 
-async function listenUpstream(): Promise<{ url: string; requests: { path: string; authorization: string; body: string }[]; close: () => void }> {
-  const requests: { path: string; authorization: string; body: string }[] = [];
+async function listenUpstream(): Promise<{
+  url: string;
+  requests: { path: string; authorization: string; body: string; traceparent: string }[];
+  close: () => void;
+}> {
+  const requests: { path: string; authorization: string; body: string; traceparent: string }[] = [];
   const server = createServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) {
@@ -354,6 +428,7 @@ async function listenUpstream(): Promise<{ url: string; requests: { path: string
       path: req.url ?? "",
       authorization: req.headers.authorization ?? req.headers["x-api-key"]?.toString() ?? "",
       body,
+      traceparent: req.headers.traceparent?.toString() ?? "",
     });
     const payload = {
       id: "chatcmpl-test",

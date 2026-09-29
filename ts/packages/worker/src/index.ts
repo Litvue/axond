@@ -1,6 +1,6 @@
 import { Client } from "pg";
 
-import { createAxond, createMetrics } from "@axond/gateway";
+import { createAxond, createMetrics, resolveTelemetry } from "@axond/gateway";
 import { rateLimitExtension } from "@axond/rate-limit";
 import type { ProviderConfig } from "@axond/sdk";
 
@@ -10,6 +10,9 @@ export interface WorkerEnv {
   HYPERDRIVE: { connectionString: string };
   GATEWAY_KEY: string;
   PROVIDERS_JSON: string;
+  OTEL_EXPORTER_OTLP_ENDPOINT?: string;
+  OTEL_EXPORTER_OTLP_PROTOCOL?: string;
+  AXOND_INSTANCE_ID?: string;
 }
 
 interface WaitContext {
@@ -45,6 +48,11 @@ export function createHandler(env: WorkerEnv) {
     };
   });
   const providers = JSON.parse(env.PROVIDERS_JSON) as ProviderConfig[];
+  const telemetry = resolveTelemetry({
+    endpoint: env.OTEL_EXPORTER_OTLP_ENDPOINT,
+    protocol: env.OTEL_EXPORTER_OTLP_PROTOCOL,
+    instanceId: env.AXOND_INSTANCE_ID,
+  });
   return {
     fetch(request: Request, ctx: WaitContext): Response | Promise<Response> {
       const app = createAxond({
@@ -55,6 +63,10 @@ export function createHandler(env: WorkerEnv) {
         extensions: [rateLimitExtension({ limit: 60, windowMs: 60_000, mode: "isolate" })],
         waitUntil: (promise) => ctx.waitUntil(promise),
         metrics,
+        telemetry: telemetry ?? undefined,
+        onLog: (record) => {
+          console.log(JSON.stringify(record));
+        },
       });
       return app.fetch(request);
     },
