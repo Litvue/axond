@@ -26,6 +26,48 @@ imports a package first (`bun build extension.ts --outfile extension.js`) and
 point the directory at the bundle. The Node wrapper resolves packages from the
 extension file.
 
+## Mount it in a Hono app
+
+`createAxond` returns a Hono app. A host keeps its own routes and mounts the
+gateway at `/`. A `pre-auth` extension may return a `Response` and stop the
+pipeline. `npm run check:docs` runs this sample.
+
+```ts
+import { Hono } from "hono";
+import { createAxond, createMemoryStore } from "@axond/gateway";
+
+const gateway = createAxond({
+  store: createMemoryStore(),
+  gatewayKey: "local-key",
+  extensions: [
+    {
+      name: "banner",
+      apiVersion: 1,
+      stage: "pre-auth",
+      async middleware() {
+        return new Response("extended");
+      },
+    },
+  ],
+});
+const app = new Hono();
+app.get("/host", (c) => c.text("host"));
+app.route("/", gateway);
+
+const health = await app.request("http://127.0.0.1/healthz");
+if (health.status !== 200 || (await health.text()) !== "ok") {
+  throw new Error(`health ${health.status}`);
+}
+const host = await app.request("http://127.0.0.1/host");
+if (host.status !== 200 || (await host.text()) !== "host") {
+  throw new Error(`host ${host.status}`);
+}
+const extended = await app.request("http://127.0.0.1/api/v1/namespaces");
+if ((await extended.text()) !== "extended") {
+  throw new Error("extension did not run");
+}
+```
+
 ## Prove it
 
 ```bash

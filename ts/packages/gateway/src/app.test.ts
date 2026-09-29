@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import test from "node:test";
+import { Hono } from "hono";
 
 import { createAxond } from "./app.ts";
 import { rewriteTopLevelModel } from "./body.ts";
@@ -64,6 +65,35 @@ async function gateway() {
   });
   return { app, store, upstream };
 }
+
+test("a host Hono app mounts the gateway and keeps its own route", async () => {
+  const store = createMemoryStore();
+  const gateway = createAxond({
+    store,
+    gatewayKey: KEY,
+    extensions: [
+      {
+        name: "banner",
+        apiVersion: 1,
+        stage: "pre-auth",
+        async middleware() {
+          return new Response("extended");
+        },
+      },
+    ],
+  });
+  const host = new Hono();
+  host.get("/host", (c) => c.text("host"));
+  host.route("/", gateway);
+  const health = await host.request("http://127.0.0.1/healthz");
+  assert.equal(health.status, 200);
+  assert.equal(await health.text(), "ok");
+  const own = await host.request("http://127.0.0.1/host");
+  assert.equal(own.status, 200);
+  assert.equal(await own.text(), "host");
+  const extended = await host.request("http://127.0.0.1/api/v1/namespaces");
+  assert.equal(await extended.text(), "extended");
+});
 
 test("rewrite keeps duplicate keys and large integers", () => {
   const raw = new TextEncoder().encode('{"model":"fake-openai/chat","n":9007199254740993,"a":1,"a":2}');

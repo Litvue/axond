@@ -48,6 +48,7 @@ jobs:
           npm test
           npm run lint:web
           npm run check:alerts
+          npm run check:docs
           node --experimental-strip-types --disable-warning=ExperimentalWarning -e 'import { writeFile } from "node:fs/promises"; import { OPENAPI } from "./packages/gateway/src/openapi.ts"; await writeFile("openapi.json", JSON.stringify(OPENAPI));'
           npm run test:workerd
       - name: OpenAPI document
