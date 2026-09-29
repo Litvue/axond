@@ -378,6 +378,7 @@ namespace = "platform"
   assert.equal(loaded.transport.connectTimeoutMs, 5_000);
   assert.equal(loaded.transport.streamTerminalGraceMs, 1_000);
   assert.equal(loaded.transport.overallTimeoutMs, 30_000);
+  assert.equal(loaded.transport.maxAttempts, 3);
   assert.equal(loaded.maxRequestBytes, 2 * 1024 * 1024);
   assert.equal(loaded.maxPromptTokens, 1_000_000);
   assert.equal(loaded.maxOutputTokens, 200_000);
@@ -434,6 +435,28 @@ namespace = "platform"
       return true;
     },
   );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${toml}\n[failover]\nmax_attempts = 0\n`,
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /failover\.max_attempts must be an integer of at least 1/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${toml}\n[failover]\nmax_attempts = 1.5\n`,
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /failover\.max_attempts must be an integer of at least 1/);
+      return true;
+    },
+  );
 });
 
 test("credential pool threshold, cooldown, and weight load from toml", async () => {
@@ -467,9 +490,12 @@ weight = 3
 strategy = "weighted"
 failure_threshold = 1
 cooldown_seconds = 5
+[failover]
+max_attempts = 1
 `;
   const loaded = await loadConfig(toml, envSecretReader({ GW_KEY: "k", OPENAI_KEY: "sk" }, async () => ""));
   assert.deepEqual(loaded.credentialPool, { strategy: "weighted", failureThreshold: 1, cooldownSeconds: 5 });
+  assert.equal(loaded.transport.maxAttempts, 1);
   assert.deepEqual(
     loaded.credentials.map((credential) => credential.weight),
     [1, 3],

@@ -26,6 +26,7 @@ import {
   noteCredentialFailure,
   noteCredentialSuccess,
   planCredentials,
+  targetAttemptCap,
   type CredentialPool,
 } from "./dispatch.ts";
 import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors.ts";
@@ -586,6 +587,10 @@ async function dispatch(
   const continuation = pinned && typeof previous === "string" && previous.length > 0;
   const clock = opts.clock ?? Date.now;
   const deadlineAt = clock() + (opts.transport?.overallTimeoutMs ?? 30_000);
+  const targetCap = targetAttemptCap(pinned, opts.transport?.maxAttempts);
+  if (!Number.isInteger(targetCap) || targetCap < 1) {
+    throw new GatewayFailure("bad_request", 400, "failover.max_attempts must be an integer of at least 1");
+  }
   const headersFor = (served: CredentialConfig): Headers => {
     const built = new Headers();
     built.set("content-type", "application/json");
@@ -606,7 +611,9 @@ async function dispatch(
     }
     return built;
   };
-  for (let attempt = 0; attempt < planned.length; attempt += 1) {
+  // One configured target. `targetCap` bounds targets, so this walk still
+  // presents every planned credential.
+  for (let attempt = 0; attempt < planned.length && targetCap >= 1; attempt += 1) {
     const credential = planned[attempt]!;
     if (continuation && credentialState(pools, credential, now, policy.cooldownMs) === "parked") {
       throw new GatewayFailure(

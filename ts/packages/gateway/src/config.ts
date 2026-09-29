@@ -100,6 +100,7 @@ const DEFAULT_TRANSPORT: TransportLimits = {
   connectTimeoutMs: 5_000,
   streamTerminalGraceMs: 1_000,
   overallTimeoutMs: 30_000,
+  maxAttempts: 3,
 };
 
 /**
@@ -309,6 +310,7 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
       "transport.max_error_bytes must not exceed transport.max_response_bytes: an error body is a response body",
     );
   }
+  const failoverRaw = asRecord(parsed["failover"]) ?? {};
   const transport: TransportLimits = {
     responseHeaderTimeoutMs: boundedMillis(transportRaw, "response_header_timeout_ms", DEFAULT_TRANSPORT.responseHeaderTimeoutMs),
     bufferedBodyTimeoutMs: boundedMillis(transportRaw, "buffered_body_timeout_ms", DEFAULT_TRANSPORT.bufferedBodyTimeoutMs),
@@ -322,10 +324,16 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     maxResponseBytes,
     maxErrorBytes,
     overallTimeoutMs: boundedMillis(
-      asRecord(parsed["failover"]) ?? {},
+      failoverRaw,
       "overall_timeout_ms",
       DEFAULT_TRANSPORT.overallTimeoutMs ?? 30_000,
       "failover.overall_timeout_ms",
+    ),
+    maxAttempts: positiveInteger(
+      failoverRaw,
+      "max_attempts",
+      DEFAULT_TRANSPORT.maxAttempts ?? 3,
+      "failover.max_attempts",
     ),
   };
   const admissionRaw = asRecord(parsed["admission"]) ?? {};
@@ -557,6 +565,19 @@ function boundedMillis(
   const value = numberField(row, key, fallback);
   if (!Number.isInteger(value) || value < 1) {
     throw configError(`${label} must be at least 1`);
+  }
+  return value;
+}
+
+function positiveInteger(
+  row: Record<string, unknown>,
+  key: string,
+  fallback: number,
+  label: string,
+): number {
+  const value = numberField(row, key, fallback);
+  if (!Number.isInteger(value) || value < 1) {
+    throw configError(`${label} must be an integer of at least 1`);
   }
   return value;
 }

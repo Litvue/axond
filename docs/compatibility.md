@@ -78,6 +78,7 @@ its target or key reports the ordinary routing, credential, or upstream error.
 `/ns/{ns}/v1/chat/completions`, `/ns/{ns}/v1/messages`, and
 `/ns/{ns}/v1/embeddings` keep credential-pool rotation inside one provider.
 Alias-level failover is gone ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)).
+`failover.max_attempts` defaults to 3 and fails boot at 0. It counts target attempts. Credential rotation inside the one configured provider is a separate walk, so a cap of 1 still tries every key. Responses still uses one target.
 A streamed response sets `content-type: text/event-stream` and `cache-control: no-cache`.
 A provider failure after a credential is selected still returns that provider error, and writes one usage record with status `upstream_error`, zero token counts, and cost 0. Spent does not increase.
 A client that cancels a stream records `client_cancelled`. When the provider has not reported usage, the charge is the prompt estimate plus one token per four characters of relayed text. A stream that relayed no text is not charged.

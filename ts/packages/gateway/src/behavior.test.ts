@@ -4,7 +4,7 @@ import test from "node:test";
 import { Agent } from "undici";
 
 import { createAxond } from "./app.ts";
-import { isRateLimitPayload } from "./dispatch.ts";
+import { isRateLimitPayload, targetAttemptCap } from "./dispatch.ts";
 import { createMemoryStore } from "./memory-store.ts";
 import { createMetrics } from "./metrics.ts";
 import { usageEvent } from "./usage.ts";
@@ -478,6 +478,80 @@ test("a provider 500 stays on that credential and a 429 rotates", async () => {
   });
   assert.equal(limited.status, 200);
   assert.deepEqual(seen, ["Bearer bad-key", "Bearer good-key", "Bearer bad-key", "Bearer good-key"]);
+  upstream.close();
+});
+
+test("a target attempt cap of one still walks every credential", async () => {
+  assert.equal(targetAttemptCap(false, undefined), 3);
+  assert.equal(targetAttemptCap(false, 1), 1);
+  assert.equal(targetAttemptCap(true, 9), 1);
+  const store = await seeded();
+  const seen: string[] = [];
+  const upstream = await listen((req, res) => {
+    seen.push(req.headers.authorization ?? "");
+    res.writeHead(429, { "content-type": "application/json" });
+    res.end('{"error":{"message":"slow down"}}');
+  });
+  const transport = {
+    responseHeaderTimeoutMs: 5_000,
+    bufferedBodyTimeoutMs: 5_000,
+    streamIdleTimeoutMs: 5_000,
+    maxResponseBytes: 1024,
+    maxAttempts: 1,
+  };
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [
+      { namespace: "platform", provider: "fake-openai", secret: "key-one", id: "one" },
+      { namespace: "platform", provider: "fake-openai", secret: "key-two", id: "two" },
+    ],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport,
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const limited = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+  });
+  assert.equal(limited.status, 502);
+  assert.equal((await limited.json()).error.type, "provider_dependency_failed");
+  assert.deepEqual(seen, ["Bearer key-one", "Bearer key-two"]);
+  const refused = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "key-one", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: { ...transport, maxAttempts: 0 },
+  });
+  const before = seen.length;
+  const rejected = await refused.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+  });
+  assert.equal(rejected.status, 400);
+  assert.equal((await rejected.json()).error.type, "bad_request");
+  assert.equal(seen.length, before);
   upstream.close();
 });
 

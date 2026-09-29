@@ -372,6 +372,12 @@ export interface TransportLimits {
    * It tightens the header and buffered-body waits and does not cut an open stream.
    */
   overallTimeoutMs?: number;
+  /**
+   * Target attempts for one request, from `failover.max_attempts`. Absent uses 3.
+   * Credential rotation inside the one configured target is not counted.
+   * Responses always uses 1.
+   */
+  maxAttempts?: number;
 }
 
 export interface UsageRecord {

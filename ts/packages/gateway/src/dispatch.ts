@@ -41,6 +41,17 @@ export function credentialPolicy(input?: {
 }
 
 /**
+ * How many targets one request may open. Responses is always one target.
+ * The number does not limit credentials inside a target.
+ */
+export function targetAttemptCap(pinned: boolean, configured: number | undefined): number {
+  if (pinned) {
+    return 1;
+  }
+  return configured ?? 3;
+}
+
+/**
  * One request's credential walk. A pinned route returns the first credential
  * and does not read or advance health. Otherwise the rotation cursor moves
  * once, a cooldown-elapsed credential is taken as the single half-open probe,
@@ -333,6 +344,7 @@ function withTransportDefaults(transport: TransportLimits): Required<TransportLi
     connectTimeoutMs: transport.connectTimeoutMs ?? 5_000,
     streamTerminalGraceMs: transport.streamTerminalGraceMs ?? 1_000,
     overallTimeoutMs: transport.overallTimeoutMs ?? 30_000,
+    maxAttempts: transport.maxAttempts ?? 3,
   };
 }
 
