@@ -102,6 +102,8 @@ export function createMemoryStore(): Store {
     return period;
   }
 
+  let catalogStreak = 0;
+
   const store: Store = {
     async query(): Promise<QueryResult> {
       throw new GatewayFailure("bad_request", 400, "memory store query is only available to a trusted extension with a SQL store");
@@ -302,6 +304,17 @@ export function createMemoryStore(): Store {
           source: null,
         };
         models.set(provider, { ...current, stale: true });
+      });
+    },
+    noteCatalogRefusal() {
+      return lock(() => {
+        catalogStreak += 1;
+        return catalogStreak;
+      });
+    },
+    resetCatalogStreak() {
+      return lock(() => {
+        catalogStreak = 0;
       });
     },
   };

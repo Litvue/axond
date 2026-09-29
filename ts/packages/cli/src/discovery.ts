@@ -13,7 +13,7 @@ export interface CatalogMetrics {
   set(name: string, value: number, attributes?: Record<string, string>): void;
 }
 
-/** One store is one catalogue holder. The count is not durable across processes. */
+/** Used only when the durable streak write fails. */
 const catalogStreaks = new WeakMap<object, number>();
 
 /**
@@ -104,8 +104,15 @@ async function refreshCatalog(
     await noteCatalogRefusal(input, "not_retained");
     return;
   }
-  catalogStreaks.set(input.store, 0);
-  input.metrics?.set("axond.catalog.consecutive_refusals", 0);
+  const reset = await input.store.resetCatalogStreak().then(
+    () => 0,
+    () => {
+      catalogStreaks.set(input.store, 0);
+      return 0;
+    },
+  );
+  catalogStreaks.set(input.store, reset);
+  input.metrics?.set("axond.catalog.consecutive_refusals", reset);
   const age = Date.now() - Date.parse(fetchedAt);
   if (Number.isFinite(age)) {
     input.metrics?.set("axond.catalog.active_age", Math.max(0, age));
@@ -126,7 +133,12 @@ async function noteCatalogRefusal(
   input: { store: Store; metrics?: CatalogMetrics },
   reason: CatalogRefusalReason,
 ): Promise<void> {
-  const next = (catalogStreaks.get(input.store) ?? 0) + 1;
+  let next: number;
+  try {
+    next = await input.store.noteCatalogRefusal();
+  } catch {
+    next = (catalogStreaks.get(input.store) ?? 0) + 1;
+  }
   catalogStreaks.set(input.store, next);
   input.metrics?.record("axond.catalog.refusals", 1, { "axond.catalog.reason": reason });
   input.metrics?.set("axond.catalog.consecutive_refusals", next);

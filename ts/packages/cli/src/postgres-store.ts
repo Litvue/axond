@@ -327,6 +327,26 @@ export function createPostgresStore(
         );
       });
     },
+    async noteCatalogRefusal() {
+      return withClient(null, async (client) => {
+        const result = await client.query(
+          `INSERT INTO axond_catalog_streak (singleton, consecutive_refusals) VALUES ('catalog', 1)
+           ON CONFLICT (singleton) DO UPDATE SET consecutive_refusals = axond_catalog_streak.consecutive_refusals + 1
+           RETURNING consecutive_refusals`,
+          [],
+        );
+        return Number(result.rows[0]?.["consecutive_refusals"] ?? 1);
+      });
+    },
+    async resetCatalogStreak() {
+      return withClient(null, async (client) => {
+        await client.query(
+          `INSERT INTO axond_catalog_streak (singleton, consecutive_refusals) VALUES ('catalog', 0)
+           ON CONFLICT (singleton) DO UPDATE SET consecutive_refusals = 0`,
+          [],
+        );
+      });
+    },
   };
 }
 
@@ -409,6 +429,10 @@ CREATE TABLE IF NOT EXISTS axond_store_provider_models (
     stale boolean NOT NULL,
     models jsonb NOT NULL,
     source text
+);
+CREATE TABLE IF NOT EXISTS axond_catalog_streak (
+    singleton text PRIMARY KEY NOT NULL,
+    consecutive_refusals integer NOT NULL
 );
 CREATE TABLE IF NOT EXISTS axond_schema_migrations (
     id text PRIMARY KEY NOT NULL,

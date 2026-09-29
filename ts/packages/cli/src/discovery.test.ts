@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { createMemoryStore } from "../../gateway/src/memory-store.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
 
 import { discoverOnce } from "./discovery.ts";
+import { openSqliteStore } from "./sqlite-store.ts";
 
 test("discovery stores provider models and a catalogue document", async () => {
   const store = createMemoryStore();
@@ -167,4 +171,53 @@ test("a catalogue refusal names a bounded reason and omits the source url", asyn
   assert.equal(reason("unreachable")?.value, 2);
   assert.equal(metrics.points.find((point) => point.name === "axond.catalog.consecutive_refusals")?.value, 2);
   assert.equal(JSON.stringify(metrics.points).includes(secret), false);
+});
+
+test("catalogue refusals survive a new store object on the same database", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "axond-streak-"));
+  const path = join(dir, "axond.sqlite");
+  const metrics = createMetrics();
+  const catalog = { source: "models-dev" as const, sourceUrl: "https://example.test/models.json" };
+  const fail = async () => {
+    throw new Error("down");
+  };
+  try {
+    await discoverOnce({
+      store: openSqliteStore(path),
+      providers: [],
+      credentials: [],
+      catalog,
+      metrics,
+      fetchImpl: fail,
+    });
+    await discoverOnce({
+      store: openSqliteStore(path),
+      providers: [],
+      credentials: [],
+      catalog,
+      metrics,
+      fetchImpl: async () => new Response("no", { status: 403 }),
+    });
+    assert.equal(metrics.points.find((point) => point.name === "axond.catalog.consecutive_refusals")?.value, 2);
+    await discoverOnce({
+      store: openSqliteStore(path),
+      providers: [],
+      credentials: [],
+      catalog,
+      metrics,
+      fetchImpl: async () => new Response(JSON.stringify({ "openai/gpt-test": {} }), { status: 200 }),
+    });
+    assert.equal(metrics.points.find((point) => point.name === "axond.catalog.consecutive_refusals")?.value, 0);
+    await discoverOnce({
+      store: openSqliteStore(path),
+      providers: [],
+      credentials: [],
+      catalog,
+      metrics,
+      fetchImpl: fail,
+    });
+    assert.equal(metrics.points.find((point) => point.name === "axond.catalog.consecutive_refusals")?.value, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

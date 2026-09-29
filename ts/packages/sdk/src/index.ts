@@ -117,6 +117,10 @@ export interface Store {
   getProviderModels(provider: string): Promise<ProviderModelCache | null>;
   upsertProviderModels(row: ProviderModelCache): Promise<void>;
   markProviderModelsStale(provider: string): Promise<void>;
+  /** Add one refused catalogue import and return the durable run length. */
+  noteCatalogRefusal(): Promise<number>;
+  /** A stored import ends the refusal run. */
+  resetCatalogStreak(): Promise<void>;
 }
 
 /** What an extension is allowed to call. */

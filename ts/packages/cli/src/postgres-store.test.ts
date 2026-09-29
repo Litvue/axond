@@ -40,7 +40,7 @@ async function reset(): Promise<void> {
   await opened.client.query(`
     TRUNCATE axond_store_usage, axond_store_budget, axond_store_budget_active,
       axond_store_budget_cadence, axond_namespace_incarnation, axond_namespace,
-      axond_store_provider_models, axond_schema_migrations
+      axond_store_provider_models, axond_catalog_streak, axond_schema_migrations
   `);
   await opened.release();
 }
@@ -252,4 +252,12 @@ test("postgres provider models keep the last payload and reject a different fres
   const replaced = await db.getProviderModels("openai");
   assert.equal(replaced?.stale, false);
   assert.deepEqual(replaced?.data, [{ id: "other" }]);
+});
+
+test("a catalogue refusal streak survives a new postgres store", { skip: !dsn }, async () => {
+  await reset();
+  assert.equal(await store().noteCatalogRefusal(), 1);
+  assert.equal(await store().noteCatalogRefusal(), 2);
+  await store().resetCatalogStreak();
+  assert.equal(await store().noteCatalogRefusal(), 1);
 });

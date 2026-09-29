@@ -67,6 +67,10 @@ CREATE TABLE IF NOT EXISTS axond_store_provider_models (
     models TEXT NOT NULL,
     source TEXT
 );
+CREATE TABLE IF NOT EXISTS axond_catalog_streak (
+    singleton TEXT PRIMARY KEY NOT NULL,
+    consecutive_refusals INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS axond_schema_migrations (
     id TEXT PRIMARY KEY NOT NULL,
     applied_at INTEGER NOT NULL
@@ -309,6 +313,26 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
           return;
         }
         db.prepare("UPDATE axond_store_provider_models SET stale = 1 WHERE provider = ?").run(provider);
+      });
+    },
+    noteCatalogRefusal() {
+      return lock(null, () => {
+        const row = one(
+          db,
+          `INSERT INTO axond_catalog_streak (singleton, consecutive_refusals) VALUES ('catalog', 1)
+           ON CONFLICT(singleton) DO UPDATE SET consecutive_refusals = consecutive_refusals + 1
+           RETURNING consecutive_refusals`,
+          [],
+        );
+        return Number(row?.["consecutive_refusals"] ?? 1);
+      });
+    },
+    resetCatalogStreak() {
+      return lock(null, () => {
+        db.prepare(
+          `INSERT INTO axond_catalog_streak (singleton, consecutive_refusals) VALUES ('catalog', 0)
+           ON CONFLICT(singleton) DO UPDATE SET consecutive_refusals = 0`,
+        ).run();
       });
     },
   };
