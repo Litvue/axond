@@ -65,7 +65,7 @@ platform to verify the SBOM of what you run.
 
 - parsed and validated the complete configuration graph;
 - resolved every declared credential and gateway key;
-- connected configured usage, budget, rate-limit, and revocation backends;
+- opened the Store and connected configured usage backends;
 - bound its listener.
 
 `/readyz` does not continuously probe providers or datastores after boot.
@@ -83,16 +83,10 @@ balancer and configure that hop to:
 - expose only the intended network boundary;
 - preserve either `Authorization` or `x-api-key` headers.
 
-## Reloads and container environments
+## Configuration changes
 
-`SIGHUP` and `[reload] watch = true` rebuild the configuration snapshot. A
-mounted ConfigMap-style symlink swap is detected. The environment of an
-already-running process cannot gain a new variable, so adding a new
-environment-backed credential or verifier generally requires a replacement
-container. Existing file-backed key material can be replaced and reloaded.
-
-`[server]`, `[[usage_sink]]`, and `[budget]` changes require a restart even when
-other configuration changes can reload atomically.
+There is no hot reload. Configuration, environment, and file-backed key
+material are read at boot, so any change takes a replacement container.
 
 ## Shutdown
 

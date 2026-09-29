@@ -44,8 +44,7 @@ read the maintainer-facing
 - [ ] Provider `base_url` values contain a path only, with no query, fragment, credentials, or secret.
 - [ ] Callers send `provider-id/model-id`; there is no `[[model]]` table.
 - [ ] Provider pricing is reviewed; budgets depend on it.
-- [ ] Secret and signer rotation has been rehearsed.
-- [ ] Config reload rejection is monitored.
+- [ ] Gateway key and provider credential rotation has been rehearsed.
 
 ## State and scaling
 
@@ -53,13 +52,12 @@ read the maintainer-facing
 - [ ] Store outage policy (`[storage].on_unavailable`) is an explicit `deny` or `allow` decision.
 - [ ] Namespace budget-cap migrations were completed with the fleet stopped.
 - [ ] Postgres DDL is applied before writers using the new schema.
-- [ ] Redis key prefixes and Postgres tables are isolated between environments.
-- [ ] Postgres and Redis are on [supported versions](./stateful-backends.md#supported-versions).
+- [ ] Postgres databases or schemas are isolated between environments.
+- [ ] Postgres is on a [supported version](./stateful-backends.md#supported-versions).
 - [ ] Backup and restore procedures include schema/layout metadata and have been tested.
 - [ ] The [recovery objectives](../operations/backup-and-recovery.md#objectives) (RPO, RTO) are accepted or explicitly revised, and WAL archiving failures are alerted on.
 - [ ] A restore and a point-in-time recovery have been rehearsed against *your* backups, not only by [the drill](../operations/backup-and-recovery.md#the-drill).
-- [ ] Every persistent stateful ordinal has exported the compiled-serving cache layout required by the deployed release; after a cache-layout change, each ordinal was rebuilt with the control plane and SecretStore reachable before outage recovery was claimed.
-- [ ] Autoscaling does not accidentally multiply an in-memory budget or rate limit.
+- [ ] Autoscaling accounts for per-replica admission ceilings.
 - [ ] Per-replica `[admission]` ceilings x replica count is the concurrency the providers and the fleet can actually absorb.
 
 ## Rollout and shutdown
@@ -77,8 +75,7 @@ read the maintainer-facing
 
 - [ ] JSON logs reach the platform log sink.
 - [ ] OTLP/HTTP export is configured and reachable when required.
-- [ ] Alerts cover request failures, upstream failures, budget/rate-limit/revocation unavailable denials, and usage drops.
-- [ ] Namespace budget denials are distinguished from per-subject denials.
+- [ ] Alerts cover request failures, upstream failures, budget unavailable denials, and usage drops.
 - [ ] Credential `parked`/`probe` state can be inspected safely.
 - [ ] Dashboard owners understand cache-read/cache-write token accounting.
 

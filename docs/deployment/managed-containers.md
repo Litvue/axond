@@ -38,13 +38,10 @@ resource model rather than copying an unverified provider-specific template.
 
 ## Scaling choices
 
-Tier 0 scales with no shared state, but each replica has independent credential
-health, failover circuits, in-memory budgets, and in-memory rate limits. That is
-often correct for evaluation or simple routing.
-
-Use a managed Redis or Postgres endpoint when budgets, rate limits, revocation,
-or usage must be exact/durable across instances. Axond connects configured
-backends before listening; a bad DSN or unreachable service prevents a new
+Replicas share the Store and nothing else: each has independent credential
+health, failover circuits, and admission ceilings. SQLite serves one replica;
+use a managed Postgres endpoint for more, or when usage must be durable across
+instances. Axond connects configured backends before listening; a bad DSN or unreachable service prevents a new
 revision from becoming healthy.
 
 Set platform concurrency and autoscaling limits from measured request and
@@ -54,8 +51,7 @@ shared controls, backend availability is part of admission.
 
 ## Configuration updates
 
-- A mounted-file update can be applied by `[reload] watch = true` when the
-  platform updates the file in place or swaps its projected symlink.
+- There is no hot reload. A mounted-file update takes a new revision.
 - Environment secret changes require a new task/revision/container. Azure
   Container Apps injects Key Vault secrets at revision start; rotating the
   vault secret does not mutate process env. Create a new revision.
@@ -64,10 +60,9 @@ shared controls, backend availability is part of admission.
   edit.
 - `[server]`, `[[usage_sink]]`, and `[budget]` changes require a replacement
   instance.
-- A rejected reload leaves the prior snapshot serving; a rejected new revision
-  never binds its listener.
+- A rejected new revision never binds its listener.
 - Do not resolve the secret store on the request path. Axond reads material at
-  boot or reload.
+  boot.
 
 A worked Azure Container Apps deployment — image pin, Key Vault, probes,
 telemetry, usage, and rotation — is in
@@ -83,7 +78,7 @@ Before declaring a platform supported, test:
 - secret and config rotation behavior;
 - revision draining and client retry behavior;
 - OTLP egress and required proxy settings;
-- Redis/Postgres TLS and DNS from the execution environment.
+- Postgres TLS and DNS from the execution environment.
 
 The binary drains on `SIGTERM` within
 `drain_grace_ms + deadline_ms + flush_timeout_ms`. Confirm the platform sends

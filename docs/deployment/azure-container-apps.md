@@ -1,7 +1,7 @@
 # Production on Azure Container Apps
 
-A Tier 0 Axond replica: the public GHCR image, TOML for structure, Azure Key
-Vault for keys, JSON usage on stdout, and optional OTLP. No Redis or Postgres.
+An Axond replica: the public GHCR image, TOML for structure, a `[storage]`
+Store, Azure Key Vault for keys, JSON usage on stdout, and optional OTLP.
 Inference, telemetry, and usage records work with this shape.
 
 The [managed-container contract](./managed-containers.md) is the portable
@@ -165,7 +165,7 @@ see [usage schema](../usage-schema.md).
 Telemetry: if `OTEL_EXPORTER_OTLP_ENDPOINT` is set, traces and metrics leave
 on OTLP/HTTP (`http/protobuf` only). See [observability](../observability.md).
 
-## Rotation, reload, and what needs a new revision
+## Rotation and what needs a new revision
 
 | Change | How it lands |
 | --- | --- |
@@ -174,15 +174,9 @@ on OTLP/HTTP (`http/protobuf` only). See [observability](../observability.md).
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | New revision (environment). |
 | `[server] bind`, `[admission]`, `[transport]`, `[[usage_sink]]`, `[budget]` | New revision. These are boot-owned even when the file is re-read. |
 
-`[reload] watch = true` re-reads the mounted TOML if the platform rewrites
-that file in place. Container Apps secret volumes are populated at revision
-start, so watching does not pick up a Key Vault edit by itself. Treat a new
-revision as the reload.
-
-`mode = "stateful"` and `/admin/v1/secrets` are withdrawn
-([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)). Rotate provider
-keys by changing the env var behind `[[credential]]` and replacing the
-revision.
+There is no hot reload. Config and secrets are read at revision start, so
+every change is a new revision. Rotate provider keys by changing the env var
+behind `[[credential]]` and replacing the revision.
 
 ## Ingress limits that affect streams
 

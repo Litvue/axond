@@ -4,9 +4,9 @@ The repository ships three composable files:
 
 | File | Purpose |
 | --- | --- |
-| `docker-compose.yml` | Pull-first Tier 0 quickstart using the public release image. |
+| `docker-compose.yml` | Pull-first SQLite quickstart using the public release image. |
 | `docker-compose.build.yml` | Development/CI overlay that builds the checked-out tree. |
-| `docker-compose.stateful.yml` | Redis/Postgres dependency and health-gating overlay. |
+| `docker-compose.stateful.yml` | Postgres dependency and health-gating overlay for durable usage. |
 
 Configuration lives in `ops/compose/*.toml`; secrets and DSNs live in `.env`.
 
@@ -85,19 +85,16 @@ docker compose \
 ```
 
 Use the same files and profile on every follow-up command. The stateful example
-enables:
-
-- Redis-backed shared budgets;
-- Redis-backed in-flight rate limits;
-- Postgres durable usage with schema creation at boot.
+enables
+Postgres durable usage with schema creation at boot.
 
 Exercise the request path:
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
+curl http://127.0.0.1:8080/ns/platform/v1/chat/completions \
   -H 'Authorization: Bearer quickstart-platform-key' \
   -H 'content-type: application/json' \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hello"}]}'
 ```
 
 Usage writes are batched. Poll Postgres rather than assuming the row is visible
@@ -117,15 +114,7 @@ for attempt in $(seq 1 12); do
 done
 ```
 
-To prove Redis participates in admission, stop it and make a dispatch request:
-
-```bash
-docker compose \
-  -f docker-compose.yml -f docker-compose.stateful.yml \
-  --profile stateful stop redis
-```
-
-Period budgets live in the Store, not Redis. A missing budget is `429
+Period budgets live in the Store. A missing budget is `429
 budget_exceeded`. A Store outage is `503 budget_unavailable` under the default
 `[storage].on_unavailable = deny`. Catalogue reads
 (`GET /ns/{ns}/v1/models`) do not admit against the budget.

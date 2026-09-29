@@ -33,71 +33,19 @@ Logs are always JSON on stdout, filtered by `RUST_LOG` (default
 ## Health surfaces
 
 Two production surfaces answer two different questions
-([ADR 0031](./adr/0031-bounded-status-contract.md)). `GET /admin/v1/status` is
-unmounted ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)).
+([ADR 0031](./adr/0031-bounded-status-contract.md)).
 
 | Surface | Authentication | Question it answers |
 | --- | --- | --- |
 | `GET /healthz` | none | *Is the process alive?* Answers `ok` throughout, including the shutdown drain. Restart it if this fails. |
 | `GET /readyz` | none | *Should traffic be sent here?* `ready`, or `503 draining` once termination begins. Point the load balancer here. |
-| `GET /admin/v1/status` | unmounted | Withdrawn replica diagnostic. Not composed into production `serve()`. |
 
 Neither `/healthz` nor `/readyz` observes a dependency. A Store outage on the
 budget path is `503 budget_unavailable` (default `[storage].on_unavailable =
-deny`). Dependency health is in logs and metrics.
-
-Read the age, not just the state. Each component reports `ok`, `degraded`,
-`unavailable`, or `disabled` (nothing is configured for it) with the age of the
-observation behind it; an observation older than the staleness budget reports
-`degraded` with reason `stale`, because a replica serving a valid snapshot through
-an observation outage is stale rather than down. A component that is enabled but
-has never been observed reports `unavailable`, never `ok`.
-
-Reasons come from a closed list — `unavailable`, `unreachable`, `timeout`,
-`authentication_rejected`, `permission_denied`, `schema_incompatible`,
-`payload_corrupt`, `validation_rejected`, `projection_rejected`,
-`snapshot_rejected`, `pricing_rejected`, `clock_unsynchronised`,
-`policy_rejected`, `secret_unresolved`, `stale`, `not_configured`, `draining`,
-`capacity_exhausted`, `unknown` — and treat an unrecognised one as opaque, since
-codes are added additively. There is deliberately no free-text field: connection
-strings, tokens, raw backend errors, and rejected-revision details are logged for
-the operator and cannot appear in a response. A caller without deployment-wide
-authority additionally sees only the components its own traffic depends on,
-reasons coarsened to `unavailable`, ages rounded to whole seconds, and no revision
-summary.
-
-A component reports `disabled` when this deployment has no such dependency — that
-is the correct answer, not a degraded one — so a replica that configured nothing
-durable reports `disabled` everywhere, observes nothing, and produces no
-`axond.status.*` series at all.
-
-`GET /admin/v1/status` is unmounted. Store health is typed errors and metrics.
-Optional `[rate_limit]` Redis still participates in admission when configured.
-
-A probe asks only for reachability: a `PING` or a `SELECT 1`, with no tenant, key,
-or `jti` in it, never a `reserve`, an `acquire`, or a revocation lookup. A store
-that answers and refuses (a rotated credential) is `degraded`, not `unavailable`,
-which keeps the unreachability alert for an outage.
-
-Each component is probed under its own backend's configured bounds — a probe that
-gave up before the backend's own bounds elapsed would report an outage it had
-caused — while the shared refresh cadence is the slowest enabled component's, and
-a request-path store is never observed faster than the metric export interval that
-reads it. Backends with no reachability seam yet (the secret store, the usage
-sink, the catalogue, and provider credentials) stay `disabled` until the slice
-that owns each one exposes one; neither the response shape nor the metric names
-change when they do:
-
-```bash
-curl -sS -H "Authorization: Bearer $AXOND_KEY" http://localhost:8080/admin/v1/status
-```
-
-What to reach for, in order: `/readyz` says whether traffic belongs here,
-`/admin/v1/status` says which dependency is impaired and how fresh that knowledge
-is, and the [observability runbook](./operations/observability-runbook.md) says
-what to do about it. The shipped dashboard and alert assets under
-[`ops/observability/`](../ops/observability/) are the fleet-wide view of the same
-signals.
+deny`). Dependency health is in typed errors, logs, and metrics. The
+[observability runbook](./operations/observability-runbook.md) says what to do
+about each signal, and the shipped dashboard and alert assets under
+[`ops/observability/`](../ops/observability/) are the fleet-wide view.
 
 ## Traces
 
@@ -112,7 +60,6 @@ parked credential.
 | `http.server.request` | `http.request.method`, `http.route`, `http.response.status_code`, `axond.request_id`, `axond.namespace`, `axond.subject`, `gen_ai.request.model`, `axond.target.*`, `axond.credential_source`, `axond.status`, `axond.retry_count`, `gen_ai.usage.*`, `axond.cost_microdollars`, `axond.latency_ms`, `axond.ttft_ms` |
 | `axond.upstream.attempt` | `axond.attempt` (zero-based), `axond.target.provider`, `axond.target.model`, `axond.credential_source`, `axond.status`, `axond.latency_ms`, `axond.ttft_ms`, `axond.upstream.status` (provider HTTP refusal code), `axond.upstream.message` (bounded failure diagnostic), `axond.timeout` (which phase stalled, when one did), `axond.timeout.bound` (`phase` or `walk_budget`) |
 | `axond.credential.lease` | `axond.credential.id`, `axond.credential_source`, `axond.credential.index`, `axond.status` (`served`, `rate_limited`, `error`, `parked`) |
-| `axond.config.reload` | `axond.reload.trigger`, `axond.reload.outcome`, `axond.config.generation` |
 | `axond.revision.converge` | `axond.revision.trigger` (`boot`, `polled`, `notified`, or `pricing-boundary`), outcome, active/desired revision, lag, and generation |
 
 An inbound `traceparent` is **joined**, not replaced, and the context is
@@ -143,14 +90,6 @@ A streamed response outlives its server span: the span records where the stream
 was routed before dispatch, and the final tokens/cost land on the metrics and
 the usage record instead.
 
-When request-path middleware is registered, the prompt estimate, request
-ceilings, and budget reservation are computed from the body after the chain has
-run. A captured inbound request may therefore be smaller than the input named
-by a usage row: the row describes the body that reached the provider. For
-stream cancellation or a provider response without authoritative input usage,
-the relay's fallback input count is the same post-middleware estimate used for
-the hold.
-
 ## Metrics
 
 `axond.http.*` covers every HTTP request — including ones that never reach a
@@ -177,7 +116,7 @@ destination receives by exactly what the refusals in
 | `axond.cost.microdollars` | counter (µUSD) | same | Spend, priced from the target catalogue. |
 | `axond.upstream.errors` | counter | same | Upstream failure rate by target. |
 | `axond.upstream.timeouts` | counter | `axond.target.provider`, `axond.target.model`, `axond.timeout`, `axond.timeout.bound` | Which phase stalled — `connect`, `response_headers`, `buffered_body`, `stream_idle`, or `overall` (nothing was dispatched) — and whether the `phase` bound or the remaining `walk_budget` ended the wait. |
-| `axond.upstream.time_to_first_token` | histogram (ms) | `axond.target.provider`, `axond.target.model` | Provider TTFT measured at the first decoded stream event, before any explicit middleware response buffering. |
+| `axond.upstream.time_to_first_token` | histogram (ms) | `axond.target.provider`, `axond.target.model` | Provider TTFT measured at the first decoded stream event. |
 | `axond.upstream.circuit_state` | gauge | `axond.target.provider`, `axond.target.model` | `0` closed, `1` half-open, `2` open. |
 | `axond.usage.records_written` | counter | `axond.usage_sink` | Records a sink acknowledged. In billing-grade mode the delivery worker emits it, for records a destination accepted. |
 | `axond.usage.records_dropped` | counter | `axond.usage_sink`, `axond.drop_reason` | Records discarded rather than delaying a request. `shutdown` means the termination flush could not write them. Billing-grade mode has no buffer to drop from: a failed write stays journaled, so watch `axond.usage.journal.lost` there instead. |
@@ -207,8 +146,6 @@ destination receives by exactly what the refusals in
 | `axond.settlement.queue_wait` | histogram (ms) | — | Time a spawned settlement waited for an execution slot. Sustained growth means the Store is slower than the charge rate. |
 | `axond.settlement.oldest_pending_age` | gauge (ms) | — | Age of the oldest spawned settlement not yet finished. A rising age with a flat depth is a stalled Store; a rising depth with a flat age is a burst. |
 | `axond.settlement.failures` | counter | `axond.settlement.reason` | Settlements that missed a bound: `queue_timeout` (outlived `settlement_queue_wait_ms` and never started — spend not recorded), `execution_timeout` (outlived `settlement_timeout_ms`; the slot stays occupied until non-cancellable Store work ends so charge and usage stay together), `panicked`, `cancelled` (the task was aborted or the runtime stopped under it), `refused` (background work that carried no admission reservation met a saturated replica). None is retried, because a budget charge is not idempotent. |
-| `axond.config.reloads` | counter | `axond.reload.trigger`, `axond.reload.outcome` | Reload attempts and whether they applied. |
-| `axond.config.generation` | gauge | — | `0` at boot, `+1` per applied reload. |
 | `axond.budget.capacity_denials` | counter | — | In-memory admissions denied because the ledger bound was exhausted. |
 | `axond.budget.namespace_denials` | counter | — | Admissions denied by `namespace_limit_microdollars` rather than by the subject's own cap. Both answer `429`. |
 | `axond.budget.retained_subjects` | gauge | — | In-memory ledgers retained after capacity-pressure pruning; watch against `max_subjects`. |
@@ -219,19 +156,9 @@ destination receives by exactly what the refusals in
 | `axond.store.connections_reused` | counter | `axond.store.backend` | Postgres checkouts that took a healthy idle session instead of connecting. |
 | `axond.store.connections_discarded` | counter | `axond.store.backend` | Postgres sessions dropped rather than returned idle: a closed backend at checkin, a closed client found in the idle list, a cancelled checkout, or a typed error that refuses reuse. A rise that tracks request bursts after idle retention matches the pool size is a reconnect storm, not expected drain. |
 | `axond.store.pool.sessions` | gauge | `axond.store.backend`, `axond.store.pool.state` | Postgres occupancy right now: `live` is checked out, `idle` is retained. The sum is the session count the semaphore bounds (32 per replica). SQLite does not record this gauge. |
-| `axond.middleware.capacity_wait` | histogram (ms) | — | Time content middleware waits for one of the bounded blocking-executor slots. Sustained growth means late synchronous invocations are retaining capacity. |
-| `axond.middleware.capacity_timeouts` | counter | — | Requests whose middleware deadline expired while waiting for blocking capacity. Alert on any sustained increase alongside `middleware_unavailable` responses. |
-| `axond.middleware.response_buffering_duration` | histogram (ms) | — | Gateway-added delay when an operator explicitly buffers a byte-faithful streaming route so response middleware can run; compare with upstream TTFT to separate policy cost from provider latency. |
-| `axond.rate_limit.denials` | counter | — | Inbound concurrency admissions rejected. |
-| `axond.rate_limit.capacity_denials` | counter | — | In-memory admissions rejected because the bounded subject map is full. |
-| `axond.rate_limit.unavailable_denials` | counter | — | Redis rate-limit admissions denied because the store was unavailable. |
-| `axond.policy.unenforceable_denials` | counter | `axond.policy.condition`, `axond.policy.store` | Admissions denied because this replica holds no policy it can enforce for the namespace: `ungoverned` (no published document governs it) or `layout` (the published cap disagrees with the key layout the store booted on). The store is healthy in both cases, so these are counted apart from the unavailable-denial counters; the explanatory log line is sampled, this count is not. `axond.policy.store` names the responsibility as well as the backend — `budget:in_memory`, `budget:redis`, `budget:postgres` or `rate_limit:redis` — because a namespace with neither a published spend cap nor a published concurrency ceiling is denied by two stores that are commonly the same Redis, and the two are fixed separately. |
 | `axond.admission.queue.depth` | histogram | — | Exact server-side queue depth observed when a request acquires a bounded queue slot. The label-free histogram retains short-lived peaks between export intervals; compare its maximum with `queue_capacity`. |
-| `axond.admission.in_flight` | up-down counter | `axond.admission.resource` | Admission capacity held right now, by resource: `request`, `stream`, `tenant`, `queue`, `diagnostic` (status reads being answered, ceiling eight), `diagnostic_auth` (status reads being authenticated, ceiling seventy-two, split forty-eight for minted tokens, sixteen for credentials that resolve in memory, and eight for callers presenting none — a separate dimension because one read holds one of each and the two ceilings differ). Bounded label set — no tenant, subject, or request identity. |
+| `axond.admission.in_flight` | up-down counter | `axond.admission.resource` | Admission capacity held right now, by resource: `request`, `stream`, `tenant`, `queue`. Bounded label set — no tenant, subject, or request identity. |
 | `axond.admission.rejections` | counter | `axond.admission.resource`, `axond.error.type` | Requests shed by admission control, by resource and stable error type. |
-| `axond.status.component_state` | gauge | `axond.status.component` | Last observed dependency state: `0` disabled, `1` ok, `2` degraded, `3` unavailable — a severity ladder, so `>= 2` is trouble and the stateless posture (`disabled` everywhere) sits below `ok` rather than above `unavailable`. Bounded label set — no tenant, subject, or credential identity. |
-| `axond.status.observation_age` | gauge (ms) | `axond.status.component` | Age of the cached observation behind that state; a rising age means the refresher, not the dependency, is the problem. |
-| `axond.status.refreshes` | counter | `axond.status.component`, `axond.status.outcome` | Background refresh attempts and how they ended. |
 | `axond.catalog.refusals` | counter | `axond.catalog.reason` | Catalogue imports refused, by typed reason: `unreachable`, `denied`, `oversized`, `not_json`, `schema`, `id_mismatch`, `identifier`, `unknown_status`, `unknown_modality`, `price`, `unknown_tier_type`, `duplicate_tier`, `neutral_price`, `uncanonicalizable_text`, `ambiguous_model_key`, `content`, `unsupported_endpoint`, `unknown`. A refusal keeps the previous catalogue active, so nothing else moves when one happens. The JSON Pointer and message the refusal also carries are logged, never labelled. |
 | `axond.catalog.active_age` | gauge (ms) | — | How long since the active catalogue was last confirmed current — admitted, or answered `304`. Absent, not zero, before a first import. |
 | `axond.catalog.consecutive_refusals` | gauge | — | Imports refused in a row. Reset by any admitted or confirmed-unchanged import. |
@@ -274,7 +201,6 @@ renamed instrument cannot leave an alert silently matching nothing.
 | A replica is stuck draining | `axond.shutdown.phase` ≥ 1 for longer than `drain_grace_ms + deadline_ms + flush_timeout_ms` | The orchestrator sent `SIGTERM` but the process is not going away; expect a `SIGKILL` and lost buffered usage. |
 | A target is out | `axond.upstream.circuit_state = 2`, sustained | Every request is failing over (or failing) for that target. |
 | Budget denials | `axond.http.server.requests{status=429}` rising | Tenants are hitting their cap. |
-| Inbound concurrency denials | `axond.rate_limit.denials` rising | Authenticated callers are reaching their per-replica in-flight limit. |
 | Load shedding | `axond.admission.rejections` rising | Split by `axond.admission.resource`: `request` means the replica's own ceiling (scale out or raise it), `tenant` means one namespace's ceiling (the tenant's own traffic), `queue` means queueing is absorbing more than a burst. |
 | Admission saturation | `axond.admission.in_flight{axond.admission.resource="request"}` near `admission.max_in_flight` | Leading indicator of shedding; watch it before the rejections start. |
 | Settlement falling behind | `axond.settlement.in_flight` summed over stages approaching `admission.max_pending_settlements`, or `axond.settlement.oldest_pending_age` beyond seconds | The Store is charging slower than the replica is serving. At the ceiling new requests are refused `503 settlement_capacity_exhausted` (`axond.admission.rejections{axond.admission.resource="settlement"}`) rather than an admitted charge being dropped. Fix the Store before raising the ceiling. |
@@ -282,8 +208,6 @@ renamed instrument cannot leave an alert silently matching nothing.
 | Rollouts are abandoning charges | `axond.shutdown.abandoned_settlements` > 0 per rollout | Settlements were still queued or executing when the settle share of `shutdown.flush_timeout_ms` ran out. Lengthen the flush budget, or look at why the Store was slow during the drain. |
 | Rollouts are dropping the usage index | `axond.shutdown.abandoned_index` > 0 per rollout | Graceful shutdown ran out of flush budget before the Store usage-index worker wrote queued events. Billing is elsewhere; `GET .../usage` on this replica will be short. Lengthen `shutdown.flush_timeout_ms`, or look at Store contention (`axond.store.acquire_wait`). |
 | Budget store down | `axond.http.server.requests{status=503}` rising | Fail-closed denial: fix the store, or the whole tenant is refused. |
-| Config drift across the fleet | `axond.config.generation` differs between replicas | A replica missed a reload and is serving stale routing or keys. |
-| Rejected reloads | `axond.config.reloads{outcome="rejected"}` > 0 | Someone edited the config into an invalid state; the old one is still serving. |
 | Budget capacity exhausted | `axond.budget.capacity_denials` > 0 | The replica is refusing unseen subjects; investigate subject churn and the in-memory bound. |
 | Budget ledger pressure | `axond.budget.retained_subjects` near configured `max_subjects` | Leading indicator that the bound is approaching; watch it before capacity denials occur. |
 | Namespace budget exhausted | `axond.budget.namespace_denials` > 0 | The whole namespace is out of budget, so *every* subject in it is being denied — not one noisy caller. Raise `namespace_limit_microdollars` or investigate what is spending. |
@@ -385,14 +309,8 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `400` | `unknown_provider` / `model_unprefixed` | Request `model` is not `provider-id/model-id`. | Prefix with a configured `[[provider]] id`. `GET /ns/{ns}/v1/models` lists cached ids. |
 | `400` | `unsupported_wire` | The alias's target (or one of its failover targets) does not speak this route's wire — e.g. an OpenAI-only alias on `/v1/messages`. Raised **before** anything is reserved or dispatched. | Fix the alias's targets; no route translates between wires. See the [compatibility contract](./compatibility.md). |
 | `400` | `invalid_request`, `context_window_exceeded`, `bad_request` | The provider (or the gateway) rejected the request shape. | Caller-side fix; retrying will not help. |
-| `400` | `middleware_refused` | Request middleware rejected the request as invalid before provider dispatch. The bounded message never echoes request content or middleware diagnostics. | Correct the request; retrying the same body will not help. |
-| `403` | `middleware_refused` | A content-policy middleware guardrail denied the authenticated request before provider dispatch. | Check the policy selected for the caller's namespace; changing provider health or retrying unchanged input will not help. |
 | `429` | `budget_exceeded` | The namespace's active period is at or over cap (`spent >= limit`), or no budget row exists. In-flight requests are not reserved against remaining. | Raise `limit_microdollars` or wait. This is the tenant's own cap, not a provider rate limit. |
 | `503` | `budget_unavailable` | The Store could not be reached and `[storage].on_unavailable = "deny"` (the default). | Fix SQLite/Postgres. **Distinguish this from `429`:** `429` is the tenant over budget, `503` is *your* dependency down. |
-| `503` | `rate_limit_unavailable` | The Redis rate-limit store could not be reached and `on_unavailable = "deny"` (the default). | Fix Redis or deliberately choose `on_unavailable = "allow"`. |
-| `503` | `middleware_unavailable` | A fail-closed content middleware invocation failed, exceeded its end-to-end deadline, could not acquire bounded global or per-id blocking capacity before that deadline, or its middleware id is temporarily quarantined while an abandoned invocation remains running. | Check middleware failure logs plus `axond.middleware.capacity_wait` and `axond.middleware.capacity_timeouts`. Other middleware ids remain operational; repair the named implementation, and restart only if its abandoned call never returns. |
-| `400` | `middleware_response_incompatible` | A streaming `/v1/messages` or `/v1/responses` request selected applicable stream-event middleware without explicitly opting that route into buffering. Even non-mutating middleware can refuse, so the gateway will not release byte-faithful content before its verdict. Refused before admission or provider dispatch. | Add the route to the governing policy's `buffered_response_routes` only if callers accept delayed output; mutating chains reconstruct events, while non-mutating chains preserve the original bytes. Otherwise remove the stream middleware. |
-| `503` | `model_not_priced` | Every target the alias could route to is bound to a catalogue offering the serving snapshot has no **approved** price for — the book is a draft, or it does not price the offering. On a route that pins its destination (`/v1/responses`), the pinned target alone decides this: an unpriced pin is refused this way even where a later target of the alias is chargeable. Raised before admission or a rate-limit permit is spent, so a refused request costs nothing. The alias stays listed by `/v1/models`: it is discoverable but not chargeable. | Approve a price book covering the offering, or drop the target's `catalog` binding to charge the configured `price` again. The response body carries a stable, redacted reason ("no price is in force for this model") and never names the price book or its approval state — those are control-plane facts, and they go to the gateway log instead, on the `alias has no approved price` warning ([ADR 0056](./adr/0056-request-path-pricing.md)). |
 | `503` | `draining` | The replica is terminating and has closed admission; `Retry-After: 0`. Expected during a rollout, on the requests that arrive after the readiness drain window. | Nothing on the gateway: the caller (or load balancer) should retry, and another replica should answer. Sustained volume means callers are not honoring readiness — check endpoint removal and `shutdown.drain_grace_ms`. |
 | `503` | `all_provider_circuits_open` | Every target the request could consider has a tripped circuit. That is all of the alias's targets on every route except `/v1/responses`, which considers only its pinned first target — so a Responses request can raise this while the alias's later targets are healthy. | The upstreams are down or the thresholds are too tight; check `axond.upstream.circuit_state`. On `/v1/responses`, read it as *the first target* being down, not the whole alias, and do not alert on it as an alias-wide outage. |
 | `502` | `no_credential` | The namespace has no credential for the resolved provider and no platform fallback. | Add a `[[credential]]`, or set `allow_platform_fallback` deliberately. |
@@ -400,15 +318,13 @@ Error bodies are `{"error": {"type": …, "message": …}}`.
 | `504` | `upstream_timeout` | A transport bound fired before a response could be served: connecting, waiting for headers, reading a buffered body, waiting for the next chunk of an open stream, or the walk's budget running out. | `axond.upstream.timeouts{axond.timeout}` and the attempt span's `axond.timeout` name the phase; `axond.timeout.bound` names the bound. Tune the matching `[transport]` bound, or `overall_timeout_ms` when the bound is `walk_budget`. |
 | `502` | `upstream_body_too_large` | A buffered provider response exceeded `transport.max_response_bytes`, so it was refused instead of held in memory. | Raise `max_response_bytes` if the workload legitimately returns bodies that size; otherwise treat it as a misbehaving target. |
 | `429` | `tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. The caller's own concurrency is the cause, so it is a `429` rather than a `503`. | Raise the per-tenant ceiling, or have the caller lower its concurrency. Carries `Retry-After: 1`. |
-| `503` | `gateway_overloaded`, `stream_capacity_exhausted` | The replica is at `admission.max_in_flight` (or `max_in_flight_streams`). Raised after authentication and before the rate-limit store, the budget reservation, and the provider, so a shed request costs nothing. | Scale out, or raise the ceilings to what one process can actually hold. `axond.admission.in_flight` says which resource ran out. |
+| `503` | `gateway_overloaded`, `stream_capacity_exhausted` | The replica is at `admission.max_in_flight` (or `max_in_flight_streams`). Raised after authentication and before the budget check and the provider, so a shed request costs nothing. | Scale out, or raise the ceilings to what one process can actually hold. `axond.admission.in_flight` says which resource ran out. |
 | `503` | `admission_queue_full`, `admission_queue_timeout` | Queueing is enabled and the queue is full, or a queued request outlived `admission.queue_wait_ms`. | Sustained shedding here means under-provisioning rather than burstiness; queueing only helps short bursts. |
-| `503` | `diagnostic_concurrency_exceeded` | Eight diagnostic reads (`GET /admin/v1/status`) were already being answered on this replica, or the share of the seventy-two pre-authentication permits its credential's shape may hold was already full — forty-eight for minted tokens, sixteen for credentials that resolve in memory, eight for callers presenting none, so neither a slow revocation store nor a credential-less flood can refuse a static key. That second ceiling sits outside authentication, which the first cannot bound without letting anonymous callers hold it closed. A fixed ceiling of its own, separate from `max_in_flight`: served traffic at its ceiling never makes the replica unanswerable, and polling the diagnostic never consumes served capacity. | Poll less often. It is not configurable, and a diagnostic answers from memory, so eight concurrent is a bound on abuse rather than a capacity dial. Carries `Retry-After: 1`. |
 | `503` | `admission_tenant_capacity_exhausted` | More distinct namespaces were in flight than `admission.max_tenants`, so the admission table itself is full. | Raise `max_tenants`. No `Retry-After` is sent: waiting will not change it. |
-| `503` | `settlement_capacity_exhausted` | The replica is carrying `admission.max_pending_settlements` charges its Store has not yet settled, so it refuses to admit another rather than serve it with a charge nowhere to go. Raised at admission, before the rate-limit store, the budget reservation, and the provider, so the refused request costs nothing. | The Store is slow or down: check `axond.settlement.oldest_pending_age` and the budget backend's own signals. Raising the ceiling only buys memory; the charge rate is the Store's. Carries `Retry-After: 1`. |
-| `413` | `request_too_large`, `prompt_too_large` | The inbound body exceeded `admission.max_request_bytes` (refused by the router before buffering), request middleware expanded it past that same ceiling (refused before provider dispatch), or the estimated input exceeded `admission.max_prompt_tokens`. | Caller-side or content-policy fix, or raise the bound if the workload needs it. Neither message echoes the request. |
+| `503` | `settlement_capacity_exhausted` | The replica is carrying `admission.max_pending_settlements` charges its Store has not yet settled, so it refuses to admit another rather than serve it with a charge nowhere to go. Raised at admission, before the budget check and the provider, so the refused request costs nothing. | The Store is slow or down: check `axond.settlement.oldest_pending_age` and the budget backend's own signals. Raising the ceiling only buys memory; the charge rate is the Store's. Carries `Retry-After: 1`. |
+| `413` | `request_too_large`, `prompt_too_large` | The inbound body exceeded `admission.max_request_bytes` (refused by the router before buffering) or the estimated input exceeded `admission.max_prompt_tokens`. | Caller-side or content-policy fix, or raise the bound if the workload needs it. Neither message echoes the request. |
 | `415` | `unsupported_media_type` | The request did not declare `content-type: application/json`. Unchanged in status from earlier releases; only the body is now the typed JSON envelope. | Caller-side fix: send a JSON content type. |
 | `400` | `output_limit_exceeded` | The request asked for more output tokens than `admission.max_output_tokens`. Refused rather than clamped. | Lower the caller's output allowance or raise the ceiling. |
-| `200` + SSE `error` | `middleware_stream_error` | An already-open stream's response middleware failed or exceeded its bound. Policy-buffered content is discarded rather than partially released. | Check middleware failure logs and capacity metrics. The usage row is `rejected` before caller-visible content or `partial` after incremental content. |
 | `503` | `continuation_affinity_unavailable` | A request carrying `previous_response_id` could not use the alias's pinned first target or credential, and continuity forbids substituting another. | Restore the first target/credential; retry later. An *initial* Responses request in the same state reports the ordinary error above instead. |
 
 `/v1/responses` records exactly one upstream attempt per request: it is pinned to
@@ -478,20 +394,3 @@ while parsing and validating the file:
 None of these messages contain a secret value — only env-var names, namespaces,
 and provider ids.
 
-### Reloads
-
-`SIGHUP` (and `[reload] watch`) re-run the same validation. A rejected candidate
-logs at `error` with the reason and leaves the previous config serving; the
-counter still increments with `outcome="rejected"`, so "someone tried and
-failed" is visible. An applied reload logs an added/removed diff of namespaces,
-providers, aliases, credential labels, and gateway-key env-var names, and bumps
-`axond.config.generation`.
-
-If a replica's generation lags the fleet, it missed a reload — its file or its
-process environment differs. Restarting it is always safe: it is stateless.
-
-The applied reload log also carries `catalog_changed` and
-`restart_required`. When `catalog_changed` is `true`, the
-`[catalog]` edit was validated but the boot-owned importer, and the serving
-snapshot's catalogue settings, remain unchanged; the warning immediately after
-the log line tells the operator to restart.

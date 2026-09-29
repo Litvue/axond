@@ -14,7 +14,7 @@ byte-faithfulness guarantees of [ADR 0012](./0012-native-provider-routes.md) and
 [ADR 0028](./0028-transport-phase-bounds.md) and
 [ADR 0030](./0030-request-bounds-and-load-shedding.md). Policy delivery reuses
 [ADR 0036](./0036-typed-policy-documents-generations-and-transitions.md) and
-[ADR 0050](./0050-runtime-policy-activation.md) rather than inventing a second
+ADR 0050 rather than inventing a second
 one.
 
 ## Context

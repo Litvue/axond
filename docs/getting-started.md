@@ -22,7 +22,7 @@ docker compose up -d
 
 The base Compose file pulls the current public image and mounts
 `ops/compose/axond.quickstart.toml`. It requires `[storage]` (a temp SQLite
-file inside the container). Redis is not started. Axond writes one JSON usage
+file inside the container). Axond writes one JSON usage
 record per completed request to its container log.
 
 The values in `.env` are intentionally public placeholders. They are safe only
@@ -118,9 +118,8 @@ before every Compose command.
 
 ## Try the Postgres overlay
 
-The stateful Compose example adds a Postgres Store (and leftover Redis from
-the old overlay — budgets no longer use it). File-owned providers and prices
-stay in TOML; namespaces and period caps live in the Store.
+The stateful Compose example adds Postgres for durable usage rows. File-owned
+providers and prices stay in TOML; namespaces and period caps live in the Store.
 
 ```bash
 export AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml
@@ -131,9 +130,6 @@ docker compose \
 
 Use those same `-f` and `--profile` flags on every follow-up command. See the
 [Compose guide](./deployment/docker-compose.md).
-
-`mode = "stateful"`, `[control_plane]`, and `axond admin model apply` are
-withdrawn. Do not follow the old `/admin/v1` runbooks.
 
 ## Run current source instead
 

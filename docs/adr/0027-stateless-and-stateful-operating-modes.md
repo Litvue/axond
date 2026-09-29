@@ -227,7 +227,7 @@ would silently serve state an administrator already replaced. It is
 authenticated before it is interpreted and re-verified through the domain's
 integrity checks afterwards, so an edited cache refuses to boot rather than
 becoming desired state. See
-[revision convergence](../operations/revision-convergence.md).
+revision convergence.
 
 The asymmetry that remains is deliberate: a running replica must survive a
 control-plane outage, and a brand-new replica can only do so if a sibling left

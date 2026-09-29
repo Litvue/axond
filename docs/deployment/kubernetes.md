@@ -129,12 +129,9 @@ ops/pin-image-digest.sh --print 0.6.3 # x-release-please-version, prints the dig
 ops/pin-image-digest.sh 0.6.3 # x-release-please-version, rewrites the overlays
 ```
 
-Both production overlays are rewritten, and a bare `--check` answers for both:
-the stateful one pins its migration Job itself, so a helper blind to it would
-report a resolved fleet while that Job still named an image no node can pull.
-That is the answer a repository gate wants. Name an overlay when you are rolling
-one out and want an answer about it — an unresolved sentinel in an overlay you
-are not applying is not a reason to fail your rollout.
+A bare `--check` answers for every overlay, which is the answer a repository
+gate wants. Name an overlay when you are rolling one out and want an answer
+about it.
 
 Resolution insists on the multi-architecture index, so a digest naming one
 architecture's child image — schedulable onto that architecture alone — is
@@ -182,252 +179,9 @@ Autoscaling on CPU does not make `[admission]` ceilings fleet-wide — read
 [Scaling](#scaling) before enabling it, and treat
 `axond.admission.rejections` as the saturation signal that CPU may not show.
 
-## Stateful mode
-
-> **Withdrawn ([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).**
-> `mode = "stateful"` and `/admin/v1` are not served. Use the production overlay
-> with `[storage]` (SQLite or Postgres). The rest of this section is a
-> historical record of the control-plane overlay.
-
-`deploy/kubernetes/overlays/production-stateful` is the production overlay plus
-the `deploy/kubernetes/components/stateful` component, and it deploys a fleet
-with a different lifecycle: a stateful replica boots, serves `/admin/v1` against
-the control plane, and remains fail-closed until a published revision or valid
-last-known-good cache compiles into a runtime snapshot ([revision convergence](../operations/revision-convergence.md)).
-Until that snapshot is active, **no replica reports Ready**, and three defaults
-of a serving fleet become wrong at once. The component answers each:
-
-- **The upgrade.** `Recreate`, replacing the base's rolling update: a rolling
-  update with `maxUnavailable: 0` waits for an availability that never arrives,
-  so an upgrade of a stateful fleet stalls with one surge Pod and three
-  untouched replicas. `kubectl rollout status` also waits for availability, so
-  it times out on a completed upgrade too — watch `.status.updatedReplicas`
-  instead:
-
-  ```bash
-  kubectl -n axond get deployment axond \
-    -o jsonpath='{.status.updatedReplicas}/{.status.replicas}{"\n"}'
-  ```
-
-  Recovering a fleet already stalled that way takes two changes, not one:
-  restoring `strategy: Recreate` leaves the surge Pod carrying the target
-  template, so the Deployment has nothing new to converge on and stays where it
-  is. Restore the strategy *and* roll the template in the same edit — the drill
-  below asserts that pair, and that the strategy alone is not enough.
-
-- **Administrative access.** The default stateful component deliberately creates
-  no `axond-admin` Service. A ClusterIP is not a security boundary when a
-  cluster's CNI ignores NetworkPolicy, and `/admin/v1` shares the listener with
-  inference. Reach one replica through an operator-controlled Pod port-forward:
-  The `axond` Service selects Ready endpoints and therefore has none. That is
-  correct for inference, and direct Pod forwarding keeps the administrative
-  surface out of the cluster-wide Service namespace.
-
-  ```bash
-  kubectl -n axond get pods -l app.kubernetes.io/name=axond
-  kubectl -n axond port-forward pod/<running-axond-pod> 8080:8080
-  curl -fsS -H "Authorization: Bearer ${GW_ADMIN_BREAKGLASS}" \
-    http://127.0.0.1:8080/admin/v1/tenants
-  ```
-
-  A port-forward is a kubelet-mediated operator action rather than a
-  cluster-wide network endpoint, so this remains fail-closed even when the CNI
-  does not implement NetworkPolicy. The production overlay's ingress allowance
-  is also replaced by `admin-boundary.yaml`; until a complete stateful snapshot
-  is qualified, inheriting that allowance would expose `/admin/v1` to the public
-  ingress path.
-
-  ```yaml
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              axond.dev/admin-client: "true"
-      ports:
-        - protocol: TCP
-          port: 8080
-  ```
-
-  If a Service is required, apply
-  `deploy/kubernetes/components/stateful/admin-service.yaml` only as an explicit
-  opt-in alongside a CNI-enforced, operator-authenticated boundary. Do not add it
-  to the default component or restore the inference ingress rule. The only
-  authentication in front of the surface itself today is the break-glass
-  credential in `axond-secrets`.
-
-  The manifest gate requires the default stateful render to contain no
-  `axond-admin` Service and no ingress route to it, so a CNI implementation detail
-  cannot silently widen the administrative surface.
-
-- **Node drains.** `unhealthyPodEvictionPolicy: AlwaysAllow` on the disruption
-  budget. The default (`IfHealthyBudget`) evicts an unready Pod only while the
-  budget is otherwise satisfied, so on a fleet where no Pod is healthy it
-  refuses every eviction and a node drain never finishes.
-
-The schema is applied once, by the `axond-migrate` Job the component adds, not
-by the replicas: `axond migrate apply` is forward-only and idempotent, but a
-restart that let three replicas migrate concurrently is a database being
-rewritten while its peers read it. The Job
-carries its own default-deny NetworkPolicy (DNS plus Postgres, nothing else),
-and does not wear `app.kubernetes.io/name: axond`, so it is neither a Service
-endpoint nor selected by the gateway's own policies. A Job is immutable once
-created, so an upgrade re-runs it explicitly:
-
-```bash
-kubectl delete job axond-migrate -n axond --ignore-not-found
-kubectl apply -k deploy/kubernetes/overlays/production-stateful
-kubectl wait --for=condition=complete job/axond-migrate -n axond --timeout=5m
-kubectl logs job/axond-migrate -n axond
-```
-
-Nothing orders that apply: the Job and the Deployment are created together, and
-a replica that finds an unrecognised schema refuses to boot and exits. So a
-first install crash-loops for as long as the migration takes, then converges on
-kubelet's backoff — self-healing, but indistinguishable at a glance from a
-broken deployment. For an install that does not look like one, migrate against
-an empty fleet:
-
-```bash
-kubectl apply -k deploy/kubernetes/overlays/production-stateful
-kubectl scale deployment/axond -n axond --replicas=0
-kubectl wait --for=condition=complete job/axond-migrate -n axond --timeout=5m
-kubectl scale deployment/axond -n axond --replicas=3
-```
-
-That convergence is the replicas' and not the Job's. A Job that exhausts its
-backoff — a control-plane database that never answered, most often on a first
-install — is `Failed` permanently, and the fleet then crash-loops forever while
-looking exactly like one waiting out a slow migration. Check the Job before
-concluding a stuck install is transient, and recover it by re-running it once
-the database answers:
-
-```bash
-kubectl get job axond-migrate -n axond   # BackoffLimitExceeded ⇒ it will not retry
-kubectl delete job axond-migrate -n axond
-kubectl apply -k deploy/kubernetes/overlays/production-stateful
-```
-
-`axond migrate status` — the same binary, read-only — is what tells a
-crash-looping replica apart from one waiting for a projected serving snapshot:
-the first reports a schema behind the binary, the second reports it current.
-
-The overlay pins its own images, because the production overlay's transformer
-never sees the Job: `ops/pin-image-digest.sh` resolves the sentinel in
-`overlays/production-stateful/kustomization.yaml` alongside the production one,
-and its `--check` refuses either while unresolved. The mounted
-`axond.toml` declares `mode = "stateful"`, the control-plane DSN, the SecretStore
-KEK, and a break-glass principal, and declares no providers, models, aliases,
-tenants, or `[convergence]` cache: in this mode the control plane owns
-resources, and this Recreate Deployment has no durable per-replica volume for a
-cold-boot cache. Apply the `axond-secrets` Secret first — including
-`GW_CONTROL_PLANE_DSN`, `GW_SECRET_STORE_KEK`, and `GW_ADMIN_BREAKGLASS` — then
-apply the ConfigMap/overlay. The shipped
-`production-stateful-persistent` StatefulSet/PVC overlay adds the authenticated
-cache; provision its canonical 32-byte signing key before the ConfigMap and keep
-the exact value on every replica. Never put the key in the ConfigMap or
-diagnostics.
-and see [Stateful backends](./stateful-backends.md) for choosing the stores and
-[backup and recovery](../operations/backup-and-recovery.md) for what has to be
-recoverable before the fleet holds anything.
-
-Whether the upgrade lands, whether `/admin/v1` is reachable, and whether a node
-drains are API-server outcomes no rendered manifest can answer, so each is
-proven on a real cluster with its counterfactual:
-
-```bash
-just stateful-deploy-drill        # ops/stateful-deploy-drill.sh on a three-worker
-                                  # kind cluster, ~5 minutes
-just stateful-persistent-drill    # retained PVC ordinal replacement on kind
-```
-
-The drill migrates once, asserts three Running and zero Ready replicas, probes
-`/healthz`, `/readyz`, inference, and `/admin/v1` through an operator Pod
-port-forward, then
-requires a `RollingUpdate` to stall and the default disruption budget to refuse
-the eviction that `AlwaysAllow` permits. Run it when you change the strategy,
-the Services, the budget, or the migration Job.
-
-### Durable StatefulSet option
-
-`deploy/kubernetes/overlays/production-stateful-persistent` is a separate,
-opt-in render for replicas that must retain a signed last-known-good snapshot
-across Pod replacement. It layers on the same stateful ConfigMap, migration Job,
-NetworkPolicies, administrative boundary, and image pinning as the Recreate
-overlay, then replaces only the Deployment with:
-
-- a three-replica `StatefulSet` with `podManagementPolicy: Parallel`, stable
-  ordinal identity, and `updateStrategy: OnDelete`;
-- a headless `axond-headless` governing Service used for StatefulSet identity
-  only; the existing `axond` Service still excludes unready replicas; and
-- one retained `ReadWriteOnce` `1Gi` PVC per ordinal, mounted at
-  `/var/lib/axond`, where `[convergence].cache_path` writes the authenticated
-  `last-known-good.snapshot`.
-
-The Pod sets `fsGroup: 65532`, matching the distroless `:nonroot` group, so the
-non-root image can write the cache on root-owned CSI volumes.
-
-The PVC template deliberately omits `storageClassName`, so the cluster's
-default StorageClass must be a durable CSI-backed class. Review that class's
-replication, reclaim, encryption, and snapshot policy before applying this
-option; a PVC is per-replica persistence, not a substitute for the database
-backup and PITR procedure. `whenDeleted: Retain` and `whenScaled: Retain` keep a
-replica's cache available for investigation and recovery rather than silently
-deleting it with the workload.
-
-This option does not change the existing
-`deploy/kubernetes/overlays/production-stateful` render. The latter remains the
-Recreate/emptyDir administrative deployment and is the current fail-closed
-path. The persistent option keeps `OnDelete` so the operator controls
-replacement of each stable ordinal and its retained RWO volume. A complete
-projected revision can report Ready and serve; an incomplete bootstrap remains
-intentionally unready. Keep replacement manual until the stateful rollout
-qualification is retained, and use the persistent option only when its storage
-class and recovery ownership are approved:
-
-```bash
-overlay=deploy/kubernetes/overlays/production-stateful-persistent
-ops/pin-image-digest.sh --check overlays/production-stateful-persistent
-kubectl apply -k "$overlay"
-kubectl -n axond wait --for=condition=complete job/axond-migrate --timeout=5m
-kubectl -n axond get statefulset axond
-kubectl -n axond get pvc -l app.kubernetes.io/name=axond
-```
-
-Run the disposable runtime qualification before enabling this option in a
-real cluster:
-
-```bash
-ops/stateful-persistent-drill.sh
-```
-
-That drill verifies the migration Job, three Bound PVCs, the cache mount, and
-ordinal replacement. The stateful integration recovery lane separately writes
-and restores the signed desired-state and encrypted compiled-serving caches;
-the two checks together cover both the cache format and the storage lifecycle.
-
-The four Secret values remain the same as the Recreate path, including the
-deployment-wide `GW_LAST_KNOWN_GOOD_KEY`. Provision that key before applying
-the ConfigMap. To replace one replica, delete its Pod and leave its PVC in
-place; the StatefulSet recreates the same ordinal and the process can read its
-authenticated cache. To update the image or mounted configuration, delete the
-Pods one ordinal at a time after the migration Job is current. Do not delete
-the PVCs as part of that operation.
-
-For the operator sequence around these checks — including the deliberately
-unready probe contract, first-install migration ordering, desired-state rollback,
-and a compatible image rollback — use the
-[stateful Kubernetes deployment runbook](../operations/stateful-deployment-runbook.md).
-
 ## Configuration and secrets
 
-The stable `axond-config` ConfigMap name and `[reload] watch = true` allow a
-projected-volume symlink swap to be observed without a process restart. A bad
-candidate is rejected while the previous snapshot keeps serving.
-
-Not every setting is live-reloadable. Changes to `[server]`, `[[usage_sink]]`,
-`[budget]`, or `[catalog]` require a rollout restart. Catalogue edits are
-validated and reported, but the existing importer remains on its boot-time
-source, store, and schedule until the Pod is replaced. Environment-backed
+Config changes take a rollout restart; there is no hot reload. Environment-backed
 secrets also require replacement Pods because a running process cannot acquire
 new environment values:
 
@@ -435,25 +189,15 @@ new environment values:
 kubectl -n axond rollout restart deployment/axond
 ```
 
-Use a CSI secret volume and file-backed `[[gateway_key]]` or
-`[[gateway_verifier]]` when same-process key-material reload is required.
+A file-backed `[[gateway_key]]` from a CSI secret volume is read at boot.
 Provider credentials and backend DSNs are environment references today.
-
-The stateful component's replacement `axond.toml` omits `[reload]` deliberately.
-What a stateful replica reads from a file is `[server]`, `[control_plane]`,
-`[secret_store]`, `[[admin_breakglass]]`, and `[admission]`; none of those is
-live-reloadable, and everything that changes day to day is administered through
-`/admin/v1` instead. So a watch would observe swaps it could not act on. Changing
-that file on a stateful fleet is a rollout, and with `strategy: Recreate` that
-takes the admin surface down for the length of it — plan it as a maintenance
-window, as you would a version upgrade.
 
 ## Probes
 
 The listener binds only after boot validation, secret resolution, and initial
 connections to configured backends succeed. `/readyz` therefore proves a valid
-serving snapshot at boot, but it does not continuously probe providers, Redis,
-or Postgres. Alert on request-path metrics and typed `503` responses for
+serving snapshot at boot, but it does not continuously probe providers or
+Postgres. Alert on request-path metrics and typed `503` responses for
 runtime dependency health.
 
 `/readyz` also reports the drain: it answers `503 draining` from the moment
@@ -469,7 +213,6 @@ parts remain replica-local:
 
 - credential and target circuit state;
 - round-robin/weighted cursors;
-- in-memory `[rate_limit]` (unless `backend = "redis"`);
 - `[admission]` request bounds and load shedding.
 
 See [Store backends](./stateful-backends.md).

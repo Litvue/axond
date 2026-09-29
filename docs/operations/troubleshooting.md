@@ -12,13 +12,10 @@ connects configured backends before binding the socket.
 | --- | --- | --- |
 | `failed to load config` | Missing file, invalid TOML, invalid graph, or unsupported combination. | Check `AXOND_CONFIG`, then compare against the configuration reference. |
 | `references env var ... unset or empty` | A credential, gateway key, verifier, or DSN reference is absent from the process environment. | Set it on the actual service/container and restart. |
-| `cached guardrail key reference ... resolves to different material` | A cold-recovery cache was compiled with a different value behind the same `key_env` name. | Restore the original value, or recover control-plane access and publish a new policy naming a new versioned environment variable before rotating. |
 | `exactly one \`[[gateway_key]]\`` | Zero or more than one static key. | Declare exactly one deployment-wide key. |
 | `mode is withdrawn` | `mode` is set. | Remove the `mode` key. |
 | `usage sink configuration failed` | Postgres or OTLP configuration/connectivity failed, or the usage outbox could not connect to or read its tables. | Verify DSN/endpoint, DNS, TLS, schema, and credentials; for `[usage_journal]`, that `ops/postgres/usage_outbox_v1.sql` is applied in the named schema and the role can read it. |
 | `budget configuration failed` | Budget backend unavailable or layout migration incomplete. | Restore the backend or complete the named migration. |
-| `rate-limit configuration failed` | Redis is unavailable or invalid. | Verify URL, TLS, DNS, and connectivity. |
-| `revocation configuration failed` | Redis/Postgres revocation store is unavailable or missing schema. | Apply DDL or restore connectivity. |
 
 Boot errors name references and identifiers, not secret values.
 
@@ -26,19 +23,15 @@ Boot errors name references and identifiers, not secret values.
 
 | Status / type | Meaning | First check |
 | --- | --- | --- |
-| `401 unauthorized` | No presented credential matched the static gateway key, or the caller sent `axt1.`. | Header value; minted tokens are not inbound identity. |
+| `401 unauthorized` | No presented credential matched the static gateway key. | Header value. |
 | `404 unknown_namespace` | Path namespace missing or deleted. | `GET /api/v1/namespaces/{ns}`; same body for never-existed and deleted. |
 | `400 model_unprefixed` / `unknown_provider` | Request `model` is not `provider-id/model-id`. | Prefix with a configured provider id. |
 | `400 unsupported_wire` | Route and alias provider family differ. | Keep every alias target in one wire family and use the matching route. |
 | `400 bad_request` | Invalid request or query shape. | Error message; repeated/invalid `namespaces` values are rejected deliberately. |
-| `400 middleware_refused` | Request middleware classified the request as invalid before provider dispatch. | Request shape and the namespace's selected content policy. |
-| `403 middleware_refused` | A content-policy guardrail denied the authenticated request before provider dispatch, including an unrewritable match in a JSON key, continuation id, forwarded native wire header, or split text fragment. | The namespace's selected policy and request structure; this is not provider or credential health. |
 | `429 budget_exceeded` | Namespace spend cap: `spent >= limit`, or no budget row. | `GET /api/v1/namespaces/{ns}/budgets/{period}`. |
-| `429 rate_limit_exceeded` | In-flight concurrency cap reached. | Caller concurrency and limiter metrics. |
 | `429 tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. | `axond.admission.in_flight`; whether the tenant's own concurrency, not the replica, is the cause. |
-| `413 request_too_large` / `413 prompt_too_large` | Inbound or post-middleware body over `admission.max_request_bytes`, or estimated input over `admission.max_prompt_tokens`. | The caller's payload size and selected content policy; raise the bound only if the workload genuinely needs it. |
+| `413 request_too_large` / `413 prompt_too_large` | Inbound body over `admission.max_request_bytes`, or estimated input over `admission.max_prompt_tokens`. | The caller's payload size; raise the bound only if the workload genuinely needs it. |
 | `200` + SSE `error` typed `upstream_stream_error` | A stream hit `admission.max_stream_duration_ms` or `admission.max_stream_bytes`; the bounds cannot change a status already sent. | The event's message names the bound; the usage record settles with what was relayed. |
-| `200` + SSE `error` typed `middleware_stream_error` | Response middleware failed after the upstream stream opened, including an incomplete request-generated redaction token at strict EOF. Explicitly buffered content is discarded; incremental content already sent cannot be recalled. | Middleware logs and capacity metrics; for `axond.redact`, verify the provider returned every placeholder byte and did not alter it. Usage status distinguishes `rejected` from `partial`. |
 | `415 unsupported_media_type` | The request did not declare `content-type: application/json`. | The caller's `Content-Type` header. |
 | `400 output_limit_exceeded` | The request asked for more output tokens than `admission.max_output_tokens`. | The request's `max_tokens`/`max_completion_tokens`/`max_output_tokens`. |
 | `503 gateway_overloaded` / `503 stream_capacity_exhausted` | The replica is at `admission.max_in_flight` or `max_in_flight_streams`. | `axond.admission.rejections` by resource, replica count, and whether the ceilings match what one process can hold. |
@@ -50,11 +43,7 @@ Boot errors name references and identifiers, not secret values.
 | `502 upstream_body_too_large` | A buffered provider body exceeded `transport.max_response_bytes`. | Whether the workload really returns bodies that size; otherwise treat the target as misbehaving. |
 | `502 invalid_request` | Provider returned a non-retryable request/auth error. | Provider credential, model deployment, and provider body. |
 | `503 usage_not_durable` | Billing-grade delivery is on and the request's usage event could not be made durable, so the gateway will not report success for a request it cannot bill. | `axond.usage.journal.appends` by outcome, and depth against capacity: a full outbox usually means delivery has stalled, not that appends are too fast — or a retired `consumer` name is still registered and holding retention open ([usage outbox](./usage-outbox.md#when-a-request-is-refused)). |
-| `503 budget_unavailable` | Shared budget backend failed under fail-closed policy. | Redis/Postgres health and latency. |
-| `503 rate_limit_unavailable` | Redis limiter failed under fail-closed policy. | Redis health, invoke saturation, connection recovery. |
-| `503 middleware_unavailable` | Fail-closed middleware failed, exceeded its end-to-end deadline, timed out waiting for bounded global or per-id blocking capacity, or its id is temporarily quarantined while an abandoned invocation remains running. `axond.redact` also refuses atomically above 4,096 distinct originals or carry channels, 1 MiB of carry identity, or 64 KiB of carry prefixes. | Middleware warning logs, `axond.middleware.capacity_wait`, and `axond.middleware.capacity_timeouts`. For redaction, inspect request match cardinality and provider stream-channel identity/cardinality. Other ids continue to run; repair the named implementation, and restart only if its abandoned call never returns. |
-| `400 middleware_response_incompatible` | A byte-faithful streaming route selected stream-event middleware without the route's explicit buffering opt-in. Even a non-mutating callback can refuse, so bytes cannot be released ahead of its verdict. | The governing policy's `buffered_response_routes`; opt in only if delayed output is acceptable. Mutating chains reconstruct events. Non-mutating chains preserve original bytes and therefore fail closed on comments, blank heartbeats, `id:`, `retry:`, unknown SSE fields, duplicate JSON keys, and post-terminal content; qualify the provider/proxy wire first. |
-| `503 revocation_unavailable` | JTI store failed under fail-closed policy. | Redis/Postgres health and configured policy. |
+| `503 budget_unavailable` | The Store failed under `[storage] on_unavailable = "deny"`. | SQLite/Postgres health and latency. |
 | `503 continuation_affinity_unavailable` | A request carrying `previous_response_id` cannot safely use its pinned first target or credential. | First-target circuit and first-credential state; retry later. |
 
 All error bodies use `{"error":{"type":...,"message":...}}`.
@@ -88,7 +77,7 @@ provider/network telemetry.
 ```bash
 curl --fail \
   -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" \
-  http://127.0.0.1:8080/v1/credentials
+  http://127.0.0.1:8080/ns/platform/v1/credentials
 ```
 
 - `healthy`: available to selection.
@@ -98,30 +87,19 @@ curl --fail \
 Status reads are pure and do not consume a probe. A connection-refused provider
 does not park a credential; only provider `429` exhaustion does.
 
-The all-namespace view requires a scope-less static key in the configured
-default namespace:
+The all-namespace view requires the static key whose `namespace` is the
+configured default namespace:
 
 ```bash
 curl --fail \
   -H "Authorization: Bearer $GW_INBOUND_PLATFORM_KEY" \
-  'http://127.0.0.1:8080/v1/credentials?namespaces=all'
+  'http://127.0.0.1:8080/ns/platform/v1/credentials?namespaces=all'
 ```
 
-Minted tokens cannot access this operator view, even if they carry a forged
-`credentials:all` claim.
+## A config change did not apply
 
-## Reload did not apply
-
-A rejected candidate leaves the old snapshot serving. Look for
-`config reload rejected` and fix the complete error before retrying.
-
-- A new environment variable cannot be injected into a running process.
-- File-backed key material can be replaced and re-read.
-- `[server]`, `[transport]`, `[[usage_sink]]`, and `[budget]` changes require
-  restart; a changed `[transport]` is validated and warned about, because the
-  upstream HTTP client is already pooled.
-- ConfigMap/projected-volume updates require `[reload] watch = true` or an
-  explicit `SIGHUP`.
+There is no hot reload. Config, environment, and file-backed key material are
+read at boot, so a change takes a restart or a rollout.
 
 ## A request hangs, or ends sooner than expected
 

@@ -21,7 +21,7 @@ replaced by one complete namespace-owned model and alias view.
 Types the entitlement half of the stateful mode chosen in
 [ADR 0027](./0027-stateless-and-stateful-operating-modes.md), inside the tenancy
 bodies of
-[revision convergence](../operations/revision-convergence.md#resource-body-schemas),
+revision convergence,
 and keeps the wire-family rule of
 [ADR 0020](./0020-alias-wire-family-validation.md) as the constraint an alias's
 targets are held to.
@@ -149,7 +149,7 @@ rather than taste:
   Untyped alias rows exist in revisions already in the journal, and refusing one
   would stop an existing revision from hydrating on upgrade. Such a row is
   neither validated nor refused by these rules, which
-  [revision convergence](../operations/revision-convergence.md#resource-body-schemas)
+  revision convergence
   states as the one exception to the untyped-body rule. The exception is keyed on
   the field being *absent*: a body that carries a `schema` which is not text is
   refused, because a damaged marker is not an older release's writing and reading

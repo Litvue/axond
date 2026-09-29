@@ -33,7 +33,7 @@ For expected responses, source builds, and the Postgres overlay, follow
 
 | Environment | Guide | Best fit |
 | --- | --- | --- |
-| Docker Compose | [Compose](./deployment/docker-compose.md) | Evaluation, local integration, and reproducible stateful demos. |
+| Docker Compose | [Compose](./deployment/docker-compose.md) | Evaluation, local integration, and reproducible demos. |
 | Docker or Podman | [Container](./deployment/container.md) | Existing container platforms and custom orchestration. |
 | Linux VM / bare metal | [systemd](./deployment/systemd.md) | Static binary behind an existing proxy/load balancer. |
 | Kubernetes | [Kubernetes](./deployment/kubernetes.md) | Horizontally scaled container deployment with ConfigMap/Secret delivery. |
@@ -140,8 +140,7 @@ TOML owns structure; scalar overrides are for deployment adaptation. Secret
 *values* never belong in the file: `env = "NAME"` or, for inbound keys, `file =
 "/run/secrets/..."`. Azure Key Vault (or any platform store) injects those
 references at process start. Changing an env-injected secret is a new
-revision. Reloading re-reads process env and referenced files; it cannot see a
-secret the platform has not yet placed. Provider `[[credential]]` is env-only
+revision. Provider `[[credential]]` is env-only
 today. Do not look up Key Vault on the request path.
 
 ## Health and readiness
@@ -154,7 +153,7 @@ today. Do not look up Key Vault on the request path.
 | `GET /ns/{ns}/v1/credentials` | gateway credential | Replica-local credential labels and circuit state. |
 
 `/readyz` does not probe providers or the Store. Dependency health is typed
-errors (`503 budget_unavailable`) and metrics. `/admin/v1/status` is unmounted.
+errors (`503 budget_unavailable`) and metrics.
 
 Point the load balancer at `/readyz` and liveness at `/healthz`: on `SIGTERM`
 the replica fails readiness first, keeps serving for `shutdown.drain_grace_ms`,
@@ -174,41 +173,17 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318
 Unset is supported: Axond writes JSON logs and usage records to stdout. See the
 [observability runbook](./observability.md).
 
-## Hot-reload and rotation
+## Configuration changes and rotation
 
-`SIGHUP` and optional `[reload] watch = true` validate and atomically publish a
-new snapshot. Invalid candidates leave the old snapshot serving. File-backed
-key material can be replaced and re-read; new process environment variables
-require a replacement process/container.
+Config changes take a restart; there is no hot reload. Rotate the static
+gateway key or a provider credential by rolling replicas with the new value.
+Replicas share nothing but the Store, so a rolling restart keeps serving.
 
-`[server]`, `[[usage_sink]]`, `[budget]`, and `[catalog]` changes require
-restart. A catalogue edit is validated on reload and called out in the applied
-reload log, but the running importer and the serving snapshot retain their
-boot-time settings until restart. Follow the [minted-token
-guide](./minted-token-guide.md) for signer and revocation operations.
+## Sizing
 
-## Sizing and stateful opt-ins
-
-Tier 0 has no datastore and scales by adding replicas, but circuits, credential
-health, and in-memory controls are replica-local. Redis and Postgres make
-selected controls exact/durable and therefore become availability and migration
-dependencies. The [stateful guide](./deployment/stateful-backends.md) contains
-the capability matrix, failure policy, and namespace-cap migration sequence.
-
-Every deployment described here runs the stateless operating mode, where TOML is
-the authority, and nothing about them changes if you never set `mode`. The
-opt-in, Postgres-backed control plane accepted in
-[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) is partly
-built: a stateful replica boots, applies no schema of its own, and serves
-[`/admin/v1`](./operations/admin-api.md). Before any complete revision has been
-published, the replica fails `/readyz` and remains fail-closed: anonymous
-inference is `401 unauthorized`, while an already authenticated bootstrap
-caller reaches the typed `503 inference_unavailable` convergence refusal. A
-complete revision projects recoverable workload principals with its tenancy,
-providers, credentials, models, aliases, and pricing, then publishes that whole
-serving snapshot atomically. Its deployment shape, and the operator commands
-that prepare its schema, are in
-[Kubernetes › Stateful mode](./deployment/kubernetes.md#stateful-mode).
+Replicas scale horizontally against one Store. Circuits, credential health,
+and admission ceilings are replica-local. SQLite serves one replica; use
+Postgres for more. See [Store backends](./deployment/stateful-backends.md).
 
 ## Next steps
 

@@ -18,9 +18,7 @@ Two rules hold everywhere:
   or, for gateway key material, a file path. No config key takes material
   inline.
 - **Fail at boot, not at request time.** The whole graph is validated before the
-  socket is bound, and again on every reload. Anything listed as "rejected"
-  below is a boot error (or, on reload, is rejected while the previous config
-  keeps serving).
+  socket is bound. Anything listed as "rejected" below is a boot error.
 
 Loading order: the TOML file (`AXOND_CONFIG`, default `axond.toml`), then
 `AXOND_`-prefixed environment variables layered on top with `__` as the section
@@ -32,8 +30,7 @@ TOML plus env holds bind, providers, credentials, **exactly one**
 fallback, the blocklist, and process bounds (`[admission]`, `[transport]`,
 `[shutdown]`, telemetry). Namespaces, period budgets, and usage also live in the
 Store: file `[[namespace]]` rows are seeded at boot; further namespaces are
-created through `/api/v1`. Changing process config is a restart or a reload of
-the keys that reload supports.
+created through `/api/v1`. Changing process config is a restart.
 
 ## State tiers
 
@@ -49,141 +46,43 @@ missing or unreachable store is a boot failure.
 | `[credential_pool]`, `[failover]` | In-memory, per replica. Alias-level failover is gone; credential-pool rotation inside one provider remains. |
 | `[transport]`, `[admission]`, `[shutdown]` | Process-level bounds. |
 | `[[gateway_key]]` | **Exactly one** deployment-wide static key. |
-| `[reload]` | Re-reads the config file, referenced key-material files, and process environment. Not a live channel for `[storage]`. |
 | `[[usage_sink]]` omitted or `kind = "stdout"` | One JSON line on stdout. |
 | `[[usage_sink]] kind = "otlp"` | Process-local export; a collector is a boot-time dependency. |
 | `[[usage_sink]] kind = "postgres"` | Durable usage rows (optional sink; the Store already has a usage index). |
 | `[usage_journal]` omitted or `backend = "none"` | Telemetry-grade usage delivery. |
 | `[usage_journal] backend = "postgres"` | Durable usage outbox on the request path. |
 | `[budget]` | Hold TTL only. `backend = "redis"\|"postgres"\|"in-memory"` is a boot error. Caps are `PUT /api/v1/namespaces/{ns}/budget` (monthly) or `PUT /api/v1/namespaces/{ns}/budgets/{period}` (fixed). |
-| `[rate_limit]` | Optional per-replica or Redis in-flight limiter. Not a budget backend. |
 | `/healthz`, `/readyz` | Unauthenticated liveness / readiness. |
 
-`[[model]]` is a boot error. Callers send `provider-id/model-id`. There is no
-config hot-reload of a model table.
+`[[model]]` is a boot error. Callers send `provider-id/model-id`.
 
-## Operating mode
+## Removed sections
 
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `mode` | withdrawn | omitted | Any presence is a boot error, including `mode = "stateless"` and `mode = "stateful"`. Axond is store-backed; there is no mode matrix. Remove the key. |
+[ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md) withdrew these.
+A config that still names one fails to boot; delete it:
 
-Omitting `mode` is the only valid configuration. The two-mode product in
-[ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) is superseded
-by [ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md).
-
-### Stateful bootstrap
-
-These sections still parse far enough for diagnostics to name them, then fail
-validation. They are not a supported deployment. The parser-accepted field
-names are listed so an old file's error is readable; do not copy them into a
-new config. [`axond.stateful.example.toml`](../axond.stateful.example.toml) is
-the withdrawn file with prose — it is not a runnable bootstrap.
-
-A referenced env var must also stay clear of the `AXOND_<section>` shape,
-because `AXOND_`-prefixed variables are the override layer: `AXOND_ADMIN_BREAKGLASS`
-would be merged as the `admin_breakglass` *key* rather than resolved as a
-reference. Such a name is rejected at validation, naming the variable and the
-key it collides with. Live examples use the `GW_` prefix for secret-bearing
-variables.
-
-Presence of `[control_plane]`, `[secret_store]`, `[[admin_breakglass]]`,
-`[admin_oidc]`, or `[convergence]` is a boot error: Axond has no control-plane
-mode and does not serve `/admin/v1`.
-
-#### `[control_plane]`
-
-Withdrawn. Presence is a boot error.
-
-| Key | Type | Default | Meaning (historical) |
-| --- | --- | --- | --- |
-| `backend` | `object-storage` \| `postgres` | `postgres` | Durable control-plane implementation. Redis and memory were refused. |
-| `dsn_env` | string | — | **Postgres only.** Name of the env var holding the control-plane connection string. |
-| `schema` | string | connection default | **Postgres only.** PostgreSQL journal schema. A single unqualified identifier. |
-| `migrate` | boolean | `false` | **Postgres only.** Whether a booting process may apply pending migrations. |
-| `environment_id` | string | — | **Object storage only.** Stable environment object-key segment. |
-| `container_url` | absolute URL | — | **Object storage only.** Credential-free container URL. |
-| `authentication` | `workload-identity` | — | **Object storage only.** Adapter workload-identity chain. |
-| `max_object_bytes` | integer | `16777216` | **Object storage only.** Absolute object ceiling. |
-| `max_read_bytes` | integer | `min(16777216, max_object_bytes)` | **Object storage only.** Streaming read ceiling. |
-| `max_write_bytes` | integer | `min(16777216, max_object_bytes)` | **Object storage only.** Conditional-write ceiling. |
-| `allow_loopback_http` | boolean | `false` | **Object storage only.** Insecure development/Azurite escape hatch. |
-| `connect_timeout_ms` | integer | `5000` | Bound on establishing a backend connection. `0` was rejected. |
-| `operation_timeout_ms` | integer | `30000` | Bound on one control-plane operation. `0` was rejected. |
-
-Historical object-storage shape (does not boot):
-
-```toml
-mode = "stateful"
-
-[control_plane]
-backend = "object-storage"
-environment_id = "prod-us-east"
-container_url = "https://axondstate.blob.core.windows.net/control-plane"
-authentication = "workload-identity"
-
-[[admin_breakglass]]
-env = "GW_ADMIN_BREAKGLASS"
-```
-
-#### `[secret_store]` (legacy PostgreSQL control plane)
-
-Withdrawn. Presence is a boot error.
-
-| Key | Type | Default | Meaning (historical) |
-| --- | --- | --- | --- |
-| `backend` | `postgres` | `postgres` | Which store held wrapped material. |
-| `dsn_env` | string | `[control_plane] dsn_env` | Name of the env var holding the store's connection string. |
-| `kek_env` | string | — | Name of the env var holding the key-encryption key. |
-| `kek_file` | string | — | Path to a file holding the key-encryption key. |
-| `schema` | string | connection default | PostgreSQL schema `axond_secret` lived in. |
-| `create_table` | boolean | `true` | Whether boot applied `secret_store_v1.sql`. |
-
-Exactly one of `kek_env` and `kek_file` had to be non-empty.
-
-#### `[convergence]`
-
-Withdrawn with the control plane. Presence of a non-default section is a boot
-error.
-
-| Key | Type | Default | Meaning (historical) |
-| --- | --- | --- | --- |
-| `cache_path` | path | unset | Per-replica signed desired-state cache. |
-| `cache_key_env` | string | unset | Environment-variable name containing the cache HMAC key. |
-
-#### `[[admin_breakglass]]`
-
-Withdrawn. Presence is a boot error. `/admin/v1` is unmounted.
-
-| Key | Type | Default | Meaning (historical) |
-| --- | --- | --- | --- |
-| `env` | string | — | Name of the env var holding the credential. |
-| `file` | string | — | Path to a file holding the credential. |
-| `id` | string | the source reference | Non-secret attribution label for audit events. |
-
-Exactly one of `env` and `file` had to be non-empty.
-
-#### `[admin_oidc]`
-
-Withdrawn. Presence is a boot error.
-
-| Key | Type | Default | Meaning (historical) |
-| --- | --- | --- | --- |
-| `issuer` | string | — | Exact `iss` claim accepted. |
-| `audience` | string | — | Required `aud` value. |
-| `jwks_url` | string | — | JWKS endpoint. |
+- `mode`, `[control_plane]`, `[secret_store]`, `[convergence]`,
+  `[[admin_breakglass]]`, `[admin_oidc]`: the stateful control plane and
+  `/admin/v1`.
+- `[gateway_minting]`, `[gateway_token]`, `[[gateway_verifier]]`,
+  `[[gateway_token_epoch]]`, `[revocation]`: minted tokens and `POST /v1/tokens`.
+- `[reload]`: hot reload and `SIGHUP`. Config changes take a restart.
+- `[rate_limit]`: use `[admission]` for per-tenant concurrency.
+- `[core_middleware]`: the legacy accounting mode.
+- `[[model]]`: aliases. Callers send `provider-id/model-id`.
+- `[budget] backend`: Redis, in-memory, and Postgres budget backends. Budgets
+  live in the Store.
 
 ## `[server]`
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `bind` | socket address | `0.0.0.0:8080` | Listening address. Changing it needs a restart; a reload warns and ignores it. |
+| `bind` | socket address | `0.0.0.0:8080` | Listening address. |
 
 ## `[storage]` — required (ADR 0063)
 
-The durable namespace store. Boot refuses a config without this section. A
-reload that changes `backend`, `path`, or `dsn_env` is reported and ignored
-until restart — the live `Store` is opened once.
+The durable namespace store. Boot refuses a config without this section. The
+Store is opened once at boot.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -273,9 +172,8 @@ far the index lags ([observability](./observability.md#metrics)).
 ## `[shutdown]` — Tier 0
 
 Bounds on the `SIGTERM`/`SIGINT` sequence
-([ADR 0029](./adr/0029-bounded-termination.md)). All three are read when the
-signal arrives and enforced as one snapshot, so a reload applies to the
-termination that follows it.
+([ADR 0029](./adr/0029-bounded-termination.md)). All three are read at boot and
+enforced as one snapshot.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -383,7 +281,7 @@ Not on the inference path. `GET /api/v1/providers/{id}/models` and
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `refresh_interval_seconds` | integer | `300` | Seconds between refresh rounds. Read after each round, so a reload takes effect without a restart. The first round runs at boot; an empty provider set retries with short backoff instead of waiting the full interval. `0` is rejected. |
+| `refresh_interval_seconds` | integer | `300` | Seconds between refresh rounds. The first round runs at boot; an empty provider set retries with short backoff instead of waiting the full interval. `0` is rejected. |
 
 ## `[[credential]]` — outbound provider keys
 
@@ -502,9 +400,8 @@ time for; `failover.overall_timeout_ms` is what keeps them finite in practice.
 Tighten them below the walk budget only when you want to cap a single attempt so
 later targets get a turn.
 
-`connect_timeout_ms` configures the shared pooled HTTP client, so the whole
-section is read at boot: a reload validates a changed `[transport]` and warns
-that a restart is needed to apply it, exactly as `[server] bind` behaves.
+`connect_timeout_ms` configures the shared pooled HTTP client; the whole
+section is read at boot.
 
 ## `[admission]` — request bounds and load shedding, Tier 0
 
@@ -514,7 +411,7 @@ many may be in flight at once.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `max_request_bytes` | integer | `2097152` | Largest request body accepted. The router refuses an oversized inbound body before buffering; request middleware output is measured again and refused before provider dispatch if expansion crosses the same ceiling. Must be ≥ 1. |
+| `max_request_bytes` | integer | `2097152` | Largest request body accepted. The router refuses an oversized inbound body before buffering. Must be ≥ 1. |
 | `max_prompt_tokens` | integer | `1000000` | Largest estimated input size a request may carry. `0` disables. Only binds below `max_request_bytes` / 4 — see below. |
 | `max_output_tokens` | integer | `200000` | Largest output allowance a request may ask for (`max_tokens`, `max_completion_tokens`, or `max_output_tokens`). Refused, not clamped, so the caller is never silently given a different request than it sent. `0` disables. |
 | `max_in_flight` | integer | `1024` | Concurrent requests this replica admits. `0` disables. |
@@ -524,7 +421,7 @@ many may be in flight at once.
 | `queue_capacity` | integer | `0` | Requests that may wait for capacity instead of being refused. `0` refuses immediately. |
 | `queue_wait_ms` | integer | `0` | How long a queued request waits before it is shed. Must be set together with `queue_capacity`, and queueing requires a finite `max_in_flight`. |
 | `max_stream_duration_ms` | integer | `3600000` | Total lifetime of one stream, however productive. Distinct from `transport.stream_idle_timeout_ms`, which bounds silence: this is the bound on a stream that never stops talking. Applies to a stream the caller is draining — see below. `0` disables. |
-| `max_stream_bytes` | integer | `67108864` | Raw upstream bytes one stream may relay before it is ended. `0` disables this configured ceiling. Reconstructed output from response-mutating middleware, and streams held for policy validation, still have a 64 MiB rendered-output safety ceiling. Ordinary and block-only OpenAI re-emission remains unlimited when this is `0`. |
+| `max_stream_bytes` | integer | `67108864` | Raw upstream bytes one stream may relay before it is ended. `0` disables this configured ceiling. |
 | `max_pending_settlements` | integer | 4 × `max_in_flight` | Requests whose spend this replica is still carrying toward the Store: admitted and not yet settled, settlements queued for an execution slot, and settlements executing. Every admitted request reserves one slot (no ledger write) and the settlement it spawns releases it, so a Store that has fallen this far behind serving refuses new requests with `503 settlement_capacity_exhausted` rather than accumulating detached work. `0` disables. See below. |
 | `max_in_flight_settlements` | integer | `64` | Settlements executing against the Store at once; bounds the charge concurrency one replica presents to the ledger. `0` disables. |
 | `settlement_queue_wait_ms` | integer | `10000` | How long a spawned settlement waits for one of those execution slots before it is abandoned. `0` waits without bound (shutdown still bounds it). |
@@ -654,13 +551,10 @@ bound is a queue that hides an outage.
 Every ceiling here is per replica and in process memory. A fleet of *N*
 replicas admits *N* × `max_in_flight` requests, and a tenant behind a
 round-robin load balancer gets *N* × `max_in_flight_per_tenant`. Size these
-from what one process can hold — sockets, relay tasks, buffered bodies — and
-use `[rate_limit]` for a per-subject in-flight bound. Period spend caps live
-on the Store, not in this section.
+from what one process can hold: sockets, relay tasks, buffered bodies. Period
+spend caps live on the Store, not in this section.
 
-The ceilings own semaphores built at boot, so a reload validates a changed
-`[admission]` and warns that a restart is needed to apply it, exactly as
-`[transport]` behaves
+The ceilings own semaphores built at boot
 ([ADR 0030](./adr/0030-request-bounds-and-load-shedding.md)).
 
 ## `[[gateway_key]]` — inbound authentication (required)
@@ -673,9 +567,8 @@ per-namespace list is withdrawn.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `env` | string | — | *Name* of the environment variable holding the inbound token. Exactly one of `env` and `file` must be non-empty. |
-| `file` | string | — | Path to a UTF-8 file holding the inbound token. Exactly one of `file` and `env` must be non-empty; the file is re-read on every reload. |
+| `file` | string | — | Path to a UTF-8 file holding the inbound token. Exactly one of `file` and `env` must be non-empty. |
 | `namespace` | string | — | Must name a defined `[[namespace]]`. The key itself is deployment-wide; this field is the seed namespace used for credential-status authority. |
-| `can_mint` | boolean | `false` | Withdrawn with in-gateway minting. Leave `false`. |
 
 Exactly one source (`env` or `file`) is permitted; both declared or
 neither declared is a config error. File contents are read without trimming:
@@ -689,10 +582,6 @@ budget ledgers keyed by the old subject do not carry over. An absolute secret
 mount path is emitted as written and may therefore expose tenant names in
 usage sinks.
 
-Reload fingerprints are salted per process: they are comparable only within
-one process lifetime and show that material changed at this reload; they are
-not a stable identifier for a key.
-
 Callers present the token as `Authorization: Bearer <token>` or
 `x-api-key: <token>`. Minted `axt1.` tokens are `401` and are not issued.
 The usage record's `subject` is the env var's *name*
@@ -700,147 +589,6 @@ The usage record's `subject` is the env var's *name*
 
 A key whose `namespace` is the file default namespace may use
 `GET /ns/{ns}/v1/credentials?namespaces=all` and see every namespace.
-
-## `[gateway_minting]` — withdrawn (ADR 0063)
-
-`POST /v1/tokens` is unmounted. Do not enable this section. Field names below
-are the parser surface only.
-
-This section is absent by default; its presence registers `POST /v1/tokens`.
-It may be paired with a static `[[gateway_key]]` with `can_mint = true`; if no
-such key is enabled, the route remains present but rejects every caller.
-
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `kid` | string | — | Existing verifier key identifier used for the minted token. |
-| `env` / `file` | string | — | Exactly one signing-material source; resolved at boot and reload. |
-| `max_ttl` | duration | verifier `max_ttl` | Issuance ceiling, never above the matching verifier's ceiling and at most 24h. When omitted, it tracks the verifier's `max_ttl`; raising that verifier ceiling also raises the issuance ceiling. |
-| `scope` | array of string | — | Optional capability ceiling. When configured, omitted requests inherit it; when absent, omitted scope uses the ordinary capability posture. The operator-only `credentials:all` is rejected here and is never issued by `POST /v1/tokens`. |
-| `aliases` | array of string | — | Optional alias-pattern ceiling. When configured, omitted requests inherit it; when absent, `*` is permitted, but alias dispatch still narrows it to aliases the namespace can already reach. |
-| `max_request_microdollars` | u64 | — | Optional per-request ceiling. Omitted requests inherit it. |
-
-The route is registered only at boot. Enabling minting on reload is reported
-but requires a restart; removing it takes effect immediately and returns a
-typed 404. Key material and ceilings otherwise reload normally. Enabling this
-feature means every replica with minting enabled holds signing material: a
-compromised replica can forge tokens. EdDSA otherwise supports verification-only
-replicas with only public key material; HS256 never had that property because
-every verifier already holds the forging secret. Keep offline `axond mint` as
-the default, prefer EdDSA when verification-only replicas matter, and consider
-a separately deployed minting replica set with short `max_ttl`.
-
-## `[gateway_token]` — withdrawn minted-token policy (ADR 0063)
-
-Minted inbound identity is withdrawn. `axt1.` presentations are `401`. This
-section is documented so an old file's keys are still named.
-
-This section is optional when the gateway uses only static gateway keys. It is
-required when any `[[gateway_verifier]]` is declared: the verifier needs one
-deployment-wide audience to validate the `aud` claim.
-
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `audience` | string | — | Audience accepted by every configured minted token verifier. It must be present and non-empty when verifiers are declared. |
-
-The audience is config-owned and is applied to every verifier. A token with a
-different audience is rejected. The value is not a secret and is written
-directly in TOML.
-
-## `[[gateway_verifier]]` — withdrawn minted-token verification (ADR 0063)
-
-Do not configure verifiers. Production authentication does not verify `axt1.`
-tokens. Historical field names:
-
-Verifiers were additive to the required static gateway keys. They resolved
-`axt1.` compact JWS credentials without a per-caller registry or a runtime
-datastore. See the withdrawn [minted identity guide](./minted-token-guide.md).
-
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `kid` | string | — | JWS key identifier. Required, non-empty, and unique across verifier entries. |
-| `alg` | `EdDSA` \| `HS256` | — | Signature algorithm. Required and authoritative for this verifier. |
-| `env` | string | — | *Name* of the environment variable holding the public Ed25519 key or opaque HS256 secret. Exactly one of `env` and `file` must be non-empty; the referenced variable must be set and non-empty at boot and reload. |
-| `file` | string | — | Path to a UTF-8 file holding the public Ed25519 key or opaque HS256 secret. Exactly one of `file` and `env` must be non-empty; the file is re-read at boot and reload. |
-| `namespaces` | array of string | — | Namespaces this signer may place in the token's `ns` claim. Required and non-empty; every namespace must be declared by `[[namespace]]`. |
-| `max_ttl` | duration | — | Maximum `exp - iat` lifetime accepted for this verifier. Required, at least `1s`, and no more than `24h`. |
-
-The verifier's `kid` must be present in the JWS header and its `alg` must match
-the configured algorithm. Ed25519 values from either source are standard-base64
-raw 32-byte public keys; surrounding whitespace is trimmed, so a trailing
-newline is accepted. HS256 values are opaque exact bytes, are not trimmed, and
-must be at least 32 bytes: a trailing newline changes the secret and must not be
-written accidentally (`printf %s 'secret' > /run/secrets/verifier`). Empty,
-absent, unreadable, or non-UTF-8 files are rejected at boot or reload, leaving
-the previous running snapshot in place on reload. File permissions are checked
-on Unix and group/other-readable files produce a warning.
-
-The gateway validates the verifier's namespace set, lifetime, audience, and
-signature on every token. At least one static `[[gateway_key]]` remains
-mandatory as breakglass access. See the [minted identity guide](./minted-token-guide.md)
-for the new-`kid` rotation procedure and the Tier 0/Tier 1 revocation boundary.
-
-An optional `aliases` claim narrows the aliases the token may use. It is an array
-of strings, matched as a case-sensitive union: a string without `*` is an exact
-alias; one `*` at the end is a prefix match (`foo*`); one at the beginning is a
-suffix match (`*foo`); and bare `*` matches every alias. Empty strings, a `*`
-in the middle, or more than one `*` are invalid and reject the request with
-`403`. An empty array permits no aliases, and a claim that is present but not an
-array of strings — including `null` — is invalid. The claim can only narrow the
-namespace's existing authority: it never adds aliases the namespace cannot
-already reach. Static gateway keys remain unrestricted.
-
-The check runs before the alias is looked up, so a disallowed alias returns `403`
-whether or not it is configured and regardless of whether the endpoint supports
-the target's wire protocol.
-
-## `[[gateway_token_epoch]]` — withdrawn minted-token epochs (ADR 0063)
-
-An issuance epoch invalidated minted tokens whose `iat` is earlier than the
-configured instant. Minted tokens are no longer a supported inbound identity.
-
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `namespace` | string | — | Declared namespace whose minted tokens are affected. Required. |
-| `subject` | string | omitted | Optional subject-specific override. If present, this entry is the only epoch used for that subject; otherwise the namespace-wide entry applies. |
-| `min_iat` | integer or RFC 3339 UTC string | — | Earliest accepted token issuance time, as Unix seconds or a timestamp such as `2026-08-10T12:00:00Z`. Required. |
-
-Entries must use declared namespaces and may not duplicate a
-`(namespace, subject)` pair. A namespace-wide epoch cannot spare one subject;
-use a per-subject entry with an earlier epoch when that exception is needed.
-Epochs affect minted `axt1.` tokens only. Static `[[gateway_key]]` credentials
-remain valid.
-
-## `[reload]` — Tier 0
-
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `watch` | bool | `false` | Also reload when the config file's contents change. `SIGHUP` always reloads regardless. |
-| `poll_interval_ms` | integer | `2000` | How often the watcher compares contents. Below `100` is rejected. |
-
-A reload re-runs the full boot validation against the current file, current
-process environment, and referenced key-material files; a bad candidate is
-rejected and the running config keeps serving. Replacing file contents in place
-or via an atomic rename is therefore reload-reachable without a process
-restart. `[[namespace]]` changes are reloadable and appear in the reported
-namespace delta. Period budget ledgers live in the Store, not in an in-memory
-retention floor. `[server] bind`,
-`[transport]`, `[admission]`, `[[usage_sink]]`, `[usage_journal]`, `[budget]`,
-`[rate_limit]`, `[revocation]`, and `[catalog]` changes warn and are ignored
-until restart;
-this includes `limit_microdollars` ([ADR 0011](./adr/0011-config-hot-reload.md)).
-The catalogue candidate is still fully validated, but the running snapshot
-keeps the boot-time `[catalog]` settings so it cannot claim that a new source,
-store, or refresh schedule is active when the importer task is still using the
-old one. Restart after changing `[catalog]`; the applied reload log includes
-`catalog_changed = true` and a restart warning.
-The same log entry sets `restart_required = true` for catalogue and other
-boot-owned changes; `changed` only reports live serving state applied by the
-reload.
-
-`[storage]` is boot-owned: a reload that changes `backend`, `path`, or
-`dsn_env` warns and is ignored until restart. Namespaces, period budgets, and
-usage after boot are `/api/v1`, not `/admin/v1`. `mode` and control-plane
-bootstrap sections are boot errors; there is no stateful file-reload exception.
 
 ## `[[usage_sink]]` — Tier 0 by default; Tier 2 for `postgres`
 
@@ -1015,81 +763,6 @@ without a cadence budget behaves exactly as before, and `GET …/budget` then
 synthesizes the `fixed` view of its active period (`404 unknown_budget` when
 there is none).
 
-## `[rate_limit]` — opt-in inbound concurrency enforcement
-
-Omit this section for the Tier 0 default: `NoLimit` has zero state and no
-network dependency. The in-memory backend limits concurrent requests per
-`(namespace, subject)` and is per-replica and approximate. `backend = "redis"`
-is Tier 1 and enforces exact fleet-wide in-flight concurrency using expiring
-leases; it is not an RPM/token-bucket limiter.
-
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `backend` | `none` \| `in-memory` \| `redis` | `none` | Selects no-op, per-replica in-memory, or exact shared Redis leases. |
-| `max_in_flight_per_subject` | integer | `16` | Maximum concurrent dispatches for one authenticated caller. Must be nonzero when enabled. |
-| `max_subjects` | integer | `10000` | Maximum retained caller keys in the in-memory map. Must be nonzero when enabled. |
-| `dsn_env` | string | — | Name of the env var holding the Redis URL. If omitted, a Redis budget's `dsn_env` is reused explicitly. |
-| `key_prefix` | string | `axond:rate_limit` | Redis key namespace. |
-| `on_unavailable` | `deny` \| `allow` | `deny` | Redis outage policy. `deny` fails closed with `503 rate_limit_unavailable`; `allow` admits unenforced and warns. |
-| `lease_ttl_seconds` | integer | `300` | Redis lease lifetime and crash-safety backstop. Must be ≥ 1 for Redis. |
-| `timeout_ms` | integer | `250` | Bounded Redis acquire/release operation timeout. Must be ≥ 1 for Redis. |
-| `connect_timeout_ms` | integer | `5000` | Bounded Redis connection setup and boot-time `PING` timeout. Must be ≥ 1 for Redis. |
-
-When `max_subjects` is reached, a new caller is refused rather than silently
-admitted without a limit; zero-in-flight entries are evicted on permit drop, so
-the map retains only active callers.
-
-Redis connects and PINGs at boot. A Redis limiter's lease is released when its
-permit drops; if the process or Redis is unavailable, the TTL reclaims it.
-
-## `[core_middleware]` — accounting ownership migration gate
-
-The fixed rate-limit and budget stages default to response-lifetime middleware
-ownership. The backend, numeric limits, refusal envelope, charging policy, and
-acquisition order do not change. Ownership lifetime does: the permit and
-reservation are stored beside configurable middleware state and follow that
-owner into a buffered response or streaming accounting. In `middleware` mode,
-a buffered response keeps its rate-limit permit until the response body reaches
-EOF or is dropped, rather than releasing it when the handler returns. Slow
-response consumers can therefore occupy a subject's concurrency ceiling longer
-and cause more `429 rate_limited` responses at the same configured limit.
-`legacy` preserves the former buffered permit-release timing.
-
-| Key | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `accounting` | `middleware` \| `legacy` | `middleware` | `middleware` uses the ADR 0060 response-lifetime owner. `legacy` restores the previous straight-line permit and reservation guards as an operational rollback without changing the binary. A reload binds the selection to new requests through their captured snapshot; in-flight requests keep the mode they started with. |
-
-The legacy mode is a migration escape hatch, not a different accounting
-contract. Qualification runs both modes against the same refusal, settlement,
-failure, and cancellation expectations. Operators should return to
-`middleware` after diagnosing a rollback because subsequent fixed-core stages
-build on that ownership model.
-
-## `[revocation]` — withdrawn minted-token denylist (ADR 0063)
-
-Minted tokens are not verified, so a revocation denylist is unused. Omit this
-section. Historical keys:
-
-| Key | Type | Default | Applies to | Meaning |
-| --- | --- | --- | --- | --- |
-| `backend` | `none` \| `redis` \| `postgres` | `none` | all | Selects the denylist backend. |
-| `dsn_env` | string | — | `redis`, `postgres` | Env-var name for the connection string; omitted Redis references reuse a Redis budget's `dsn_env`. |
-| `key_prefix` | string | `axond:revocation` | `redis` | Prefix for `<prefix>:{<jti>}` keys. |
-| `table` | string | `axond_revocation` | `postgres` | Revocation table, validated as an identifier. |
-| `create_table` | bool | `false` | `postgres` | Apply the shipped versioned DDL at boot. |
-| `on_unavailable` | `deny` \| `allow` | `deny` | shared | For outages after boot, fail closed with `503 revocation_unavailable`, or explicitly admit and warn. `allow` is an explicit fail-open opt-in: during a store-wide recovery window or invoke-cap exhaustion, every revoked JTI is admitted, not just the triggering request. The backend connects and PINGs/`SELECT`s before the listener binds, so an unreachable store aborts startup for either value. |
-| `timeout_ms` | integer | `250` | shared | Maximum time a request waits for the operation; the owned Redis operation may continue under a longer liveness budget, and must be nonzero. |
-| `connect_timeout_ms` | integer | `5000` | shared | Bounded connection/PING timeout; must be nonzero. |
-
-For Redis, a liveness-budget expiry retires the shared connection generation.
-Until the replacement connection is published, all revocation checks use the
-configured unavailable policy, so the default `deny` produces a `503` window
-for all minted-token traffic rather than only failing the triggering operation.
-With `allow`, that same window admits all revoked JTIs. Invoke-cap exhaustion
-also applies the policy store-wide.
-The separate request-wait and liveness budgets keep ordinary slowness from
-triggering that generation-wide recovery path.
-
 ## `[catalog]` — imported model metadata and charging rates (opt-in)
 
 Omit this section for the default: nothing is imported, no HTTP client is built,
@@ -1110,8 +783,8 @@ fetch, and a fetch cannot delay a request.
 | --- | --- | --- | --- |
 | `source` | `none` \| `models-dev` \| `seed` | `none` | Selects no import, models.dev over HTTPS, or the bundled offline excerpt. |
 | `source_url` | string | `https://models.dev/catalog.json` | The document a `models-dev` import fetches; must be a hosted `https://` URL without embedded credentials, is validated at boot against the adapter, and is rejected for other sources. |
-| `store` | `in-memory` \| `postgres` | `in-memory` | Where accepted snapshots are retained. `in-memory` is a development store and is refused in stateful mode, which loses every snapshot and its provenance on restart. |
-| `dsn_env` | string | — | Name of the env var holding the Postgres connection string. Inherits `[control_plane] dsn_env` when omitted. The value never appears in config or in a log line. |
+| `store` | `in-memory` \| `postgres` | `in-memory` | Where accepted snapshots are retained. `in-memory` is a development store that loses every snapshot and its provenance on restart. |
+| `dsn_env` | string | — | Name of the env var holding the Postgres connection string. The value never appears in config or in a log line. |
 | `schema` | string | — | Schema qualifying the catalogue tables, validated as an identifier. |
 | `create_table` | bool | `true` | Apply the shipped versioned catalogue DDL at boot. |
 | `refresh_interval_seconds` | integer | `21600` | Scheduled cadence. Must be nonzero. |

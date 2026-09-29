@@ -23,9 +23,9 @@ Supersedes:
 - [ADR 0027](./0027-stateless-and-stateful-operating-modes.md)
 - [ADR 0036](./0036-typed-policy-documents-generations-and-transitions.md)
 - [ADR 0042](./0042-model-enablement-and-alias-contracts.md)
-- [ADR 0050](./0050-runtime-policy-activation.md)
+- ADR 0050
 - [ADR 0058](./0058-tenant-owned-alias-names-and-the-management-catalogue.md)
-- [P0: one operator model](../design/p0-one-operator-model.md)
+- P0: one operator model
 
 Also supersedes the blob-backed control plane, grant model, `/namespaces/`
 spelling, and namespace-owned model/alias graph of

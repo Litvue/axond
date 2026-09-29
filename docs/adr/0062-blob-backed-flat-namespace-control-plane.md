@@ -35,7 +35,7 @@ The following ADR 0027 properties remain in force:
 This ADR changes the target architecture before the PostgreSQL stateful surface
 has entered the `0.x` compatibility promise. The implementation and migration
 sequence is tracked in
-[the namespace control-plane migration plan](../maintainers/namespace-control-plane-migration.md).
+the namespace control-plane migration plan.
 
 ## Context
 
