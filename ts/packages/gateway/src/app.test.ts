@@ -5,6 +5,7 @@ import test from "node:test";
 import { Hono } from "hono";
 
 import { createAxond } from "./app.ts";
+import { StoreFailure } from "./errors.ts";
 import { rewriteTopLevelModel } from "./body.ts";
 import { loadConfig, envSecretReader } from "./config.ts";
 import { createMemoryStore } from "./memory-store.ts";
@@ -372,6 +373,23 @@ namespace = "platform"
 `;
   const loaded = await loadConfig(toml, envSecretReader({ GW_KEY: "k" }, async () => ""));
   assert.deepEqual(loaded.shutdown, { drainGraceMs: 5_000, deadlineMs: 15_000, flushTimeoutMs: 5_000 });
+  assert.equal(loaded.storage.onUnavailable, "deny");
+  const allowed = await loadConfig(
+    toml.replace('path = "/tmp/axond.sqlite"', 'path = "/tmp/axond.sqlite"\non_unavailable = "allow"'),
+    envSecretReader({ GW_KEY: "k" }, async () => ""),
+  );
+  assert.equal(allowed.storage.onUnavailable, "allow");
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace('path = "/tmp/axond.sqlite"', 'path = "/tmp/axond.sqlite"\non_unavailable = "sometimes"'),
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /on_unavailable/);
+      return true;
+    },
+  );
   await assert.rejects(
     () =>
       loadConfig(
@@ -383,6 +401,118 @@ namespace = "platform"
       return true;
     },
   );
+});
+
+test("a down budget store is budget_unavailable and a down management store is store_unavailable", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000n);
+  const down = new Proxy(store, {
+    get(target, prop, receiver) {
+      if (prop === "resolveNamespace" || prop === "listNamespaces") {
+        return async () => {
+          throw new StoreFailure();
+        };
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const app = createAxond({
+    store: down,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: "http://127.0.0.1:9" }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+  });
+  const chat = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+  });
+  assert.equal(chat.status, 503);
+  assert.deepEqual(await chat.json(), {
+    error: { type: "budget_unavailable", message: "budget store is unavailable" },
+  });
+  const models = await app.request("http://127.0.0.1/ns/platform/v1/models", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(models.status, 503);
+  assert.deepEqual(await models.json(), {
+    error: { type: "store_unavailable", message: "store is unavailable" },
+  });
+  const listed = await app.request("http://127.0.0.1/api/v1/namespaces", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(listed.status, 503);
+  assert.deepEqual(await listed.json(), {
+    error: { type: "store_unavailable", message: "store is unavailable" },
+  });
+});
+
+test("allow serves a chat when the budget read fails and does not charge", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000n);
+  const down = new Proxy(store, {
+    get(target, prop, receiver) {
+      if (prop === "resolveNamespace") {
+        return async () => {
+          throw new StoreFailure();
+        };
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const upstream = await listenUpstream();
+  const app = createAxond({
+    store: down,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    onStoreUnavailable: "allow",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream-openai", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 2_500_000n,
+        outputMicrodollarsPerMillion: 10_000_000n,
+      },
+    ],
+  });
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "hi" }] }),
+  });
+  assert.equal(response.status, 200);
+  await response.json();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const budget = await store.getBudget("platform", "compat");
+  assert.equal(budget?.spent, 0n);
+  upstream.close();
 });
 
 test("closed admission returns draining before authentication", async () => {

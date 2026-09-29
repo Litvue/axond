@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { StoreFailure } from "../../gateway/src/errors.ts";
 import { applyMigration, openSqliteStore } from "./sqlite-store.ts";
 
 test("sqlite settlement is exactly once per request_id and survives reopen", async () => {
@@ -70,6 +71,21 @@ test("delete then recreate bumps incarnation so a late settle does not charge", 
     assert.equal(late.charged, false);
     const budget = await store.getBudget("temp", "p");
     assert.equal(budget?.spent, 0n);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("sqlite hides a driver error behind store failure", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-"));
+  const path = join(directory, "axond.sqlite");
+  try {
+    const store = openSqliteStore(path);
+    await assert.rejects(() => store.query("NOT SQL"), (error: unknown) => {
+      assert.ok(error instanceof StoreFailure);
+      assert.equal(error.message.includes("syntax"), false);
+      return true;
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

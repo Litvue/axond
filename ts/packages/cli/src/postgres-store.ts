@@ -8,7 +8,7 @@ import type {
   Store,
 } from "@axond/sdk";
 
-import { GatewayFailure } from "../../gateway/src/errors.ts";
+import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 
 export interface SqlExecutor {
@@ -24,11 +24,24 @@ const I64_MAX = "9223372036854775807";
  */
 export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor; release: () => Promise<void> }>): Store {
   async function withClient<T>(fn: (client: SqlExecutor) => Promise<T>): Promise<T> {
-    const { client, release } = await connect();
+    let opened: { client: SqlExecutor; release: () => Promise<void> };
     try {
-      return await fn(client);
+      opened = await connect();
+    } catch (error) {
+      if (error instanceof GatewayFailure) {
+        throw error;
+      }
+      throw new StoreFailure();
+    }
+    try {
+      return await fn(opened.client);
+    } catch (error) {
+      if (error instanceof GatewayFailure || error instanceof StoreFailure) {
+        throw error;
+      }
+      throw new StoreFailure();
     } finally {
-      await release();
+      await opened.release().catch(() => undefined);
     }
   }
 

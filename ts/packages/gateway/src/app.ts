@@ -20,7 +20,7 @@ import { API_VERSION } from "@axond/sdk";
 import { assertGatewayKey, presentedCredential } from "./auth.ts";
 import { ByteRequestBody } from "./body.ts";
 import { callUpstream, noteCredentialFailure, selectCredential, type CredentialPool } from "./dispatch.ts";
-import { GatewayFailure, badRequest, gatewayError } from "./errors.ts";
+import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors.ts";
 import { globMatch } from "./glob.ts";
 import { budgetJson, money, namespaceJson } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, parseNamespaceId, validatePeriod, validateTimezone } from "./namespace.ts";
@@ -191,7 +191,7 @@ async function pipeline(
     if (kind === "inference") {
       const path = opts.rawPath?.(c) ?? new URL(c.req.url).pathname;
       const namespaceId = namespaceFromCanonicalPath(path);
-      await bindNamespace(axond, opts, namespaceId);
+      await bindNamespace(axond, opts, namespaceId, chargesBudget(path));
       axond.route = routeOf(path);
     }
     await runStage(c, "post-auth", extensions, opts.store, async () => {
@@ -219,6 +219,9 @@ async function pipeline(
   } catch (error) {
     if (error instanceof StageStop) {
       return error.response;
+    }
+    if (error instanceof StoreFailure) {
+      throw new GatewayFailure("store_unavailable", 503, "store is unavailable");
     }
     throw error;
   }
@@ -259,8 +262,49 @@ async function resolveKey(opts: AxondOptions, c: Context<AxondEnv>): Promise<str
   return typeof opts.gatewayKey === "function" ? opts.gatewayKey(c) : opts.gatewayKey;
 }
 
-async function bindNamespace(axond: MutableContext, opts: AxondOptions, id: string): Promise<void> {
-  const resolved = await opts.store.resolveNamespace(id, opts.clock?.() ?? Date.now());
+function chargesBudget(path: string): boolean {
+  return (
+    path.endsWith("/chat/completions") ||
+    path.endsWith("/messages") ||
+    path.endsWith("/embeddings") ||
+    path.endsWith("/responses")
+  );
+}
+
+async function bindNamespace(
+  axond: MutableContext,
+  opts: AxondOptions,
+  id: string,
+  charging: boolean,
+): Promise<void> {
+  let resolved;
+  try {
+    resolved = await opts.store.resolveNamespace(id, opts.clock?.() ?? Date.now());
+  } catch (error) {
+    if (!(error instanceof StoreFailure)) {
+      throw error;
+    }
+    if (!charging) {
+      throw new GatewayFailure("store_unavailable", 503, "store is unavailable");
+    }
+    if (opts.onStoreUnavailable === "allow") {
+      const record = await opts.store.getNamespace(id);
+      if (!record) {
+        throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+      }
+      axond.namespace = {
+        id: record.id,
+        attrs: record.attrs,
+        ...(record.blocklist === null ? {} : { blocklist: record.blocklist }),
+      };
+      axond.resolvedIncarnation = 1n;
+      axond.resolvedPeriod = null;
+      (axond as MutableContext & { admitted?: boolean }).admitted = true;
+      (axond as MutableContext & { record?: NamespaceWrite }).record = record;
+      return;
+    }
+    throw new GatewayFailure("budget_unavailable", 503, "budget store is unavailable");
+  }
   if (!resolved) {
     throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
   }

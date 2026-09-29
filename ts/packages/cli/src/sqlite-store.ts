@@ -14,7 +14,7 @@ import type {
   UsageSummaryRow,
 } from "@axond/sdk";
 
-import { GatewayFailure } from "../../gateway/src/errors.ts";
+import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { budgetJson } from "../../gateway/src/memory-store.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 
@@ -81,7 +81,16 @@ export function openSqliteStore(path: string): Store {
   db.exec(SCHEMA);
   let chain: Promise<unknown> = Promise.resolve();
   const lock = <T>(fn: () => T): Promise<T> => {
-    const run = chain.then(() => fn());
+    const run = chain.then(() => {
+      try {
+        return fn();
+      } catch (error) {
+        if (error instanceof GatewayFailure || error instanceof StoreFailure) {
+          throw error;
+        }
+        throw new StoreFailure();
+      }
+    });
     chain = run.then(
       () => undefined,
       () => undefined,

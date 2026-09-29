@@ -1,3 +1,11 @@
+/** A Store call failed. The driver message is dropped so it cannot leak a DSN. */
+export class StoreFailure extends Error {
+  constructor() {
+    super("store is unavailable");
+    this.name = "StoreFailure";
+  }
+}
+
 export class GatewayFailure extends Error {
   readonly type: string;
   readonly status: number;

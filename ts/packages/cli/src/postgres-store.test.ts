@@ -3,6 +3,7 @@ import test from "node:test";
 
 import pg from "pg";
 
+import { StoreFailure } from "../../gateway/src/errors.ts";
 import { createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
 import type { Store } from "@axond/sdk";
 
@@ -42,6 +43,17 @@ async function reset(): Promise<void> {
   `);
   await opened.release();
 }
+
+test("a postgres connection error drops the driver message", async () => {
+  const db = createPostgresStore(async () => {
+    throw new Error("password=super-secret-value");
+  });
+  await assert.rejects(() => db.getNamespace("platform"), (error: unknown) => {
+    assert.ok(error instanceof StoreFailure);
+    assert.equal(error.message.includes("super-secret-value"), false);
+    return true;
+  });
+});
 
 test("postgres 16 charges one request_id once and ignores a stale incarnation", { skip: !dsn }, async () => {
   await reset();

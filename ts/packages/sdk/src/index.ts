@@ -238,6 +238,11 @@ export interface AxondOptions {
   /** When false, /readyz reports draining. Liveness stays ok. */
   serving?: () => boolean;
   /**
+   * What a charging route does when the budget read fails. `deny` answers
+   * `503 budget_unavailable`. `allow` serves the request without a charge.
+   */
+  onStoreUnavailable?: "deny" | "allow";
+  /**
    * When false, new `/api` and `/ns` requests are refused before authentication.
    * Readiness can fail while this still returns true: that is the drain window.
    */

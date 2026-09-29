@@ -63,6 +63,7 @@ async function main(): Promise<void> {
     extensions,
     rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
     serving: () => serving,
+    onStoreUnavailable: config.storage.onUnavailable,
     admitting: () => admitting,
     metrics: createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []),
     telemetry: telemetry ?? undefined,

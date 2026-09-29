@@ -47,7 +47,13 @@ const OVERRIDE_KEYS = [
 
 export interface LoadedConfig {
   bind: string;
-  storage: { backend: "sqlite" | "postgres"; path?: string; dsn?: string; createTable: boolean };
+  storage: {
+    backend: "sqlite" | "postgres";
+    path?: string;
+    dsn?: string;
+    createTable: boolean;
+    onUnavailable: "deny" | "allow";
+  };
   namespaces: { id: string; default: boolean; allowPlatformFallback: boolean }[];
   providers: ProviderConfig[];
   credentials: CredentialConfig[];
@@ -106,13 +112,18 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     throw configError("`[storage] backend` must be `sqlite` or `postgres`");
   }
   const createTable = storageRaw["create_table"] !== false;
+  const stance = storageRaw["on_unavailable"];
+  const onUnavailable = stance === undefined || stance === "deny" ? "deny" : stance === "allow" ? "allow" : null;
+  if (onUnavailable === null) {
+    throw configError("`[storage] on_unavailable` must be `deny` or `allow`");
+  }
   let storage: LoadedConfig["storage"];
   if (backend === "sqlite") {
     const path = typeof storageRaw["path"] === "string" ? storageRaw["path"] : "";
     if (path.length === 0) {
       throw configError('`[storage] path` is required when `backend = "sqlite"`');
     }
-    storage = { backend, path, createTable };
+    storage = { backend, path, createTable, onUnavailable };
   } else {
     const dsnEnv = typeof storageRaw["dsn_env"] === "string" ? storageRaw["dsn_env"] : "";
     if (dsnEnv.length === 0) {
@@ -122,7 +133,7 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     if (dsn === undefined || dsn.length === 0) {
       throw configError(`\`[storage] dsn_env\` names \`${dsnEnv}\`, which is unset`);
     }
-    storage = { backend, dsn, createTable };
+    storage = { backend, dsn, createTable, onUnavailable };
   }
 
   const namespaces = asArray(parsed["namespace"]).map((entry) => {
