@@ -78,6 +78,8 @@ its target or key reports the ordinary routing, credential, or upstream error.
 `/ns/{ns}/v1/chat/completions`, `/ns/{ns}/v1/messages`, and
 `/ns/{ns}/v1/embeddings` keep credential-pool rotation inside one provider.
 Alias-level failover is gone ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)).
+A streamed response sets `content-type: text/event-stream` and `cache-control: no-cache`.
+A provider failure after a credential is selected still returns that provider error, and writes one usage record with status `upstream_error`, zero token counts, and cost 0. Spent does not increase.
 
 ## Providers
 

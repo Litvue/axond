@@ -7,7 +7,8 @@ import { createAxond } from "./app.ts";
 import { isRateLimitPayload } from "./dispatch.ts";
 import { createMemoryStore } from "./memory-store.ts";
 import { createMetrics } from "./metrics.ts";
-import type { AxondOptions, Store } from "@axond/sdk";
+import { usageEvent } from "./usage.ts";
+import type { AxondOptions, Store, UsageRecord } from "@axond/sdk";
 
 const KEY = "test-inbound-key";
 
@@ -209,6 +210,66 @@ test("a provider 500 stays on that credential and a 429 rotates", async () => {
   assert.equal(limited.status, 200);
   assert.deepEqual(seen, ["Bearer bad-key", "Bearer good-key", "Bearer bad-key", "Bearer good-key"]);
   upstream.close();
+});
+
+test("a provider failure records upstream_error and does not charge", async () => {
+  const store = await seeded();
+  const before = (await store.getBudget("platform", "compat"))!;
+  const upstream = await listen((_req, res) => {
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end('{"error":{"message":"down"}}');
+  });
+  const records: UsageRecord[] = [];
+  try {
+    const app = createAxond({
+      store,
+      gatewayKey: KEY,
+      defaultNamespace: "platform",
+      providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url, unpricedModels: "allow" }],
+      credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "cred-1" }],
+      onUsage: (record) => {
+        records.push(record);
+      },
+    });
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "PROMPT_SENTINEL" }] }),
+    });
+    assert.equal(response.status, 502);
+    const body = await response.json();
+    assert.equal(body.error.type, "provider_dependency_failed");
+    assert.equal(JSON.stringify(body).includes("PROMPT_SENTINEL"), false);
+    assert.equal(JSON.stringify(body).includes("sk-live-secret"), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    const record = records[0]!;
+    assert.equal(record.status, "upstream_error");
+    assert.equal(record.credentialId, "cred-1");
+    assert.equal(record.credentialSource, "platform");
+    assert.equal(record.costMicrodollars, 0n);
+    assert.equal(record.inputTokens, 0n);
+    assert.equal(record.outputTokens, 0n);
+    assert.equal(record.cacheReadTokens, 0n);
+    assert.equal(record.cacheWriteTokens, 0n);
+    assert.equal(record.attempts, 1);
+    assert.equal(record.latencyMs >= 0, true);
+    const event = JSON.stringify(usageEvent(record));
+    assert.equal(event.includes("sk-live-secret"), false);
+    assert.equal(event.includes("PROMPT_SENTINEL"), false);
+    assert.equal(event.includes('"status":"upstream_error"'), true);
+    assert.equal(event.includes('"cost_microdollars":"0"'), true);
+    const after = (await store.getBudget("platform", "compat"))!;
+    assert.equal(after.spent, before.spent);
+    const summary = await store.summarizeUsage("platform", "compat");
+    assert.equal(summary.length, 1);
+    assert.equal(summary[0]!.status, "upstream_error");
+    assert.equal(summary[0]!.cost_microdollars, 0);
+  } finally {
+    upstream.close();
+  }
 });
 
 test("two rate limits park the credential and a success clears the streak", async () => {

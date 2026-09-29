@@ -92,6 +92,8 @@ for (const [name, route, model, kind] of [
       body: JSON.stringify({ model, stream: true, messages: [{ role: "user", content: "hi" }] }),
     });
     assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "text/event-stream");
+    assert.equal(response.headers.get("cache-control"), "no-cache");
     const got = new Uint8Array(await response.arrayBuffer());
     assert.deepEqual(got, bytes);
     upstream.close();

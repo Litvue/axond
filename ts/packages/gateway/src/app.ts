@@ -755,6 +755,8 @@ async function dispatch(
         noteCredentialFailure(pools, record.id, provider.id, credential.id, now, policy.failureThreshold);
       }
       if (!(rateLimited && !pinned && attempt + 1 < planned.length)) {
+        noteServed(axond, opts, credential);
+        scheduleSettle(opts, axond, emptyUsage(), "upstream_error");
         throw error;
       }
     }
@@ -922,7 +924,10 @@ function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageT
 
 async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): Promise<void> {
   const price = lookupPrice(opts.prices ?? [], axond.target?.provider ?? "", axond.target?.model ?? "");
-  const cost = price ? costMicrodollars(price, usage) : null;
+  const priced = price ? costMicrodollars(price, usage) : null;
+  // A provider failure has no measured usage. Cost 0 matches the usage event
+  // and adds nothing to spent; null would omit the cost the record requires.
+  const cost = status === "upstream_error" ? 0n : priced;
   const result = await opts.store.settle({
     requestId: axond.requestId,
     namespace: axond.namespace?.id ?? "",

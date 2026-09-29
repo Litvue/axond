@@ -297,9 +297,8 @@ export async function callUpstream(input: {
     input.onStreamDone?.(reason);
   }, input.onTimeout, input.onBeforeContentRateLimit, input.onCredentialRateLimit);
   const headers = passHeaders(response.headers);
-  if (!headers.has("content-type")) {
-    headers.set("content-type", "text/event-stream");
-  }
+  headers.set("content-type", "text/event-stream");
+  headers.set("cache-control", "no-cache");
   return {
     response: new Response(stream, { status: response.status, headers }),
     usage,
