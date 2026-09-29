@@ -1067,3 +1067,83 @@ test("a native messages stream does not rotate on a rate-limit event", async () 
   assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "parked");
   upstream.close();
 });
+
+function estimateCost(body: Record<string, unknown>, embeddings = false): bigint {
+  const input = BigInt(Math.floor(new TextEncoder().encode(JSON.stringify(body)).length / 4));
+  const output = embeddings ? 0n : BigInt(typeof body["max_tokens"] === "number" ? body["max_tokens"] : 1024);
+  return input + output;
+}
+
+test("a spend cap refuses the estimate before the provider is called", async () => {
+  const store = await seeded();
+  let hits = 0;
+  const upstream = await listen((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1_000_000n,
+        outputMicrodollarsPerMillion: 1_000_000n,
+      },
+    ],
+    extensions: [
+      {
+        name: "cap",
+        apiVersion: 1,
+        stage: "pre-auth",
+        async middleware(c, next) {
+          const cap = c.req.header("x-test-cap");
+          if (cap) {
+            c.get("axond").spendCapMicrodollars = BigInt(cap);
+          }
+          await next();
+        },
+      },
+    ],
+  });
+  const payload = { model: "fake-openai/gpt-test", messages: [{ role: "user", content: "PROMPT_SENTINEL" }], max_tokens: 4 };
+  const estimated = estimateCost(payload);
+  const refused = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { ...CHAT_HEADERS, "x-test-cap": String(estimated - 1n) },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(refused.status, 403);
+  const error = await refused.json();
+  assert.equal(error.error.type, "request_cost_ceiling_exceeded");
+  assert.equal(
+    error.error.message,
+    `request cost ceiling exceeded for model \`fake-openai/gpt-test\`: estimated ${estimated} microdollars exceeds the per-request ceiling of ${estimated - 1n} microdollars`,
+  );
+  assert.equal(JSON.stringify(error).includes("PROMPT_SENTINEL"), false);
+  assert.equal(hits, 0);
+  const allowed = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { ...CHAT_HEADERS, "x-test-cap": String(estimated) },
+    body: JSON.stringify(payload),
+  });
+  assert.equal(allowed.status, 200);
+  await allowed.text();
+  assert.equal(hits, 1);
+  const embedding = { model: "fake-openai/gpt-test", input: "PROMPT_SENTINEL", max_tokens: 100_000 };
+  const embeddingCost = estimateCost(embedding, true);
+  const embedded = await app.request("http://127.0.0.1/ns/platform/v1/embeddings", {
+    method: "POST",
+    headers: { ...CHAT_HEADERS, "x-test-cap": String(embeddingCost) },
+    body: JSON.stringify(embedding),
+  });
+  assert.equal(embedded.status, 200);
+  await embedded.text();
+  assert.equal(hits, 2);
+  upstream.close();
+});

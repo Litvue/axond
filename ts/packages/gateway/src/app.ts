@@ -436,6 +436,14 @@ async function prepareInference(c: Context<AxondEnv>, opts: AxondOptions, axond:
     throw new GatewayFailure("unpriced_model", 400, `model \`${model}\` has no price`);
   }
   checkEstimateBounds(parsed, opts);
+  const estimated = estimatedRequestCost(axond.route, parsed, price);
+  if (axond.spendCapMicrodollars !== undefined && estimated > axond.spendCapMicrodollars) {
+    throw new GatewayFailure(
+      "request_cost_ceiling_exceeded",
+      403,
+      `request cost ceiling exceeded for model \`${model}\`: estimated ${estimated} microdollars exceeds the per-request ceiling of ${axond.spendCapMicrodollars} microdollars`,
+    );
+  }
   const record = (axond as MutableContext & { record?: NamespaceWrite }).record;
   const admitted = (axond as MutableContext & { admitted?: boolean }).admitted;
   if (!admitted) {
@@ -482,6 +490,21 @@ function ceiling(value: number | undefined, fallback: number): number | null {
 
 function estimatedInputTokens(body: Record<string, unknown>): number {
   return Math.floor(new TextEncoder().encode(JSON.stringify(body)).length / 4);
+}
+
+/** Pre-dispatch cost for a spend cap. Embeddings bill no completion. Absent output allowance uses 1024. */
+function estimatedRequestCost(
+  route: InferenceRoute | "management" | "other",
+  body: Record<string, unknown>,
+  price: ReturnType<typeof lookupPrice>,
+): bigint {
+  if (!price) {
+    return 0n;
+  }
+  const usage = emptyUsage();
+  usage.inputTokens = BigInt(estimatedInputTokens(body));
+  usage.outputTokens = route === "embeddings" ? 0n : BigInt(requestedOutputTokens(body) ?? 1_024);
+  return costMicrodollars(price, usage);
 }
 
 function requestedOutputTokens(body: Record<string, unknown>): number | null {
@@ -882,10 +905,7 @@ function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageT
 
 async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): Promise<void> {
   const price = lookupPrice(opts.prices ?? [], axond.target?.provider ?? "", axond.target?.model ?? "");
-  let cost = price ? costMicrodollars(price, usage) : null;
-  if (cost !== null && axond.spendCapMicrodollars !== undefined && cost > axond.spendCapMicrodollars) {
-    cost = axond.spendCapMicrodollars;
-  }
+  const cost = price ? costMicrodollars(price, usage) : null;
   const result = await opts.store.settle({
     requestId: axond.requestId,
     namespace: axond.namespace?.id ?? "",
