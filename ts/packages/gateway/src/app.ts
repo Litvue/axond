@@ -36,6 +36,7 @@ interface MutableContext extends AxondContext {
   resolvedIncarnation: bigint;
   resolvedPeriod: string | null;
   alias: string;
+  startedMs: number;
 }
 
 /**
@@ -176,6 +177,7 @@ function createContext(c: Context<AxondEnv>, opts: AxondOptions): MutableContext
   const requestId = header && /^[A-Za-z0-9._:-]{1,128}$/.test(header) ? header : crypto.randomUUID();
   const ctx: MutableContext = {
     requestId,
+    startedMs: Date.now(),
     route: "other",
     body: new ByteRequestBody(c.req.raw),
     authenticated: false,
@@ -498,6 +500,7 @@ function recordSettlementMetrics(
     "axond.status": status,
   };
   opts.metrics.record("axond.request.count", 1, attributes);
+  opts.metrics.record("axond.request.duration", Math.max(0, Date.now() - axond.startedMs), attributes);
   opts.metrics.record("axond.tokens.input", metricNumber(usage.inputTokens), attributes);
   opts.metrics.record("axond.tokens.output", metricNumber(usage.outputTokens), attributes);
   opts.metrics.record("axond.tokens.cache_read", metricNumber(usage.cacheReadTokens), attributes);

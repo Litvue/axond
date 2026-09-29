@@ -15,7 +15,7 @@ import type { Store } from "@axond/sdk";
 
 const KEY = "test-inbound-key";
 
-async function gateway() {
+async function gateway(metrics?: ReturnType<typeof createMetrics>) {
   const store = createMemoryStore();
   await store.putNamespace({
     id: "platform",
@@ -62,6 +62,7 @@ async function gateway() {
       },
     ],
     rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
+    metrics,
   });
   return { app, store, upstream };
 }
@@ -127,6 +128,38 @@ test("a buffered chat completion rewrites the model and forwards the provider cr
   assert.equal(summary.length, 1);
   assert.equal(summary[0]!.count, 1);
   assert.equal(summary[0]!.cost_microdollars, 100);
+  upstream.close();
+});
+
+test("a settled chat records request duration without the prompt", async () => {
+  const metrics = createMetrics([KEY]);
+  const { app, upstream } = await gateway(metrics);
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${KEY}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "fake-openai/gpt-test",
+      messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+    }),
+  });
+  assert.equal(response.status, 200);
+  await response.text();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const count = metrics.points.find((point) => point.name === "axond.request.count");
+  assert.equal(count?.value, 1);
+  assert.equal(count?.attributes["axond.namespace"], "platform");
+  assert.equal(count?.attributes["axond.status"], "ok");
+  assert.equal(count?.attributes["gen_ai.request.model"], "fake-openai/gpt-test");
+  const duration = metrics.points.find((point) => point.name === "axond.request.duration");
+  assert.ok(duration && duration.value >= 0);
+  const cost = metrics.points.find((point) => point.name === "axond.cost.microdollars");
+  assert.equal(cost?.value, 100);
+  const encoded = JSON.stringify(metrics.points);
+  assert.equal(encoded.includes(KEY), false);
+  assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
   upstream.close();
 });
 
