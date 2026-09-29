@@ -8,8 +8,7 @@ evidence and known limitations; the reusable process lives in the
 
 | Criterion | Status | Evidence |
 | --- | --- | --- |
-| Required routes, failover, credential pools, identity, controls, telemetry, and durable usage are implemented | Met | Compatibility contract, ADRs, unit/integration tests, SDK compatibility, stateful tests, Tier 0 gate, and stream soak. |
-| Blob-backed flat-namespace stateful-v2 qualification | Pending | ADR 0062 is accepted but not implemented. PostgreSQL stateful-v1 records are historical compatibility evidence and cannot satisfy this gate. |
+| Required routes, failover, credential pools, identity, controls, telemetry, and durable usage are implemented | Met | Compatibility contract, ADRs, unit/integration tests, SDK compatibility, Store tests, Tier 0 gate, and stream soak. |
 | Public source repository | Met | `https://github.com/Litvue/axond`. |
 | Cross-platform release archives | Met | The [latest GitHub release](https://github.com/Litvue/axond/releases/latest) contains Linux x86-64 and ARM64 GNU/musl, Apple Silicon macOS, and Windows archives, checksums, SBOMs, and provenance. |
 | Public OCI image | Met | The versioned `ghcr.io/litvue/axond` image for each release is public, published as a `linux/amd64` + `linux/arm64` index, smoke-tested per architecture, signed keylessly, and attested: provenance on every manifest including the index, SBOM on the per-architecture children. |
@@ -43,12 +42,7 @@ and publishes crates.io last because registry versions are immutable.
 - Release archives are verified by checksum and GitHub attestation; keyless
   cosign signatures cover the published image manifests only.
 - `/readyz` reports a serving, boot-validated process; it does not continuously
-  probe providers, Redis, or Postgres.
-- The implemented stateful control plane is PostgreSQL-backed and is not the
-  accepted production target. [ADR 0062](./docs/adr/0062-blob-backed-flat-namespace-control-plane.md)
-  selects a blob-backed flat-namespace stateful-v2 design; it is not implemented
-  or qualified yet, and the current PostgreSQL qualification cohort must not be
-  presented as evidence for it.
+  probe providers or the Store.
 - Cross-provider request translation is intentionally not supported. OpenAI and
   Anthropic aliases must use their native wire families.
 - Every `/v1/responses` request, initial calls included, pins to the alias's
@@ -72,8 +66,6 @@ operational consequences.
 ## Release gates
 
 `CI Success` is a software-change gate, not a production-qualification gate.
-It can be green while the blob-backed stateful-v2 release gates above remain
-pending; skipped PostgreSQL stateful-v1 lanes do not satisfy or replace them.
 
 The required pull-request CI aggregate covers:
 
@@ -88,12 +80,9 @@ The required pull-request CI aggregate covers:
   target's own platform;
 - Docker image and Compose quickstart smoke tests.
 
-Kubernetes stateful overlay drills are excluded from pull requests, pushes,
-merge queues, and schedules. They remain manually available only when
-`run_legacy_postgres_qualification=true` is explicitly supplied. Recovery,
-rollout, and stateful-endurance qualification harnesses were retired with the
-tier matrix (ADR 0063 / #427). Request-path qualification is SQLite +
-`/ns/{ns}/v1` and does not require Redis.
+Recovery, rollout, and stateful-endurance qualification harnesses were retired
+with the tier matrix (ADR 0063 / #427). Request-path qualification is SQLite +
+`/ns/{ns}/v1`.
 
 Release jobs add archive/image SBOMs, provenance attestations, cosign signing,
 native per-architecture archive smoke — the same binary smoke against the exact

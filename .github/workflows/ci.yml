@@ -7,18 +7,7 @@ on:
     branches: [main]
     tags: ['v*']
   merge_group:
-  # Kubernetes stateful overlay drills remain behind an explicit opt-in. They
-  # are not request-path qualification and do not require Redis.
   workflow_dispatch:
-    inputs:
-      run_legacy_postgres_qualification:
-        description: >-
-          Run the historical PostgreSQL Kubernetes stateful overlay drills.
-          Request-path qualification is SQLite + /ns/{ns}/v1 and does not use
-          this input.
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -420,8 +409,7 @@ jobs:
           shellcheck install.sh ops/publish-image-index.sh \
             ops/verify-image-evidence.sh ops/check-compose-platform.sh \
             ops/check-installer-download.sh ops/check-index-promotion.sh \
-            ops/pin-image-digest.sh ops/rollout-drill.sh \
-            ops/stateful-deploy-drill.sh
+            ops/pin-image-digest.sh ops/rollout-drill.sh
           # A failed download must name the kind of failure: the older-release
           # explanation belongs to a 404, and a transport failure must read as
           # retryable rather than as a missing artifact.
@@ -759,81 +747,6 @@ jobs:
           AXOND_ROLLOUT_IMAGE: axond-ci-rollout
         run: bash ops/rollout-drill.sh
 
-  # This drill intentionally seeds no serving revision, so the stateful replica
-  # remains fail-closed and never reports Ready. Three serving-fleet defaults are
-  # therefore wrong for this administrative bootstrap state: an upgrade waits
-  # for availability that cannot arrive, the ordinary Service has no endpoints,
-  # and the disruption budget blocks every eviction. Whether the overlay's
-  # explicit bootstrap answers work is an API-server outcome rather than a
-  # manifest property, so the drill runs each against a real cluster with the
-  # counterfactual that keeps the result honest.
-  stateful-deploy-drill:
-    name: Legacy PostgreSQL stateful deploy drill (three nodes)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Downloaded and checksummed for the same reason the rollout lane does it:
-      # the cluster tool is a supply-chain input the workflow policy's SHA
-      # pinning does not reach inside an action to cover.
-      - name: Install kind and kubectl
-        env:
-          KIND_VERSION: v0.30.0
-          KIND_SHA256: 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889
-          KUBECTL_VERSION: v1.33.4
-          KUBECTL_SHA256: c2ba72c115d524b72aaee9aab8df8b876e1596889d2f3f27d68405262ce86ca1
-        run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/kind \
-            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          echo "${KIND_SHA256}  /tmp/kind" | sha256sum --check --strict
-          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
-          curl -fsSL -o /tmp/kubectl \
-            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          echo "${KUBECTL_SHA256}  /tmp/kubectl" | sha256sum --check --strict
-          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-      # This commit's own image, not a release: `serve` did not bring up
-      # `/admin/v1` in the last published one, so a drill on a tag would assert
-      # against a gateway older than the manifests it is checking.
-      - name: Build the image the overlay deploys
-        run: docker build --tag axond-ci-stateful .
-      - name: Deploy the stateful overlay and drill its lifecycle
-        env:
-          AXOND_STATEFUL_IMAGE: axond-ci-stateful
-        run: bash ops/stateful-deploy-drill.sh
-
-  # The opt-in persistent overlay is a separate workload shape, not a static
-  # claim layered on top of the Recreate drill. Run it on a real three-worker
-  # cluster and require an ordinal PVC to retain data across Pod replacement.
-  stateful-persistent-drill:
-    name: Legacy PostgreSQL StatefulSet PVC drill (three nodes)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_postgres_qualification == true }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install kind and kubectl
-        env:
-          KIND_VERSION: v0.30.0
-          KIND_SHA256: 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889
-          KUBECTL_VERSION: v1.33.4
-          KUBECTL_SHA256: c2ba72c115d524b72aaee9aab8df8b876e1596889d2f3f27d68405262ce86ca1
-        run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/kind \
-            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          echo "${KIND_SHA256}  /tmp/kind" | sha256sum --check --strict
-          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
-          curl -fsSL -o /tmp/kubectl \
-            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          echo "${KUBECTL_SHA256}  /tmp/kubectl" | sha256sum --check --strict
-          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-      - name: Build the image the overlay deploys
-        run: docker build --tag axond-ci-stateful-persistent .
-      - name: Deploy the persistent overlay and drill PVC replacement
-        env:
-          AXOND_STATEFUL_PERSISTENT_IMAGE: axond-ci-stateful-persistent
-        run: bash ops/stateful-persistent-drill.sh
-
   quickstart-smoke:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
@@ -872,8 +785,6 @@ jobs:
       - docker-smoke
       - cosign-format
       - rollout-drill
-      - stateful-deploy-drill
-      - stateful-persistent-drill
       - quickstart-smoke
     runs-on: ubuntu-latest
     steps:
@@ -884,5 +795,4 @@ jobs:
           CI_RUST: ${{ needs.changes.outputs.rust }}
           CI_EVENT: ${{ github.event_name }}
           CI_DEPENDENCIES: ${{ needs.changes.outputs.dependencies }}
-          CI_LEGACY: ${{ inputs.run_legacy_postgres_qualification }}
         run: python3 ops/ci-success.py

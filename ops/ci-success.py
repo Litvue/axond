@@ -14,19 +14,17 @@ RELEASE = {
     "rustdoc", "publish-dry-run", "static-binary", "binary-smoke", "docker-smoke",
     "cosign-format", "rollout-drill", "quickstart-smoke",
 }
-LEGACY = {"stateful-deploy-drill", "stateful-persistent-drill"}
 
 
-def expected_results(event, dependencies, legacy, rust):
+def expected_results(event, dependencies, rust):
     expected = {job: "success" if rust == "true" or job in {"changes", "workflow-policy"} else "skipped" for job in COMMON}
     expected.update({job: "skipped" if rust == "false" or event == "pull_request" else "success" for job in RELEASE})
-    expected.update({job: "success" if event == "workflow_dispatch" and legacy == "true" else "skipped" for job in LEGACY})
     expected["dependency-policy"] = "success" if dependencies == "true" else "skipped"
     return expected
 
 
-def failures(needs, event, dependencies, legacy, rust):
-    expected = expected_results(event, dependencies, legacy, rust)
+def failures(needs, event, dependencies, rust):
+    expected = expected_results(event, dependencies, rust)
     errors = []
     if rust not in {"true", "false"}:
         errors.append("Rust change detection must succeed")
@@ -44,27 +42,27 @@ def failures(needs, event, dependencies, legacy, rust):
 
 
 def self_test():
-    all_jobs = COMMON | RELEASE | LEGACY | {"dependency-policy"}
+    all_jobs = COMMON | RELEASE | {"dependency-policy"}
     cases = [
-        ("pull_request", "false", "", "true"), ("pull_request", "true", "", "true"),
-        ("push", "true", "", "true"), ("merge_group", "true", "", "true"),
-        ("workflow_dispatch", "true", "false", "true"), ("workflow_dispatch", "true", "true", "true"),
-        ("pull_request", "false", "", "false"), ("push", "false", "", "false"),
-        ("merge_group", "false", "", "false"),
+        ("pull_request", "false", "true"), ("pull_request", "true", "true"),
+        ("push", "true", "true"), ("merge_group", "true", "true"),
+        ("workflow_dispatch", "true", "true"),
+        ("pull_request", "false", "false"), ("push", "false", "false"),
+        ("merge_group", "false", "false"),
     ]
-    for event, dependencies, legacy, rust in cases:
-        needs = {job: {"result": result} for job, result in expected_results(event, dependencies, legacy, rust).items()}
-        assert not failures(needs, event, dependencies, legacy, rust)
+    for event, dependencies, rust in cases:
+        needs = {job: {"result": result} for job, result in expected_results(event, dependencies, rust).items()}
+        assert not failures(needs, event, dependencies, rust)
         for job in all_jobs:
             original = needs[job]["result"]
             for result in {"success", "failure", "cancelled", "skipped"} - {original}:
                 needs[job]["result"] = result
-                assert failures(needs, event, dependencies, legacy, rust), (event, job, result)
+                assert failures(needs, event, dependencies, rust), (event, job, result)
             needs[job]["result"] = original
-        assert failures(needs, event, "", legacy, rust)
-        assert failures(needs, event, dependencies, legacy, "")
-        assert failures(needs, event, "true", legacy, "false")
-        assert failures({}, event, dependencies, legacy, rust)
+        assert failures(needs, event, "", rust)
+        assert failures(needs, event, dependencies, "")
+        assert failures(needs, event, "true", "false")
+        assert failures({}, event, dependencies, rust)
 
     workflow = (Path(__file__).resolve().parent.parent / ".github/workflows/ci.yml").read_text()
     jobs = set(re.findall(r"^  ([\w-]+):$", workflow.split("jobs:\n", 1)[1], re.M))
@@ -93,7 +91,7 @@ if __name__ == "__main__":
         self_test()
     else:
         errors = failures(json.loads(os.environ["CI_NEEDS"]), os.environ["CI_EVENT"],
-                          os.environ["CI_DEPENDENCIES"], os.environ.get("CI_LEGACY", ""), os.environ.get("CI_RUST", ""))
+                          os.environ["CI_DEPENDENCIES"], os.environ.get("CI_RUST", ""))
         for error in errors:
             print(f"::error::{error}")
         sys.exit(bool(errors))

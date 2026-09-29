@@ -55,22 +55,15 @@ OpenAI-kind alias to `/v1/messages` or an Anthropic-kind alias to
 
 Observed behaviour worth reusing (all reproducible offline, no provider keys):
 
-- Authority matrix: scope-less principals (static `[[gateway_key]]` **and** a minted token
-  with no `scope` claim) get `200` on the own-namespace view. On `?namespaces=all` only a
-  scope-less static key in the configured *default* namespace gets `200`; a static key in
-  a tenant namespace and every minted token get `403 token_scope_insufficient` naming
-  `credentials:all`. A scoped token needs `credentials` for the route;
-  `credentials:all` alone is denied with `credentials`.
+- Authority matrix: the static `[[gateway_key]]` gets `200` on the own-namespace view.
+  On `?namespaces=all` only a key in the configured *default* namespace gets `200`; a key
+  in a tenant namespace gets `403 token_scope_insufficient` naming `credentials:all`.
 - `?namespaces=` is the caller's *own* namespace only when omitted entirely. Any other
   value — including `""`, `ALL`, a real other namespace, or `all,platform` — is typed
   `400 bad_request`. Unknown params (`?foo=bar`) are ignored.
 - A repeated `namespaces` param is deliberately rejected with a typed `400 bad_request`
   (for example, `?namespaces=all&namespaces=beta`); it never exposes a query deserializer
   error or bypasses the gateway's typed-error envelope.
-- `credentials:all` in a token is inert: the all-namespaces view follows *authority*, not
-  the claim, so a token carrying it is denied even in the default namespace. `axond mint
-  --scope credentials:all` still signs the claim, which makes it a useful negative test.
-  `POST /v1/tokens` refuses to issue it, and an omitted minting scope does not inherit it.
 - A namespace with no credentials and fallback off answers `200 {"data":[]}` — an empty
   list, not an error.
 - The list is sorted by `(namespace, provider, credential_id)`, with omitted ids sorting
@@ -123,49 +116,15 @@ concatenation** of `base_url`
 + route path, so a `base_url` with a query string or trailing junk will produce a mangled
 URL — keep test `base_url`s path-only unless that is what you are testing.
 
-## Minted tokens (withdrawn) and file-backed key material
+## File-backed key material
 
 Minted `axt1.` tokens are not inbound identity ([ADR 0063](../../../docs/adr/0063-stateful-only-namespaced-gateway.md)):
-production `authenticate` returns `401` for that prefix and `POST /v1/tokens`
-is unmounted. The `keygen`/`mint` recipes below remain useful for parser and
-fuzz tests only.
+`authenticate` returns `401` for that prefix, `POST /v1/tokens` is unmounted, and
+the binary has no `keygen`/`mint` subcommands. The only inbound credential is the
+one static `[[gateway_key]]`, which takes **exactly one** of `env = "NAME"` or
+`file = "/path"`. There is no hot reload: changing key material needs a restart.
 
-`[[gateway_verifier]]` and `[[gateway_key]]` take **exactly one** of `env = "NAME"` or
-`file = "/path"`. File material is re-read whenever a reload candidate is built, so
-`SIGHUP` rotates it without a restart.
-
-```bash
-# Ed25519 signer: writes the private PKCS#8 base64 (0600, trailing newline) to the
-# path and prints the public key as an `export NAME='...'` line plus a TOML snippet.
-axond keygen --private-key /tmp/kt/sign.key --kid my-kid \
-  --env GW_VERIFY --namespace platform --max-ttl 15m
-# Verifier from a file: write just the public base64 into the configured path.
-printf %s "$PUB" > /tmp/kt/verifier.pub
-
-# Mint reads the *signing* material from an env var name; --config lets it infer
-# alg/audience/max_ttl from a matching verifier entry.
-export SIGN_KEY="$(cat /tmp/kt/sign.key)"
-axond mint --kid my-kid --key-env SIGN_KEY --namespace platform \
-  --subject tester --ttl 15m --config /tmp/kt/axond.toml   # prints axt1.<jws>
-```
-
-A verifier requires `[gateway_token] audience`, and at least one static
-`[[gateway_key]]` is always mandatory (breakglass). Send the minted token as
-`Authorization: Bearer axt1....`.
-
-Rotation / negative testing:
-
-- Replace material under the same `kid` (`printf %s … > f.next && mv f.next f`) then
-  `kill -HUP $PID`. The applied `"config reloaded"` JSON line carries
-  `gateway_verifiers: "+[] -[] ~[<kid>]"` plus `gateway_verifier_fingerprints` /
-  `gateway_key_fingerprints` (16 hex chars, SHA-256 prefix, never the material) — diff
-  the fingerprint across reloads to prove the re-read happened. Tokens signed by the
-  retired key then return `401 token_invalid_signature`.
-- A bad candidate (empty, deleted, non-UTF-8, corrupt base64, HS256 < 32 bytes) logs
-  `"config reload rejected; the running config keeps serving"` at ERROR with the path,
-  does not emit an applied line, and leaves the previous snapshot serving 200.
-- Whitespace: Ed25519 base64 is `trim()`ed (trailing newline fine); HS256 secrets and
-  static gateway-key files are **exact bytes**. Note a static key whose file ends in a
+- Whitespace: static gateway-key files are **exact bytes**. A key file that ends in a
   newline is effectively unusable over HTTP, because header values cannot carry a
   trailing newline (curl strips it) — expect 401 and use `printf %s`.
 - Booting several configs on different ports: `AXOND_SERVER__BIND=127.0.0.1:180xx`.
@@ -182,47 +141,6 @@ git worktree add /tmp/axond-main origin/main
 # ... run both binaries against the same config/port, diff the outputs ...
 git worktree remove /tmp/axond-main --force
 ```
-
-## Minted inbound identity (`keygen` / `mint` / `[[gateway_verifier]]`)
-
-Minted tokens can be exercised fully offline. Working recipe:
-
-```bash
-axond keygen --private-key ./sign.key --kid k1 --env GW_VERIFY_K1 \
-  --namespace acme --max-ttl 15m          # stdout = public key export + verifier snippet
-# config needs: [gateway_token] audience, [[gateway_verifier]], AND >=1 [[gateway_key]]
-export GW_VERIFY_K1='<from keygen stdout>'   # must be in the env BEFORE the gateway starts
-export GW_SIGN_K1="$(cat ./sign.key)"
-TOKEN=$(axond mint --config ./axond.toml --kid k1 --alg EdDSA --key-env GW_SIGN_K1 \
-  --namespace acme --subject agent-1 --ttl 10m)
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/v1/models
-```
-
-- Mint-time enforcement only happens when a config is loaded. Dropping `--config` (and
-  `AXOND_CONFIG`) and passing `--alg` plus `--audience` explicitly makes `mint` enforce
-  just the 24h ceiling, which is how you produce a token the gateway must reject
-  (`token_invalid_lifetime`, `token_signer_not_permitted`) — the cheapest way to test
-  verify-side checks without hand-forging a JWS.
-- Verify-side rejections are typed: `token_unknown_key` (kid removed/absent),
-  `token_invalid_signature` (key material swapped), `token_invalid_lifetime`
-  (`exp - iat > max_ttl`), `token_signer_not_permitted` (403, `ns` not in the verifier's
-  `namespaces`), `token_wrong_audience`.
-- `signer_kid` appears in the JSON usage record on stdout only for minted callers; static
-  `[[gateway_key]]` records use the env var *name* as `subject` and omit `signer_kid`. To
-  emit a record with no provider, point the provider `base_url` at `http://127.0.0.1:1/v1`
-  and POST `/v1/chat/completions` (502) — the usage record is still written.
-- **A running process's environment cannot gain a new variable.** SIGHUP re-reads
-  `std::env::vars()` of the *same* process, so adding a `[[gateway_verifier]]` whose `env`
-  was exported after the gateway started makes the reload fail with
-  "references env var `X`, which is unset or empty" and the old config keeps serving.
-  Any new-`kid` rotation test must pre-export every verifier env var before boot, or
-  restart the process. Same-`kid` key-material swaps likewise need a restart.
-- The reload summary line renders the verifier delta as
-  `gateway_verifiers="+[new] -[old] ~[changed-definition]"`; key material is never part of
-  the diff, so a material-only change reports `gateway_verifiers="unchanged", changed=false`.
-- EdDSA base64 is trimmed on both mint and verify sides (a trailing `\n` in either env var
-  still works). HS256 secrets are *not* trimmed — a trailing newline on the signing side
-  yields `token_invalid_signature`, which is the expected, documented behaviour.
 
 ## Gotchas
 
@@ -317,13 +235,6 @@ export AXOND_QUICKSTART_CONFIG=./ops/compose/axond.stateful.toml
 docker compose -f docker-compose.yml -f docker-compose.stateful.yml --profile stateful up -d
 ```
 
-- Proving Redis is really in admission (not silently ignored): `docker compose ... stop redis`,
-  then POST `/v1/chat/completions` → `503` `rate_limit_unavailable` (or `budget_unavailable`).
-  `/v1/models` still answers `200`, so only the dispatch path is gated. After
-  `start redis`, expect ~10-15s of transient `503`s before requests flow again — do not
-  read the first failure after a restart as a bug.
-- Redis holds no keys for a request that never spends (cost 0), so `redis-cli KEYS '*'`
-  being empty is not evidence Redis is unwired; use the fail-closed probe above instead.
 - Postgres usage rows are batched: `select count(*) from axond_usage` immediately after a
   request returns `0` and flips to `1` a few seconds later. Always poll before asserting,
   as shown in the deployment guide.

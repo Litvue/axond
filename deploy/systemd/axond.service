@@ -12,7 +12,6 @@ WorkingDirectory=/var/lib/axond
 Environment=AXOND_CONFIG=/etc/axond/axond.toml
 EnvironmentFile=/etc/axond/axond.env
 ExecStart=/usr/local/bin/axond
-ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 # Must exceed shutdown.drain_grace_ms + deadline_ms + flush_timeout_ms (25s with

@@ -1,17 +1,12 @@
-# Docker Compose stateful quickstart configuration.
+# Docker Compose "stateful" profile configuration.
 #
-# "Stateful" here means the shared *state backends* of ADR 0017 (Tier 1 Redis,
-# Tier 2 Postgres), not the `mode = "stateful"` control plane of ADR 0027. This
-# is a stateless-mode file: TOML still owns every resource, which is why the
-# catalogue below is present and `mode` is absent.
+# "Stateful" here means the optional shared Postgres usage backend, not the
+# withdrawn control-plane product (ADR 0063). It is the quickstart file plus a
+# durable Postgres `[[usage_sink]]`: `create_table = true` applies the
+# committed usage schema and additive migrations at boot.
 #
 # This duplicates axond.quickstart.toml because TOML has no include. Keep the
-# catalogue and routing sections in sync; only the trailing budget,
-# rate_limit, and usage_sink sections differ. The shared backends are:
-# - Tier 1: Redis-backed budget and inbound rate limiting. Redis is now part of
-#   admission and the default `deny` policy fails closed when it is unavailable.
-# - Tier 2: Postgres durable usage rows. `create_table = true` applies the
-#   committed usage schema and additive migrations at boot.
+# catalogue and routing sections in sync; only the trailing usage_sink differs.
 
 [server]
 bind = "0.0.0.0:8080"
@@ -80,14 +75,6 @@ model = "text-embedding-3-small"
 input_microdollars_per_million = 20_000
 output_microdollars_per_million = 0
 
-
-[budget]
-reservation_ttl_seconds = 300
-
-[rate_limit]
-backend = "redis"
-dsn_env = "AXOND_RATE_LIMIT_REDIS_URL"
-on_unavailable = "deny"
 
 [[usage_sink]]
 kind = "postgres"

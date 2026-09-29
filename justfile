@@ -65,8 +65,6 @@ docs-check: ops-venv
     bash -n ops/verify-image-evidence.sh
     bash -n ops/pin-image-digest.sh
     bash -n ops/rollout-drill.sh
-    bash -n ops/stateful-deploy-drill.sh
-    bash -n ops/stateful-persistent-drill.sh
     bash ops/check-compose-platform.sh
     bash ops/check-installer-download.sh
     bash ops/check-index-promotion.sh
@@ -102,21 +100,6 @@ deploy-check:
 # documented in docs/deployment/kubernetes.md.
 rollout-drill:
     bash ops/rollout-drill.sh
-
-# Deploy the stateful overlay on a real three-worker kind cluster: migrate once,
-# serve /admin/v1 on replicas that refuse inference and never report Ready, then
-# prove a RollingUpdate stalls and the default disruption budget refuses the
-# eviction AlwaysAllow permits. Needs Docker, kind, kubectl, and kustomize. About
-# five minutes; documented in docs/deployment/kubernetes.md.
-stateful-deploy-drill:
-    bash ops/stateful-deploy-drill.sh
-
-# Deploy the opt-in persistent StatefulSet overlay on a real three-worker kind
-# cluster and prove a retained ordinal PVC survives Pod replacement. Needs
-# Docker, kind, kubectl, and kustomize. About five minutes; documented in
-# docs/deployment/kubernetes.md.
-stateful-persistent-drill:
-    bash ops/stateful-persistent-drill.sh
 
 # Refresh the manifest gate's lockfile, excluding releases newer than a week.
 deploy-lock:
