@@ -88,6 +88,13 @@ That runs the workspace tests, `tests/compat`, and `tests/compat-ts` with
 Trusted extensions may `query` the process store. Untrusted ones are scoped to
 the request namespace. Tables must be named `axond_ext_<name>_...`.
 
+## Container
+
+`ts/Dockerfile` is the TypeScript image. The repository-root `Dockerfile` stays
+the Rust release image. A local build (`axond-ts:local`, 235 MB) served
+`GET /healthz` as `ok` and listed the configured `platform` namespace from
+SQLite inside the container.
+
 ## Worker
 
 `ts/packages/worker` is the Hyperdrive template. Set the Hyperdrive id, keep
