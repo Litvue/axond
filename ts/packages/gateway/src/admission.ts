@@ -115,7 +115,7 @@ export function createAdmission(limits: AdmissionLimits) {
     released(metrics, "request");
   };
 
-  const stage = (metrics: MetricSink | undefined, name: "queued" | "executing", delta: number) => {
+  const stage = (metrics: MetricSink | undefined, name: "reserved" | "queued" | "executing", delta: number) => {
     record(metrics, "axond.settlement.in_flight", delta, { "axond.settlement.stage": name });
   };
 
@@ -263,6 +263,9 @@ export function createAdmission(limits: AdmissionLimits) {
   return {
     limits,
     oldestPendingAgeMs,
+    inFlightRequests() {
+      return requests;
+    },
     observeAge,
     awaitIdle(boundMs: number): Promise<SettlementBacklog> {
       const snapshot = (): SettlementBacklog => ({ spawned: backlog.length, oldestAgeMs: oldestPendingAgeMs() });
@@ -331,6 +334,15 @@ export function createAdmission(limits: AdmissionLimits) {
       let admissionReleased = false;
       let executionState: "idle" | "waiting" | "held" = "idle";
       let spawnedId: number | null = null;
+      let reservedHeld = true;
+      stage(metrics, "reserved", 1);
+      const releaseReserved = (callMetrics?: MetricSink) => {
+        if (!reservedHeld) {
+          return;
+        }
+        reservedHeld = false;
+        stage(callMetrics ?? metrics, "reserved", -1);
+      };
       return {
         get settlementClaimed() {
           return settlementState === "claimed" || settlementState === "released";
@@ -351,6 +363,7 @@ export function createAdmission(limits: AdmissionLimits) {
           }
         },
         releaseSettlement() {
+          releaseReserved();
           if (settlementState !== "held" && settlementState !== "claimed") {
             return;
           }
@@ -386,6 +399,7 @@ export function createAdmission(limits: AdmissionLimits) {
           if (spawnedId !== null) {
             return;
           }
+          releaseReserved(callMetrics);
           spawnedId = enqueueSpawned();
           observeAge(callMetrics ?? metrics);
         },

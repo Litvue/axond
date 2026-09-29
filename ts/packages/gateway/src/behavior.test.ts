@@ -2042,6 +2042,83 @@ test("a settlement that outlives its deadline still records the charge", async (
   }
 });
 
+test("an admitted request holds a reserved settlement until the charge is spawned", async () => {
+  const admission = createAdmission({
+    ...defaultAdmission(),
+    maxInFlight: 4,
+    maxPendingSettlements: 4,
+  });
+  const metrics = createMetrics(["sk-live-secret"]);
+  const store = await seeded();
+  let releaseUpstream: () => void = () => undefined;
+  const upstream = await listen((_req, res) => {
+    void new Promise<void>((resolve) => {
+      releaseUpstream = () => {
+        releaseUpstream = () => undefined;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}');
+        resolve();
+      };
+    });
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    admissionControl: admission,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1_000_000n,
+        outputMicrodollarsPerMillion: 1_000_000n,
+      },
+    ],
+    metrics,
+  });
+  const payload = JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "hi" }] });
+  const reserved = () =>
+    metrics.points.find(
+      (point) =>
+        point.name === "axond.settlement.in_flight" && point.attributes["axond.settlement.stage"] === "reserved",
+    );
+  try {
+    const pending = app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: CHAT_HEADERS,
+      body: payload,
+    });
+    for (let attempt = 0; attempt < 50 && (reserved()?.value ?? 0) !== 1; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(reserved()?.value, 1);
+    assert.equal(admission.inFlightRequests(), 1);
+    const anonymous = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: payload,
+    });
+    assert.equal(anonymous.status, 401);
+    await anonymous.text();
+    assert.equal(reserved()?.value, 1);
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+    releaseUpstream();
+    const response = await pending;
+    assert.equal(response.status, 200);
+    await response.text();
+    for (let attempt = 0; attempt < 30 && (reserved()?.value ?? 1) !== 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(reserved()?.value, 0);
+    assert.equal(admission.inFlightRequests(), 0);
+  } finally {
+    releaseUpstream();
+    upstream.close();
+  }
+});
+
 test("a spawned charge's age climbs until the charge finishes", async () => {
   const admission = createAdmission({
     ...defaultAdmission(),

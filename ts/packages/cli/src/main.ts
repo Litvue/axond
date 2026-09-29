@@ -135,11 +135,15 @@ async function main(): Promise<void> {
   });
   let phase: "serving" | "draining" | "closing" = "serving";
   let exited = false;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   const finish = async () => {
     if (exited) {
       return;
     }
     exited = true;
+    if (deadlineTimer) {
+      clearTimeout(deadlineTimer);
+    }
     const leftovers = await admission.awaitIdle(Math.floor(config.shutdown.flushTimeoutMs / 2));
     if (leftovers.spawned > 0) {
       metrics.record("axond.shutdown.abandoned_settlements", leftovers.spawned);
@@ -152,11 +156,16 @@ async function main(): Promise<void> {
     }
     phase = "closing";
     admitting = false;
-    const deadline = setTimeout(() => {
+    metrics.set("axond.shutdown.phase", 2, { "axond.lifecycle_phase": "closing" });
+    deadlineTimer = setTimeout(() => {
+      const stuck = admission.inFlightRequests();
+      if (stuck > 0) {
+        metrics.record("axond.shutdown.abandoned_requests", stuck);
+      }
       server.closeAllConnections();
       void finish();
     }, config.shutdown.deadlineMs);
-    deadline.unref();
+    deadlineTimer.unref();
     server.close(() => {
       void finish();
     });
@@ -171,6 +180,7 @@ async function main(): Promise<void> {
       return;
     }
     phase = "draining";
+    metrics.set("axond.shutdown.phase", 1, { "axond.lifecycle_phase": "draining" });
     stopDiscovery();
     serving = false;
     if (config.shutdown.drainGraceMs === 0) {
