@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { emptyUsage, noteSseChunk, sseTerminalSeen, usageFromJson } from "./usage.ts";
+import { emptyUsage, noteSseChunk, sseTerminalSeen, usageEvent, usageFromJson } from "./usage.ts";
 
 test("openai cached prompt tokens are billed once", () => {
   const usage = usageFromJson("chat", {
@@ -71,4 +71,47 @@ test("anthropic cache tokens stay disjoint from input", () => {
   assert.equal(usage.inputTokens, 19n);
   assert.equal(usage.cacheReadTokens, 3n);
   assert.equal(usage.cacheWriteTokens, 1n);
+});
+
+test("usage event names the serving credential and omits an absent trace", () => {
+  const base = {
+    schemaVersion: 2 as const,
+    requestId: "req-1",
+    traceId: null,
+    namespace: "platform",
+    period: "compat",
+    subject: "gateway-key",
+    model: "fake-openai/gpt-test",
+    targetProvider: "fake-openai",
+    targetModel: "gpt-test",
+    credentialSource: "byok" as const,
+    credentialId: "tenant-own",
+    status: "ok",
+    inputTokens: 4n,
+    outputTokens: 1n,
+    reasoningTokens: 0n,
+    cacheReadTokens: 2n,
+    cacheWriteTokens: 0n,
+    costMicrodollars: 5n,
+    catalogVersion: 0 as const,
+    priceBook: null,
+    priceBookChecksum: null,
+    priceCatalog: null,
+    signerKid: null,
+    latencyMs: 12,
+    attempts: 1,
+  };
+  const plain = usageEvent(base);
+  assert.equal(Object.hasOwn(plain, "trace_id"), false);
+  assert.equal(plain.credential_source, "byok");
+  assert.equal(plain.credential_id, "tenant-own");
+  assert.equal(plain.attempts, 1);
+  assert.equal(plain.latency_ms, 12);
+  assert.equal(plain.period, "compat");
+  assert.equal(plain.cache_read_tokens, "2");
+  assert.equal(plain.price_catalog, null);
+  const traced = usageEvent({ ...base, traceId: "0123456789abcdef0123456789abcdef" });
+  assert.equal(traced.trace_id, "0123456789abcdef0123456789abcdef");
+  const keys = Object.keys(traced);
+  assert.equal(keys.indexOf("trace_id"), keys.indexOf("request_id") + 1);
 });

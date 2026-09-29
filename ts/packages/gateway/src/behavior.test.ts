@@ -875,6 +875,7 @@ test("an openai chat rate limit before content rotates and is not forwarded", as
   const store = await seeded();
   const seen: string[] = [];
   let settlements = 0;
+  let servedCredential = "";
   const upstream = await listen((req, res) => {
     const authorization = req.headers.authorization ?? "";
     seen.push(authorization);
@@ -887,8 +888,11 @@ test("an openai chat rate limit before content rotates and is not forwarded", as
   });
   const app = poolApp(store, upstream.url, {
     credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
-    onUsage: () => {
+    onUsage: (record) => {
       settlements += 1;
+      servedCredential = `${record.credentialSource}:${record.credentialId}:${record.attempts}:${record.period}`;
+      assert.equal(record.latencyMs >= 0, true);
+      assert.equal(record.traceId, null);
     },
   });
   const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
@@ -903,6 +907,7 @@ test("an openai chat rate limit before content rotates and is not forwarded", as
   assert.equal(body.includes("rate_limit_exceeded"), false);
   assert.deepEqual(seen, ["Bearer bad-key", "Bearer good-key"]);
   assert.equal(settlements, 1);
+  assert.equal(servedCredential, "platform:good:1:compat");
   const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
   const rows = (await status.json()).data as { credential_id: string; state: string }[];
   assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "parked");

@@ -10,3 +10,4 @@ export { resolveTelemetry } from "./otel.ts";
 export { OPENAPI } from "./openapi.ts";
 export { scopeStore } from "./scoped-store.ts";
 export { costMicrodollars, lookupPrice } from "./pricing.ts";
+export { usageEvent } from "./usage.ts";

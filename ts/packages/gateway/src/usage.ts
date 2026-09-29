@@ -1,4 +1,4 @@
-import type { UsageTokens } from "@axond/sdk";
+import type { UsageRecord, UsageTokens } from "@axond/sdk";
 
 export function emptyUsage(): UsageTokens {
   return {
@@ -175,6 +175,37 @@ export function noteSseChunk(route: string, usage: UsageTokens, text: string): v
       assignUsage(usage, usageFromJson(route, record));
     }
   }
+}
+
+/** The stdout usage event. `trace_id` is omitted when the request had no inbound trace. */
+export function usageEvent(record: UsageRecord): Record<string, unknown> {
+  const line: Record<string, unknown> = {
+    schema_version: record.schemaVersion,
+    request_id: record.requestId,
+    ...(record.traceId ? { trace_id: record.traceId } : {}),
+    namespace: record.namespace,
+    period: record.period,
+    subject: record.subject,
+    signer_kid: record.signerKid,
+    model: record.model,
+    target_provider: record.targetProvider,
+    target_model: record.targetModel,
+    credential_source: record.credentialSource,
+    credential_id: record.credentialId,
+    status: record.status,
+    input_tokens: record.inputTokens.toString(),
+    cache_read_tokens: record.cacheReadTokens.toString(),
+    cache_write_tokens: record.cacheWriteTokens.toString(),
+    output_tokens: record.outputTokens.toString(),
+    cost_microdollars: record.costMicrodollars?.toString() ?? null,
+    catalog_version: record.catalogVersion,
+    price_book: record.priceBook,
+    price_book_checksum: record.priceBookChecksum,
+    price_catalog: record.priceCatalog,
+    latency_ms: record.latencyMs,
+    attempts: record.attempts,
+  };
+  return line;
 }
 
 export function assignUsage(target: UsageTokens, next: UsageTokens): void {

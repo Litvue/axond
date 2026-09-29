@@ -6,7 +6,7 @@ import { Agent } from "undici";
 import { getRequestListener } from "@hono/node-server";
 import pg from "pg";
 
-import { createAxond, createMetrics, envSecretReader, loadConfig, resolveTelemetry } from "../../gateway/src/index.ts";
+import { createAxond, createMetrics, envSecretReader, loadConfig, resolveTelemetry, usageEvent } from "../../gateway/src/index.ts";
 import type { AxondExtension } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
@@ -81,24 +81,7 @@ async function main(): Promise<void> {
       process.stdout.write(`${JSON.stringify(record)}\n`);
     },
     onUsage: (record) => {
-      const line = {
-        schema_version: record.schemaVersion,
-        request_id: record.requestId,
-        namespace: record.namespace,
-        subject: record.subject,
-        model: record.model,
-        target_provider: record.targetProvider,
-        target_model: record.targetModel,
-        status: record.status,
-        input_tokens: record.inputTokens.toString(),
-        output_tokens: record.outputTokens.toString(),
-        cost_microdollars: record.costMicrodollars?.toString() ?? null,
-        catalog_version: record.catalogVersion,
-        price_book: record.priceBook,
-        price_book_checksum: record.priceBookChecksum,
-        signer_kid: record.signerKid,
-      };
-      process.stdout.write(`${JSON.stringify(line)}\n`);
+      process.stdout.write(`${JSON.stringify(usageEvent(record))}\n`);
     },
   });
   const listener = getRequestListener(app.fetch);

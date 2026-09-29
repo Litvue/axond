@@ -32,7 +32,7 @@ import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors
 import { globMatch } from "./glob.ts";
 import { budgetJson, money, namespaceJson } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, parseNamespaceId, validatePeriod, validateTimezone } from "./namespace.ts";
-import { beginTrace, childTrace, formatTraceparent, metricPayload, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
+import { beginTrace, childTrace, formatTraceparent, metricPayload, parseTraceparent, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
 import { sanitizeAttributes } from "./metrics.ts";
 import { OPENAPI } from "./openapi.ts";
 import { costMicrodollars, lookupPrice } from "./pricing.ts";
@@ -53,6 +53,10 @@ interface MutableContext extends AxondContext {
   resolvedPeriod: string | null;
   alias: string;
   startedMs: number;
+  traceId: string | null;
+  servedCredentialId: string;
+  servedCredentialSource: "platform" | "byok";
+  upstreamAttempts: number;
 }
 
 /**
@@ -262,6 +266,10 @@ function createContext(c: Context<AxondEnv>, opts: AxondOptions): MutableContext
     resolvedIncarnation: 1n,
     resolvedPeriod: null,
     alias: "",
+    traceId: parseTraceparent(c.req.header("traceparent"))?.traceId ?? null,
+    servedCredentialId: "",
+    servedCredentialSource: "platform",
+    upstreamAttempts: 0,
     store: scopeStore(opts.store, ""),
     onSettle(fn) {
       ctx.hooks.push(fn);
@@ -644,6 +652,7 @@ async function dispatch(
       if (reason === "end" && streamServed) {
         noteCredentialSuccess(pools, record.id, provider.id, served.id);
       }
+      noteServed(axond, opts, served);
       if (stream && opts.waitUntil) {
         releaseStream();
         return;
@@ -719,6 +728,7 @@ async function dispatch(
             : undefined,
       });
       if (!stream) {
+        noteServed(axond, opts, credential);
         scheduleSettle(opts, axond, upstream.usage, "ok");
       }
       if (!stream) {
@@ -895,6 +905,12 @@ function copyUsage(target: UsageTokens, next: UsageTokens): void {
   target.cacheWriteTokens = next.cacheWriteTokens;
 }
 
+function noteServed(axond: MutableContext, opts: AxondOptions, credential: CredentialConfig): void {
+  axond.servedCredentialId = credential.id;
+  axond.servedCredentialSource = credential.namespace === opts.defaultNamespace ? "platform" : "byok";
+  axond.upstreamAttempts = 1;
+}
+
 function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): void {
   const task = settle(opts, axond, usage, status);
   if (opts.waitUntil) {
@@ -929,11 +945,15 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
   const record: UsageRecord = {
     schemaVersion: 2,
     requestId: axond.requestId,
+    traceId: axond.traceId,
     namespace: settlement.namespace,
+    period: axond.resolvedPeriod,
     subject: axond.subject ?? "",
     model: axond.alias,
     targetProvider: axond.target?.provider ?? "",
     targetModel: axond.target?.model ?? "",
+    credentialSource: axond.servedCredentialSource,
+    credentialId: axond.servedCredentialId,
     status,
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
@@ -944,7 +964,10 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
     catalogVersion: 0,
     priceBook: null,
     priceBookChecksum: null,
+    priceCatalog: null,
     signerKid: null,
+    latencyMs: Math.max(0, Date.now() - axond.startedMs),
+    attempts: axond.upstreamAttempts,
   };
   opts.onUsage?.(record);
   recordSettlementMetrics(opts, axond, usage, status, cost);

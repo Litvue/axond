@@ -365,11 +365,19 @@ export interface TransportLimits {
 export interface UsageRecord {
   schemaVersion: 2;
   requestId: string;
+  /** Inbound W3C trace id. Null when the request carried no valid traceparent. */
+  traceId: string | null;
   namespace: string;
+  /** Budget period at admission. Null when the request was not held. */
+  period: string | null;
   subject: string;
   model: string;
   targetProvider: string;
   targetModel: string;
+  /** `platform` when the serving credential belongs to the default namespace. */
+  credentialSource: "platform" | "byok";
+  /** Non-secret label of the credential that served the request. */
+  credentialId: string;
   status: string;
   inputTokens: bigint;
   outputTokens: bigint;
@@ -381,7 +389,12 @@ export interface UsageRecord {
   catalogVersion: 0;
   priceBook: null;
   priceBookChecksum: null;
+  priceCatalog: null;
   signerKid: null;
+  /** Milliseconds from request start to settlement. */
+  latencyMs: number;
+  /** Upstream targets tried. One target means `1` even after credential rotation. */
+  attempts: number;
 }
 
 /**
