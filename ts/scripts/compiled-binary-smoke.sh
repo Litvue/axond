@@ -88,7 +88,8 @@ dir="$(mktemp -d)"
 port="$(free_port)"
 write_config "$dir" "$port"
 err="${dir}/stderr"
-AXOND_EXTENSIONS_DIR= AXOND_CONFIG="${dir}/axond.toml" GW_INBOUND_KEY=test-inbound-key \
+AXOND_EXTENSIONS_DIR= AXOND_CONFIG="${dir}/axond.toml" \
+  GW_INBOUND_KEY=test-inbound-key GW_FAKE_OPENAI_KEY=upstream \
   "$bin" >"${dir}/stdout" 2>"$err" &
 pid=$!
 wait_health "http://127.0.0.1:${port}/healthz" "$err"
@@ -138,7 +139,8 @@ export default {
 EOF
 write_config "$dir" 9
 err="${dir}/stderr"
-AXOND_CONFIG="${dir}/axond.toml" AXOND_EXTENSIONS_DIR="$dir" GW_INBOUND_KEY=test-inbound-key \
+AXOND_CONFIG="${dir}/axond.toml" AXOND_EXTENSIONS_DIR="$dir" \
+  GW_INBOUND_KEY=test-inbound-key GW_FAKE_OPENAI_KEY=upstream \
   "$bin" >"${dir}/stdout" 2>"$err" &
 pid=$!
 attempt=0
