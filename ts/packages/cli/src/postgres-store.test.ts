@@ -4,6 +4,7 @@ import test from "node:test";
 import pg from "pg";
 
 import { StoreFailure } from "../../gateway/src/errors.ts";
+import { createMetrics } from "../../gateway/src/metrics.ts";
 import { createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
 import type { Store } from "@axond/sdk";
 
@@ -53,6 +54,65 @@ test("a postgres connection error drops the driver message", async () => {
     assert.equal(error.message.includes("super-secret-value"), false);
     return true;
   });
+});
+
+test("postgres store counts one session per call and omits a failed connect", async () => {
+  const metrics = createMetrics();
+  const store = createPostgresStore(async () => {
+    return {
+      client: {
+        query: async () => ({ rows: [], rowCount: 0 }),
+      },
+      release: async () => undefined,
+    };
+  }, metrics);
+  await store.query("select 1");
+  assert.equal(
+    metrics.points.some((point) => point.name === "axond.store.operations"),
+    false,
+  );
+  const opened = metrics.points.find((point) => point.name === "axond.store.connections_opened");
+  const discarded = metrics.points.find((point) => point.name === "axond.store.connections_discarded");
+  assert.equal(opened?.value, 1);
+  assert.equal(opened?.attributes["axond.store.backend"], "postgres");
+  assert.equal(discarded?.value, 1);
+  assert.equal(await store.getNamespace("platform"), null);
+  const read = metrics.points.find(
+    (point) => point.name === "axond.store.operations" && point.attributes["axond.store.operation"] === "namespace_read",
+  );
+  const duration = metrics.points.find(
+    (point) => point.name === "axond.store.query_duration" && point.attributes["axond.store.operation"] === "namespace_read",
+  );
+  assert.equal(read?.value, 1);
+  assert.equal(read?.attributes["axond.store.outcome"], "ok");
+  assert.equal(read?.attributes["axond.store.backend"], "postgres");
+  assert.ok(duration && duration.value >= 0);
+  assert.equal(opened?.value, 2);
+  assert.equal(discarded?.value, 2);
+
+  const failing = createMetrics();
+  const down = createPostgresStore(async () => {
+    throw new Error("password=sk-live-secret");
+  }, failing);
+  await assert.rejects(() => down.getNamespace("platform"), (error: unknown) => error instanceof StoreFailure);
+  const failed = failing.points.find((point) => point.name === "axond.store.operations");
+  assert.equal(failed?.value, 1);
+  assert.equal(failed?.attributes["axond.store.outcome"], "error");
+  assert.equal(failed?.attributes["axond.store.operation"], "namespace_read");
+  assert.equal(
+    failing.points.some((point) => point.name === "axond.store.query_duration"),
+    false,
+  );
+  assert.equal(
+    failing.points.some((point) => point.name === "axond.store.connections_opened"),
+    false,
+  );
+  assert.equal(
+    failing.points.some((point) => point.name === "axond.store.connections_discarded"),
+    false,
+  );
+  assert.equal(JSON.stringify(failing.points).includes("sk-live-secret"), false);
+  assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
 });
 
 test("postgres 16 charges one request_id once and ignores a stale incarnation", { skip: !dsn }, async () => {

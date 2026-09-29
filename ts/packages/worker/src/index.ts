@@ -51,7 +51,7 @@ export function createHandler(env: WorkerEnv) {
       },
       release: () => client.end(),
     };
-  });
+  }, metrics);
   const providers = JSON.parse(env.PROVIDERS_JSON) as ProviderConfig[];
   const credentials = JSON.parse(env.CREDENTIALS_JSON ?? "[]") as CredentialConfig[];
   const catalog = workerCatalog(env);

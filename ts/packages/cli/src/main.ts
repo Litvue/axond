@@ -31,10 +31,11 @@ async function main(): Promise<void> {
     toml,
     envSecretReader(process.env, async (path) => readFile(path, "utf8")),
   );
+  const metrics = createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []);
   const store =
     config.storage.backend === "sqlite"
-      ? openSqliteStore(config.storage.path!)
-      : await openPostgres(config.storage.dsn!);
+      ? openSqliteStore(config.storage.path!, metrics)
+      : await openPostgres(config.storage.dsn!, metrics);
   for (const namespace of config.namespaces) {
     await store.putNamespace({
       id: namespace.id,
@@ -60,7 +61,6 @@ async function main(): Promise<void> {
   });
   let serving = true;
   let admitting = true;
-  const metrics = createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []);
   const admission = createAdmission(
     admissionFromOptions({
       maxInFlight: config.admission.maxInFlight,
@@ -210,7 +210,7 @@ function connectDispatcher(connectTimeoutMs: number): object | undefined {
   });
 }
 
-async function openPostgres(dsn: string) {
+async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgresStore>[1]) {
   const setup = new Client({ connectionString: dsn });
   await setup.connect();
   await setup.query(POSTGRES_SCHEMA);
@@ -227,7 +227,7 @@ async function openPostgres(dsn: string) {
       },
       release: () => client.end(),
     };
-  });
+  }, metrics);
 }
 
 async function loadExtensionDir(dir: string | null): Promise<AxondExtension[]> {

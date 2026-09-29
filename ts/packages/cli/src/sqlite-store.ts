@@ -17,6 +17,7 @@ import type {
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { budgetJson } from "../../gateway/src/memory-store.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
+import { recordStoreCall, type StoreMetrics, type StoreOperation } from "../../gateway/src/store-metrics.ts";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS axond_namespace (
@@ -74,17 +75,22 @@ CREATE TABLE IF NOT EXISTS axond_schema_migrations (
 
 const I64_MAX = 9223372036854775807n;
 
-export function openSqliteStore(path: string): Store {
+export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
   const db = new DatabaseSync(path);
   db.exec("PRAGMA journal_mode=WAL");
   db.exec("PRAGMA busy_timeout=5000");
   db.exec(SCHEMA);
   let chain: Promise<unknown> = Promise.resolve();
-  const lock = <T>(fn: () => T): Promise<T> => {
+  const lock = <T>(operation: StoreOperation | null, fn: () => T): Promise<T> => {
+    const called = Date.now();
     const run = chain.then(() => {
+      const acquired = Date.now();
       try {
-        return fn();
+        const value = fn();
+        recordStoreCall(metrics, "sqlite", operation, acquired - called, Date.now() - acquired, "ok");
+        return value;
       } catch (error) {
+        recordStoreCall(metrics, "sqlite", operation, acquired - called, Date.now() - acquired, "error");
         if (error instanceof GatewayFailure || error instanceof StoreFailure) {
           throw error;
         }
@@ -100,10 +106,10 @@ export function openSqliteStore(path: string): Store {
 
   const store: Store = {
     query(sql, params = []) {
-      return lock(() => ({ rows: all(db, sql, params) }));
+      return lock(null, () => ({ rows: all(db, sql, params) }));
     },
     resolveNamespace(id, nowMs) {
-      return lock(() => {
+      return lock("namespace_resolve", () => {
         const record = readNamespace(db, id);
         if (!record) {
           return null;
@@ -144,7 +150,7 @@ export function openSqliteStore(path: string): Store {
       });
     },
     putNamespace(record) {
-      return lock(() => {
+      return lock("namespace_write", () => {
         const exists = one(db, "SELECT id FROM axond_namespace WHERE id = ?", [record.id]);
         if (exists) {
           return "exists" as const;
@@ -162,10 +168,10 @@ export function openSqliteStore(path: string): Store {
       });
     },
     getNamespace(id) {
-      return lock(() => readNamespace(db, id));
+      return lock("namespace_read", () => readNamespace(db, id));
     },
     updateNamespace(id, attrs, blocklist) {
-      return lock(() => {
+      return lock("namespace_write", () => {
         const current = readNamespace(db, id);
         if (!current) {
           return null;
@@ -179,7 +185,7 @@ export function openSqliteStore(path: string): Store {
       });
     },
     deleteNamespace(id) {
-      return lock(() => {
+      return lock("namespace_write", () => {
         const result = db.prepare("DELETE FROM axond_namespace WHERE id = ?").run(id);
         if (Number(result.changes) === 0) {
           return false;
@@ -195,7 +201,7 @@ export function openSqliteStore(path: string): Store {
       });
     },
     listNamespaces(cursor, limit) {
-      return lock(() => {
+      return lock("namespace_read", () => {
         const rows = all(
           db,
           "SELECT id FROM axond_namespace WHERE (? IS NULL OR id > ?) ORDER BY id LIMIT ?",
@@ -210,7 +216,7 @@ export function openSqliteStore(path: string): Store {
       });
     },
     putBudget(namespace, period, limit) {
-      return lock(() => {
+      return lock("budget_write", () => {
         if (!readNamespace(db, namespace)) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
@@ -227,7 +233,7 @@ export function openSqliteStore(path: string): Store {
       });
     },
     getBudget(namespace, period) {
-      return lock(() => {
+      return lock("budget_read", () => {
         if (!readNamespace(db, namespace)) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
@@ -235,10 +241,10 @@ export function openSqliteStore(path: string): Store {
       });
     },
     putBudgetPolicy(input) {
-      return lock(() => writePolicy(db, input));
+      return lock("budget_write", () => writePolicy(db, input));
     },
     getBudgetPolicy(namespace) {
-      return lock(() => {
+      return lock("budget_read", () => {
         if (!readNamespace(db, namespace)) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
@@ -253,10 +259,10 @@ export function openSqliteStore(path: string): Store {
       });
     },
     settle(input) {
-      return lock(() => settleSqlite(db, input));
+      return lock("budget_charge", () => settleSqlite(db, input));
     },
     summarizeUsage(namespace, period) {
-      return lock(() => {
+      return lock("usage_summary", () => {
         if (!readNamespace(db, namespace)) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
@@ -274,16 +280,16 @@ export function openSqliteStore(path: string): Store {
       });
     },
     listProviderModels() {
-      return lock(() => all(db, "SELECT * FROM axond_store_provider_models", []).map(modelRow));
+      return lock("provider_models", () => all(db, "SELECT * FROM axond_store_provider_models", []).map(modelRow));
     },
     getProviderModels(provider) {
-      return lock(() => {
+      return lock("provider_models", () => {
         const row = one(db, "SELECT * FROM axond_store_provider_models WHERE provider = ?", [provider]);
         return row ? modelRow(row) : null;
       });
     },
     upsertProviderModels(row) {
-      return lock(() => {
+      return lock("provider_models", () => {
         db.prepare(
           `INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models, source)
            VALUES (?, ?, ?, ?, ?)
@@ -294,7 +300,7 @@ export function openSqliteStore(path: string): Store {
       });
     },
     markProviderModelsStale(provider) {
-      return lock(() => {
+      return lock("provider_models", () => {
         const current = one(db, "SELECT provider FROM axond_store_provider_models WHERE provider = ?", [provider]);
         if (!current) {
           db.prepare(

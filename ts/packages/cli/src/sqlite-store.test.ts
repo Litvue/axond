@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { StoreFailure } from "../../gateway/src/errors.ts";
+import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
+import { createMetrics } from "../../gateway/src/metrics.ts";
 import { applyMigration, openSqliteStore } from "./sqlite-store.ts";
 
 test("sqlite settlement is exactly once per request_id and survives reopen", async () => {
@@ -126,6 +127,63 @@ test("sqlite provider models keep the last payload and reject a different fresh 
     const replaced = await store.getProviderModels("openai");
     assert.equal(replaced?.stale, false);
     assert.deepEqual(replaced?.data, [{ id: "other" }]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("sqlite store operations record wait and query duration without the namespace", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-"));
+  const path = join(directory, "axond.sqlite");
+  try {
+    const metrics = createMetrics();
+    const store = openSqliteStore(path, metrics);
+    await store.putNamespace({
+      id: "sk-live-secret",
+      attrs: {},
+      blocklist: null,
+      allowPlatformFallback: false,
+      fromConfig: true,
+    });
+    await store.settle({
+      requestId: "req-1",
+      namespace: "sk-live-secret",
+      period: "compat",
+      model: "fake/gpt",
+      status: "ok",
+      cost: null,
+      incarnation: 1n,
+    });
+    await assert.rejects(
+      () => store.getBudget("missing", "compat"),
+      (error: unknown) => error instanceof GatewayFailure,
+    );
+    const operations = metrics.points.filter((point) => point.name === "axond.store.operations");
+    const write = operations.find((point) => point.attributes["axond.store.operation"] === "namespace_write");
+    const charge = operations.find((point) => point.attributes["axond.store.operation"] === "budget_charge");
+    const read = operations.find((point) => point.attributes["axond.store.operation"] === "budget_read");
+    assert.equal(write?.value, 1);
+    assert.equal(write?.attributes["axond.store.backend"], "sqlite");
+    assert.equal(write?.attributes["axond.store.outcome"], "ok");
+    assert.equal(charge?.value, 1);
+    assert.equal(charge?.attributes["axond.store.outcome"], "ok");
+    assert.equal(read?.value, 1);
+    assert.equal(read?.attributes["axond.store.outcome"], "error");
+    for (const operation of ["namespace_write", "budget_charge", "budget_read"]) {
+      const wait = metrics.points.find(
+        (point) => point.name === "axond.store.acquire_wait" && point.attributes["axond.store.operation"] === operation,
+      );
+      const duration = metrics.points.find(
+        (point) => point.name === "axond.store.query_duration" && point.attributes["axond.store.operation"] === operation,
+      );
+      assert.ok(wait && wait.value >= 0);
+      assert.ok(duration && duration.value >= 0);
+    }
+    assert.equal(
+      metrics.points.some((point) => point.name === "axond.store.connections_opened"),
+      false,
+    );
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

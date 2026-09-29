@@ -10,6 +10,13 @@ import type {
 
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
+import {
+  recordConnectionDiscarded,
+  recordConnectionOpened,
+  recordStoreCall,
+  type StoreMetrics,
+  type StoreOperation,
+} from "../../gateway/src/store-metrics.ts";
 
 export interface SqlExecutor {
   query(sql: string, params?: readonly SqlValue[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
@@ -22,38 +29,49 @@ const I64_MAX = "9223372036854775807";
  * pass a connector that opens `pg.Client` against the Hyperdrive string and
  * closes it in `release`. Do not issue session-level SET.
  */
-export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor; release: () => Promise<void> }>): Store {
-  async function withClient<T>(fn: (client: SqlExecutor) => Promise<T>): Promise<T> {
+export function createPostgresStore(
+  connect: () => Promise<{ client: SqlExecutor; release: () => Promise<void> }>,
+  metrics?: StoreMetrics,
+): Store {
+  async function withClient<T>(operation: StoreOperation | null, fn: (client: SqlExecutor) => Promise<T>): Promise<T> {
+    const called = Date.now();
     let opened: { client: SqlExecutor; release: () => Promise<void> };
     try {
       opened = await connect();
     } catch (error) {
+      recordStoreCall(metrics, "postgres", operation, Date.now() - called, null, "error");
       if (error instanceof GatewayFailure) {
         throw error;
       }
       throw new StoreFailure();
     }
+    recordConnectionOpened(metrics);
+    const acquired = Date.now();
     try {
-      return await fn(opened.client);
+      const value = await fn(opened.client);
+      recordStoreCall(metrics, "postgres", operation, acquired - called, Date.now() - acquired, "ok");
+      return value;
     } catch (error) {
+      recordStoreCall(metrics, "postgres", operation, acquired - called, Date.now() - acquired, "error");
       if (error instanceof GatewayFailure || error instanceof StoreFailure) {
         throw error;
       }
       throw new StoreFailure();
     } finally {
       await opened.release().catch(() => undefined);
+      recordConnectionDiscarded(metrics);
     }
   }
 
   return {
     async query(sql, params = []) {
-      return withClient(async (client) => {
+      return withClient(null, async (client) => {
         const result = await client.query(sql, params);
         return { rows: result.rows };
       });
     },
     async resolveNamespace(id, nowMs) {
-      return withClient(async (client) => {
+      return withClient("namespace_resolve", async (client) => {
         const found = await client.query(
           "SELECT id, attrs, blocklist, allow_platform_fallback, from_config FROM axond_namespace WHERE id = $1",
           [id],
@@ -103,7 +121,7 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     async putNamespace(record) {
-      return withClient(async (client) => {
+      return withClient("namespace_write", async (client) => {
         const result = await client.query(
           `INSERT INTO axond_namespace (id, attrs, blocklist, allow_platform_fallback, from_config)
            VALUES ($1, $2::jsonb, $3::jsonb, $4, $5)
@@ -120,13 +138,13 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     async getNamespace(id) {
-      return withClient(async (client) => {
+      return withClient("namespace_read", async (client) => {
         const result = await client.query("SELECT * FROM axond_namespace WHERE id = $1", [id]);
         return result.rows[0] ? namespaceFrom(result.rows[0]) : null;
       });
     },
     async updateNamespace(id, attrs, blocklist) {
-      return withClient(async (client) => {
+      return withClient("namespace_write", async (client) => {
         const result = await client.query(
           `UPDATE axond_namespace SET attrs = $2::jsonb, blocklist = $3::jsonb WHERE id = $1 RETURNING *`,
           [id, JSON.stringify(attrs), blocklist === null ? null : JSON.stringify(blocklist)],
@@ -135,7 +153,7 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     async deleteNamespace(id) {
-      return withClient(async (client) => {
+      return withClient("namespace_write", async (client) => {
         const deleted = await client.query("DELETE FROM axond_namespace WHERE id = $1", [id]);
         if ((deleted.rowCount ?? 0) === 0) {
           return false;
@@ -152,7 +170,7 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     async listNamespaces(cursor, limit) {
-      return withClient(async (client) => {
+      return withClient("namespace_read", async (client) => {
         const result = await client.query(
           "SELECT * FROM axond_namespace WHERE ($1::text IS NULL OR id > $1) ORDER BY id LIMIT $2",
           [cursor, limit + 1],
@@ -163,7 +181,7 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     async putBudget(namespace, period, limit) {
-      return withClient(async (client) => {
+      return withClient("budget_write", async (client) => {
         const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [namespace]);
         if (!known.rows[0]) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -183,7 +201,7 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     async getBudget(namespace, period) {
-      return withClient(async (client) => {
+      return withClient("budget_read", async (client) => {
         const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [namespace]);
         if (!known.rows[0]) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -192,7 +210,7 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     async putBudgetPolicy(input: BudgetPolicyWrite) {
-      return withClient(async (client) => {
+      return withClient("budget_write", async (client) => {
         const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [input.namespace]);
         if (!known.rows[0]) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -232,7 +250,7 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     async getBudgetPolicy(namespace) {
-      return withClient(async (client) => {
+      return withClient("budget_read", async (client) => {
         const policy = await client.query("SELECT * FROM axond_store_budget_cadence WHERE namespace = $1", [namespace]);
         if (!policy.rows[0]) {
           const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [namespace]);
@@ -258,10 +276,10 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     settle(input) {
-      return withClient((client) => settlePostgres(client, input));
+      return withClient("budget_charge", (client) => settlePostgres(client, input));
     },
     async summarizeUsage(namespace, period) {
-      return withClient(async (client) => {
+      return withClient("usage_summary", async (client) => {
         const result = await client.query(
           `SELECT model, status, COUNT(*)::int AS count, COALESCE(SUM(cost_microdollars), 0) AS cost
            FROM axond_store_usage WHERE namespace = $1 AND period = $2 GROUP BY model, status`,
@@ -276,19 +294,19 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     async listProviderModels() {
-      return withClient(async (client) => {
+      return withClient("provider_models", async (client) => {
         const result = await client.query("SELECT * FROM axond_store_provider_models", []);
         return result.rows.map(modelFrom);
       });
     },
     async getProviderModels(provider) {
-      return withClient(async (client) => {
+      return withClient("provider_models", async (client) => {
         const result = await client.query("SELECT * FROM axond_store_provider_models WHERE provider = $1", [provider]);
         return result.rows[0] ? modelFrom(result.rows[0]) : null;
       });
     },
     async upsertProviderModels(row) {
-      return withClient(async (client) => {
+      return withClient("provider_models", async (client) => {
         await client.query(
           `INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models, source)
            VALUES ($1, $2, $3, $4::jsonb, $5)
@@ -300,7 +318,7 @@ export function createPostgresStore(connect: () => Promise<{ client: SqlExecutor
       });
     },
     async markProviderModelsStale(provider) {
-      return withClient(async (client) => {
+      return withClient("provider_models", async (client) => {
         await client.query(
           `INSERT INTO axond_store_provider_models (provider, fetched_at, stale, models, source)
            VALUES ($1, NULL, true, '[]'::jsonb, NULL)
