@@ -250,6 +250,7 @@ export interface AxondOptions {
   /** Catalogue recorder. Absent means the process emits no metrics. */
   metrics?: {
     record(name: string, value: number, attributes?: Record<string, string>): void;
+    set?(name: string, value: number, attributes?: Record<string, string>): void;
     points?: readonly {
       name: string;
       value: number;
@@ -372,14 +373,36 @@ export interface AdmissionPermit {
   }): Promise<boolean>;
   releaseExecution(metrics?: {
     record(name: string, value: number, attributes?: Record<string, string>): void;
+    set?(name: string, value: number, attributes?: Record<string, string>): void;
   }): void;
+  beginSpawned(metrics?: {
+    record(name: string, value: number, attributes?: Record<string, string>): void;
+    set?(name: string, value: number, attributes?: Record<string, string>): void;
+  }): void;
+  endSpawned(metrics?: {
+    record(name: string, value: number, attributes?: Record<string, string>): void;
+    set?(name: string, value: number, attributes?: Record<string, string>): void;
+  }): void;
+}
+
+export interface SettlementBacklog {
+  spawned: number;
+  oldestAgeMs: number;
 }
 
 export interface AdmissionControl {
   admit(
     kind: "buffered" | "streamed",
-    metrics?: { record(name: string, value: number, attributes?: Record<string, string>): void },
+    metrics?: {
+      record(name: string, value: number, attributes?: Record<string, string>): void;
+      set?(name: string, value: number, attributes?: Record<string, string>): void;
+    },
   ): Promise<AdmissionPermit>;
+  oldestPendingAgeMs(): number;
+  observeAge(metrics?: {
+    set?(name: string, value: number, attributes?: Record<string, string>): void;
+  }): void;
+  awaitIdle(boundMs: number): Promise<SettlementBacklog>;
 }
 
 export interface ProviderConfig {

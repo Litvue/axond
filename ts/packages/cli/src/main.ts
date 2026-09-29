@@ -6,7 +6,16 @@ import { Agent } from "undici";
 import { getRequestListener } from "@hono/node-server";
 import pg from "pg";
 
-import { createAxond, createMetrics, envSecretReader, loadConfig, resolveTelemetry, usageEvent } from "../../gateway/src/index.ts";
+import {
+  admissionFromOptions,
+  createAdmission,
+  createAxond,
+  createMetrics,
+  envSecretReader,
+  loadConfig,
+  resolveTelemetry,
+  usageEvent,
+} from "../../gateway/src/index.ts";
 import type { AxondExtension } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
@@ -51,6 +60,19 @@ async function main(): Promise<void> {
   });
   let serving = true;
   let admitting = true;
+  const metrics = createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []);
+  const admission = createAdmission(
+    admissionFromOptions({
+      maxInFlight: config.admission.maxInFlight,
+      maxInFlightStreams: config.admission.maxInFlightStreams,
+      queueCapacity: config.admission.queueCapacity,
+      queueWaitMs: config.admission.queueWaitMs,
+      maxPendingSettlements: config.admission.maxPendingSettlements,
+      maxInFlightSettlements: config.admission.maxInFlightSettlements,
+      settlementQueueWaitMs: config.admission.settlementQueueWaitMs,
+      settlementTimeoutMs: config.admission.settlementTimeoutMs,
+    }),
+  );
   const app = createAxond({
     store,
     providers: config.providers,
@@ -66,14 +88,7 @@ async function main(): Promise<void> {
     maxOutputTokens: config.maxOutputTokens,
     maxStreamDurationMs: config.maxStreamDurationMs,
     maxStreamBytes: config.maxStreamBytes,
-    maxInFlight: config.admission.maxInFlight,
-    maxInFlightStreams: config.admission.maxInFlightStreams,
-    admissionQueueCapacity: config.admission.queueCapacity,
-    admissionQueueWaitMs: config.admission.queueWaitMs,
-    maxPendingSettlements: config.admission.maxPendingSettlements,
-    maxInFlightSettlements: config.admission.maxInFlightSettlements,
-    settlementQueueWaitMs: config.admission.settlementQueueWaitMs,
-    settlementTimeoutMs: config.admission.settlementTimeoutMs,
+    admissionControl: admission,
     credentialPool: {
       strategy: config.credentialPool.strategy,
       failureThreshold: config.credentialPool.failureThreshold,
@@ -85,7 +100,7 @@ async function main(): Promise<void> {
     serving: () => serving,
     onStoreUnavailable: config.storage.onUnavailable,
     admitting: () => admitting,
-    metrics: createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []),
+    metrics,
     telemetry: telemetry ?? undefined,
     onLog: (record) => {
       process.stdout.write(`${JSON.stringify(record)}\n`);
@@ -119,6 +134,18 @@ async function main(): Promise<void> {
     intervalSeconds: config.discoveryIntervalSeconds,
   });
   let phase: "serving" | "draining" | "closing" = "serving";
+  let exited = false;
+  const finish = async () => {
+    if (exited) {
+      return;
+    }
+    exited = true;
+    const leftovers = await admission.awaitIdle(Math.floor(config.shutdown.flushTimeoutMs / 2));
+    if (leftovers.spawned > 0) {
+      metrics.record("axond.shutdown.abandoned_settlements", leftovers.spawned);
+    }
+    process.exit(0);
+  };
   const closeAdmission = () => {
     if (phase === "closing") {
       return;
@@ -127,10 +154,12 @@ async function main(): Promise<void> {
     admitting = false;
     const deadline = setTimeout(() => {
       server.closeAllConnections();
-      process.exit(0);
+      void finish();
     }, config.shutdown.deadlineMs);
     deadline.unref();
-    server.close(() => process.exit(0));
+    server.close(() => {
+      void finish();
+    });
     server.closeIdleConnections();
   };
   const shutdown = () => {

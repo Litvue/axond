@@ -1,5 +1,5 @@
 export { createAxond } from "./app.ts";
-export { createAdmission, defaultAdmission } from "./admission.ts";
+export { createAdmission, defaultAdmission, admissionFromOptions } from "./admission.ts";
 export { loadConfig, envSecretReader, WITHDRAWN_SECTIONS } from "./config.ts";
 export type { LoadedConfig, SecretReader } from "./config.ts";
 export { createMemoryStore, budgetJson, money, namespaceJson } from "./memory-store.ts";

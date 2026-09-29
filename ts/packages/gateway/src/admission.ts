@@ -40,10 +40,20 @@ export interface AdmissionHold {
    */
   acquireExecution(metrics?: MetricSink): Promise<boolean>;
   releaseExecution(metrics?: MetricSink): void;
+  /** Start the age clock for this request's spawned charge. */
+  beginSpawned(metrics?: MetricSink): void;
+  /** The spawned charge finished or was dropped. */
+  endSpawned(metrics?: MetricSink): void;
+}
+
+export interface SettlementBacklog {
+  spawned: number;
+  oldestAgeMs: number;
 }
 
 interface MetricSink {
   record(name: string, value: number, attributes?: Record<string, string>): void;
+  set?(name: string, value: number, attributes?: Record<string, string>): void;
 }
 
 interface Waiter {
@@ -68,8 +78,11 @@ export function createAdmission(limits: AdmissionLimits) {
   let pending = 0;
   let queueDepth = 0;
   let executing = 0;
+  let sequence = 0;
   const waiters: Waiter[] = [];
   const executionWaiters: { grant: () => void }[] = [];
+  const backlog: { id: number; enqueuedAt: number }[] = [];
+  const idleWaiters: (() => void)[] = [];
 
   const record = (metrics: MetricSink | undefined, name: string, value: number, attributes?: Record<string, string>) => {
     metrics?.record(name, value, attributes);
@@ -152,6 +165,45 @@ export function createAdmission(limits: AdmissionLimits) {
     });
   };
 
+  const oldestPendingAgeMs = (): number => {
+    if (backlog.length === 0) {
+      return 0;
+    }
+    let oldest = backlog[0]!.enqueuedAt;
+    for (const entry of backlog) {
+      if (entry.enqueuedAt < oldest) {
+        oldest = entry.enqueuedAt;
+      }
+    }
+    return Math.max(0, Date.now() - oldest);
+  };
+  const observeAge = (metrics: MetricSink | undefined) => {
+    metrics?.set?.("axond.settlement.oldest_pending_age", oldestPendingAgeMs());
+  };
+  const wakeIdle = () => {
+    if (backlog.length !== 0) {
+      return;
+    }
+    const waiting = idleWaiters.splice(0);
+    for (const waiter of waiting) {
+      waiter();
+    }
+  };
+  const enqueueSpawned = (): number => {
+    const id = sequence;
+    sequence += 1;
+    backlog.push({ id, enqueuedAt: Date.now() });
+    return id;
+  };
+  const dequeueSpawned = (id: number) => {
+    const index = backlog.findIndex((entry) => entry.id === id);
+    if (index < 0) {
+      return;
+    }
+    backlog.splice(index, 1);
+    wakeIdle();
+  };
+
   const releaseExecutionSlot = (metrics: MetricSink | undefined) => {
     if (executionLimit === null) {
       return;
@@ -210,6 +262,34 @@ export function createAdmission(limits: AdmissionLimits) {
 
   return {
     limits,
+    oldestPendingAgeMs,
+    observeAge,
+    awaitIdle(boundMs: number): Promise<SettlementBacklog> {
+      const snapshot = (): SettlementBacklog => ({ spawned: backlog.length, oldestAgeMs: oldestPendingAgeMs() });
+      if (backlog.length === 0 || boundMs <= 0) {
+        return Promise.resolve(snapshot());
+      }
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          clearTimeout(timer);
+          const index = idleWaiters.indexOf(waiter);
+          if (index >= 0) {
+            idleWaiters.splice(index, 1);
+          }
+          resolve(snapshot());
+        };
+        const waiter = () => finish();
+        const timer = setTimeout(finish, boundMs);
+        const unref = timer as { unref?: () => void };
+        unref.unref?.();
+        idleWaiters.push(waiter);
+      });
+    },
     async admit(kind: "buffered" | "streamed", metrics?: MetricSink): Promise<AdmissionHold> {
       const requestHeld = await acquireRequest(metrics);
       let streamHeld = false;
@@ -250,6 +330,7 @@ export function createAdmission(limits: AdmissionLimits) {
       }
       let admissionReleased = false;
       let executionState: "idle" | "waiting" | "held" = "idle";
+      let spawnedId: number | null = null;
       return {
         get settlementClaimed() {
           return settlementState === "claimed" || settlementState === "released";
@@ -300,6 +381,22 @@ export function createAdmission(limits: AdmissionLimits) {
           }
           executionState = "idle";
           releaseExecutionSlot(callMetrics ?? metrics);
+        },
+        beginSpawned(callMetrics) {
+          if (spawnedId !== null) {
+            return;
+          }
+          spawnedId = enqueueSpawned();
+          observeAge(callMetrics ?? metrics);
+        },
+        endSpawned(callMetrics) {
+          if (spawnedId === null) {
+            return;
+          }
+          const id = spawnedId;
+          spawnedId = null;
+          dequeueSpawned(id);
+          observeAge(callMetrics ?? metrics);
         },
       };
     },

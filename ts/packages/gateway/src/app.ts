@@ -114,6 +114,7 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
         );
         opts.metrics?.record("axond.http.server.requests", 1, httpAttributes);
         opts.metrics?.record("axond.http.server.duration", Date.now() - started, httpAttributes);
+        admission.observeAge(opts.metrics);
         const axond = readAxond(c);
         const ended = Date.now();
         opts.onLog?.({
@@ -1047,6 +1048,8 @@ function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageT
 async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): Promise<void> {
   const hold = admissionHolds.get(axond);
   hold?.claimSettlement();
+  hold?.beginSpawned(opts.metrics);
+  try {
   const granted = hold ? await hold.acquireExecution(opts.metrics) : true;
   if (!granted) {
     opts.metrics?.record("axond.settlement.failures", 1, { "axond.settlement.reason": "queue_timeout" });
@@ -1130,6 +1133,9 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
     }
     hold?.releaseExecution(opts.metrics);
     hold?.releaseSettlement();
+  }
+  } finally {
+    hold?.endSpawned(opts.metrics);
   }
 }
 

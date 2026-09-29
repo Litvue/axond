@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import test from "node:test";
 import { Agent } from "undici";
 
+import { createAdmission, defaultAdmission } from "./admission.ts";
 import { createAxond } from "./app.ts";
 import { isRateLimitPayload, targetAttemptCap } from "./dispatch.ts";
 import { createMemoryStore } from "./memory-store.ts";
@@ -2037,6 +2038,85 @@ test("a settlement that outlives its deadline still records the charge", async (
     );
     assert.equal(executing?.value, 0);
   } finally {
+    upstream.close();
+  }
+});
+
+test("a spawned charge's age climbs until the charge finishes", async () => {
+  const admission = createAdmission({
+    ...defaultAdmission(),
+    maxInFlight: 4,
+    maxPendingSettlements: 4,
+    settlementTimeoutMs: 0,
+  });
+  const metrics = createMetrics(["sk-live-secret"]);
+  const store = await seeded();
+  let releaseSettle: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    releaseSettle = resolve;
+  });
+  const original = store.settle.bind(store);
+  store.settle = async (input) => {
+    await gate;
+    return original(input);
+  };
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":4,"completion_tokens":4}}');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    admissionControl: admission,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1_000_000n,
+        outputMicrodollarsPerMillion: 1_000_000n,
+      },
+    ],
+    metrics,
+  });
+  const payload = JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "hi" }] });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: CHAT_HEADERS,
+      body: payload,
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    for (let attempt = 0; attempt < 50 && admission.oldestPendingAgeMs() === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    const first = admission.oldestPendingAgeMs();
+    assert.ok(first >= 0);
+    assert.ok(admission.oldestPendingAgeMs() >= first);
+    await new Promise((wake) => setTimeout(wake, 40));
+    const later = admission.oldestPendingAgeMs();
+    assert.ok(later > first, `age ${later} did not pass ${first}`);
+    admission.observeAge(metrics);
+    const aged = metrics.points.find((point) => point.name === "axond.settlement.oldest_pending_age");
+    assert.ok((aged?.value ?? 0) >= 30);
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+    const waiting = admission.awaitIdle(30);
+    const started = Date.now();
+    const backlog = await waiting;
+    assert.ok(Date.now() - started >= 20);
+    assert.equal(backlog.spawned, 1);
+    assert.ok(backlog.oldestAgeMs >= 40);
+    releaseSettle();
+    const idle = await admission.awaitIdle(500);
+    assert.equal(idle.spawned, 0);
+    assert.equal(idle.oldestAgeMs, 0);
+    const cleared = metrics.points.find((point) => point.name === "axond.settlement.oldest_pending_age");
+    assert.equal(cleared?.value, 0);
+  } finally {
+    releaseSettle();
     upstream.close();
   }
 });

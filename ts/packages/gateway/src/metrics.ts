@@ -124,5 +124,23 @@ export function createMetrics(secrets: readonly string[] = []) {
       series.set(signature, point);
       points.push(point);
     },
+    set(name: string, value: number, attributes: Record<string, string> = {}) {
+      if (!(METRIC_NAMES as readonly string[]).includes(name) && !name.startsWith("axond.ext.")) {
+        throw new Error(`metric ${name} is not in the catalogue`);
+      }
+      const safe = sanitizeAttributes(attributes, secrets);
+      const signature = `${name}\0${JSON.stringify(safe)}`;
+      const existing = series.get(signature);
+      if (existing) {
+        existing.value = value;
+        return;
+      }
+      if (series.size >= MAX_CARDINALITY) {
+        return;
+      }
+      const point: MetricPoint = { name, value, attributes: safe };
+      series.set(signature, point);
+      points.push(point);
+    },
   };
 }
