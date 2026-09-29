@@ -327,15 +327,29 @@ From Cloudflare's docs (research pass, 2026-09-28). Re-verify before committing.
 4. **Confirm** with those numbers, then complete the port: management API, budgets, cadence, models listing, credentials, SQLite store.
 5. **Gate** with the `tests/compat*` lanes. Record the result as an ADR that supersedes the single-binary Rust framing in ADR 0063, and states the extension contract, its versioning, and who may author extensions.
 
+## 14. Spike results (2026-09-29)
+
+Recorded while landing the TypeScript gateway. [ADR 0066](../adr/0066-typescript-hono-extension-contract.md) is the decision record.
+
+| Question | Result |
+| --- | --- |
+| Worker + Hyperdrive + PlanetScale | **No-go for a live claim.** `wrangler deploy --dry-run` bundled `ts/packages/worker` (322.90 KiB gzip 70.51 KiB) with a Hyperdrive binding and the rate-limit extension imported statically. This environment has no Cloudflare or PlanetScale credentials, so disconnect latency, connection counting, and a real Hyperdrive round trip were not measured. |
+| Idempotent charge | **Go on Postgres 16.** Ten concurrent settlements of one `request_id` plus ten distinct ids charged 11 times (`spent = 11000`). A settle carrying the pre-delete incarnation charged nothing after delete and recreate. The same case passes on SQLite. A wrapper that caches `SELECT`s still returned a deleted namespace; the live store returned none. Hyperdrive caching stays disabled for that reason. PlanetScale was not in the run. |
+| Compiled binary | **Go.** Bun 1.4.2 `bun build --compile` produced an 81,679,840-byte executable. A successful boot reached `/healthz` in 137 ms and loaded a `.ts` extension from `AXOND_EXTENSIONS_DIR` without a rebuild. An unsupported `apiVersion` is refused at mount. |
+| Extension npm dependency | **Bundle the extension.** A compiled binary that `import()`s a `.ts` file cannot resolve that file's `node_modules` (`Cannot find package 'smol-toml'`). `bun build probe.ts --outfile probe.js` embeds the dependency, and the same binary then served the parsed value `7`. The Node wrapper still resolves packages from the extension directory. |
+| Extension seam | Promoted. Stages are `pre-auth`, `post-auth`, `pre-dispatch`, with response transforms after `await next()` and `onSettle` after the charge. Reference packages: `@axond/rate-limit`, `@axond/redact`, `@axond/tokens`. |
+
 ## Open questions
 
-1. Should the Rust implementation remain a supported product after the TS gateway ships, or become a reference and conformance oracle? The maintainer's direction suggests retiring it. That is not yet stated.
-2. Does Litvue's API already run on Cloudflare Workers, or on Bun or Node? That decides between the same-Worker, Service Binding, and same-process shapes.
-3. Who may author extensions: only the operator, first-party maintainers, or third parties? Third-party authorship needs an isolation boundary beyond in-process middleware.
-4. What shared-state primitive does the SDK give extensions? The candidates are extension-owned Postgres tables (portable), Durable Objects (Workers only), and Redis (an extra dependency).
-5. Is billing-grade usage delivery (the ADR 0049 journal) required, or is the idempotent usage row in `axond_store_usage` enough?
-6. Does the SQLite store need to ship in the TS package, or is Postgres the only supported store for TS?
-7. Should per-tenant admission limits ship in core or as a reference extension? Workers cannot enforce them without a Durable Object or Rate Limiting binding.
+Answers are in [ADR 0066](../adr/0066-typescript-hono-extension-contract.md).
+
+1. Should the Rust implementation remain a supported product after the TS gateway ships, or become a reference and conformance oracle? **Oracle for this 0.x line.** The crates stay. A later minor can make the TypeScript build the release binary.
+2. Does Litvue's API already run on Cloudflare Workers, or on Bun or Node? **Not in this repository.** The recommended shape is a separate Worker behind a service binding. Same-process `createAxond` when the API is Bun or Node. The interim proxy of the Rust binary is a Litvue API change (#501), not an Axond route.
+3. Who may author extensions: **operators and first-party maintainers**, reviewed like core. No third-party isolation boundary.
+4. What shared-state primitive does the SDK give extensions? **Extension-owned Postgres or SQLite tables** via `Store.query`. No Durable Objects or Redis dependency.
+5. Is billing-grade usage delivery (the ADR 0049 journal) required? **No.** The idempotent `axond_store_usage` row is the charge key. A failed insert skips the charge (under-billing).
+6. Does the SQLite store need to ship? **Yes**, for Bun, Node, and the compiled binary. Postgres is the Worker and highly available store.
+7. Should per-tenant admission limits ship in core? **No.** The rate-limit extension owns that. Core does not emit `tenant_concurrency_exceeded`.
 
 ## Sources
 

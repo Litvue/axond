@@ -16,8 +16,15 @@ export GW_INBOUND_KEY=...
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
-directory of `.ts` files. Each file's default export is an extension with
-`apiVersion: 1`. Restart the process to pick up a new file; do not rebuild.
+directory of `.ts`, `.js`, or `.mjs` files. Each file's default export is an
+extension with `apiVersion: 1`. Restart the process to pick up a new file; do
+not rebuild.
+
+A compiled `bun build --compile` binary loads those files, but it does not
+resolve packages from the extension's `node_modules`. Bundle an extension that
+imports a package first (`bun build extension.ts --outfile extension.js`) and
+point the directory at the bundle. The Node wrapper resolves packages from the
+extension file.
 
 ## Prove it
 

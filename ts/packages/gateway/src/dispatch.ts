@@ -261,7 +261,8 @@ async function readWithIdle(
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
   });
 }
 
