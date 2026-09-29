@@ -119,36 +119,7 @@ jobs:
           set -euo pipefail
           bun build packages/cli/src/main.ts --compile --outfile "$RUNNER_TEMP/axond"
           bash scripts/sign-artifact.sh "$RUNNER_TEMP/axond" "$RUNNER_TEMP/sign"
-          dir="$RUNNER_TEMP/smoke"
-          mkdir -p "$dir"
-          printf '%s\n' \
-            '[server]' \
-            'bind = "127.0.0.1:18081"' \
-            '' \
-            '[storage]' \
-            'backend = "sqlite"' \
-            "path = \"$dir/axond.sqlite\"" \
-            '' \
-            '[[namespace]]' \
-            'id = "platform"' \
-            'default = true' \
-            '' \
-            '[[gateway_key]]' \
-            'env = "GW_INBOUND_KEY"' \
-            'namespace = "platform"' \
-            > "$dir/axond.toml"
-          AXOND_CONFIG="$dir/axond.toml" GW_INBOUND_KEY=test-inbound-key "$RUNNER_TEMP/axond" &
-          pid=$!
-          trap 'kill "$pid"' EXIT
-          for _ in 1 2 3 4 5 6 7 8 9 10; do
-            if curl -fsS http://127.0.0.1:18081/healthz; then
-              echo
-              exit 0
-            fi
-            sleep 0.3
-          done
-          echo "compiled binary did not become healthy" >&2
-          exit 1
+          bash scripts/compiled-binary-smoke.sh "$RUNNER_TEMP/axond"
 
   release-sign:
     name: Keyless signature for a tag
