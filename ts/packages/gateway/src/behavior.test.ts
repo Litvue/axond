@@ -1323,6 +1323,127 @@ test("an incomplete tail after the terminal event is relayed through eof", async
   }
 });
 
+const MESSAGES_TERMINAL = [
+  'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+  'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":1}}\n\n',
+  'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+].join("");
+
+function messagesApp(
+  store: Store,
+  baseUrl: string,
+  records: UsageRecord[],
+  metrics?: ReturnType<typeof createMetrics>,
+) {
+  return createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    metrics,
+    providers: [{ id: "fake-anthropic", kind: "anthropic", baseUrl }],
+    credentials: [{ namespace: "platform", provider: "fake-anthropic", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-anthropic",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 1_000,
+      bufferedBodyTimeoutMs: 1_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 1_000,
+      maxResponseBytes: 4096,
+    },
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+}
+
+test("a transport error after message_stop keeps the completed body", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const metrics = createMetrics();
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(MESSAGES_TERMINAL, () => {
+      // Next turn: Bun drops the body if the socket resets inside this callback.
+      setTimeout(() => res.destroy(), 0);
+    });
+  });
+  const app = messagesApp(store, upstream.url, records, metrics);
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-anthropic/claude-test",
+        stream: true,
+        messages: [],
+        max_tokens: 16,
+      }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text, MESSAGES_TERMINAL);
+    assert.equal(text.includes("upstream_stream_error"), false);
+    assert.equal(text.includes("sk-live-secret"), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.inputTokens, 3n);
+    assert.equal(records[0]!.outputTokens, 1n);
+    assert.equal(metrics.points.some((point) => point.name === "axond.upstream.errors"), false);
+    assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("an incomplete tail after message_stop is relayed through eof", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const wire = Buffer.concat([
+    Buffer.from(MESSAGES_TERMINAL),
+    Buffer.from("event: provider.extension\ndata: "),
+    Buffer.from([0xf0]),
+  ]);
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(wire);
+  });
+  const app = messagesApp(store, upstream.url, records);
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-anthropic/claude-test",
+        stream: true,
+        messages: [],
+        max_tokens: 16,
+      }),
+    });
+    assert.equal(response.status, 200);
+    const body = Buffer.from(await response.arrayBuffer());
+    assert.deepEqual(body, wire);
+    assert.equal(body.includes(Buffer.from("sk-live-secret")), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.outputTokens, 1n);
+  } finally {
+    upstream.close();
+  }
+});
+
 test(
   "a connect timeout is upstream_timeout and hides the address",
   { skip: process.versions.bun !== undefined && "Bun fetch does not enforce connect_timeout_ms" },
