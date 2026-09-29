@@ -13,10 +13,6 @@ max_request_bytes = 9223372036854775807
 max_in_flight = 0
 max_in_flight_streams = 9223372036854775807
 
-[reload]
-watch = true
-poll_interval_ms = 0
-
 [shutdown]
 drain_grace_ms = 9223372036854775807
 deadline_ms = 0

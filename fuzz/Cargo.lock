@@ -172,7 +172,6 @@ dependencies = [
  "gateway-core",
  "libfuzzer-sys",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -738,10 +737,6 @@ name = "gateway-core"
 version = "0.6.3"
 dependencies = [
  "base64",
- "regex",
- "regex-syntax",
- "ring",
- "secrecy",
  "serde",
  "serde_json",
  "thiserror",
