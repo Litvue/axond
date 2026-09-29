@@ -125,6 +125,7 @@ async function main(): Promise<void> {
     providers: config.providers,
     credentials: config.credentials,
     catalog: config.catalog,
+    metrics,
   });
   const stopDiscovery = startDiscovery({
     store,
@@ -132,6 +133,7 @@ async function main(): Promise<void> {
     credentials: config.credentials,
     catalog: config.catalog,
     intervalSeconds: config.discoveryIntervalSeconds,
+    metrics,
   });
   let phase: "serving" | "draining" | "closing" = "serving";
   let exited = false;

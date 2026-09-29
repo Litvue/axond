@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createMemoryStore } from "../../gateway/src/memory-store.ts";
+import { createMetrics } from "../../gateway/src/metrics.ts";
 
 import { discoverOnce } from "./discovery.ts";
 
@@ -70,4 +71,100 @@ test("a failed discovery keeps the last catalogue and a fresh row rejects a diff
   const replaced = await store.getProviderModels("fake-openai");
   assert.deepEqual(replaced?.data, [{ id: "other" }]);
   assert.equal(replaced?.stale, false);
+});
+
+test("a catalogue refusal names a bounded reason and omits the source url", async () => {
+  const store = createMemoryStore();
+  const metrics = createMetrics();
+  const secret = "sk-live-secret";
+  const catalog = { source: "models-dev" as const, sourceUrl: `https://example.test/${secret}.json` };
+  await discoverOnce({
+    store,
+    providers: [],
+    credentials: [],
+    catalog,
+    metrics,
+    fetchImpl: async () => {
+      throw new Error(secret);
+    },
+  });
+  await discoverOnce({
+    store,
+    providers: [],
+    credentials: [],
+    catalog,
+    metrics,
+    fetchImpl: async () => new Response("no", { status: 401 }),
+  });
+  const reason = (name: string) =>
+    metrics.points.find(
+      (point) => point.name === "axond.catalog.refusals" && point.attributes["axond.catalog.reason"] === name,
+    );
+  assert.equal(reason("unreachable")?.value, 1);
+  assert.equal(reason("denied")?.value, 1);
+  assert.equal(metrics.points.find((point) => point.name === "axond.catalog.consecutive_refusals")?.value, 2);
+  assert.equal(
+    metrics.points.some((point) => point.name === "axond.catalog.active_age"),
+    false,
+  );
+  assert.equal(JSON.stringify(metrics.points).includes(secret), false);
+
+  await store.upsertProviderModels({
+    provider: "catalog",
+    fetchedAt: new Date(Date.now() - 5_000).toISOString(),
+    stale: false,
+    data: [{ id: "kept" }],
+    source: "https://example.test/models.json",
+  });
+  await discoverOnce({
+    store,
+    providers: [],
+    credentials: [],
+    catalog: { source: "models-dev", sourceUrl: "https://example.test/models.json" },
+    metrics,
+    fetchImpl: async () => new Response("not-json", { status: 200 }),
+  });
+  const age = metrics.points.find((point) => point.name === "axond.catalog.active_age");
+  assert.ok(age && age.value >= 4_000);
+  assert.equal(reason("not_json")?.value, 1);
+  assert.equal(metrics.points.find((point) => point.name === "axond.catalog.consecutive_refusals")?.value, 3);
+  const kept = await store.getProviderModels("catalog");
+  assert.equal(kept?.stale, true);
+  assert.deepEqual(kept?.data, [{ id: "kept" }]);
+
+  await discoverOnce({
+    store,
+    providers: [],
+    credentials: [],
+    catalog: { source: "models-dev", sourceUrl: "https://example.test/models.json" },
+    metrics,
+    fetchImpl: async () => new Response(JSON.stringify({ "openai/gpt-test": { id: "gpt-test" } }), { status: 200 }),
+  });
+  assert.equal(metrics.points.find((point) => point.name === "axond.catalog.consecutive_refusals")?.value, 0);
+  const admittedAge = metrics.points.find((point) => point.name === "axond.catalog.active_age");
+  assert.ok(admittedAge && admittedAge.value >= 0 && admittedAge.value < 5_000);
+  const admitted = await store.getProviderModels("catalog");
+  assert.equal(admitted?.stale, false);
+  assert.deepEqual(admitted?.data, [{ id: "openai/gpt-test" }]);
+
+  await discoverOnce({
+    store,
+    providers: [],
+    credentials: [],
+    catalog: { source: "models-dev", sourceUrl: "https://example.test/models.json" },
+    metrics,
+    fetchImpl: async () => new Response("missing", { status: 404 }),
+  });
+  await discoverOnce({
+    store,
+    providers: [],
+    credentials: [],
+    catalog: { source: "models-dev", sourceUrl: "https://example.test/models.json" },
+    metrics,
+    fetchImpl: async () => new Response("down", { status: 500 }),
+  });
+  assert.equal(reason("unsupported_endpoint")?.value, 1);
+  assert.equal(reason("unreachable")?.value, 2);
+  assert.equal(metrics.points.find((point) => point.name === "axond.catalog.consecutive_refusals")?.value, 2);
+  assert.equal(JSON.stringify(metrics.points).includes(secret), false);
 });

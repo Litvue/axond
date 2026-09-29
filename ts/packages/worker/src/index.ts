@@ -4,7 +4,7 @@ import { createAdmission, createAxond, createMetrics, defaultAdmission, resolveT
 import { rateLimitExtension } from "@axond/rate-limit";
 import type { CredentialConfig, ProviderConfig, Store } from "@axond/sdk";
 
-import { discoverOnce } from "../../cli/src/discovery.ts";
+import { discoverOnce, type CatalogMetrics } from "../../cli/src/discovery.ts";
 import { createPostgresStore, POSTGRES_SCHEMA } from "../../cli/src/postgres-store.ts";
 
 export interface WorkerEnv {
@@ -62,7 +62,7 @@ export function createHandler(env: WorkerEnv) {
   });
   return {
     scheduled(ctx: WaitContext, fetchImpl?: typeof fetch): void {
-      ctx.waitUntil(discoverOnce({ store, providers, credentials, catalog, fetchImpl }));
+      ctx.waitUntil(discoverOnce({ store, providers, credentials, catalog, fetchImpl, metrics }));
     },
     fetch(request: Request, ctx: WaitContext): Response | Promise<Response> {
       const app = createAxond({
@@ -104,6 +104,7 @@ export function discoverOnSchedule(
   store: Store,
   ctx: WaitContext,
   fetchImpl?: typeof fetch,
+  metrics?: CatalogMetrics,
 ): void {
   const providers = JSON.parse(env.PROVIDERS_JSON) as ProviderConfig[];
   const credentials = JSON.parse(env.CREDENTIALS_JSON ?? "[]") as CredentialConfig[];
@@ -114,6 +115,7 @@ export function discoverOnSchedule(
       credentials,
       catalog: workerCatalog(env),
       fetchImpl,
+      metrics,
     }),
   );
 }
