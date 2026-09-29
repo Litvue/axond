@@ -92,6 +92,70 @@ output_microdollars_per_million = 1
   }
 });
 
+test("unsupported_extension_api_version_is_refused_when_loaded_from_disk", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "axond-ext-"));
+  try {
+    await writeFile(
+      join(dir, "future.ts"),
+      `export default {
+  name: "future",
+  apiVersion: 2,
+  stage: "pre-auth",
+  async middleware() {
+    return new Response("nope");
+  },
+};
+`,
+    );
+    await writeFile(
+      join(dir, "axond.toml"),
+      `
+[server]
+bind = "127.0.0.1:9"
+
+[storage]
+backend = "sqlite"
+path = "${join(dir, "axond.sqlite")}"
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+env = "GW_INBOUND_KEY"
+namespace = "platform"
+`,
+    );
+    const child = spawn(BIN.pathname, {
+      env: {
+        ...process.env,
+        AXOND_CONFIG: join(dir, "axond.toml"),
+        AXOND_EXTENSIONS_DIR: dir,
+        GW_INBOUND_KEY: "test-inbound-key",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    const code = await new Promise<number | null>((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGTERM");
+        resolve(null);
+      }, 10_000);
+      child.once("exit", (status) => {
+        clearTimeout(timer);
+        resolve(status);
+      });
+    });
+    assert.equal(code, 1, stderr);
+    assert.match(stderr, /future\.ts apiVersion 2 is not supported \(want 1\)/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function freePort(): Promise<number> {
   return new Promise((resolve) => {
     const probe = createServer();

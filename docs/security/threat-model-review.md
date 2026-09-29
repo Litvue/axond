@@ -389,8 +389,9 @@ file from a directory without rebuilding the process;
 `untrusted_extension_query_without_namespace_is_refused` refuses an untrusted
 query that omits the request namespace;
 `nested_quantifier_redaction_pattern_is_rejected` refuses a nested-quantifier
-redaction pattern; `unsupported_extension_api_version_is_refused_at_mount`
-refuses an extension whose apiVersion is not 1;
+redaction pattern; `unsupported_extension_api_version_is_refused_at_mount` and
+`unsupported_extension_api_version_is_refused_when_loaded_from_disk` refuse an
+extension whose apiVersion is not 1;
 `extension_migration_outside_its_prefix_is_refused` refuses a migration that
 creates a table outside that extension's table prefix.
 
