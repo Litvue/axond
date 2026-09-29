@@ -47,23 +47,6 @@ ANCHORED_IDENTITY = re.compile(r"^\s*SIGNER_IDENTITY:\s*\^.+\$\s*$")
 # of this list, which is the point.
 KEY_VERIFY_FILES = frozenset({"ops/check-cosign-format.sh"})
 
-# Kubernetes stateful overlay drills remain behind an explicit opt-in. Request-
-# path qualification (capacity, endurance, provider/transport faults) is SQLite
-# + `/ns/{ns}/v1` and does not use this input. Recovery, rollout, and
-# stateful-endurance qualification jobs were retired with the tier matrix
-# (ADR 0063 / #427).
-LEGACY_POSTGRES_INPUT = "run_legacy_postgres_qualification"
-LEGACY_POSTGRES_GUARD = (
-    "${{ github.event_name == 'workflow_dispatch' && "
-    "inputs.run_legacy_postgres_qualification == true }}"
-)
-LEGACY_POSTGRES_JOBS = {
-    ".github/workflows/ci.yml": {
-        "stateful-deploy-drill": LEGACY_POSTGRES_GUARD,
-        "stateful-persistent-drill": LEGACY_POSTGRES_GUARD,
-    },
-}
-UNSCHEDULED_LEGACY_WORKFLOWS = frozenset()
 ACTIONS_ENDURANCE_WORKFLOW = ".github/workflows/endurance.yml"
 ACTIONS_ENDURANCE_MAX_JOB_MINUTES = 15
 ACTIONS_ENDURANCE_SMOKE_JOBS = {
@@ -349,85 +332,6 @@ def dispatch_block(text: str) -> list[str]:
     return []
 
 
-def check_legacy_postgres_qualification(root: Path) -> list[str]:
-    """Keep remaining PostgreSQL overlay drills manual, explicit, and visible."""
-    failures: list[str] = []
-    for relative, expected_jobs in LEGACY_POSTGRES_JOBS.items():
-        path = root / relative
-        if not path.is_file():
-            failures.append(f"{relative}: legacy PostgreSQL workflow is missing")
-            continue
-        text = path.read_text(encoding="utf-8")
-        dispatch = dispatch_block(text)
-        try:
-            input_start = dispatch.index(f"      {LEGACY_POSTGRES_INPUT}:")
-        except ValueError:
-            failures.append(
-                f"{relative}: workflow_dispatch must declare the explicit boolean "
-                f"{LEGACY_POSTGRES_INPUT!r} opt-in"
-            )
-        else:
-            input_lines = nested_block(dispatch, input_start, 6)
-            required = {line.strip() for line in input_lines}
-            for setting in ("required: true", "default: false", "type: boolean"):
-                if setting not in required:
-                    failures.append(
-                        f"{relative}: {LEGACY_POSTGRES_INPUT} must include `{setting}`"
-                    )
-
-        if relative in UNSCHEDULED_LEGACY_WORKFLOWS and re.search(
-            r"(?m)^  schedule:\s*$", text
-        ):
-            failures.append(
-                f"{relative}: legacy/long qualification must not have a schedule"
-            )
-
-        jobs = named_blocks(text, "jobs")
-        for job, expected_guard in expected_jobs.items():
-            block = jobs.get(job)
-            if block is None:
-                failures.append(f"{relative}: legacy PostgreSQL job {job!r} is missing")
-                continue
-            guards = [
-                line.strip().removeprefix("if:").strip()
-                for line in block
-                if re.match(r"^    if:\s*", line)
-            ]
-            if guards != [expected_guard]:
-                failures.append(
-                    f"{relative}: legacy PostgreSQL job {job!r} must use the exact "
-                    f"explicit-dispatch guard `{expected_guard}`; found {guards or 'none'}"
-                )
-    return failures
-
-
-def check_blob_qualification_status(root: Path) -> list[str]:
-    """A green software CI aggregate must not imply stateful-v2 qualification."""
-    required = {
-        "RELEASE.md": (
-            "| Blob-backed flat-namespace stateful-v2 qualification | Pending |",
-            "is a software-change gate, not a production-qualification gate",
-        ),
-        "docs/operations/qualification.md": (
-            "run_legacy_postgres_qualification=true",
-            "The blob-backed stateful-v2 gates remain **pending**",
-        ),
-    }
-    failures: list[str] = []
-    for relative, markers in required.items():
-        path = root / relative
-        if not path.is_file():
-            failures.append(f"{relative}: qualification status document is missing")
-            continue
-        text = path.read_text(encoding="utf-8")
-        for marker in markers:
-            if marker not in text:
-                failures.append(
-                    f"{relative}: missing explicit blob qualification status {marker!r}"
-                )
-    return failures
-
-
 def check_actions_endurance_budget(root: Path) -> list[str]:
     """GitHub Actions may exercise endurance smoke, never a configurable soak."""
     relative = ACTIONS_ENDURANCE_WORKFLOW
@@ -528,8 +432,6 @@ def check(root: Path) -> list[str]:
     # without carrying Axond's release documents. A real checkout always has
     # RELEASE.md, which turns on the repository-specific transition contract.
     if (root / "RELEASE.md").is_file():
-        failures.extend(check_legacy_postgres_qualification(root))
-        failures.extend(check_blob_qualification_status(root))
         failures.extend(check_actions_endurance_budget(root))
     return failures
 
@@ -637,74 +539,10 @@ def self_test() -> list[str]:
     ]
     problems: list[str] = []
 
-    opt_in = (
-        "  workflow_dispatch:\n"
-        "    inputs:\n"
-        f"      {LEGACY_POSTGRES_INPUT}:\n"
-        "        description: legacy only\n"
-        "        required: true\n"
-        "        default: false\n"
-        "        type: boolean\n"
-    )
-
-    def legacy_fixture(relative: str) -> str:
-        jobs = LEGACY_POSTGRES_JOBS[relative]
-        body = "name: fixture\non:\n"
-        if relative.endswith("ci.yml"):
-            body += "  pull_request:\n"
-        body += opt_in + "permissions:\n  contents: read\njobs:\n"
-        for job, guard in jobs.items():
-            body += f"  {job}:\n    if: {guard}\n    runs-on: ubuntu-latest\n"
-        return body
-
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         workflow_dir = root / ".github" / "workflows"
         workflow_dir.mkdir(parents=True)
-        fixtures = {
-            relative: legacy_fixture(relative)
-            for relative in LEGACY_POSTGRES_JOBS
-        }
-
-        def write_legacy_fixtures() -> None:
-            for relative, body in fixtures.items():
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(body, encoding="utf-8")
-
-        write_legacy_fixtures()
-        failures = check_legacy_postgres_qualification(root)
-        if failures:
-            problems.append(
-                f"self-test: explicit legacy PostgreSQL opt-ins were rejected: {failures}"
-            )
-
-        ci = root / ".github/workflows/ci.yml"
-        ci.write_text(
-            fixtures[".github/workflows/ci.yml"].replace(
-                f"    if: {LEGACY_POSTGRES_GUARD}\n", "", 1
-            ),
-            encoding="utf-8",
-        )
-        failures = check_legacy_postgres_qualification(root)
-        if not any("explicit-dispatch guard" in failure for failure in failures):
-            problems.append(
-                "self-test: an unguarded PR-triggered legacy PostgreSQL job was accepted"
-            )
-
-        write_legacy_fixtures()
-        ci.write_text(
-            fixtures[".github/workflows/ci.yml"].replace(
-                "        default: false\n", "        default: true\n", 1
-            ),
-            encoding="utf-8",
-        )
-        failures = check_legacy_postgres_qualification(root)
-        if not any("default: false" in failure for failure in failures):
-            problems.append(
-                "self-test: a default-on legacy PostgreSQL dispatch was accepted"
-            )
-
         actions_smoke = (
             "name: Endurance smoke\n"
             "on:\n"
@@ -767,33 +605,6 @@ def self_test() -> list[str]:
         if not any("does not invoke" in failure for failure in failures):
             problems.append(
                 "self-test: an Actions endurance soak entry point was accepted"
-            )
-
-        (root / "RELEASE.md").write_text(
-            "| Blob-backed flat-namespace stateful-v2 qualification | Pending | x |\n"
-            "CI Success is a software-change gate, not a production-qualification gate\n",
-            encoding="utf-8",
-        )
-        qualification = root / "docs/operations/qualification.md"
-        qualification.parent.mkdir(parents=True)
-        qualification.write_text(
-            "run_legacy_postgres_qualification=true\n"
-            "The blob-backed stateful-v2 gates remain **pending**\n",
-            encoding="utf-8",
-        )
-        if check_blob_qualification_status(root):
-            problems.append(
-                "self-test: explicit pending blob qualification status was rejected"
-            )
-        qualification.write_text(
-            "run_legacy_postgres_qualification=true\n", encoding="utf-8"
-        )
-        if not any(
-            "missing explicit blob qualification status" in failure
-            for failure in check_blob_qualification_status(root)
-        ):
-            problems.append(
-                "self-test: a missing pending blob qualification status was accepted"
             )
 
     good_musl = (

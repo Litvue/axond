@@ -6,12 +6,10 @@
 #
 # Cargo has no per-crate rustflags, so this reaches every dependency too — the
 # same graph-wide flag `cargo fuzz` sets. That matters because a crate is allowed
-# to *change behaviour* under `cfg(fuzzing)`, and a stubbed verifier would make
-# `token_verify` assert on nothing. Audited across `fuzz/Cargo.lock`: nothing on
-# the signing or verification path (`jsonwebtoken`, `ring`, `hmac`, `sha2`,
-# `ed25519-dalek`, `base64`, `serde_json`) mentions the cfg at all, and the only
-# crate in the graph that uses it — `quinn-proto`, which no target reaches —
-# widens item visibility without altering behaviour. A dependency bump that
-# brought in a fuzzing-conditional verifier would have to be re-checked here.
+# to *change behaviour* under `cfg(fuzzing)`, and a parser stubbed that way
+# would make a target assert on nothing. Audited across `fuzz/Cargo.lock`: the
+# only crate in the graph that uses the cfg — `quinn-proto`, which no target
+# reaches — widens item visibility without altering behaviour. A dependency bump
+# that brought in a fuzzing-conditional parser would have to be re-checked here.
 [build]
 rustflags = ["--cfg", "fuzzing"]

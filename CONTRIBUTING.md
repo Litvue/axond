@@ -83,7 +83,7 @@ toolchain, and the Node runtime exactly and type-checks the calls before running
 them. `ops/compat-ts-pins.py` (`just compat-ts-pins`) enforces those pins; how to
 bump an SDK is in [that lane's README](./tests/compat-ts/README.md).
 
-Touching a parser that reads untrusted input — configuration, minted tokens, or
+Touching a parser that reads untrusted input — configuration, provider wire, or
 a query string? [`fuzz/`](./fuzz/README.md) is a separate Cargo workspace, so the
 root checks skip it; `just fuzz-smoke` runs the required pull-request replay on
 stable, and `just fuzz <target>` runs a bounded coverage-guided run once

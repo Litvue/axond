@@ -116,11 +116,13 @@ impl Uuid7 {
         Ok(Self(bytes))
     }
 
+    #[cfg(test)]
     pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
 
     /// The embedded creation time, in Unix milliseconds.
+    #[cfg(test)]
     pub fn timestamp_millis(&self) -> u64 {
         let mut millis = [0u8; 8];
         millis[2..].copy_from_slice(&self.0[..6]);
@@ -128,6 +130,7 @@ impl Uuid7 {
     }
 
     /// The 12-bit intra-millisecond sequence.
+    #[cfg(test)]
     pub fn sequence(&self) -> u16 {
         u16::from(self.0[6] & 0x0f) << 8 | u16::from(self.0[7])
     }
@@ -257,57 +260,6 @@ impl fmt::Debug for Uuid7Generator {
     }
 }
 
-/// Declare a typed id: a distinct Rust type over a [`Uuid7`] with a prefixed
-/// text form.
-///
-/// The prefix is what makes the *text* form typed as well as the Rust form:
-/// `ten_…` cannot be parsed as a project id, so an id pasted into the wrong
-/// admin field is a parse error rather than a lookup that finds nothing (or,
-/// worse, finds something).
-macro_rules! typed_id {
-    ($(#[$doc:meta])* $name:ident, $prefix:literal) => {
-        $(#[$doc])*
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(Uuid7);
-
-        /// Renders the prefixed text form, so a `Debug`-formatted structure
-        /// carries ids an operator can search for.
-        impl fmt::Debug for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                fmt::Display::fmt(self, f)
-            }
-        }
-
-        impl $name {
-            /// The text-form prefix that distinguishes this id from every other.
-            pub const PREFIX: &'static str = $prefix;
-
-            pub const fn new(id: Uuid7) -> Self {
-                Self(id)
-            }
-
-            pub const fn uuid(&self) -> Uuid7 {
-                self.0
-            }
-
-            /// Parse the prefixed text form.
-            pub fn parse(text: &str) -> Result<Self, InvalidId> {
-                let uuid = text.strip_prefix(Self::PREFIX).ok_or_else(|| InvalidId::Prefix {
-                    expected: Self::PREFIX,
-                    found: text.to_owned(),
-                })?;
-                Ok(Self(Uuid7::parse(uuid)?))
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}{}", Self::PREFIX, self.0)
-            }
-        }
-    };
-}
-
 /// Why a typed id could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidId {
@@ -320,187 +272,6 @@ pub enum InvalidId {
     },
     #[error(transparent)]
     Uuid(#[from] InvalidUuid7),
-}
-
-typed_id!(
-    /// A tenant: the isolation boundary every scoped resource hangs from.
-    TenantId,
-    "ten_"
-);
-typed_id!(
-    /// A project inside a tenant.
-    ProjectId,
-    "prj_"
-);
-typed_id!(
-    /// A durable resource, independent of which of its versions is referenced.
-    ResourceId,
-    "res_"
-);
-typed_id!(
-    /// A published revision of desired state.
-    RevisionId,
-    "rev_"
-);
-typed_id!(
-    /// One administrative mutation, whatever number of resources it touched.
-    MutationId,
-    "mut_"
-);
-typed_id!(
-    /// One audit event.
-    AuditEventId,
-    "aud_"
-);
-typed_id!(
-    /// One durable secret, independent of which of its versions is referenced.
-    ///
-    /// Deliberately *not* a [`ResourceId`]. A secret is not a resource: it is
-    /// never a row in a revision, never named by a manifest entry, and never
-    /// addressable by an operator as a versioned resource. Giving it its own type
-    /// is what stops a credential's resource id and the id of the material it
-    /// points at from being interchangeable — including in their text forms, so a
-    /// `res_…` pasted where a secret belongs is a parse error rather than a lookup
-    /// against the wrong table.
-    SecretId,
-    "sct_"
-);
-
-typed_id!(
-    /// A principal: a human administrator or a workload service account.
-    ///
-    /// Axond-owned even for a human, whose *authentication* identity is an
-    /// issuer-scoped OIDC subject: the pair `(issuer, subject)` names who signs
-    /// in, and this names the durable object their grants hang off, so a subject
-    /// that is renamed at the identity provider does not become a second
-    /// principal with its own history.
-    PrincipalId,
-    "prn_"
-);
-
-/// A readable, scope-unique name for a resource.
-///
-/// Deliberately restrictive and ASCII-only: a slug appears in URLs, config, log
-/// lines, and operator conversation, so two slugs must be equal or unequal
-/// without reference to Unicode equivalence. Case is normalized down at parse
-/// time, so `Prod` and `prod` are the same name rather than two names that look
-/// alike.
-///
-/// A slug is *not* identity. Renaming a resource keeps its [`ResourceId`], and
-/// nothing in a manifest joins on the slug.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Slug(String);
-
-/// Why a slug was refused.
-///
-/// The refused text is carried but never rendered, for the reason [`InvalidId`]
-/// gives: a name field is one of the places material gets mispasted, and a
-/// refusal reaches a response body, a log line and an audit trail. What is wrong
-/// with the name is renderable; the name is not.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum InvalidSlug {
-    #[error("a slug must not be empty")]
-    Empty,
-    #[error("a slug of {length} characters is over the {max}-character limit")]
-    TooLong {
-        slug: String,
-        length: usize,
-        max: usize,
-    },
-    #[error(
-        "a slug may not contain `{character}`; only ASCII letters, digits, `-`, and `_` are allowed"
-    )]
-    Character { slug: String, character: char },
-    #[error("a slug must start and end with a letter or digit")]
-    Boundary { slug: String },
-    #[error("a slug may not look like an id; ids are not names")]
-    IdLike { slug: String },
-}
-
-impl Slug {
-    pub const MAX_LEN: usize = 63;
-
-    /// The prefixes an id uses, which a slug may therefore not use.
-    const ID_PREFIXES: &'static [&'static str] = &[
-        TenantId::PREFIX,
-        ProjectId::PREFIX,
-        ResourceId::PREFIX,
-        RevisionId::PREFIX,
-        MutationId::PREFIX,
-        AuditEventId::PREFIX,
-        SecretId::PREFIX,
-        PrincipalId::PREFIX,
-    ];
-
-    /// Ordinary resource names (tenants, projects, providers, …).
-    /// `.` is not allowed: a tenant slug `acme.corp` would compile to a namespace
-    /// that [`crate::namespace::NamespaceId`] cannot parse. Enablements that
-    /// clone a published id use [`Self::parse_alias`].
-    pub fn parse(input: &str) -> Result<Self, InvalidSlug> {
-        Self::parse_chars(input, false)
-    }
-
-    /// Alias slugs are published model ids (`gpt-4o`, `gpt-5.5`). `.` is allowed
-    /// here only; tenants, projects, and providers still use [`Self::parse`].
-    /// Model enablements that copy that published id hydrate through this parser
-    /// too.
-    pub fn parse_alias(input: &str) -> Result<Self, InvalidSlug> {
-        Self::parse_chars(input, true)
-    }
-
-    fn parse_chars(input: &str, allow_dot: bool) -> Result<Self, InvalidSlug> {
-        if input.is_empty() {
-            return Err(InvalidSlug::Empty);
-        }
-        if input.chars().count() > Self::MAX_LEN {
-            return Err(InvalidSlug::TooLong {
-                slug: input.to_owned(),
-                length: input.chars().count(),
-                max: Self::MAX_LEN,
-            });
-        }
-        let lowered = input.to_ascii_lowercase();
-        if let Some(character) = lowered.chars().find(|c| {
-            !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || (allow_dot && *c == '.'))
-        }) {
-            return Err(InvalidSlug::Character {
-                slug: input.to_owned(),
-                character,
-            });
-        }
-        let boundaries_are_alphanumeric = lowered
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric())
-            && lowered
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_alphanumeric());
-        if !boundaries_are_alphanumeric {
-            return Err(InvalidSlug::Boundary {
-                slug: input.to_owned(),
-            });
-        }
-        if Self::ID_PREFIXES
-            .iter()
-            .any(|prefix| lowered.starts_with(prefix))
-        {
-            return Err(InvalidSlug::IdLike {
-                slug: input.to_owned(),
-            });
-        }
-        Ok(Self(lowered))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Slug {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
 }
 
 #[cfg(test)]
@@ -596,141 +367,5 @@ mod tests {
         let later = Uuid7::from_parts(11, 0, 0).unwrap();
         assert!(earlier < later, "the timestamp dominates the entropy");
         assert!(Uuid7::from_parts(10, 4, u64::MAX).unwrap() < earlier);
-    }
-
-    #[test]
-    fn typed_ids_do_not_parse_each_others_text_form() {
-        let uuid = Uuid7::from_parts(42, 0, 7).unwrap();
-        let tenant = TenantId::new(uuid);
-        assert_eq!(tenant.to_string(), format!("ten_{uuid}"));
-        assert_eq!(TenantId::parse(&tenant.to_string()).unwrap(), tenant);
-        assert!(matches!(
-            ProjectId::parse(&tenant.to_string()),
-            Err(InvalidId::Prefix {
-                expected: "prj_",
-                ..
-            })
-        ));
-        assert!(matches!(
-            TenantId::parse(&uuid.to_string()),
-            Err(InvalidId::Prefix { .. })
-        ));
-        assert!(matches!(
-            TenantId::parse("ten_not-a-uuid"),
-            Err(InvalidId::Uuid(_))
-        ));
-        assert_eq!(tenant.uuid(), uuid);
-        // A structure printed with `Debug` carries searchable ids, not bytes.
-        assert_eq!(format!("{tenant:?}"), tenant.to_string());
-        assert_eq!(format!("{uuid:?}"), uuid.to_string());
-    }
-
-    /// A slug is a name field, and a name field takes pasted text: the reason a
-    /// name was refused is renderable, the name itself is not.
-    #[test]
-    fn a_slug_refusal_never_repeats_the_text_it_refused() {
-        const MATERIAL: &str = "sk-live-0123456789abcdefghij";
-
-        for input in [
-            format!("{MATERIAL}!"),
-            format!("{MATERIAL}-"),
-            format!("{}{MATERIAL}", TenantId::PREFIX),
-            "a".repeat(Slug::MAX_LEN + 1),
-        ] {
-            let refusal = Slug::parse(&input).expect_err("the slug is refused");
-            assert!(
-                !refusal.to_string().contains(&input),
-                "the refusal echoed the name: {refusal}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_id_refusal_never_repeats_the_text_it_refused() {
-        const MATERIAL: &str = "sk-live-0123456789abcdefghij";
-
-        let wrong_kind = TenantId::parse(MATERIAL).expect_err("material is not a tenant id");
-        assert_eq!(
-            wrong_kind.to_string(),
-            "is not prefixed `ten_`, so it identifies something else"
-        );
-        assert!(!wrong_kind.to_string().contains(MATERIAL));
-        // The text is still carried, for a caller that needs it deliberately.
-        assert!(matches!(wrong_kind, InvalidId::Prefix { found, .. } if found == MATERIAL));
-
-        let pasted_after_prefix = format!("{}{MATERIAL}", TenantId::PREFIX);
-        let malformed =
-            TenantId::parse(&pasted_after_prefix).expect_err("material is not a uuid either");
-        assert_eq!(
-            malformed.to_string(),
-            "is not a hyphenated 8-4-4-4-12 UUID",
-            "a right prefix must not be blamed for a malformed uuid"
-        );
-        assert!(!malformed.to_string().contains(MATERIAL));
-
-        let uppercase = format!(
-            "{}{}",
-            TenantId::PREFIX,
-            Uuid7::from_parts(42, 0, 7)
-                .unwrap()
-                .to_string()
-                .to_uppercase()
-        );
-        let digit = TenantId::parse(&uppercase).expect_err("uppercase hex is refused");
-        assert_eq!(
-            digit.to_string(),
-            "contains a character that is not a lowercase hex digit"
-        );
-        assert!(!digit.to_string().contains(&uppercase));
-    }
-
-    #[test]
-    fn every_typed_id_has_its_own_prefix() {
-        let prefixes: std::collections::BTreeSet<&str> =
-            Slug::ID_PREFIXES.iter().copied().collect();
-        assert_eq!(prefixes.len(), Slug::ID_PREFIXES.len());
-    }
-
-    #[test]
-    fn slugs_are_normalized_ascii_names() {
-        assert_eq!(Slug::parse("Prod-EU").unwrap().as_str(), "prod-eu");
-        assert_eq!(
-            Slug::parse("Prod-EU").unwrap(),
-            Slug::parse("prod-eu").unwrap()
-        );
-        assert_eq!(Slug::parse("a").unwrap().to_string(), "a");
-        assert_eq!(Slug::parse("team_1-x").unwrap().as_str(), "team_1-x");
-        assert_eq!(Slug::parse_alias("gpt-5.5").unwrap().as_str(), "gpt-5.5");
-        assert!(Slug::parse("gpt-5.5").is_err());
-        assert!(Slug::parse("acme.corp").is_err());
-        assert!(Slug::parse_alias("acme.corp").is_ok());
-    }
-
-    #[test]
-    fn slugs_refuse_names_that_are_not_names() {
-        assert!(matches!(Slug::parse(""), Err(InvalidSlug::Empty)));
-        assert!(matches!(
-            Slug::parse(&"a".repeat(Slug::MAX_LEN + 1)),
-            Err(InvalidSlug::TooLong { .. })
-        ));
-        for input in ["prod eu", "prod.eu", "prodé", "prod/eu"] {
-            assert!(
-                matches!(Slug::parse(input), Err(InvalidSlug::Character { .. })),
-                "`{input}` must be refused"
-            );
-        }
-        for input in ["-prod", "prod-", "_prod", "prod_"] {
-            assert!(
-                matches!(Slug::parse(input), Err(InvalidSlug::Boundary { .. })),
-                "`{input}` must be refused"
-            );
-        }
-        // A slug that looks like an id would make "is this a name or an id?"
-        // ambiguous in every admin surface that accepts either.
-        assert!(matches!(
-            Slug::parse("ten_acme"),
-            Err(InvalidSlug::IdLike { .. })
-        ));
-        assert!(Slug::parse("tenant-acme").is_ok());
     }
 }

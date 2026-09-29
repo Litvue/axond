@@ -1,23 +1,9 @@
-//! Bounded retry pacing for convergence.
+//! Bounded retry pacing for the background catalogue refresh.
 //!
-//! A reconciler that retried immediately would turn a control-plane outage into a
-//! second incident: N replicas polling a struggling Postgres as fast as it can
-//! refuse them. A reconciler that retried forever at a fixed long interval would
-//! make a transient blip cost a full interval of staleness. So the delay is
-//! exponential from a short first retry up to a hard ceiling, and it is reset the
-//! moment an attempt succeeds.
-//!
-//! Two deliberate omissions:
-//!
-//! - **No jitter.** The delay sequence is a pure function of the failure count,
-//!   which is what lets a test assert the sequence exactly instead of asserting a
-//!   range. Herd avoidance comes from replicas polling on independent schedules
-//!   (they boot at different times), not from randomizing a retry.
-//! - **No attempt limit.** Convergence has nowhere to give up *to*: a replica
-//!   that stopped retrying would serve its old snapshot forever while reporting
-//!   nothing wrong. Instead the delay saturates at [`BackoffPolicy::max`], the
-//!   failure count keeps rising, and the failure count is what gets reported
-//!   (see [`super::status`]).
+//! The delay is exponential from a short first retry up to a hard ceiling, and
+//! it is reset the moment an attempt succeeds. There is no jitter, so the delay
+//! sequence is a pure function of the failure count, and no attempt limit: the
+//! delay saturates at [`BackoffPolicy::max`] and the failure count keeps rising.
 
 use std::time::Duration;
 
@@ -124,11 +110,13 @@ impl Backoff {
         self.failures = 0;
     }
 
+    #[cfg(test)]
     pub const fn failures(&self) -> u32 {
         self.failures
     }
 
     /// The delay currently owed, without recording another failure.
+    #[cfg(test)]
     pub fn delay(&self) -> Duration {
         self.policy.delay(self.failures)
     }

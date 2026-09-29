@@ -22,17 +22,17 @@ use tracing::{Instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::config::{Model, Provider, ProviderKind, Target};
+use crate::core_accounting::CoreAccounting;
 use crate::credentials::{CredentialLease, CredentialPlan, CredentialSource};
 use crate::error::GatewayError;
-use crate::middleware::MiddlewareExecution;
-use crate::pricing::{AliasPrices, Ineligible, RequestPrice};
+use crate::pricing::RequestPrice;
 use crate::state::{AppState, ConfigSnapshot, InboundKey, adapter_for};
 use crate::streaming::{self, StreamContext, StreamDelivery};
 use crate::telemetry;
 use crate::usage::UsageRecord;
 use crate::usage::identity::EventIdentity;
 
-use super::accounting::{BudgetHold, BudgetReservation};
+use super::accounting::BudgetHold;
 use super::{Route, Wire, target_key};
 
 /// The target that produced the outcome (served it, or made the last attempt),
@@ -71,7 +71,7 @@ pub(super) async fn dispatch_with_failover(
     snapshot: &ConfigSnapshot,
     caller: &InboundKey,
     model: &Model,
-    prices: &AliasPrices,
+    price: RequestPrice,
     body: &Value,
     wire: &Wire,
 ) -> Result<FailoverOutcome, GatewayError> {
@@ -90,19 +90,6 @@ pub(super) async fn dispatch_with_failover(
         if walk.attempts >= max_attempts || Instant::now() >= deadline {
             break;
         }
-        // An ineligible target is skipped exactly like one behind an open
-        // circuit: it is configured and discoverable, but nothing approved says
-        // what it costs, so it cannot be dispatched under a budget hold.
-        let Some(price) = prices.get(index) else {
-            if continuation {
-                return Err(GatewayError::ContinuationAffinityUnavailable {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                });
-            }
-            walk.note_unpriced(&model.name, prices.ineligible(index));
-            continue;
-        };
         let Some(provider) = cfg.provider(&target.provider) else {
             if continuation {
                 return Err(GatewayError::ContinuationAffinityUnavailable {
@@ -361,24 +348,13 @@ pub(super) async fn stream_with_failover(
     let StreamRequest {
         alias,
         body,
-        prices,
+        price,
         wire,
         identity,
-        mut middleware_execution,
+        mut core_accounting,
         delivery,
         mut hold,
     } = request;
-    let mut reservation_guard = middleware_execution
-        .core_budget_context()
-        .is_none()
-        .then(|| {
-            BudgetReservation::new(
-                state.clone(),
-                hold.key.clone(),
-                hold.reservation.clone(),
-                middleware_execution.settlement_slot(),
-            )
-        });
     let cfg = &snapshot.config;
     let policy = FailoverPolicy;
     let deadline = Instant::now() + Duration::from_millis(cfg.failover.overall_timeout_ms);
@@ -395,17 +371,6 @@ pub(super) async fn stream_with_failover(
         if walk.attempts >= max_attempts || Instant::now() >= deadline {
             break;
         }
-        // Ineligible: discoverable, but not dispatchable under a budget hold.
-        let Some(price) = prices.get(index) else {
-            if continuation {
-                return Err(GatewayError::ContinuationAffinityUnavailable {
-                    provider: target.provider.clone(),
-                    model: target.model.clone(),
-                });
-            }
-            walk.note_unpriced(&model.name, prices.ineligible(index));
-            continue;
-        };
         let Some(provider) = cfg.provider(&target.provider) else {
             if continuation {
                 return Err(GatewayError::ContinuationAffinityUnavailable {
@@ -504,7 +469,6 @@ pub(super) async fn stream_with_failover(
                 price,
                 budget_key: hold.key.clone(),
                 reservation: hold.reservation.clone(),
-                rate_limit_permit: None,
                 admission_permit: None,
                 estimated_input_tokens: hold.estimated_input_tokens,
                 attempts: 0,
@@ -526,9 +490,6 @@ pub(super) async fn stream_with_failover(
             ctx.attempts = target_attempt + 1;
             match opened {
                 Ok((decoder, bytes)) => {
-                    if let Some(guard) = reservation_guard.take() {
-                        guard.disarm();
-                    }
                     telemetry::finish_upstream_attempt(
                         span,
                         telemetry::ATTEMPT_OK,
@@ -538,7 +499,6 @@ pub(super) async fn stream_with_failover(
                             .as_millis() as u64,
                         None,
                     );
-                    ctx.rate_limit_permit = hold.permit.take();
                     ctx.admission_permit = hold.admission.take();
                     record_target_success(&snapshot, target, &circuit_key);
                     telemetry::record_routing(
@@ -600,7 +560,6 @@ pub(super) async fn stream_with_failover(
                                     price,
                                     budget_key,
                                     reservation,
-                                    rate_limit_permit: None,
                                     // Rotation re-opens upstream for a relay that
                                     // already holds the request's permits.
                                     admission_permit: None,
@@ -636,14 +595,15 @@ pub(super) async fn stream_with_failover(
                             move |lease| snapshot.credentials.record_success(lease)
                         },
                     );
-                    return Ok(streaming::relay_opened_with_middleware(
+                    return Ok(streaming::relay_opened_with_accounting(
                         state.clone(),
                         ctx,
                         streaming::OpenedStream { decoder, bytes },
                         started,
                         wire.route.framing(),
                         Some(rotation),
-                        streaming::StreamMiddleware::new(middleware_execution, delivery),
+                        core_accounting,
+                        delivery,
                     ));
                 }
                 Err(err) if is_credential_exhausted(&err) => {
@@ -696,36 +656,20 @@ pub(super) async fn stream_with_failover(
 
     if let Some(err) = walk.last_error.take() {
         if let Some((mut ctx, started)) = last_ctx {
-            if let Some(guard) = reservation_guard.take() {
-                guard.disarm();
-            }
             ctx.attempts = walk.attempts;
-            ctx.rate_limit_permit = hold.permit.take();
             ctx.admission_permit = hold.admission.take();
-            streaming::settle_upstream_error_with_middleware(
+            streaming::settle_upstream_error_with_accounting(
                 state.clone(),
                 ctx,
                 started,
-                middleware_execution,
+                core_accounting,
             );
         } else {
-            if !middleware_execution.release_core_budget().await {
-                reservation_guard
-                    .take()
-                    .expect("legacy budget guard")
-                    .release()
-                    .await;
-            }
+            core_accounting.release_core_budget().await;
         }
         return Err(err.into());
     }
-    if !middleware_execution.release_core_budget().await {
-        reservation_guard
-            .take()
-            .expect("legacy budget guard")
-            .release()
-            .await;
-    }
+    core_accounting.release_core_budget().await;
     Err(walk.into_error())
 }
 /// One streamed request as the failover walk sees it: the alias it resolved,
@@ -734,19 +678,18 @@ pub(super) async fn stream_with_failover(
 pub(super) struct StreamRequest<'a> {
     pub(super) alias: String,
     pub(super) body: Value,
-    /// What each target is charged at under the snapshot the request started
-    /// with, resolved before admission so the relay's settlement cannot depend on
-    /// a price book published while the stream was open.
-    pub(super) prices: &'a AliasPrices,
+    /// What the request is charged at, copied at admission so the relay's
+    /// settlement cannot depend on a catalogue admitted while the stream was open.
+    pub(super) price: RequestPrice,
     pub(super) wire: &'a Wire,
     /// The identity of the usage event this request will settle as, minted at
     /// admission and cloned into every stream context the walk builds — including
     /// a credential rotation's — so a stream that rotates, ends, is cancelled, or
     /// never opens all report the same event.
     pub(super) identity: EventIdentity,
-    /// Pinned chain plus request-scope state, moved into the relay's
+    /// The budget hold and settlement slot, moved into the relay's
     /// response-lifetime accounting owner when a stream opens.
-    pub(super) middleware_execution: MiddlewareExecution,
+    pub(super) core_accounting: CoreAccounting,
     pub(super) delivery: StreamDelivery,
     pub(super) hold: BudgetHold,
 }
@@ -759,10 +702,6 @@ pub(super) struct FailoverWalk {
     attempts: u32,
     skipped_open: Vec<String>,
     no_credential: Option<GatewayError>,
-    /// The refusal for a target skipped because nothing approved prices it,
-    /// carried so a walk pinned to that target reports the pricing refusal
-    /// instead of a generic "nothing to attempt" request error.
-    unpriced: Option<GatewayError>,
     /// The last buffered attempt's error + attribution, carried so a walk that
     /// exhausts its targets still returns a real upstream error.
     last: Option<(TransportError, ServedTarget, u64, Option<u64>)>,
@@ -779,29 +718,8 @@ impl FailoverWalk {
             attempts: 0,
             skipped_open: Vec::new(),
             no_credential: None,
-            unpriced: None,
             last: None,
             last_error: None,
-        }
-    }
-
-    /// Remember that a candidate was skipped for want of an approved price. The
-    /// operator-facing identity of the book stays in the log; the walk keeps only
-    /// the stable redacted reason a caller may be told (#147).
-    fn note_unpriced(&mut self, alias: &str, refusal: Option<&Ineligible>) {
-        let Some(refusal) = refusal else {
-            return;
-        };
-        if self.unpriced.is_none() {
-            tracing::warn!(
-                model = %alias,
-                detail = %refusal.detail(),
-                "skipping a target with no approved price"
-            );
-            self.unpriced = Some(GatewayError::ModelNotPriced {
-                alias: alias.to_owned(),
-                reason: refusal.reason().to_owned(),
-            });
         }
     }
 
@@ -820,7 +738,6 @@ impl FailoverWalk {
             return ProviderError::AllCircuitsOpen(self.skipped_open).into();
         }
         self.no_credential
-            .or(self.unpriced)
             .unwrap_or_else(|| ProviderError::InvalidRequest("no attemptable target".into()).into())
     }
 }

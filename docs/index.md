@@ -61,7 +61,6 @@ disk as records.
 - [Managed containers](./deployment/managed-containers.md) — the portable
   contract for ECS/Fargate, Cloud Run, Azure Container Apps, and Nomad.
 - [Store backends](./deployment/stateful-backends.md) — SQLite vs Postgres.
-  Redis/control-plane pages are historical.
 - [Production checklist](./deployment/production-checklist.md) — security,
   streaming, rollout, observability, and recovery review.
 
@@ -97,26 +96,11 @@ disk as records.
 - [Deployment security model](./security/deployment-model.md) — trust
   boundaries, TLS termination, secret delivery, and image verification.
 - [Tenant isolation evidence](./security/tenant-isolation-evidence.md) — which
-  layer enforces each part of isolation, the test that proves it, and what is
-  not covered yet.
+  layer enforces each part of isolation and the test that proves it.
 - [Security policy](../SECURITY.md) — private vulnerability reporting, the
   supported-version window, response targets, and how a fix and advisory ship.
 - [Fuzzing](./security/fuzzing.md) — the config, token, and query targets, the
   properties they assert, and the required-versus-scheduled lanes.
-
-### Withdrawn operator surfaces (historical)
-
-These pages describe the pre-0063 control plane, minted tokens, or `/admin/v1`.
-They are not runbooks for a current deployment:
-
-- [Minted-token guide](./minted-token-guide.md)
-- [Administering a stateful deployment](./operations/admin-api.md)
-- [Stateful Kubernetes deployment runbook](./operations/stateful-deployment-runbook.md)
-- [Control-plane revision journal](./operations/control-plane-journal.md)
-- [Revision convergence](./operations/revision-convergence.md)
-- [Stateful integration](./operations/stateful-integration.md)
-- [Policy activation](./operations/policy-activation.md)
-- [Secret material in the stateful control plane](./security/secret-material.md)
 
 ## Develop and maintain
 
@@ -129,8 +113,6 @@ They are not runbooks for a current deployment:
 - [Backend responsibility boundaries](./maintainers/backend-contracts.md) — the
   eight responsibility-specific backend contracts, which paths they may be
   called from, and why there is no universal state backend.
-- [Namespace and blob control-plane migration](./maintainers/namespace-control-plane-migration.md)
-  — historical staged work for the superseded ADR 0062 target.
 - [Release runbook](./maintainers/releasing.md) — release-please, artifact
   repair, crates.io ordering, and verification.
 - [Release readiness](../RELEASE.md) — current public-beta evidence and known

@@ -27,16 +27,6 @@ env = "GW_TIER0_UPSTREAM_KEY"
 env = "GW_TIER0_INBOUND_KEY"
 namespace = "platform"
 
-[gateway_token]
-audience = "tier0-gate"
-
-[[gateway_verifier]]
-kid = "tier0-gate"
-alg = "HS256"
-env = "GW_TIER0_VERIFIER"
-namespaces = ["platform"]
-max_ttl = "15m"
-
 [[price]]
 provider = "fake-openai"
 model = "fixture-chat"

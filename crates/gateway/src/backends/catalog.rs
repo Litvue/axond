@@ -70,6 +70,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 
+#[cfg(test)]
 use super::{BackendFailure, BackendKind, Capabilities, FailureCategory};
 use crate::desired_state::{
     BlobKind, BlobRef, Canonical, CanonicalError, CanonicalValue, Checksum,
@@ -78,12 +79,15 @@ use crate::desired_state::{
 /// The sources a deployment may select for catalogue metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg(test)]
 pub enum CatalogBackend {
     #[default]
     ModelsDev,
 }
 
+#[cfg(test)]
 impl CatalogBackend {
+    #[cfg(test)]
     pub const fn kind(self) -> BackendKind {
         match self {
             Self::ModelsDev => BackendKind::ModelsDev,
@@ -132,6 +136,7 @@ pub struct SourceValidators {
 }
 
 impl SourceValidators {
+    #[cfg(any(test, fuzzing))]
     pub fn etag(etag: impl Into<String>) -> Self {
         Self {
             etag: Some(ETag(etag.into())),
@@ -253,14 +258,6 @@ impl RawPayload {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
-
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
 }
 
 /// Length only. A payload is an upstream document of unbounded size, and a
@@ -362,6 +359,7 @@ pub enum RefusalReason {
 ///
 /// Duplicated as strings so the metric catalogue can name the vocabulary in a
 /// const context; a test asserts the two never drift.
+#[cfg(test)]
 pub const REFUSAL_REASONS: &[&str] = &[
     "unreachable",
     "denied",
@@ -540,6 +538,7 @@ pub enum CatalogError {
 
 impl CatalogError {
     /// The bounded reason this failure refused an import.
+    #[cfg(test)]
     pub const fn refused_by(&self) -> &Refusal {
         match self {
             Self::Unavailable { refusal, .. }
@@ -550,6 +549,7 @@ impl CatalogError {
     }
 
     /// An unreachable source.
+    #[cfg(test)]
     pub const fn unavailable(backend: &'static str, message: String) -> Self {
         Self::Unavailable {
             backend,
@@ -559,6 +559,7 @@ impl CatalogError {
     }
 }
 
+#[cfg(test)]
 impl BackendFailure for CatalogError {
     fn category(&self) -> FailureCategory {
         match self {
@@ -575,6 +576,7 @@ impl BackendFailure for CatalogError {
 pub trait CatalogSource: Send + Sync {
     fn name(&self) -> &'static str;
 
+    #[cfg(test)]
     fn capabilities(&self) -> Capabilities;
 
     /// Read metadata, skipping the transfer when `since` still matches the
@@ -802,17 +804,6 @@ pub enum ModelCapability {
 }
 
 impl ModelCapability {
-    pub const ALL: &'static [Self] = &[
-        Self::Attachment,
-        Self::Reasoning,
-        Self::ToolCall,
-        Self::Temperature,
-        Self::StructuredOutput,
-        Self::Interleaved,
-        Self::OpenWeights,
-        Self::Experimental,
-    ];
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Attachment => "attachment",
@@ -824,13 +815,6 @@ impl ModelCapability {
             Self::OpenWeights => "open-weights",
             Self::Experimental => "experimental",
         }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|capability| capability.as_str() == value)
     }
 }
 
@@ -866,14 +850,8 @@ impl ModelLifecycle {
         }
     }
 
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|lifecycle| lifecycle.as_str() == value)
-    }
-
     /// Whether the source marks the model as retiring or retired.
+    #[cfg(test)]
     pub const fn deprecated(self) -> bool {
         matches!(self, Self::Deprecated)
     }
@@ -919,6 +897,7 @@ impl Canonical for ModelLimits {
 pub struct ObservedRate(u64);
 
 impl ObservedRate {
+    #[cfg(test)]
     pub const ZERO: Self = Self(0);
 
     pub const fn from_nanos(nanos: u64) -> Self {
@@ -950,6 +929,7 @@ pub struct PriceRates {
 
 impl PriceRates {
     /// The two rates every published price states.
+    #[cfg(test)]
     pub const fn new(input: ObservedRate, output: ObservedRate) -> Self {
         Self {
             input,
@@ -1044,6 +1024,7 @@ pub struct ObservedPrice {
 }
 
 impl ObservedPrice {
+    #[cfg(test)]
     pub fn new(base: PriceRates) -> Self {
         Self {
             base,
@@ -1088,23 +1069,7 @@ pub enum ModelField {
 }
 
 impl ModelField {
-    pub const ALL: &'static [Self] = &[
-        Self::DisplayName,
-        Self::Family,
-        Self::Capabilities,
-        Self::InputModalities,
-        Self::OutputModalities,
-        Self::ContextTokens,
-        Self::InputTokens,
-        Self::OutputTokens,
-        Self::Lifecycle,
-        Self::KnowledgeCutoff,
-        Self::ReleaseDate,
-        Self::LastUpdated,
-        Self::Endpoint,
-        Self::PublishedModelId,
-    ];
-
+    #[cfg(any(test, fuzzing))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::DisplayName => "display_name",
@@ -1357,23 +1322,7 @@ pub enum ProviderField {
     EnvVars,
 }
 
-impl ProviderField {
-    pub const ALL: &'static [Self] = &[
-        Self::DisplayName,
-        Self::DocUrl,
-        Self::Endpoint,
-        Self::EnvVars,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::DisplayName => "display_name",
-            Self::DocUrl => "doc_url",
-            Self::Endpoint => "endpoint",
-            Self::EnvVars => "env_vars",
-        }
-    }
-}
+impl ProviderField {}
 
 /// A provider as the source describes it, without its models.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1475,10 +1424,12 @@ pub struct ProviderOffering {
 
 impl ProviderOffering {
     /// Whether this provider contradicts the neutral record anywhere.
+    #[cfg(test)]
     pub fn has_overrides(&self) -> bool {
         !self.overrides.is_empty()
     }
 
+    #[cfg(test)]
     pub fn overrides_field(&self, field: ModelField) -> bool {
         self.overrides.iter().any(|(name, _)| *name == field)
     }
@@ -1536,6 +1487,7 @@ pub struct CatalogModelEntry {
 impl CatalogModelEntry {
     /// This provider's offering of the model, or its first by published id when
     /// the provider publishes the model under several.
+    #[cfg(test)]
     pub fn offering(&self, provider: &ProviderId) -> Option<&ProviderOffering> {
         self.offerings
             .iter()
@@ -1746,15 +1698,18 @@ impl CatalogContent {
         self.providers.iter().find(|provider| &provider.id == id)
     }
 
+    #[cfg(test)]
     pub fn model(&self, id: &ModelId) -> Option<&CatalogModelEntry> {
         self.models.iter().find(|model| &model.id == id)
     }
 
+    #[cfg(test)]
     pub fn offering(&self, model: &ModelId, provider: &ProviderId) -> Option<&ProviderOffering> {
         self.model(model)?.offering(provider)
     }
 
     /// The number of offerings across every model.
+    #[cfg(any(test, fuzzing))]
     pub fn offering_count(&self) -> usize {
         self.models.iter().map(|model| model.offerings.len()).sum()
     }
@@ -2139,10 +2094,12 @@ impl CatalogDiff {
         Self { changes }
     }
 
+    #[cfg(any(test, fuzzing))]
     pub fn changes(&self) -> &[CatalogChange] {
         &self.changes
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.changes.is_empty()
     }
@@ -2172,6 +2129,7 @@ impl CatalogDiff {
 
     /// Whether any published price moved. The question an operator asks first,
     /// and the reason price changes are classified separately.
+    #[cfg(test)]
     pub fn has_price_changes(&self) -> bool {
         self.changes
             .iter()
@@ -2310,6 +2268,7 @@ pub enum Refreshed {
 
 impl Refreshed {
     /// The admission, when the refresh advanced or confirmed the catalogue.
+    #[cfg(test)]
     pub const fn admission(&self) -> Option<&Admission> {
         match self {
             Self::Admitted(admission) => Some(admission),
@@ -2318,6 +2277,7 @@ impl Refreshed {
     }
 
     /// The refusal to record, when the refresh advanced nothing.
+    #[cfg(test)]
     pub const fn refusal(&self) -> Option<&Refusal> {
         match self {
             Self::Admitted(_) => None,
@@ -2417,6 +2377,7 @@ impl LastKnownGoodCatalog {
         self.active.as_ref()
     }
 
+    #[cfg(test)]
     pub fn content(&self) -> Option<&CatalogContent> {
         self.active.as_ref().map(|snapshot| &snapshot.content)
     }
@@ -2551,6 +2512,7 @@ impl LastKnownGoodCatalog {
     /// is the one place that sees both the refusal and the run of refusals before
     /// it. The error itself is returned unchanged, so a caller still logs the
     /// typed detail — pointer included — that a metric may not carry.
+    #[cfg(any(test, fuzzing))]
     pub fn admit_result<E: Refusable>(
         &mut self,
         parsed: Result<CatalogSnapshot, E>,
@@ -2647,13 +2609,8 @@ impl LastKnownGoodCatalog {
         self.last_refusal = Some(refusal);
     }
 
-    /// How many imports in a row have been refused. Zero after any admitted or
-    /// confirmed-unchanged import.
-    pub const fn consecutive_refusals(&self) -> u32 {
-        self.consecutive_refusals
-    }
-
     /// The most recent refusal, still holding its pointer for a log line.
+    #[cfg(test)]
     pub const fn last_refusal(&self) -> Option<&Refusal> {
         self.last_refusal.as_ref()
     }
@@ -2687,6 +2644,7 @@ impl LastKnownGoodCatalog {
 /// the first evidence that the catalogue has stopped advancing across intervals
 /// rather than within one. The threshold is a count rather than a duration so it
 /// means the same thing whatever cadence a scheduler eventually runs at.
+#[cfg(test)]
 pub const PERSISTENT_REFUSAL_THRESHOLD: u32 = 2;
 
 /// The active snapshot, as an operator sees it.
@@ -2722,6 +2680,7 @@ pub struct CatalogReport {
 impl CatalogReport {
     /// Whether refusals have persisted across more than one import attempt. The
     /// alert condition, evaluated on data rather than restated by each consumer.
+    #[cfg(test)]
     pub const fn persistent_refusal(&self) -> bool {
         self.consecutive_refusals >= PERSISTENT_REFUSAL_THRESHOLD
     }

@@ -13,9 +13,8 @@ Two classes of check live here:
 * internal consistency of one manifest set — every image pinned, every container
   bounded, the disruption budget survivable at the replica count it ships with;
 * consistency between a documented policy and the thing that enforces it — the
-  supported Postgres/Redis versions against the version the gateway refuses below
-  and the images CI actually exercises, and the recovery drill against the lane
-  that runs it;
+  recovery objectives against the recovery page, and the rollout drill against
+  the lane that runs it;
 * consistency between a manifest and the process it runs — the termination grace
   period against axond's own `[shutdown]` defaults, and the container's memory
   limit against the `[admission]` ceilings in its own ConfigMap. Those are the
@@ -54,19 +53,10 @@ ROOT = Path(__file__).resolve().parent.parent
 BASE = ROOT / "deploy/kubernetes/base"
 PRODUCTION = ROOT / "deploy/kubernetes/overlays/production"
 AUTOSCALING = ROOT / "deploy/kubernetes/components/autoscaling"
-PRODUCTION_STATEFUL = ROOT / "deploy/kubernetes/overlays/production-stateful"
-PRODUCTION_STATEFUL_PERSISTENT = (
-    ROOT / "deploy/kubernetes/overlays/production-stateful-persistent"
-)
 KUBERNETES_DOC = ROOT / "docs/deployment/kubernetes.md"
-STATEFUL_DOC = ROOT / "docs/deployment/stateful-backends.md"
 RECOVERY_DOC = ROOT / "docs/operations/backup-and-recovery.md"
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
-SCHEMA_SOURCE = ROOT / "crates/gateway/src/backends/control_plane/schema.rs"
-REVOCATION_SOURCE = ROOT / "crates/gateway/src/revocation/redis.rs"
 ROLLOUT_DRILL = ROOT / "ops/rollout-drill.sh"
-STATEFUL_DRILL = ROOT / "ops/stateful-deploy-drill.sh"
-STATEFUL_PERSISTENT_DRILL = ROOT / "ops/stateful-persistent-drill.sh"
 TELEMETRY_SOURCE = ROOT / "crates/gateway/src/telemetry/mod.rs"
 
 IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
@@ -78,9 +68,6 @@ SELECTOR = {"app.kubernetes.io/name": "axond"}
 # gcr.io/distroless/static-debian12:nonroot's documented nonroot UID/GID.
 DISTROLESS_NONROOT_GROUP = 65532
 PRIVATE_RANGES = {"169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}
-# The Redis release that added `SET … PXAT`, which the revocation write uses and
-# which is therefore what the documented floor has to say.
-REDIS_PXAT_FLOOR = "6.2"
 
 Document = dict[str, Any]
 
@@ -493,9 +480,8 @@ def check_service_port(documents: list[Document], label: str) -> list[str]:
                 f"{label}: container {container['name']!r} exposes {sorted(ports)} but the "
                 f"mounted config binds {bind_port}"
             )
-    # Every Service, not one: the stateful overlay publishes the administrative
-    # surface on a second Service, and it reaches the same listener. Emptiness is
-    # its own failure, because `of_kind` reports nothing where `one` raised: a
+    # Every Service, not one: each must reach the listener. Emptiness is its own
+    # failure, because `of_kind` reports nothing where `one` raised: a
     # manifest set that publishes no Service at all reaches no caller.
     services = of_kind(documents, "Service")
     if not services:
@@ -539,8 +525,7 @@ def check_disruption_budget(
             f"{label}: {replicas} replicas against minAvailable {minimum} leaves no "
             "room for a voluntary disruption"
         )
-    # A Recreate fleet has no rolling update to bound; `check_stateful` asserts
-    # that it upgrades that way and keeps no rollingUpdate settings beside it.
+    # A Recreate fleet has no rolling update to bound.
     if (
         deployment["kind"] == "Deployment"
         and deployment["spec"].get("strategy", {}).get("type") != "Recreate"
@@ -616,131 +601,11 @@ def check_example_secret(
     return failures
 
 
-def ci_service_images(workflow: dict[str, Any]) -> dict[str, str]:
-    """Backend images required CI actually runs, keyed by service name.
-
-    Request-path qualification boots SQLite and does not attach Redis or
-    Postgres. Overlay drills are opt-in and are not this map.
-    """
-    images: dict[str, str] = {}
-    for job in workflow.get("jobs", {}).values():
-        for name, service in (job.get("services") or {}).items():
-            image = service.get("image")
-            if image:
-                images[name] = image
-    return images
-
-
-REQUIRED_CI_IMAGE = re.compile(r"^`([^`]+)`$")
-
-
-def documented_backends(page: str) -> dict[str, tuple[str, str]]:
-    """The supported-version table, as `{backend: (supported column, exercised)}`."""
-    rows: dict[str, tuple[str, str]] = {}
-    for line in page.splitlines():
-        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if len(cells) < 3 or cells[0] not in {"PostgreSQL", "Redis"}:
-            continue
-        rows[cells[0]] = (cells[1], cells[2])
-    return rows
-
-
-def claimed_required_ci_image(exercised: str) -> str | None:
-    """A backtick-only cell is a required-CI image claim; anything else is not."""
-    match = REQUIRED_CI_IMAGE.fullmatch(exercised.strip())
-    return match.group(1) if match else None
-
-
-def enforced_postgres_floor(source: str) -> int:
-    """The major version the gateway refuses to run below, from its own constant."""
-    match = re.search(r"MINIMUM_SERVER_VERSION_NUM: i32 = ([0-9_]+);", source)
-    if match is None:
-        raise SystemExit(
-            "crates/gateway/src/backends/control_plane/schema.rs: MINIMUM_SERVER_VERSION_NUM is gone; "
-            "the supported-version gate reads it"
-        )
-    return int(match.group(1).replace("_", "")) // 10_000
-
-
-def check_supported_backends(
-    page: str, images: dict[str, str], floor: int, revocation_source: str
-) -> list[str]:
-    """The documented support window is the one that is enforced and exercised.
-
-    Three ways this table rots, each of which turns a support statement into a
-    guess: the floor drifts from the version the gateway refuses below, the
-    "exercised in CI" column keeps naming an image the workflow no longer runs, and
-    the reason for the Redis floor disappears from the code that needed it.
-    """
-    failures: list[str] = []
-    rows = documented_backends(page)
-    for backend, service in (("PostgreSQL", "postgres"), ("Redis", "redis")):
-        if backend not in rows:
-            failures.append(
-                f"docs/deployment/stateful-backends.md: no supported-version row for {backend}"
-            )
-            continue
-        supported, exercised = rows[backend]
-        running = images.get(service)
-        documented_image = claimed_required_ci_image(exercised)
-        if documented_image is None:
-            marker = exercised.lower()
-            if "not exercised" not in marker and "opt-in" not in marker:
-                failures.append(
-                    f"docs/deployment/stateful-backends.md: {backend} exercised-in-CI cell "
-                    f"{exercised!r} is neither a required-CI image nor an explicit "
-                    "opt-in / not-exercised marker"
-                )
-            elif "not exercised" in marker and running is not None:
-                failures.append(
-                    f"docs/deployment/stateful-backends.md: {backend} is documented as not "
-                    f"exercised, but required CI runs `{running}`"
-                )
-        elif running is None:
-            failures.append(
-                f"docs/deployment/stateful-backends.md: {backend} is documented as exercised on "
-                f"`{documented_image}`, but required CI runs no `{service}` service"
-            )
-        elif documented_image != running:
-            failures.append(
-                f"docs/deployment/stateful-backends.md: {backend} is documented as exercised on "
-                f"`{documented_image}`, but CI runs `{running}`"
-            )
-        documented_floor = supported.split(",")[0].strip()
-        if backend == "PostgreSQL" and documented_floor != str(floor):
-            failures.append(
-                f"docs/deployment/stateful-backends.md: PostgreSQL is documented from "
-                f"{documented_floor}, but the gateway refuses below {floor} "
-                "(MINIMUM_SERVER_VERSION_NUM)"
-            )
-        if backend == "Redis":
-            # The floor is a consequence of the revocation write, not a free
-            # choice: `SET … PXAT` is 6.2. Asserting the number itself — rather
-            # than only checking the code while the number happens to read 6.2 —
-            # keeps an edit to the table from switching the check off.
-            if "PXAT" not in revocation_source:
-                failures.append(
-                    "docs/deployment/stateful-backends.md: the Redis floor is justified by the "
-                    "`SET … PXAT` revocation write, which is no longer in "
-                    "crates/gateway/src/revocation/redis.rs; re-derive the floor from whatever "
-                    "replaced it"
-                )
-            elif documented_floor != REDIS_PXAT_FLOOR:
-                failures.append(
-                    f"docs/deployment/stateful-backends.md: Redis is documented from "
-                    f"{documented_floor}, but the revocation write is `SET … PXAT`, which needs "
-                    f"{REDIS_PXAT_FLOOR}; a different floor has to follow a change in "
-                    "crates/gateway/src/revocation/redis.rs"
-                )
-    return failures
-
-
 def unblocked_lane(jobs: dict[str, Any], lane: str) -> str | None:
     """Why a drill would not block its selected CI event (ADR 0004).
 
     The aggregate delegates to ci-success.py. Check both its workflow wiring
-    and that a failed drill actually fails that event's gate, including the
-    explicit manual opt-in for legacy drills.
+    and that a failed drill actually fails that event's gate.
     """
     success = jobs["CI-Success"]
     if lane not in success["needs"]:
@@ -750,7 +615,6 @@ def unblocked_lane(jobs: dict[str, Any], lane: str) -> str | None:
         "CI_EVENT": "${{ github.event_name }}",
         "CI_RUST": "${{ needs.changes.outputs.rust }}",
         "CI_DEPENDENCIES": "${{ needs.changes.outputs.dependencies }}",
-        "CI_LEGACY": "${{ inputs.run_legacy_postgres_qualification }}",
     }
     if not any(
         str(step.get("run", "")).strip() == "python3 ops/ci-success.py"
@@ -759,15 +623,15 @@ def unblocked_lane(jobs: dict[str, Any], lane: str) -> str | None:
     ):
         return f"CI-Success does not pass the job results and event to the gate for {lane}"
     gate = runpy.run_path(str(ROOT / "ops/ci-success.py"))
-    event = "workflow_dispatch" if lane in gate["LEGACY"] else "push"
-    expected = gate["expected_results"](event, "true", "true", "true")
+    event = "push"
+    expected = gate["expected_results"](event, "true", "true")
     if expected.get(lane) != "success":
         return f"CI-Success does not require a successful {lane} on {event}"
     needs = {job: {"result": result} for job, result in expected.items()}
-    if gate["failures"](needs, event, "true", "true", "true"):
+    if gate["failures"](needs, event, "true", "true"):
         return f"CI-Success cannot pass the selected {event} lanes"
     needs[lane]["result"] = "failure"
-    if not gate["failures"](needs, event, "true", "true", "true"):
+    if not gate["failures"](needs, event, "true", "true"):
         return f"CI-Success accepts a failed {lane} on {event}"
     return None
 
@@ -842,430 +706,6 @@ def check_component_layering(kustomization: str) -> list[str]:
     return []
 
 
-def check_stateful(documents: list[Document]) -> list[str]:
-    """The stateful overlay deploys the lifecycle the runtime actually has.
-
-    A stateful replica boots, serves `/admin/v1`, and refuses inference until
-    revision convergence ships, so it never reports Ready. Three defaults of a
-    serving fleet are wrong for one that does not, and each is a silent wrongness
-    — an upgrade that hangs, an administrative surface with no endpoints, a node
-    drain that never finishes — so each is asserted here rather than left to the
-    comment that explains it. The fourth assertion is the schema ordering: the
-    migration is a Job, and a booting replica is not allowed to apply it.
-    """
-    label = "overlays/production-stateful"
-    failures: list[str] = []
-    deployment = one(documents, "Deployment")
-
-    strategy = deployment["spec"].get("strategy", {})
-    if strategy.get("type") != "Recreate":
-        failures.append(
-            f"{label}: the Deployment upgrades with {strategy.get('type')!r}; a rolling update "
-            "waits for an availability a fleet refusing inference never reports, so the upgrade "
-            "stalls instead of landing"
-        )
-    if strategy.get("rollingUpdate") is not None:
-        failures.append(f"{label}: the Deployment keeps rollingUpdate settings beside Recreate")
-
-    template = deployment["spec"].get("template")
-    if not isinstance(template, dict) or not isinstance(template.get("spec"), dict):
-        failures.append(
-            f"{label}: the Deployment is missing spec.template.spec, so Kubernetes cannot create a Pod"
-        )
-        return failures
-    # This is a Deployment with Recreate semantics, not a StatefulSet. There is
-    # no durable per-replica volume, so the shipped config must not enable the
-    # local last-known-good cache and promise recovery across Pod replacement.
-    # A future StatefulSet/PVC overlay gets its own manifest gate when it opts
-    # into `[convergence]`.
-
-    budget = one(documents, "PodDisruptionBudget")
-    if budget["spec"].get("unhealthyPodEvictionPolicy") != "AlwaysAllow":
-        failures.append(
-            f"{label}: the disruption budget does not set unhealthyPodEvictionPolicy: "
-            "AlwaysAllow, so with no Ready Pod it allows no eviction at all and every node "
-            "drain blocks"
-        )
-
-    services = {service["metadata"]["name"]: service for service in of_kind(documents, "Service")}
-    # The default stateful component must not publish `/admin/v1` through a
-    # Service. NetworkPolicy is not a security boundary on clusters whose CNI
-    # ignores it, so even a ClusterIP would make the break-glass surface
-    # reachable by every Pod. Operators use direct Pod port-forwarding; an
-    # administrative Service is an explicit opt-in outside this component.
-    if "axond-admin" in services:
-        failures.append(
-            f"{label}: the default stateful overlay publishes axond-admin; a Service cannot "
-            "secure /admin/v1 when the cluster CNI ignores NetworkPolicy — use Pod "
-            "port-forwarding or an independently enforced operator boundary"
-        )
-    # The inference ingress path is the boundary that matters here. `/admin/v1`
-    # shares one listener with inference, and on this fleet inference is refused
-    # — so the overlay's allowance for the ingress controller's namespace, which
-    # exists to admit inference callers, would admit the public path into the
-    # administrative surface and nothing else. The component replaces it with an
-    # opt-in Pod selector, and that replacement is asserted rather than trusted:
-    # a namespace-wide allowance is how it silently comes back.
-    for policy in of_kind(documents, "NetworkPolicy"):
-        if policy["spec"].get("podSelector", {}).get("matchLabels") != SELECTOR:
-            continue
-        for rule in policy["spec"].get("ingress", []):
-            for peer in rule.get("from", []):
-                if peer.get("podSelector") is None:
-                    failures.append(
-                        f"{label}: NetworkPolicy {policy['metadata']['name']!r} admits "
-                        f"{sorted(peer)} to the gateway's port; on a fleet that refuses "
-                        "inference the only surface behind that port is /admin/v1, so ingress "
-                        "is named Pod by Pod (axond.dev/admin-client) rather than by namespace"
-                    )
-
-    for ingress in of_kind(documents, "Ingress"):
-        backends = [
-            path.get("backend", {}).get("service", {}).get("name")
-            for rule in ingress["spec"].get("rules", [])
-            for path in rule.get("http", {}).get("paths", [])
-        ]
-        if "axond-admin" in backends:
-            failures.append(
-                f"{label}: Ingress {ingress['metadata']['name']!r} routes to axond-admin; this "
-                "overlay does not carry the operator authentication that would make publishing "
-                "/admin/v1 safe, so the ingress belongs beside it, not here"
-            )
-    if services.get("axond", {}).get("spec", {}).get("publishNotReadyAddresses"):
-        failures.append(
-            f"{label}: the inference Service publishes not-ready addresses, so an ingress would "
-            "route callers to a replica that refuses them"
-        )
-
-    jobs = of_kind(documents, "Job")
-    if len(jobs) != 1 or jobs[0]["metadata"]["name"] != "axond-migrate":
-        failures.append(f"{label}: the forward migration is not deployed as one axond-migrate Job")
-    else:
-        job = jobs[0]
-        pod = job["spec"]["template"]["spec"]
-        job_containers = pod.get("containers", [])
-        if ["migrate", "apply"] != job_containers[0].get("args", [])[:2]:
-            failures.append(f"{label}: the axond-migrate Job does not run `axond migrate apply`")
-        if pod.get("restartPolicy") != "Never":
-            failures.append(f"{label}: the axond-migrate Job restarts its Pod in place")
-        job_labels = job["spec"]["template"]["metadata"].get("labels", {})
-        if job_labels.get("app.kubernetes.io/name") == "axond":
-            failures.append(
-                f"{label}: the migration Pod carries the serving label, so it becomes a Service "
-                "endpoint and is selected by the gateway's NetworkPolicies"
-            )
-        selected = {
-            policy["spec"]["podSelector"].get("matchLabels", {}).get("app.kubernetes.io/name")
-            for policy in of_kind(documents, "NetworkPolicy")
-        }
-        if job_labels.get("app.kubernetes.io/name") not in selected:
-            failures.append(
-                f"{label}: no NetworkPolicy selects the migration Pod, so the Pod holding the "
-                "control-plane DSN has unrestricted egress under a default-deny overlay"
-            )
-
-    for document in (deployment, *jobs):
-        for container in document["spec"]["template"]["spec"].get("containers", []):
-            image = container["image"]
-            if f"{IMAGE_REPOSITORY}@{SENTINEL_DIGEST}" != image:
-                failures.append(
-                    f"{label}: container {container['name']!r} runs {image!r}; this overlay's "
-                    "own images: block has to pin every container — including the Job the "
-                    "production overlay's transformer never sees — to the sentinel digest"
-                )
-
-    config = gateway_config(documents)
-    if config.get("mode") != "stateful":
-        failures.append(f"{label}: the mounted config is not `mode = \"stateful\"`")
-    if "convergence" in config:
-        failures.append(
-            f"{label}: the Recreate Deployment ships [convergence] without durable per-replica "
-            "storage; use a StatefulSet/PVC overlay before enabling the cache"
-        )
-    owned_by_the_control_plane = sorted(
-        key
-        for key in ("namespace", "provider", "credential", "model", "gateway_key", "alias")
-        if key in config
-    )
-    if owned_by_the_control_plane:
-        failures.append(
-            f"{label}: the bootstrap declares {owned_by_the_control_plane}, which the control "
-            "plane owns in this mode — a boot error before the listener binds"
-        )
-    if config.get("control_plane", {}).get("migrate"):
-        failures.append(
-            f"{label}: booting replicas may apply migrations, so a restart can have one replica "
-            "migrating a database its peers are reading; the Job is the migration"
-        )
-    return failures
-
-
-def check_stateful_persistent(documents: list[Document]) -> list[str]:
-    """The opt-in StatefulSet keeps one authenticated cache per replica."""
-    label = "overlays/production-stateful-persistent"
-    failures: list[str] = []
-    deployments = of_kind(documents, "Deployment")
-    if deployments:
-        failures.append(
-            f"{label}: the persistent option still renders a Deployment; the parent Recreate "
-            "workload must be replaced by a StatefulSet"
-        )
-    statefulsets = of_kind(documents, "StatefulSet")
-    if len(statefulsets) != 1:
-        failures.append(
-            f"{label}: expected exactly one axond StatefulSet, found {len(statefulsets)}"
-        )
-        return failures
-
-    statefulset = statefulsets[0]
-    spec = statefulset["spec"]
-    if statefulset["metadata"]["name"] != "axond":
-        failures.append(f"{label}: the StatefulSet is not named axond")
-    if spec.get("serviceName") != "axond-headless":
-        failures.append(
-            f"{label}: serviceName is {spec.get('serviceName')!r}, not axond-headless"
-        )
-    if spec.get("replicas") != 3:
-        failures.append(f"{label}: the StatefulSet must declare three replicas")
-    if spec.get("podManagementPolicy") != "Parallel":
-        failures.append(
-            f"{label}: podManagementPolicy is {spec.get('podManagementPolicy')!r}; "
-            "unready replicas must not block creation of later PVC-backed ordinals"
-        )
-    if spec.get("updateStrategy", {}).get("type") != "OnDelete":
-        failures.append(
-            f"{label}: updateStrategy is {spec.get('updateStrategy', {}).get('type')!r}; "
-            "the current intentionally unready stateful process requires explicit restarts"
-        )
-    if spec.get("selector", {}).get("matchLabels") != SELECTOR:
-        failures.append(f"{label}: the StatefulSet selector is not {SELECTOR!r}")
-
-    retention = spec.get("persistentVolumeClaimRetentionPolicy", {})
-    for field in ("whenDeleted", "whenScaled"):
-        if retention.get(field) != "Retain":
-            failures.append(
-                f"{label}: persistentVolumeClaimRetentionPolicy.{field} must be Retain; "
-                "a replica's signed cache must survive workload deletion and scale changes"
-            )
-
-    budget = one(documents, "PodDisruptionBudget")
-    if budget["spec"].get("unhealthyPodEvictionPolicy") != "AlwaysAllow":
-        failures.append(
-            f"{label}: the disruption budget must set unhealthyPodEvictionPolicy: AlwaysAllow "
-            "while the current stateful replicas remain unready"
-        )
-
-    claims = spec.get("volumeClaimTemplates", [])
-    if (
-        len(claims) != 1
-        or claims[0].get("metadata", {}).get("name") != "last-known-good"
-    ):
-        failures.append(
-            f"{label}: the StatefulSet must declare exactly one last-known-good PVC template"
-        )
-    else:
-        claim = claims[0]
-        claim_spec = claim.get("spec", {})
-        if claim_spec.get("accessModes") != ["ReadWriteOnce"]:
-            failures.append(
-                f"{label}: the last-known-good PVC must use ReadWriteOnce per-replica storage"
-            )
-        if claim_spec.get("resources", {}).get("requests", {}).get("storage") != "1Gi":
-            failures.append(
-                f"{label}: the last-known-good PVC must request 1Gi of durable storage"
-            )
-
-    pod = spec["template"]["spec"]
-    if pod.get("securityContext", {}).get("fsGroup") != DISTROLESS_NONROOT_GROUP:
-        failures.append(
-            f"{label}: pod securityContext.fsGroup must be the distroless nonroot group "
-            f"{DISTROLESS_NONROOT_GROUP} so the writable PVC is usable by the image"
-        )
-    axond = next(
-        (
-            container
-            for container in pod.get("containers", [])
-            if container.get("name") == "axond"
-        ),
-        None,
-    )
-    cache_mount = next(
-        (
-            mount
-            for mount in (axond or {}).get("volumeMounts", [])
-            if mount.get("name") == "last-known-good"
-        ),
-        None,
-    )
-    if cache_mount is None or cache_mount.get("mountPath") != "/var/lib/axond":
-        failures.append(
-            f"{label}: the StatefulSet does not mount last-known-good at /var/lib/axond"
-        )
-    elif cache_mount.get("readOnly"):
-        failures.append(f"{label}: the last-known-good PVC is mounted read-only")
-    if any(volume.get("name") == "last-known-good" for volume in pod.get("volumes", [])):
-        failures.append(
-            f"{label}: last-known-good is declared as a Pod volume; it must come from the "
-            "StatefulSet PVC template rather than emptyDir or hostPath"
-        )
-
-    service = next(
-        (
-            service
-            for service in of_kind(documents, "Service")
-            if service["metadata"]["name"] == "axond-headless"
-        ),
-        None,
-    )
-    if service is None:
-        failures.append(f"{label}: the StatefulSet governing headless Service is missing")
-    else:
-        service_spec = service["spec"]
-        if service_spec.get("clusterIP") != "None":
-            failures.append(f"{label}: axond-headless is not headless")
-        if service_spec.get("publishNotReadyAddresses"):
-            failures.append(
-                f"{label}: axond-headless publishes not-ready addresses; the current stateful "
-                "fleet must not gain a bypass around /readyz"
-            )
-        if service_spec.get("selector") != SELECTOR:
-            failures.append(f"{label}: axond-headless does not select {SELECTOR!r}")
-
-    caller_service = next(
-        (
-            service
-            for service in of_kind(documents, "Service")
-            if service["metadata"]["name"] == "axond"
-        ),
-        None,
-    )
-    if caller_service is not None and caller_service["spec"].get("publishNotReadyAddresses"):
-        failures.append(
-            f"{label}: the caller-facing axond Service publishes not-ready addresses; "
-            "the current stateful fleet must remain unreachable until /readyz passes"
-        )
-
-    config = gateway_config(documents)
-    convergence = config.get("convergence", {})
-    if convergence.get("cache_path") != "/var/lib/axond/last-known-good.snapshot":
-        failures.append(
-            f"{label}: [convergence].cache_path does not point into the PVC-backed cache mount"
-        )
-    if convergence.get("cache_key_env") != "GW_LAST_KNOWN_GOOD_KEY":
-        failures.append(
-            f"{label}: [convergence].cache_key_env is not GW_LAST_KNOWN_GOOD_KEY"
-        )
-
-    for document in (statefulset, *of_kind(documents, "Job")):
-        for container in containers(document):
-            image = container["image"]
-            if image != f"{IMAGE_REPOSITORY}@{SENTINEL_DIGEST}":
-                failures.append(
-                    f"{label}: container {container['name']!r} runs {image!r}; every image "
-                    "must remain pinned to this overlay's unresolved sentinel"
-                )
-    return failures
-
-
-def check_stateful_drill(workflow: dict[str, Any], page: str, drill: str) -> list[str]:
-    """The stateful overlay's behaviour has a cluster proof, and CI runs it.
-
-    `check_stateful` reads the rendered shape. Whether `/admin/v1` is reachable,
-    whether an upgrade lands, and whether a Pod can be evicted are answers only an
-    API server gives, and each of the three has a counterfactual in the drill —
-    without them a change restoring the stateless defaults would still pass.
-    """
-    failures: list[str] = []
-    jobs = workflow["jobs"]
-    lane = jobs.get("stateful-deploy-drill")
-    if lane is None:
-        failures.append(".github/workflows/ci.yml: the stateful-deploy-drill lane is missing")
-    elif not any(
-        "ops/stateful-deploy-drill.sh" in str(step.get("run", "")) for step in lane["steps"]
-    ):
-        failures.append(
-            ".github/workflows/ci.yml: the stateful-deploy-drill lane does not run the drill"
-        )
-    elif (reason := unblocked_lane(jobs, "stateful-deploy-drill")) is not None:
-        failures.append(
-            f".github/workflows/ci.yml: {reason}, so a stateful deployment that cannot be "
-            "upgraded or drained would not block a merge"
-        )
-    if "ops/stateful-deploy-drill.sh" not in page:
-        failures.append(
-            "docs/deployment/kubernetes.md: ops/stateful-deploy-drill.sh is not documented"
-        )
-    for counterfactual, lost in (
-        ("RollingUpdate has to stall", "an upgrade that never lands would read as one that did"),
-        (
-            "the default budget has to refuse it",
-            "a budget that blocks every drain would read as one that permits them",
-        ),
-    ):
-        if counterfactual not in drill:
-            failures.append(
-                f"ops/stateful-deploy-drill.sh: the {counterfactual!r} counterfactual is gone; "
-                f"{lost}"
-            )
-    for contract, lost in (
-        (
-            "/namespaces/platform/v1/chat/completions 401 unauthorized",
-            "the canonical anonymous inference probe would no longer prove auth-first refusal",
-        ),
-        (
-            "503 inference_unavailable",
-            "the drill would no longer document the authenticated convergence contract",
-        ),
-        (
-            "an active serving revision exists",
-            "the drill would claim serving without an active projected revision",
-        ),
-    ):
-        if contract not in drill:
-            failures.append(f"ops/stateful-deploy-drill.sh: {lost}")
-    return failures
-
-
-def check_stateful_persistent_drill(
-    workflow: dict[str, Any], page: str, drill: str
-) -> list[str]:
-    """The opt-in StatefulSet has a runtime PVC-retention proof in CI."""
-    failures: list[str] = []
-    jobs = workflow["jobs"]
-    lane = jobs.get("stateful-persistent-drill")
-    if lane is None:
-        failures.append(
-            ".github/workflows/ci.yml: the stateful-persistent-drill lane is missing"
-        )
-    elif not any(
-        "ops/stateful-persistent-drill.sh" in str(step.get("run", ""))
-        for step in lane["steps"]
-    ):
-        failures.append(
-            ".github/workflows/ci.yml: the stateful-persistent-drill lane does not run the drill"
-        )
-    elif (reason := unblocked_lane(jobs, "stateful-persistent-drill")) is not None:
-        failures.append(
-            f".github/workflows/ci.yml: {reason}, so PVC loss across Pod replacement "
-            "would not block a merge"
-        )
-    if "ops/stateful-persistent-drill.sh" not in page:
-        failures.append(
-            "docs/deployment/kubernetes.md: ops/stateful-persistent-drill.sh is not documented"
-        )
-    for assertion in (
-        "three retained PVC-backed ordinals",
-        "survives Pod replacement",
-        "/namespaces/platform/v1/chat/completions remains authentication-first",
-    ):
-        if assertion not in drill:
-            failures.append(
-                f"ops/stateful-persistent-drill.sh: the {assertion!r} assertion is gone; "
-                "the persistent overlay would have only a manifest check"
-            )
-    return failures
-
-
 def check_documented() -> list[str]:
     """The operator-facing page names the paths and the sentinel workflow."""
     page = KUBERNETES_DOC.read_text(encoding="utf-8")
@@ -1273,12 +713,8 @@ def check_documented() -> list[str]:
     for path in (
         "deploy/kubernetes/base",
         "deploy/kubernetes/overlays/production",
-        "deploy/kubernetes/overlays/production-stateful",
-        "deploy/kubernetes/overlays/production-stateful-persistent",
         "deploy/kubernetes/components/autoscaling",
-        "deploy/kubernetes/components/stateful",
         "ops/pin-image-digest.sh",
-        "ops/stateful-persistent-drill.sh",
     ):
         if path not in page:
             failures.append(f"docs/deployment/kubernetes.md: {path} is not documented")
@@ -1336,7 +772,7 @@ def check_digest_scope() -> list[str]:
         overlays = ROOT / "deploy/kubernetes/overlays"
         copied = root / "deploy/kubernetes/overlays"
         copied.mkdir(parents=True)
-        for overlay in ("production", "production-stateful", "production-stateful-persistent"):
+        for overlay in ("production",):
             (copied / overlay).mkdir()
             shutil.copy(
                 overlays / overlay / "kustomization.yaml", copied / overlay / "kustomization.yaml"
@@ -1344,11 +780,6 @@ def check_digest_scope() -> list[str]:
         pinned = copied / "production/kustomization.yaml"
         pinned.write_text(
             pinned.read_text(encoding="utf-8").replace(SENTINEL_DIGEST, resolved), encoding="utf-8"
-        )
-        persistent_pinned = copied / "production-stateful-persistent/kustomization.yaml"
-        persistent_pinned.write_text(
-            persistent_pinned.read_text(encoding="utf-8").replace(SENTINEL_DIGEST, resolved),
-            encoding="utf-8",
         )
 
         def check(*arguments: str) -> int:
@@ -1360,15 +791,13 @@ def check_digest_scope() -> list[str]:
             ).returncode
 
         expectations = (
-            ((), 0, "the fleet still carries an unresolved overlay"),
+            ((), 1, "every overlay is resolved"),
             (("overlays/production",), 1, "the named overlay is resolved"),
             (
                 ("deploy/kubernetes/overlays/production/kustomization.yaml",),
                 1,
                 "the named overlay is resolved, named by path",
             ),
-            (("overlays/production-stateful",), 0, "the named overlay is unresolved"),
-            (("overlays/production-stateful-persistent",), 1, "the named overlay is resolved"),
             (("overlays/nowhere",), 0, "the named overlay does not exist"),
         )
         for arguments, forbidden, because in expectations:
@@ -1385,54 +814,8 @@ def gate(
     base: list[Document],
     production: list[Document],
     autoscaled: list[Document],
-    stateful: list[Document],
-    stateful_persistent: list[Document],
 ) -> list[str]:
     return [
-        *check_stateful(stateful),
-        *check_termination_budget(stateful, "overlays/production-stateful"),
-        *check_resources(stateful, "overlays/production-stateful"),
-        *check_service_port(stateful, "overlays/production-stateful"),
-        *check_topology_spread(stateful, "overlays/production-stateful"),
-        *check_namespaces(stateful, "overlays/production-stateful"),
-        *check_example_secret(stateful, base, "overlays/production-stateful"),
-        # The stateful overlay inherits the production overlay's policies, PDB
-        # and telemetry egress, and inheritance is exactly what a render can
-        # lose: a component that renames a label or drops a patch leaves this
-        # fleet default-open while the stateless one still passes.
-        *check_network_policies(
-            stateful, "overlays/production-stateful", pod_labels(stateful)
-        ),
-        *check_telemetry_egress(
-            stateful, TELEMETRY_SOURCE.read_text(encoding="utf-8"), "overlays/production-stateful"
-        ),
-        *check_disruption_budget(stateful, "overlays/production-stateful"),
-        *check_stateful_persistent(stateful_persistent),
-        *check_termination_budget(
-            stateful_persistent, "overlays/production-stateful-persistent"
-        ),
-        *check_resources(stateful_persistent, "overlays/production-stateful-persistent"),
-        *check_service_port(stateful_persistent, "overlays/production-stateful-persistent"),
-        *check_topology_spread(
-            stateful_persistent, "overlays/production-stateful-persistent"
-        ),
-        *check_namespaces(stateful_persistent, "overlays/production-stateful-persistent"),
-        *check_example_secret(
-            stateful_persistent, base, "overlays/production-stateful-persistent"
-        ),
-        *check_network_policies(
-            stateful_persistent,
-            "overlays/production-stateful-persistent",
-            pod_labels(stateful_persistent),
-        ),
-        *check_telemetry_egress(
-            stateful_persistent,
-            TELEMETRY_SOURCE.read_text(encoding="utf-8"),
-            "overlays/production-stateful-persistent",
-        ),
-        *check_disruption_budget(
-            stateful_persistent, "overlays/production-stateful-persistent"
-        ),
         *check_image_pinning(base, production),
         *check_termination_budget(base, "base"),
         *check_termination_budget(production, "overlays/production"),
@@ -1457,170 +840,20 @@ def self_test() -> int:
     base = render(BASE)
     production = render(PRODUCTION)
     autoscaled = render(PRODUCTION, (AUTOSCALING,))
-    stateful = render(PRODUCTION_STATEFUL)
-    stateful_persistent = render(PRODUCTION_STATEFUL_PERSISTENT)
     failures: list[str] = []
 
     def expect_failure(name: str, produced: list[str]) -> None:
         if not produced:
             failures.append(f"self-test: {name} did not fail on a manifest it must reject")
 
-    if gate(base, production, autoscaled, stateful, stateful_persistent):
+    if gate(base, production, autoscaled):
         failures.append("self-test: the committed manifests must pass the gate")
 
-    persistent_deployment = copy.deepcopy(stateful_persistent)
-    persistent_deployment.append(
-        {
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {"name": "axond", "namespace": "axond"},
-            "spec": {"replicas": 3},
-        }
-    )
-    expect_failure(
-        "the persistent option retaining the Recreate Deployment",
-        check_stateful_persistent(persistent_deployment),
-    )
-
-    persistent_empty_dir = copy.deepcopy(stateful_persistent)
-    persistent_pod = one(persistent_empty_dir, "StatefulSet")["spec"]["template"]["spec"]
-    persistent_pod["volumes"].append({"name": "last-known-good", "emptyDir": {}})
-    expect_failure(
-        "a persistent option falling back to emptyDir",
-        check_stateful_persistent(persistent_empty_dir),
-    )
-
-    persistent_deleted = copy.deepcopy(stateful_persistent)
-    one(persistent_deleted, "StatefulSet")["spec"]["persistentVolumeClaimRetentionPolicy"][
-        "whenDeleted"
-    ] = "Delete"
-    expect_failure(
-        "a persistent option deleting a replica cache with the workload",
-        check_stateful_persistent(persistent_deleted),
-    )
-
-    persistent_missing_fs_group = copy.deepcopy(stateful_persistent)
-    one(persistent_missing_fs_group, "StatefulSet")["spec"]["template"]["spec"][
-        "securityContext"
-    ].pop("fsGroup", None)
-    expect_failure(
-        "a persistent option leaving the writable PVC without a distroless nonroot group",
-        check_stateful_persistent(persistent_missing_fs_group),
-    )
-
-    rolling = copy.deepcopy(stateful)
-    one(rolling, "Deployment")["spec"]["strategy"] = {
-        "type": "RollingUpdate",
-        "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1},
-    }
-    expect_failure("a stateful fleet upgraded with RollingUpdate", check_stateful(rolling))
-
-    blocked = copy.deepcopy(stateful)
-    one(blocked, "PodDisruptionBudget")["spec"].pop("unhealthyPodEvictionPolicy")
-    expect_failure("a budget that blocks every drain", check_stateful(blocked))
-
-    missing_template = copy.deepcopy(stateful)
-    one(missing_template, "Deployment")["spec"].pop("template")
-    expect_failure("a stateful Deployment without a Pod template", check_stateful(missing_template))
-
-    published_admin = copy.deepcopy(stateful)
-    published_admin.append(
-        {
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {"name": "axond-admin", "namespace": "axond"},
-            "spec": {"type": "ClusterIP", "selector": dict(SELECTOR)},
-        }
-    )
-    expect_failure(
-        "the default stateful overlay publishes an admin Service",
-        check_stateful(published_admin),
-    )
-
-    ingressed_admin = copy.deepcopy(stateful)
-    ingressed_admin.append(
-        {
-            "apiVersion": "networking.k8s.io/v1",
-            "kind": "Ingress",
-            "metadata": {"name": "axond-admin", "namespace": "axond"},
-            "spec": {
-                "rules": [
-                    {
-                        "http": {
-                            "paths": [
-                                {
-                                    "path": "/admin",
-                                    "pathType": "Prefix",
-                                    "backend": {
-                                        "service": {
-                                            "name": "axond-admin",
-                                            "port": {"number": 8080},
-                                        }
-                                    },
-                                }
-                            ]
-                        }
-                    }
-                ]
-            },
-        }
-    )
-    expect_failure("an ingress that fronts /admin/v1", check_stateful(ingressed_admin))
-
-    routed = copy.deepcopy(stateful)
-    for service in of_kind(routed, "Service"):
-        if service["metadata"]["name"] == "axond":
-            service["spec"]["publishNotReadyAddresses"] = True
-    expect_failure("callers routed to a refusing replica", check_stateful(routed))
-
-    cache_enabled_without_durable_storage = copy.deepcopy(stateful)
-    cache_config = one(cache_enabled_without_durable_storage, "ConfigMap")
-    cache_config["data"]["axond.toml"] += (
-        "\n[convergence]\n"
-        "cache_path = \"/var/lib/axond/last-known-good.snapshot\"\n"
-        "cache_key_env = \"GW_LAST_KNOWN_GOOD_KEY\"\n"
-    )
-    expect_failure(
-        "a Recreate stateful Deployment that enables a non-durable cache",
-        check_stateful(cache_enabled_without_durable_storage),
-    )
-
-    self_migrating = copy.deepcopy(stateful)
-    config = one(self_migrating, "ConfigMap")
-    # The first occurrence only: the table header ends `[control_plane]`, and a
-    # comment further down may mention the same name without opening a table.
-    config["data"]["axond.toml"] = config["data"]["axond.toml"].replace(
-        "[secret_store]", "migrate = true\n\n[secret_store]", 1
-    )
-    expect_failure("replicas allowed to migrate at boot", check_stateful(self_migrating))
-
-    statelessly_configured = copy.deepcopy(stateful)
-    config = one(statelessly_configured, "ConfigMap")
-    config["data"]["axond.toml"] += '\n[[namespace]]\nid = "platform"\n'
-    expect_failure("a bootstrap that also declares resources", check_stateful(statelessly_configured))
-
-    tagged_job = copy.deepcopy(stateful)
-    containers(one(tagged_job, "Job"))[0]["image"] = f"{IMAGE_REPOSITORY}:0.3.27"
-    expect_failure("a migration Job left on a mutable tag", check_stateful(tagged_job))
-
-    serving_label = copy.deepcopy(stateful)
-    one(serving_label, "Job")["spec"]["template"]["metadata"]["labels"] = dict(SELECTOR)
-    expect_failure("a migration Pod wearing the serving label", check_stateful(serving_label))
-
-    unpoliced = copy.deepcopy(stateful)
-    unpoliced[:] = [
-        document
-        for document in unpoliced
-        if document.get("kind") != "NetworkPolicy"
-        or not document["metadata"]["name"].startswith("axond-migrate")
-    ]
-    expect_failure("a migration Pod no NetworkPolicy selects", check_stateful(unpoliced))
-
-    unpublished = copy.deepcopy(stateful)
+    unpublished = copy.deepcopy(production)
     unpublished[:] = [document for document in unpublished if document.get("kind") != "Service"]
     expect_failure(
         "a manifest set that publishes no Service",
-        check_service_port(unpublished, "overlays/production-stateful"),
+        check_service_port(unpublished, "overlays/production"),
     )
 
     tagged = copy.deepcopy(production)
@@ -1733,82 +966,6 @@ def self_test() -> int:
     one(shrunk, "HorizontalPodAutoscaler")["spec"]["minReplicas"] = 1
     expect_failure("autoscaler floor", check_disruption_budget(production, "overlays/production", shrunk))
 
-    # The same three gates, against the stateful render: the overlay inherits
-    # them through a component, and a component that stops applying is exactly
-    # the regression a gate on the stateless render alone would not see.
-    stateful_open = copy.deepcopy(stateful)
-    for policy in of_kind(stateful_open, "NetworkPolicy"):
-        for rule in policy["spec"].get("egress", []):
-            for peer in rule.get("to", []):
-                if peer.get("ipBlock", {}).get("cidr") == "0.0.0.0/0":
-                    peer["ipBlock"].pop("except")
-    expect_failure(
-        "private-range egress on the stateful fleet",
-        check_network_policies(
-            stateful_open, "overlays/production-stateful", pod_labels(stateful_open)
-        ),
-    )
-
-    unpoliced_job = copy.deepcopy(stateful)
-    migration = {"app.kubernetes.io/name": "axond-migrate"}
-    unpoliced_job[:] = [
-        document
-        for document in unpoliced_job
-        if document.get("kind") != "NetworkPolicy"
-        or document["spec"].get("podSelector", {}).get("matchLabels") != migration
-    ]
-    expect_failure(
-        "a migration Pod no policy denies by default",
-        check_network_policies(
-            unpoliced_job, "overlays/production-stateful", pod_labels(unpoliced_job)
-        ),
-    )
-
-    inherited_ingress = copy.deepcopy(stateful)
-    for policy in of_kind(inherited_ingress, "NetworkPolicy"):
-        if policy["spec"].get("podSelector", {}).get("matchLabels") != SELECTOR:
-            continue
-        if policy["spec"].get("ingress"):
-            policy["spec"]["ingress"] = [
-                {
-                    "from": [
-                        {
-                            "namespaceSelector": {
-                                "matchLabels": {"kubernetes.io/metadata.name": "ingress-nginx"}
-                            }
-                        }
-                    ],
-                    "ports": [{"protocol": "TCP", "port": 8080}],
-                }
-            ]
-    expect_failure(
-        "the inference ingress path inherited onto the admin surface",
-        check_stateful(inherited_ingress),
-    )
-
-    stateful_grpc = copy.deepcopy(stateful)
-    for policy in of_kind(stateful_grpc, "NetworkPolicy"):
-        for rule in policy["spec"].get("egress", []):
-            for peer in rule.get("to", []):
-                labels = peer.get("podSelector", {}).get("matchLabels", {})
-                if labels.get("app.kubernetes.io/name") == "opentelemetry-collector":
-                    rule["ports"] = [{"protocol": "TCP", "port": 4317}]
-    expect_failure(
-        "stateful telemetry egress on a port axond cannot dial",
-        check_telemetry_egress(
-            stateful_grpc,
-            TELEMETRY_SOURCE.read_text(encoding="utf-8"),
-            "overlays/production-stateful",
-        ),
-    )
-
-    stateful_tight = copy.deepcopy(stateful)
-    one(stateful_tight, "PodDisruptionBudget")["spec"]["minAvailable"] = 3
-    expect_failure(
-        "a stateful budget that leaves no room for a drain",
-        check_disruption_budget(stateful_tight, "overlays/production-stateful"),
-    )
-
     inherited = copy.deepcopy(production)
     inherited.extend(copy.deepcopy(of_kind(base, "Secret")))
     expect_failure(
@@ -1860,48 +1017,7 @@ def self_test() -> int:
     )
 
     workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
-    backends = STATEFUL_DOC.read_text(encoding="utf-8")
-    images = ci_service_images(workflow)
-    floor = enforced_postgres_floor(SCHEMA_SOURCE.read_text(encoding="utf-8"))
-    revocation = REVOCATION_SOURCE.read_text(encoding="utf-8")
     recovery = RECOVERY_DOC.read_text(encoding="utf-8")
-
-    if check_supported_backends(backends, images, floor, revocation):
-        failures.append("self-test: the committed support window must pass the gate")
-    required_redis = backends.replace(
-        "| Redis | 6.2, 7.x, 8.x | not exercised (ADR 0063) |",
-        "| Redis | 6.2, 7.x, 8.x | `redis:7.4.2-alpine` |",
-    )
-    expect_failure(
-        "required-CI image with no CI service",
-        check_supported_backends(required_redis, images, floor, revocation),
-    )
-    expect_failure(
-        "backend image drift",
-        check_supported_backends(
-            required_redis, {**images, "redis": "redis:6.0-alpine"}, floor, revocation
-        ),
-    )
-    expect_failure(
-        "not-exercised backend that CI still runs",
-        check_supported_backends(
-            backends, {**images, "redis": "redis:7.4.2-alpine"}, floor, revocation
-        ),
-    )
-    expect_failure(
-        "documented floor below what the gateway accepts",
-        check_supported_backends(backends, images, floor + 1, revocation),
-    )
-    expect_failure(
-        "Redis floor without its reason",
-        check_supported_backends(backends, images, floor, revocation.replace("PXAT", "EX")),
-    )
-    expect_failure(
-        "a Redis floor below the one PXAT needs",
-        check_supported_backends(
-            backends.replace("| Redis | 6.2", "| Redis | 6.0"), images, floor, revocation
-        ),
-    )
 
     production_kustomization = (PRODUCTION / "kustomization.yaml").read_text(encoding="utf-8")
     if check_component_layering(production_kustomization):
@@ -1942,77 +1058,6 @@ def self_test() -> int:
         check_rollout_drill(workflow, kubernetes_page, rollout.replace("has to deadlock", "runs")),
     )
 
-    stateful_drill = STATEFUL_DRILL.read_text(encoding="utf-8")
-    if check_stateful_drill(workflow, kubernetes_page, stateful_drill):
-        failures.append("self-test: the committed stateful drill wiring must pass the gate")
-    optional_stateful = copy.deepcopy(workflow)
-    optional_stateful["jobs"]["CI-Success"]["needs"].remove("stateful-deploy-drill")
-    expect_failure(
-        "optional stateful deploy lane",
-        check_stateful_drill(optional_stateful, kubernetes_page, stateful_drill),
-    )
-    unasserted_stateful = copy.deepcopy(workflow)
-    for step in unasserted_stateful["jobs"]["CI-Success"]["steps"]:
-        if "run" in step:
-            step["run"] = "true"
-    expect_failure(
-        "a needed stateful lane CI-Success never asserts",
-        check_stateful_drill(unasserted_stateful, kubernetes_page, stateful_drill),
-    )
-    for counterfactual in ("RollingUpdate has to stall", "the default budget has to refuse it"):
-        expect_failure(
-            f"stateful drill without {counterfactual!r}",
-            check_stateful_drill(
-                workflow, kubernetes_page, stateful_drill.replace(counterfactual, "runs")
-            ),
-        )
-    canonical_stateful_probe = "/namespaces/platform/v1/chat/completions 401 unauthorized"
-    expect_failure(
-        "stateful drill using a legacy inference probe",
-        check_stateful_drill(
-            workflow,
-            kubernetes_page,
-            stateful_drill.replace(
-                canonical_stateful_probe, "/v1/chat/completions 401 unauthorized"
-            ),
-        ),
-    )
-
-    persistent_drill = STATEFUL_PERSISTENT_DRILL.read_text(encoding="utf-8")
-    if check_stateful_persistent_drill(workflow, kubernetes_page, persistent_drill):
-        failures.append(
-            "self-test: the committed stateful persistent drill wiring must pass the gate"
-        )
-    optional_persistent = copy.deepcopy(workflow)
-    optional_persistent["jobs"]["CI-Success"]["needs"].remove("stateful-persistent-drill")
-    expect_failure(
-        "optional stateful persistent lane",
-        check_stateful_persistent_drill(
-            optional_persistent, kubernetes_page, persistent_drill
-        ),
-    )
-    unasserted_persistent = copy.deepcopy(workflow)
-    for step in unasserted_persistent["jobs"]["CI-Success"]["steps"]:
-        if "run" in step:
-            step["run"] = "true"
-    expect_failure(
-        "a needed stateful persistent lane CI-Success never asserts",
-        check_stateful_persistent_drill(
-            unasserted_persistent, kubernetes_page, persistent_drill
-        ),
-    )
-    for assertion in (
-        "three retained PVC-backed ordinals",
-        "survives Pod replacement",
-        "/namespaces/platform/v1/chat/completions remains authentication-first",
-    ):
-        expect_failure(
-            f"persistent drill without {assertion!r}",
-            check_stateful_persistent_drill(
-                workflow, kubernetes_page, persistent_drill.replace(assertion, "runs")
-            ),
-        )
-
     for failure in failures:
         print(failure, file=sys.stderr)
     if failures:
@@ -2030,8 +1075,6 @@ def main(argv: list[str]) -> int:
             render(BASE),
             render(PRODUCTION),
             render(PRODUCTION, (AUTOSCALING,)),
-            render(PRODUCTION_STATEFUL),
-            render(PRODUCTION_STATEFUL_PERSISTENT),
         ),
         *check_component_layering(
             (PRODUCTION / "kustomization.yaml").read_text(encoding="utf-8")
@@ -2039,22 +1082,11 @@ def main(argv: list[str]) -> int:
         *check_documented(),
         *check_sentinel_refused(),
         *check_digest_scope(),
-        *check_supported_backends(
-            STATEFUL_DOC.read_text(encoding="utf-8"),
-            ci_service_images(yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))),
-            enforced_postgres_floor(SCHEMA_SOURCE.read_text(encoding="utf-8")),
-            REVOCATION_SOURCE.read_text(encoding="utf-8"),
-        ),
         *check_recovery_objectives(RECOVERY_DOC.read_text(encoding="utf-8")),
         *check_rollout_drill(
             yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
             KUBERNETES_DOC.read_text(encoding="utf-8"),
             ROLLOUT_DRILL.read_text(encoding="utf-8"),
-        ),
-        *check_stateful_drill(
-            yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
-            KUBERNETES_DOC.read_text(encoding="utf-8"),
-            STATEFUL_DRILL.read_text(encoding="utf-8"),
         ),
     ]
     for failure in failures:

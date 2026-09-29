@@ -16,13 +16,10 @@ use gateway_transport::TransportError;
 use serde_json::json;
 
 use crate::admission::AdmissionRejection;
-use crate::principals::{Capability, TokenVerificationError};
+use crate::principals::Capability;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
-    #[allow(dead_code)]
-    #[error("unknown model `{0}`")]
-    UnknownModel(String),
     #[error("model `{0}` is not prefixed as `provider-id/model-id`")]
     ModelUnprefixed(String),
     #[error("unknown provider `{0}`")]
@@ -35,19 +32,6 @@ pub enum GatewayError {
     NoCredential { namespace: String, provider: String },
     #[error("budget exceeded for model `{0}`")]
     BudgetExceeded(String),
-    /// Every target behind an alias is priced by an approved price book that does
-    /// not price it, so the request cannot be held against a budget. The alias
-    /// stays discoverable — it is listed, and its configuration is valid — but a
-    /// budget-controlled request against it is refused rather than served at
-    /// rates nobody approved or charged as free (#147).
-    ///
-    /// `reason` is the refusal's stable redacted form
-    /// ([`crate::pricing::Ineligible::reason`]) and never the price book's
-    /// identity or approval state: this message reaches an unprivileged caller,
-    /// and which book a deployment runs is a control-plane fact. The identifying
-    /// detail is logged where the refusal is raised.
-    #[error("model `{alias}` is not chargeable: {reason}")]
-    ModelNotPriced { alias: String, reason: String },
     #[error(
         "request cost ceiling exceeded for model `{alias}`: estimated {estimated_microdollars} microdollars exceeds the per-request ceiling of {ceiling_microdollars} microdollars"
     )]
@@ -64,14 +48,8 @@ pub enum GatewayError {
     /// *acknowledgement* of a request whose spend would otherwise go unrecorded.
     #[error("usage could not be recorded durably: {reason}")]
     UsageNotDurable { reason: &'static str },
-    #[error("rate-limit store is unavailable")]
-    RateLimitUnavailable,
     #[error("continuation affinity unavailable for Responses target `{provider}/{model}`")]
     ContinuationAffinityUnavailable { provider: String, model: String },
-    #[error("revocation store is unavailable")]
-    RevocationUnavailable,
-    #[error("inbound concurrency limit exceeded")]
-    RateLimitExceeded { retry_after_seconds: Option<u64> },
     /// Load shed by admission control: the process, the tenant, or the stream
     /// ceiling is full (see [`crate::admission`]). Typed per ceiling so an
     /// operator can tell a saturated replica from one noisy tenant.
@@ -101,35 +79,10 @@ pub enum GatewayError {
         requested_tokens: u64,
         limit_tokens: u64,
     },
-    /// A request was refused by a content middleware before any provider work
-    /// began. The reason is a stable, bounded code; middleware diagnostics and
-    /// request content stay in operator telemetry rather than this envelope.
-    #[allow(dead_code)]
-    #[error("request refused by middleware: {reason}")]
-    MiddlewareRefused { reason: &'static str },
-    /// A fail-closed middleware could not complete within its declared bound
-    /// or returned an internal failure before provider dispatch.
-    #[allow(dead_code)]
-    #[error("middleware is unavailable")]
-    MiddlewareUnavailable,
-    /// A policy selected decoded stream-event middleware for a byte-faithful
-    /// route without explicitly opting that route into buffering. Even a
-    /// non-mutating middleware can refuse, so releasing provider bytes before
-    /// it runs would violate fail-closed policy.
-    #[allow(dead_code)]
-    #[error("stream-event middleware requires explicit buffering on {route} ({framing} framing)")]
-    MiddlewareResponseIncompatible {
-        route: &'static str,
-        framing: &'static str,
-    },
     #[error("the gateway is shutting down and is no longer accepting requests")]
     Draining,
     #[error("unauthorized")]
     Unauthorized,
-    #[error("token authentication failed: {0}")]
-    TokenUnauthorized(#[source] TokenVerificationError),
-    #[error("token authorization failed: {0}")]
-    TokenForbidden(#[source] TokenVerificationError),
     #[error("token scope does not authorize `{0}`")]
     ScopeInsufficient(Capability),
     #[error("namespace identifier is invalid")]
@@ -150,16 +103,6 @@ pub enum GatewayError {
     Transport(#[from] TransportError),
     #[error("bad request: {0}")]
     BadRequest(String),
-    #[error("minting is disabled")]
-    MintingDisabled,
-    #[error("caller is not authorized to mint tokens")]
-    MintNotAuthorized,
-    #[error("requested claims are not narrower than the minting ceiling")]
-    MintClaimsNotNarrowing,
-    #[error(
-        "minting key `{kid}` has an epoch at {min_iat} that cannot produce a currently valid token"
-    )]
-    MintEpochNotUsable { kid: String, min_iat: u64 },
     /// A native route reached with an alias whose target cannot speak that wire
     /// shape (an OpenAI-only alias on `/v1/messages`, say). The caller asked for
     /// something the configuration cannot serve, so it is a request error rather
@@ -175,7 +118,6 @@ pub enum GatewayError {
 impl GatewayError {
     fn status(&self) -> StatusCode {
         match self {
-            Self::UnknownModel(_) => StatusCode::NOT_FOUND,
             Self::ModelUnprefixed(_)
             | Self::UnknownProvider(_)
             | Self::ModelBlocked(_)
@@ -185,7 +127,6 @@ impl GatewayError {
             // The configuration is servable and the caller's request is
             // well-formed; what is missing is an operator's approval, so this is
             // the deployment's state rather than the caller's fault.
-            Self::ModelNotPriced { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::RequestCostCeilingExceeded { .. } => StatusCode::FORBIDDEN,
             // Fail-closed: the cap cannot be enforced, so the request is a
             // dependency failure rather than an over-cap caller (ADR 0010).
@@ -194,10 +135,7 @@ impl GatewayError {
             // usage outbox: billing-grade delivery promised the event is durable
             // before the response is acknowledged, and it is not.
             Self::UsageNotDurable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            Self::RateLimitUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::ContinuationAffinityUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            Self::RevocationUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::RateLimitExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::Overloaded(rejection) => {
                 if rejection.is_caller_limit() {
                     StatusCode::TOO_MANY_REQUESTS
@@ -211,16 +149,10 @@ impl GatewayError {
             // A policy guardrail denied an authenticated request rather than
             // finding its shape malformed. Keep invalid-request refusals at 400,
             // but expose policy denial with the ordinary authorization status.
-            Self::MiddlewareRefused { reason: "policy" } => StatusCode::FORBIDDEN,
-            Self::MiddlewareRefused { .. } => StatusCode::BAD_REQUEST,
-            Self::MiddlewareUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-            Self::MiddlewareResponseIncompatible { .. } => StatusCode::BAD_REQUEST,
             // Retryable elsewhere immediately: this replica is leaving, not
             // failing, and readiness has already said so.
             Self::Draining => StatusCode::SERVICE_UNAVAILABLE,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
-            Self::TokenUnauthorized(_) => StatusCode::UNAUTHORIZED,
-            Self::TokenForbidden(_) => StatusCode::FORBIDDEN,
             Self::ScopeInsufficient(_) => StatusCode::FORBIDDEN,
             Self::InvalidNamespace => StatusCode::BAD_REQUEST,
             Self::UnknownNamespace => StatusCode::NOT_FOUND,
@@ -229,10 +161,6 @@ impl GatewayError {
             Self::StoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::NamespaceNotAuthorized => StatusCode::FORBIDDEN,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
-            Self::MintingDisabled => StatusCode::NOT_FOUND,
-            Self::MintNotAuthorized
-            | Self::MintClaimsNotNarrowing
-            | Self::MintEpochNotUsable { .. } => StatusCode::FORBIDDEN,
             Self::UnsupportedWire { .. } => StatusCode::BAD_REQUEST,
             // Provider credentials belong to the operator. The provider parser
             // groups these refusals with invalid requests, but their original
@@ -266,32 +194,23 @@ impl GatewayError {
 
     fn code(&self) -> &str {
         match self {
-            Self::UnknownModel(_) => "unknown_model",
             Self::ModelUnprefixed(_) => "model_unprefixed",
             Self::UnknownProvider(_) => "unknown_provider",
             Self::ModelBlocked(_) => "model_blocked",
             Self::UnpricedModel(_) => "unpriced_model",
             Self::NoCredential { .. } => "no_credential",
             Self::BudgetExceeded(_) => "budget_exceeded",
-            Self::ModelNotPriced { .. } => "model_not_priced",
             Self::RequestCostCeilingExceeded { .. } => "request_cost_ceiling_exceeded",
             Self::BudgetUnavailable => "budget_unavailable",
             Self::UsageNotDurable { .. } => "usage_not_durable",
-            Self::RateLimitUnavailable => "rate_limit_unavailable",
             Self::ContinuationAffinityUnavailable { .. } => "continuation_affinity_unavailable",
-            Self::RevocationUnavailable => "revocation_unavailable",
-            Self::RateLimitExceeded { .. } => "rate_limited",
             Self::Overloaded(rejection) => rejection.code(),
             Self::RequestTooLarge => "request_too_large",
             Self::UnsupportedMediaType => "unsupported_media_type",
             Self::PromptTooLarge { .. } => "prompt_too_large",
             Self::OutputLimitExceeded { .. } => "output_limit_exceeded",
-            Self::MiddlewareRefused { .. } => "middleware_refused",
-            Self::MiddlewareUnavailable => "middleware_unavailable",
-            Self::MiddlewareResponseIncompatible { .. } => "middleware_response_incompatible",
             Self::Draining => "draining",
             Self::Unauthorized => "unauthorized",
-            Self::TokenUnauthorized(error) | Self::TokenForbidden(error) => error.code(),
             Self::ScopeInsufficient(_) => "token_scope_insufficient",
             Self::InvalidNamespace => "invalid_namespace",
             Self::UnknownNamespace => "unknown_namespace",
@@ -300,10 +219,6 @@ impl GatewayError {
             Self::StoreUnavailable => "store_unavailable",
             Self::NamespaceNotAuthorized => "namespace_not_authorized",
             Self::BadRequest(_) => "bad_request",
-            Self::MintingDisabled => "minting_disabled",
-            Self::MintNotAuthorized => "mint_not_authorized",
-            Self::MintClaimsNotNarrowing => "mint_claims_not_narrowing",
-            Self::MintEpochNotUsable { .. } => "mint_epoch_not_usable",
             Self::UnsupportedWire { .. } => "unsupported_wire",
             Self::Provider(e) => e.code(),
             Self::Transport(
@@ -340,9 +255,6 @@ impl IntoResponse for GatewayError {
         let status = self.status();
         let code = self.code().to_owned();
         let retry_after = match &self {
-            Self::RateLimitExceeded {
-                retry_after_seconds: Some(seconds),
-            } => Some(seconds.to_string()),
             Self::Overloaded(rejection) => rejection
                 .retry_after_seconds()
                 .map(|seconds| seconds.to_string()),
@@ -352,8 +264,6 @@ impl IntoResponse for GatewayError {
             _ => None,
         };
         let message = match &self {
-            Self::TokenUnauthorized(_) => "token authentication failed".to_owned(),
-            Self::TokenForbidden(_) => "token authorization failed".to_owned(),
             Self::Transport(error) => transport_caller_message(error),
             _ => self.to_string(),
         };
@@ -381,19 +291,6 @@ mod tests {
     use http_body_util::BodyExt;
 
     #[test]
-    fn token_error_statuses_and_codes_are_distinct() {
-        let unauthorized = GatewayError::TokenUnauthorized(TokenVerificationError::Expired);
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(unauthorized.code(), "token_expired");
-
-        let forbidden = GatewayError::TokenForbidden(TokenVerificationError::UnknownNamespace {
-            namespace: "ghost".to_owned(),
-        });
-        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
-        assert_eq!(forbidden.code(), "token_unknown_namespace");
-    }
-
-    #[test]
     fn request_cost_ceiling_and_budget_errors_are_distinct() {
         let ceiling = GatewayError::RequestCostCeilingExceeded {
             alias: "gpt-4o".to_owned(),
@@ -406,26 +303,6 @@ mod tests {
         let budget = GatewayError::BudgetExceeded("gpt-4o".to_owned());
         assert_eq!(budget.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(budget.code(), "budget_exceeded");
-        let unavailable = GatewayError::RateLimitUnavailable;
-        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(unavailable.code(), "rate_limit_unavailable");
-    }
-
-    #[test]
-    fn middleware_refusal_distinguishes_policy_from_invalid_input() {
-        let policy = GatewayError::MiddlewareRefused { reason: "policy" };
-        assert_eq!(policy.status(), StatusCode::FORBIDDEN);
-        assert_eq!(policy.code(), "middleware_refused");
-
-        let invalid = GatewayError::MiddlewareRefused {
-            reason: "invalid_request",
-        };
-        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(invalid.code(), "middleware_refused");
-
-        let unavailable = GatewayError::MiddlewareUnavailable;
-        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(unavailable.code(), "middleware_unavailable");
     }
 
     #[test]
@@ -440,90 +317,6 @@ mod tests {
                 .get(axum::http::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok()),
             Some("0")
-        );
-    }
-
-    #[tokio::test]
-    async fn token_error_bodies_do_not_echo_caller_details() {
-        let unauthorized = GatewayError::TokenUnauthorized(TokenVerificationError::UnknownKey {
-            kid: "caller-kid".to_owned(),
-        })
-        .into_response();
-        let unauthorized_body = unauthorized
-            .into_body()
-            .collect()
-            .await
-            .expect("response body")
-            .to_bytes();
-        let unauthorized_body = String::from_utf8(unauthorized_body.to_vec()).unwrap();
-        assert!(!unauthorized_body.contains("caller-kid"));
-
-        let forbidden = GatewayError::TokenForbidden(TokenVerificationError::UnknownNamespace {
-            namespace: "caller-namespace".to_owned(),
-        })
-        .into_response();
-        let forbidden_body = forbidden
-            .into_body()
-            .collect()
-            .await
-            .expect("response body")
-            .to_bytes();
-        let forbidden_body = String::from_utf8(forbidden_body.to_vec()).unwrap();
-        assert!(!forbidden_body.contains("caller-namespace"));
-    }
-
-    #[tokio::test]
-    async fn rate_limit_error_is_typed_429_without_retry_after() {
-        let response = GatewayError::RateLimitExceeded {
-            retry_after_seconds: None,
-        }
-        .into_response();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(
-            response
-                .headers()
-                .get(axum::http::header::RETRY_AFTER)
-                .is_none()
-        );
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("response body")
-            .to_bytes();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({
-                "error": {
-                    "type": "rate_limited",
-                    "message": "inbound concurrency limit exceeded"
-                }
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn middleware_framing_incompatibility_is_typed_and_bounded() {
-        let response = GatewayError::MiddlewareResponseIncompatible {
-            route: "/v1/responses",
-            framing: "responses",
-        }
-        .into_response();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("response body")
-            .to_bytes();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({
-                "error": {
-                    "type": "middleware_response_incompatible",
-                    "message": "stream-event middleware requires explicit buffering on /v1/responses (responses framing)"
-                }
-            })
         );
     }
 

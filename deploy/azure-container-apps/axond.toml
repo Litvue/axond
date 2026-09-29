@@ -73,9 +73,3 @@ queue_capacity = 0
 queue_wait_ms = 0
 max_stream_duration_ms = 230_000
 max_stream_bytes = 33_554_432
-
-# Secret volumes on Container Apps are filled at revision start, not live.
-# Watching is harmless; a Key Vault edit still needs a new revision.
-[reload]
-watch = true
-poll_interval_ms = 2_000

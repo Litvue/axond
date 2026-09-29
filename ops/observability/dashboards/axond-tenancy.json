@@ -660,13 +660,6 @@
           "range": true,
           "refId": "A"
         }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#budget-or-rate-limit-capacity-is-exhausted",
-          "targetBlank": true
-        }
       ]
     },
     {

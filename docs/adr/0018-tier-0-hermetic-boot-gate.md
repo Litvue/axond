@@ -46,8 +46,8 @@ listener, rather than serving an empty snapshot. The gate dials the bootstrap's
 configured port to prove the last part, because the startup log line is emitted
 before the socket exists. That is a claim about this namespace, not about the
 mode: a replica that does reach its control plane boots and serves `/admin/v1`
-while refusing inference until a revision converges ([the stateful deployment
-shape](../deployment/kubernetes.md#stateful-mode)). The refusal must name the
+while refusing inference until a revision converges (the stateful deployment
+shape). The refusal must name the
 unresolved reference: a boot failure that named nothing could be a denied
 connection instead — the opposite of what this proves — and the gate also fails
 if that diagnostic contains a connection string rather than a reference name.

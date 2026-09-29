@@ -226,7 +226,6 @@ env -u OTEL_EXPORTER_OTLP_ENDPOINT -u OTEL_EXPORTER_OTLP_PROTOCOL \
 AXOND_CONFIG="$runtime_config" \
 GW_TIER0_UPSTREAM_KEY=tier0-upstream-placeholder \
 GW_TIER0_INBOUND_KEY=tier0-gateway-key \
-GW_TIER0_VERIFIER=tier0-verifier-secret-012345678901234567890123 \
 RUST_LOG=warn \
 "$bin" >"$gateway_log" 2>&1 &
 gateway_pid=$!

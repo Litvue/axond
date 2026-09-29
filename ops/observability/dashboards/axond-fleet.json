@@ -293,242 +293,6 @@
       "panels": []
     },
     {
-      "id": 11,
-      "type": "timeseries",
-      "title": "Dependency state",
-      "description": "0 disabled, 1 ok, 2 degraded, 3 unavailable. A severity ladder: >= 2 is trouble.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 18
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 8,
-            "showPoints": "never"
-          },
-          "unit": "short",
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "max by (axond_status_component) (axond_status_component_state)",
-          "legendFormat": "{{axond_status_component}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-dependency-is-impaired",
-          "targetBlank": true
-        }
-      ]
-    },
-    {
-      "id": 12,
-      "type": "timeseries",
-      "title": "Observation age",
-      "description": "A rising age with a steady state means the refresher, not the dependency.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 18
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 8,
-            "showPoints": "never"
-          },
-          "unit": "ms"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "max by (axond_status_component) (axond_status_observation_age)",
-          "legendFormat": "{{axond_status_component}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale",
-          "targetBlank": true
-        }
-      ]
-    },
-    {
-      "id": 13,
-      "type": "timeseries",
-      "title": "Status refresh outcomes",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 18
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 8,
-            "showPoints": "never"
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (axond_status_component, axond_status_outcome) (rate(axond_status_refreshes[5m]))",
-          "legendFormat": "{{axond_status_component}} {{axond_status_outcome}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#dependency-observations-have-gone-stale",
-          "targetBlank": true
-        }
-      ]
-    },
-    {
-      "id": 14,
-      "type": "timeseries",
-      "title": "Fail-closed denials",
-      "description": "Denials caused by an unreachable store under on_unavailable = deny.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 26
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 8,
-            "showPoints": "never"
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(axond_rate_limit_unavailable_denials[5m]))",
-          "legendFormat": "rate limit store",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(axond_revocation_unavailable_denials[5m]))",
-          "legendFormat": "revocation store",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-fail-closed-dependency-is-denying-requests",
-          "targetBlank": true
-        }
-      ]
-    },
-    {
       "id": 15,
       "type": "timeseries",
       "title": "Usage delivery",
@@ -539,9 +303,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 26
+        "w": 24,
+        "x": 0,
+        "y": 18
       },
       "fieldConfig": {
         "defaults": {
@@ -596,355 +360,6 @@
       ]
     },
     {
-      "id": 20,
-      "type": "row",
-      "title": "Fleet convergence",
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 34
-      },
-      "panels": []
-    },
-    {
-      "id": 21,
-      "type": "timeseries",
-      "title": "Revision lag across the fleet",
-      "description": "How long desired has differed from active. Seconds are convergence; minutes are an incident.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 35
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 8,
-            "showPoints": "never"
-          },
-          "unit": "ms"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "max(axond_revision_lag)",
-          "legendFormat": "slowest replica",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "min(axond_revision_lag)",
-          "legendFormat": "fastest replica",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "max by (service_instance_id) (axond_revision_lag)",
-          "legendFormat": "{{service_instance_id}}",
-          "range": true,
-          "refId": "C"
-        }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-replica-will-not-converge",
-          "targetBlank": true
-        }
-      ]
-    },
-    {
-      "id": 22,
-      "type": "timeseries",
-      "title": "Config generation spread",
-      "description": "Zero means the whole fleet agrees. A persistent non-zero value is one stuck replica.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 35
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 8,
-            "showPoints": "never"
-          },
-          "unit": "short",
-          "min": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "max(axond_config_generation) - min(axond_config_generation)",
-          "legendFormat": "generations apart",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "max(axond_revision_converged) - min(axond_revision_converged)",
-          "legendFormat": "convergence spread",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-fleet-is-split-across-revisions",
-          "targetBlank": true
-        }
-      ]
-    },
-    {
-      "id": 23,
-      "type": "timeseries",
-      "title": "Revision rejections by reason",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 35
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 8,
-            "showPoints": "never"
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (axond_revision_reason) (rate(axond_revision_rejections[10m]))",
-          "legendFormat": "{{axond_revision_reason}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "max(axond_revision_consecutive_failures)",
-          "legendFormat": "consecutive failures",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-replica-will-not-converge",
-          "targetBlank": true
-        }
-      ]
-    },
-    {
-      "id": 24,
-      "type": "timeseries",
-      "title": "Convergence attempts and cache restores",
-      "description": "A restored cache means a replica booted without reaching the control plane.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 43
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 8,
-            "showPoints": "never"
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (axond_revision_trigger, axond_revision_outcome) (rate(axond_revision_attempts[10m]))",
-          "legendFormat": "{{axond_revision_trigger}} {{axond_revision_outcome}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (axond_revision_outcome) (rate(axond_revision_last_known_good[10m]))",
-          "legendFormat": "cache {{axond_revision_outcome}}",
-          "range": true,
-          "refId": "B"
-        }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#the-control-plane-is-unreachable",
-          "targetBlank": true
-        }
-      ]
-    },
-    {
-      "id": 25,
-      "type": "timeseries",
-      "title": "Convergence duration p95",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 43
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 8,
-            "showPoints": "never"
-          },
-          "unit": "ms"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(axond_revision_convergence_duration_bucket[30m])))",
-          "legendFormat": "p95",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#a-replica-will-not-converge",
-          "targetBlank": true
-        }
-      ]
-    },
-    {
       "id": 30,
       "type": "row",
       "title": "Capacity and upstreams",
@@ -953,7 +368,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 26
       },
       "panels": []
     },
@@ -968,9 +383,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 12,
         "x": 0,
-        "y": 52
+        "y": 27
       },
       "fieldConfig": {
         "defaults": {
@@ -1024,9 +439,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 52
+        "w": 12,
+        "x": 12,
+        "y": 27
       },
       "fieldConfig": {
         "defaults": {
@@ -1070,95 +485,6 @@
       ]
     },
     {
-      "id": 33,
-      "type": "timeseries",
-      "title": "Budget and rate-limit pressure",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 52
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "fillOpacity": 8,
-            "showPoints": "never"
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(axond_budget_namespace_denials[5m]))",
-          "legendFormat": "namespace budget denials",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(axond_budget_capacity_denials[5m]))",
-          "legendFormat": "budget capacity denials",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "max(axond_budget_retained_subjects)",
-          "legendFormat": "retained subjects",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "editorMode": "code",
-          "expr": "sum(rate(axond_rate_limit_denials[5m]))",
-          "legendFormat": "rate limit denials",
-          "range": true,
-          "refId": "D"
-        }
-      ],
-      "links": [
-        {
-          "title": "Runbook: first response",
-          "url": "https://github.com/Litvue/axond/blob/main/docs/operations/observability-runbook.md#budget-or-rate-limit-capacity-is-exhausted",
-          "targetBlank": true
-        }
-      ]
-    },
-    {
       "id": 34,
       "type": "timeseries",
       "title": "Target circuit state",
@@ -1171,7 +497,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 60
+        "y": 35
       },
       "fieldConfig": {
         "defaults": {
@@ -1228,7 +554,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 60
+        "y": 35
       },
       "fieldConfig": {
         "defaults": {
@@ -1284,7 +610,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 60
+        "y": 35
       },
       "fieldConfig": {
         "defaults": {

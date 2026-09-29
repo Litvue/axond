@@ -31,11 +31,13 @@ use async_trait::async_trait;
 use gateway_core::ModelPrice;
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(test)]
 use super::Capabilities;
 use super::catalog::{
     Admission, CatalogContentId, CatalogError, CatalogRefresh, CatalogReport, CatalogSource,
     RefusalReason, SourceValidators,
 };
+use super::catalog_price::CatalogPriceIndex;
 use super::catalog_refresh::{
     CatalogRefresher, InvalidSchedule, RefreshOutcome, RefreshTrigger, Restored,
 };
@@ -44,7 +46,6 @@ use super::catalog_store::{
     CatalogStore, CatalogStoreError, InMemoryCatalogStore, RetainedCatalog, Retention,
     StoredCatalogState,
 };
-use super::local_catalog::CatalogPriceIndex;
 use super::models_dev::{HttpCatalogFetch, ModelsDevAdapter, ModelsDevSource, SeedCatalogSource};
 use crate::config::{CatalogConfig, CatalogSourceBackend, CatalogStoreBackend};
 
@@ -63,6 +64,7 @@ pub struct CatalogStatus {
 
 #[derive(Debug, Default)]
 struct CatalogLive {
+    #[cfg(test)]
     report: Option<CatalogReport>,
     prices: Arc<CatalogPriceIndex>,
 }
@@ -78,6 +80,7 @@ impl CatalogStatus {
     /// described content that was an hour younger then, and a surface that
     /// answered with the stored number would hide exactly the staleness it
     /// exists to show.
+    #[cfg(test)]
     pub fn report(&self) -> Option<CatalogReport> {
         let mut report = self.live.lock().expect("catalogue status lock").report?;
         let now = SystemTime::now();
@@ -98,7 +101,12 @@ impl CatalogStatus {
     }
 
     fn publish(&self, report: CatalogReport, prices: Arc<CatalogPriceIndex>) {
+        // Only the test seam reads the report back; the status route that
+        // served it was withdrawn (ADR 0063).
+        #[cfg(not(test))]
+        let _ = report;
         *self.live.lock().expect("catalogue status lock") = CatalogLive {
+            #[cfg(test)]
             report: Some(report),
             prices,
         };
@@ -134,6 +142,7 @@ impl CatalogSource for RuntimeSource {
         }
     }
 
+    #[cfg(test)]
     fn capabilities(&self) -> Capabilities {
         match self {
             Self::ModelsDev(source) => source.capabilities(),
@@ -171,13 +180,6 @@ impl CatalogStore for RuntimeStore {
         }
     }
 
-    fn capabilities(&self) -> Capabilities {
-        match self {
-            Self::Postgres(store) => store.capabilities(),
-            Self::InMemory(store) => store.capabilities(),
-        }
-    }
-
     async fn load(&self) -> Result<StoredCatalogState, CatalogStoreError> {
         match self {
             Self::Postgres(store) => store.load().await,
@@ -185,6 +187,7 @@ impl CatalogStore for RuntimeStore {
         }
     }
 
+    #[cfg(test)]
     async fn retained(
         &self,
         content_id: CatalogContentId,
@@ -195,16 +198,7 @@ impl CatalogStore for RuntimeStore {
         }
     }
 
-    async fn retained_by_raw_digest(
-        &self,
-        digest: crate::desired_state::Checksum,
-    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
-        match self {
-            Self::Postgres(store) => store.retained_by_raw_digest(digest).await,
-            Self::InMemory(store) => store.retained_by_raw_digest(digest).await,
-        }
-    }
-
+    #[cfg(test)]
     async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
         match self {
             Self::Postgres(store) => store.retain(import).await,
@@ -286,8 +280,8 @@ struct ManualRefresh {
 #[derive(Debug, Clone)]
 pub struct CatalogHandle {
     status: Arc<CatalogStatus>,
+    #[cfg(test)]
     refresh: mpsc::Sender<ManualRefresh>,
-    store: Arc<RuntimeStore>,
 }
 
 impl std::fmt::Debug for ManualRefresh {
@@ -302,16 +296,11 @@ impl CatalogHandle {
         &self.status
     }
 
-    /// The durable catalogue reader used by convergence only. It can hydrate
-    /// retained payloads, but it is never placed in request state.
-    pub fn store(&self) -> Arc<dyn CatalogStore> {
-        self.store.clone()
-    }
-
     /// Ask for an import now and wait for what it did.
     ///
     /// `None` when the task is gone — a deployment that is shutting down, which
     /// is not a refusal and must not be reported as one.
+    #[cfg(test)]
     pub async fn refresh_now(&self) -> Option<RefreshOutcome> {
         let (answer, wait) = oneshot::channel();
         self.refresh.send(ManualRefresh { answer }).await.ok()?;
@@ -400,18 +389,6 @@ pub async fn start(
     start_with_recovery(config, control_plane_dsn_env, env, shutdown, false).await
 }
 
-/// Start catalogue refresh with a permitted initial backend outage. The store
-/// remains retryable and the serving snapshot is supplied by the compiled
-/// cache; a catalogue import never becomes an inference dependency.
-pub async fn start_allow_unavailable(
-    config: &CatalogConfig,
-    control_plane_dsn_env: Option<&str>,
-    env: &std::collections::HashMap<String, String>,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
-) -> Result<Option<CatalogHandle>, CatalogBootError> {
-    start_with_recovery(config, control_plane_dsn_env, env, shutdown, true).await
-}
-
 async fn start_with_recovery(
     config: &CatalogConfig,
     control_plane_dsn_env: Option<&str>,
@@ -469,11 +446,15 @@ async fn start_with_recovery(
     }
     publish_status(&status, &refresher, SystemTime::now());
     let (sender, receiver) = mpsc::channel(1);
+    // Only tests ask for a manual refresh; production drops the sender and the
+    // loop keeps its schedule.
+    #[cfg(not(test))]
+    drop(sender);
     tokio::spawn(run(refresher, Arc::clone(&status), receiver, shutdown));
     Ok(Some(CatalogHandle {
         status,
+        #[cfg(test)]
         refresh: sender,
-        store,
     }))
 }
 

@@ -46,17 +46,12 @@
 //! future control-plane implementation, not a ninth business responsibility.
 
 pub mod catalog;
-pub mod catalog_pins;
-pub mod catalog_projection;
+
+pub mod catalog_price;
 pub mod catalog_refresh;
 pub mod catalog_runtime;
 pub mod catalog_store;
-pub mod control_plane;
-pub mod health;
-pub mod local_catalog;
 pub mod models_dev;
-pub mod object_store;
-pub mod secrets;
 
 #[cfg(test)]
 pub(crate) mod fakes;
@@ -70,6 +65,7 @@ pub(crate) mod fakes;
 /// [`BackendPath::Background`] appearing in a request handler is a bug rather
 /// than a slow path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum BackendPath {
     /// Called while an inference request is in flight. Latency and the
     /// `on_unavailable` stance are part of the contract.
@@ -87,8 +83,10 @@ pub enum BackendPath {
     Background,
 }
 
+#[cfg(test)]
 impl BackendPath {
     /// Whether an inference request may call a backend on this path.
+    #[cfg(test)]
     pub const fn on_request_path(self) -> bool {
         matches!(self, Self::RequestPath)
     }
@@ -101,6 +99,7 @@ impl BackendPath {
 /// [`BackendKind::durable_control_plane`] and
 /// [`control_plane::ControlPlaneBackend`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum BackendKind {
     /// No backend: the responsibility is unenforced or defaulted in-process.
     None,
@@ -124,6 +123,7 @@ pub enum BackendKind {
     ExternalSecretManager,
 }
 
+#[cfg(test)]
 impl BackendKind {
     /// Whether this backend may hold durable control-plane state.
     ///
@@ -132,10 +132,12 @@ impl BackendKind {
     /// transactions, migrations, backup/restore, and referential integrity.
     /// Losing Redis loses hot enforcement precision, and losing durable state
     /// loses the deployment — those must not be the same store.
+    #[cfg(test)]
     pub const fn durable_control_plane(self) -> bool {
         matches!(self, Self::Postgres | Self::ObjectStorage)
     }
 
+    #[cfg(any(test, fuzzing))]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -154,16 +156,17 @@ impl BackendKind {
 /// One row of the responsibility table: which contract, where it may be called
 /// from, and which implementations it may select.
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 pub struct Responsibility {
     /// The contract's Rust trait name.
     pub contract: &'static str,
-    /// One line on what the contract owns.
-    pub responsibility: &'static str,
     pub path: BackendPath,
     pub permitted: &'static [BackendKind],
 }
 
+#[cfg(test)]
 impl Responsibility {
+    #[cfg(test)]
     pub fn permits(&self, kind: BackendKind) -> bool {
         self.permitted.contains(&kind)
     }
@@ -174,28 +177,25 @@ impl Responsibility {
 ///
 /// Kept as data so the invariants — Redis is never durable, control-plane work
 /// is never on the request path — are asserted by tests rather than by review.
+#[cfg(test)]
 pub const RESPONSIBILITIES: &[Responsibility] = &[
     Responsibility {
         contract: "ControlPlaneStore",
-        responsibility: "durable desired state: revisions, manifests, resource versions, audit",
         path: BackendPath::ControlPlane,
         permitted: &[BackendKind::ObjectStorage, BackendKind::Postgres],
     },
     Responsibility {
         contract: "SecretStore",
-        responsibility: "wrapped secret material and unwrapping",
         path: BackendPath::SnapshotCompilation,
         permitted: &[BackendKind::Postgres, BackendKind::ExternalSecretManager],
     },
     Responsibility {
         contract: "CatalogSource",
-        responsibility: "model metadata ingestion",
         path: BackendPath::Background,
         permitted: &[BackendKind::ModelsDev],
     },
     Responsibility {
         contract: "CatalogStore",
-        responsibility: "durable retention of imported catalogue snapshots",
         // Retention is durable state, so Redis is excluded for the reason
         // `durable_control_plane` gives; in-memory is permitted because a
         // single-replica development run legitimately keeps its catalogue for
@@ -206,7 +206,6 @@ pub const RESPONSIBILITIES: &[Responsibility] = &[
     },
     Responsibility {
         contract: "BudgetStore",
-        responsibility: "spend caps",
         path: BackendPath::RequestPath,
         permitted: &[
             BackendKind::None,
@@ -217,19 +216,16 @@ pub const RESPONSIBILITIES: &[Responsibility] = &[
     },
     Responsibility {
         contract: "RateLimiter",
-        responsibility: "inbound admission",
         path: BackendPath::RequestPath,
         permitted: &[BackendKind::None, BackendKind::InMemory, BackendKind::Redis],
     },
     Responsibility {
         contract: "RevocationStore",
-        responsibility: "precise minted-token jti revocation",
         path: BackendPath::RequestPath,
         permitted: &[BackendKind::None, BackendKind::Redis, BackendKind::Postgres],
     },
     Responsibility {
         contract: "UsageSink",
-        responsibility: "durable usage rows",
         path: BackendPath::OffRequestPath,
         permitted: &[
             BackendKind::Stdout,
@@ -240,6 +236,7 @@ pub const RESPONSIBILITIES: &[Responsibility] = &[
 ];
 
 /// Look a responsibility up by its trait name.
+#[cfg(test)]
 pub fn responsibility(contract: &str) -> Option<&'static Responsibility> {
     RESPONSIBILITIES.iter().find(|r| r.contract == contract)
 }
@@ -252,21 +249,12 @@ pub fn responsibility(contract: &str) -> Option<&'static Responsibility> {
 /// (encrypted Postgres wraps under a local KEK; an external manager delegates
 /// key management), and callers must degrade or refuse explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum Capability {
     /// Multi-row writes commit atomically or not at all.
     TransactionalWrites,
-    /// Writes can be conditioned on an expected current revision.
-    OptimisticConcurrency,
-    /// A repeated write carrying the same idempotency key applies once.
-    IdempotentWrites,
-    /// Mutations persist an audit event in the mutation's own transaction.
-    TransactionalAudit,
     /// Changes can be observed without polling.
     ChangeNotification,
-    /// Secret material is stored wrapped under a key-encryption key.
-    EnvelopeEncryption,
-    /// Key management, and therefore unwrapping, happens outside this process.
-    ExternalKeyManagement,
     /// A refresh can ask for "changed since", not just the whole catalogue.
     IncrementalRefresh,
     /// The source carries price metadata alongside model metadata.
@@ -278,23 +266,30 @@ pub enum Capability {
 /// A static slice rather than a set: implementations are known at compile time,
 /// so this costs nothing and stays `const`-constructible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub struct Capabilities(&'static [Capability]);
 
+#[cfg(test)]
 impl Capabilities {
+    #[cfg(test)]
     pub const NONE: Self = Self(&[]);
 
+    #[cfg(test)]
     pub const fn new(capabilities: &'static [Capability]) -> Self {
         Self(capabilities)
     }
 
+    #[cfg(test)]
     pub fn has(&self, capability: Capability) -> bool {
         self.0.contains(&capability)
     }
 
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
         self.0.iter().copied()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -306,6 +301,7 @@ impl Capabilities {
 /// contract-specific — and maps into this shared vocabulary so shared policy
 /// (retry, surface as `503`, refuse a candidate revision) can be written once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 pub enum FailureCategory {
     /// The backend could not be reached, or timed out. Retryable; the
     /// responsibility's `on_unavailable` policy decides what a caller does
@@ -326,17 +322,20 @@ pub enum FailureCategory {
     Corrupt,
 }
 
+#[cfg(test)]
 impl FailureCategory {
     /// Whether retrying the *same* operation can plausibly succeed.
     ///
     /// [`FailureCategory::Conflict`] is deliberately false: a conflicting write
     /// must be rebuilt against the current state, not replayed.
+    #[cfg(test)]
     pub const fn retryable(self) -> bool {
         matches!(self, Self::Unavailable)
     }
 }
 
 /// A backend error that can be classified without knowing its contract.
+#[cfg(test)]
 pub trait BackendFailure: std::error::Error {
     fn category(&self) -> FailureCategory;
 

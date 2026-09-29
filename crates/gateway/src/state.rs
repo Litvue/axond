@@ -11,7 +11,7 @@
 //! credential, and its circuit against one consistent config, even if a reload
 //! lands mid-flight.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,46 +20,20 @@ use gateway_core::{
     AnthropicAdapter, CircuitBreaker, OpenAiCompatibleAdapter, OpenAiFlavor, ProviderAdapter,
 };
 use gateway_transport::{HttpDispatcher, build_client};
-use secrecy::zeroize::Zeroize;
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, Serialize};
 
-use crate::admission::{AdmissionControl, DiagnosticCredential};
-use crate::aliases::AliasScope;
-use crate::availability::{AvailabilityIndex, AvailabilityReader, RuntimeObservations};
-use crate::backends::catalog::CatalogReport;
+use crate::admission::AdmissionControl;
+
 use crate::backends::catalog_runtime::CatalogStatus;
-use crate::backends::control_plane::ControlPlaneStore;
-use crate::backends::health::BackendHealth;
 use crate::budget::BudgetStore;
-use crate::config::{Config, GatewayVerifierAlgorithm, ProviderKind, StorageBackend};
-use crate::convergence::SystemClock;
-use crate::convergence::secrets::{ResolvedSecretBinding, ResolvedSecrets};
-use crate::convergence::{RevisionReport, RevisionStatus};
-use crate::credentials::{CredentialError, Credentials};
-use crate::desired_state::mutation::Actor;
-use crate::desired_state::policy::PolicyScope;
-use crate::desired_state::pricing::{Approval, PricingSnapshot};
-use crate::desired_state::{AuthorizationSnapshot, RevisionId, WorkloadKey};
-use crate::key_material::{self, KeyMaterialError};
-use crate::middleware::{MiddlewareChain, MiddlewarePlan, MiddlewarePlanError, MiddlewareRuntime};
-use crate::policy::{PolicyRuntime, PolicyView};
-use crate::principals::{
-    Capability, ConfigPrincipals, GatewayKeyEntry, NamespaceEpoch, Presented, PrincipalAuthority,
-    PrincipalShapeError, PrincipalStoreChain, ProjectedPrincipals, TokenVerifier,
-    TokenVerifierBuildError, configured_token_epochs, resolve_token_epoch,
-};
 #[cfg(test)]
-use crate::rate_limit::NoLimit;
-use crate::rate_limit::RateLimiter;
-use crate::revocation::RevocationStore;
+use crate::config::StorageBackend;
+use crate::config::{Config, ProviderKind};
+use crate::credentials::{CredentialError, Credentials};
+use crate::key_material::{self, KeyMaterialError};
+use crate::principals::{ConfigPrincipals, GatewayKeyEntry, Presented, PrincipalAuthority};
 use crate::settlement::Settlements;
 use crate::shutdown::Lifecycle;
-use crate::status::Component;
-use crate::status::probes::{BackendProbe, CatalogProbe, ControlPlaneProbe};
-use crate::status::registry::{
-    CachedStatusRegistry, ObservationPlan, StatusRefresher, StatusSettings,
-};
 use crate::usage::UsageDelivery;
 #[cfg(test)]
 use crate::usage::UsageFanout;
@@ -84,24 +58,8 @@ pub struct Inner {
     /// Bounded capacity for the background accounting every admitted request
     /// leaves behind. Process-level like `admission`, whose section sizes it.
     pub settlements: Settlements,
-    pub rate_limiter: Box<dyn RateLimiter>,
-    pub revocation: Box<dyn RevocationStore>,
-    /// The stateful policy this replica is enforcing, and the holds outstanding
-    /// under each generation of it (#150). Process-level like the stores that
-    /// read it: a publication replaces the values, never the connections.
-    pub policy: Arc<PolicyRuntime>,
-    /// Drain state and the in-flight count. Process-level, like the sinks: a
-    /// reload replaces what a request is served *with*, never whether the
-    /// process is still accepting requests at all.
+    /// Drain state and the in-flight count. Process-level, like the sinks.
     pub lifecycle: Arc<Lifecycle>,
-    /// What the authenticated status view reads. Process-level and *cached*: the
-    /// registry is filled by a background refresher, so a status request reads a
-    /// map rather than a backend (ADR 0031).
-    pub status: Arc<CachedStatusRegistry>,
-    /// This replica's convergence state. Always `None`: the store-backed
-    /// gateway serves the file it booted from and constructs no reconciler
-    /// (ADR 0063), so there is no revision to lag behind.
-    pub revision: Option<Arc<RevisionStatus>>,
     /// What the background catalogue import last reported, when this deployment
     /// imports one at all. A read of a mutex over a bounded report: the request
     /// path never reaches the source or the store, and holding this handle is
@@ -109,155 +67,7 @@ pub struct Inner {
     pub catalogue: Option<Arc<CatalogStatus>>,
     /// Durable namespace (and later budget) store. Required (ADR 0063).
     pub store: std::sync::Arc<dyn crate::store::Store>,
-    /// Constructor-only override for primitive tests. Shipped chains live only
-    /// in [`ConfigSnapshot`].
-    #[cfg(test)]
-    pub middleware: MiddlewareChain,
-    /// Global and per-id blocking capacity for content middleware. This
-    /// is process-owned in production and isolated per constructed test state.
-    pub middleware_runtime: MiddlewareRuntime,
     config: ArcSwap<ConfigSnapshot>,
-}
-
-/// What a replica reports about itself, as distinct from what it serves.
-///
-/// Passed in rather than built inside [`AppState::new_with_policy`] because
-/// the two fields have no stateless implementation to default to *usefully*: a
-/// stateless replica has an all-`disabled` registry and no convergence, and a
-/// stateful one is handed the registry its probes publish into and the status the
-/// reconciler writes.
-pub struct ReplicaObservability {
-    pub status: Arc<CachedStatusRegistry>,
-    pub revision: Option<Arc<RevisionStatus>>,
-    pub catalogue: Option<Arc<CatalogStatus>>,
-}
-
-impl ReplicaObservability {
-    /// The stateless posture: every component `disabled`, nothing probed, no
-    /// revision.
-    pub fn stateless() -> Self {
-        Self {
-            status: Arc::new(CachedStatusRegistry::stateless()),
-            revision: None,
-            catalogue: None,
-        }
-    }
-
-    /// The posture this replica's own configuration implies: every dependency it
-    /// opened is observed, and every component it does not have stays `disabled`.
-    ///
-    /// The plan carries both halves of that — the enabled set and the probes —
-    /// because they are one fact, and the pacing in it comes from the stores' own
-    /// timeouts ([`ObservationPlan::observe`]) rather than from a default: a probe
-    /// cut off before its backend's bounds have elapsed publishes a timeout the
-    /// backend never had.
-    ///
-    /// The refresher is returned rather than spawned so the caller owns its
-    /// lifetime: it has to stop with the process, and a task spawned out of a
-    /// constructor would outlive the drain that is supposed to end it. It is
-    /// `None` for a plan with nothing in it, which is the stateless posture: a
-    /// loop observing no components would be a timer that publishes nothing.
-    pub fn observing(plan: ObservationPlan) -> (Self, Option<StatusRefresher>) {
-        if plan.is_empty() {
-            return (Self::stateless(), None);
-        }
-        let (pacing, probes) = plan.into_parts();
-        debug_assert!(pacing.validate().is_ok(), "the derived pacing is valid");
-        let status = Arc::new(CachedStatusRegistry::new(pacing, Arc::new(SystemClock)));
-        let refresher = StatusRefresher::new(Arc::clone(&status), probes);
-        (
-            Self {
-                status,
-                // Still `None`: no release constructs a reconciler, so there is
-                // no convergence state to report and an empty report would be a
-                // false all-clear (#142).
-                revision: None,
-                catalogue: None,
-            },
-            Some(refresher),
-        )
-    }
-
-    /// The plan a deployment's own stores imply: one probe per dependency that
-    /// exposes a reachability handle, and nothing for the backends that have none.
-    ///
-    /// The mapping from store to [`Component`] is made here, in one place, rather
-    /// than by each store naming its own component: one Redis server can back the
-    /// caps, the leases, and the denylist at once, and which of those a given
-    /// handle speaks for is the deployment's arrangement, not the store's.
-    pub fn plan(
-        control_plane: Option<(Arc<dyn ControlPlaneStore>, StatusSettings)>,
-        budget: &dyn BudgetStore,
-        rate_limiter: &dyn RateLimiter,
-        revocation: &dyn RevocationStore,
-    ) -> ObservationPlan {
-        let mut plan = ObservationPlan::stateless();
-        if let Some((store, pacing)) = control_plane {
-            plan.observe(Arc::new(ControlPlaneProbe::new(store)), pacing);
-        }
-        let request_path: [(Component, Option<Arc<dyn BackendHealth>>); 3] = [
-            (Component::BudgetStore, budget.health()),
-            (Component::RateLimitStore, rate_limiter.health()),
-            (Component::RevocationStore, revocation.health()),
-        ];
-        for (component, health) in request_path {
-            let Some(health) = health else {
-                continue;
-            };
-            let pacing = BackendProbe::pacing(component, &health);
-            plan.observe(Arc::new(BackendProbe::new(component, health)), pacing);
-        }
-        plan
-    }
-
-    /// Extend the deployment-derived observation plan with the bounded
-    /// process-local catalogue report, when one is running.
-    pub fn plan_with_catalogue(
-        control_plane: Option<(Arc<dyn ControlPlaneStore>, StatusSettings)>,
-        budget: &dyn BudgetStore,
-        rate_limiter: &dyn RateLimiter,
-        revocation: &dyn RevocationStore,
-        catalogue: Option<Arc<CatalogStatus>>,
-    ) -> ObservationPlan {
-        let mut plan = Self::plan(control_plane, budget, rate_limiter, revocation);
-        if let Some(catalogue) = catalogue {
-            let mut pacing = StatusSettings::default();
-            pacing.enabled.push(Component::Catalogue);
-            plan.observe(Arc::new(CatalogProbe::new(catalogue)), pacing);
-        }
-        plan
-    }
-
-    /// Report on the catalogue the background import is keeping current.
-    ///
-    /// Separate from the constructors because catalogue imports are orthogonal to
-    /// the mode: a stateless deployment may import metadata into a development
-    /// store, and a stateful one may import none at all.
-    #[must_use]
-    pub fn with_catalogue(mut self, catalogue: Arc<CatalogStatus>) -> Self {
-        self.catalogue = Some(catalogue);
-        self
-    }
-
-    /// The stateless posture with a process-local catalogue import.
-    #[cfg(test)]
-    pub fn stateless_with_catalogue(catalogue: Arc<CatalogStatus>) -> (Self, StatusRefresher) {
-        let mut settings = StatusSettings::default();
-        settings.enabled.push(Component::Catalogue);
-        let status = Arc::new(CachedStatusRegistry::new(settings, Arc::new(SystemClock)));
-        let refresher = StatusRefresher::new(
-            Arc::clone(&status),
-            vec![Arc::new(CatalogProbe::new(Arc::clone(&catalogue)))],
-        );
-        (
-            Self {
-                status,
-                revision: None,
-                catalogue: Some(catalogue),
-            },
-            refresher,
-        )
-    }
 }
 
 /// The config and everything resolved from it: the credential graph, the
@@ -266,552 +76,23 @@ impl ReplicaObservability {
 pub struct ConfigSnapshot {
     pub config: Config,
     pub credentials: Credentials,
-    /// Namespace-scoped content middleware compiled from the same desired-state
-    /// generation as the rest of this serving snapshot.
-    middleware: MiddlewarePlan,
     /// Per-target circuit breaker, keyed by the target's qualified model
     /// (`provider/model`). In-memory and per-replica, consistent with running
     /// stateless by default (ADR 0002); distinct from the per-credential health
     /// that lives on `Credentials` (ADR 0008).
     pub target_circuits: CircuitBreaker,
-    principals: PrincipalStoreChain,
+    principals: ConfigPrincipals,
     /// How many times the config has been replaced: `0` is the boot config, and
     /// each applied reload increments it. Published as a metric so an operator
     /// can tell which generation a replica is serving.
     pub generation: u64,
-    pub gateway_key_fingerprints: HashMap<String, String>,
-    pub gateway_verifier_fingerprints: HashMap<String, String>,
-    pub gateway_minting_fingerprint: Option<String>,
-    pub gateway_minting: Option<ResolvedMinting>,
-    gateway_token_epochs: HashMap<String, NamespaceEpoch>,
-    /// The durable secret material this snapshot was compiled against, unwrapped
-    /// once during compilation and held for the snapshot's whole life.
-    ///
-    /// Holding it *here* is what ties material's lifetime to the revision it
-    /// belongs to. A rotation publishes a new snapshot that holds the new version
-    /// while requests still serving the old snapshot keep the old one alive, and
-    /// the material is zeroized when the last such request finishes — not when
-    /// the administrator's call returns. A request never reaches the secret store,
-    /// because everything it could ask for is already in the snapshot it holds.
-    secrets: ResolvedSecrets,
-    /// Derived availability evidence, projected onto the snapshot rather than
-    /// resolved from the config (#206).
-    ///
-    /// Carried *beside* the config, never inside it: an availability index says
-    /// what is currently reachable, and the config says what the deployment
-    /// declares. Keeping the two apart is what makes the direction of authority
-    /// one-way — a projection cannot add a model, a namespace, or a credential, so
-    /// no amount of discovery evidence can enlarge what is served.
-    ///
-    /// [`ConfigSnapshot::build`] produces `None`. A compiler holding availability
-    /// evidence attaches a derived one during compilation (#148), off the request
-    /// path and before publication; no request consults a verdict, and nothing
-    /// polls a provider to produce it.
-    ///
-    /// Absent rather than empty, because those are different answers: a replica
-    /// that derives nothing must not report an empty catalogue, which reads
-    /// identically to a tenant that has just lost every entitlement.
-    availability: Option<Arc<AvailabilityIndex>>,
-    /// The approved pricing this snapshot serves under, when it was compiled from
-    /// a revision that published a price book (#201).
-    ///
-    /// Part of the snapshot rather than a second published value, because that is
-    /// what makes pricing and routing atomic: a request loads one pointer, so it
-    /// cannot be routed by revision *N+1* and priced by *N*. `None` for a
-    /// file-configured deployment, whose prices are the ones `[[model]]` declares.
-    pricing: Option<PricingSnapshot>,
-    /// The administrative identity directory admitted with this revision. It
-    /// is swapped alongside the serving snapshot and is never consulted by an
-    /// inference request.
-    admin_authorization: Option<Arc<AuthorizationSnapshot>>,
 }
 
-pub struct ResolvedMinting {
-    pub kid: String,
-    pub algorithm: crate::mint::MintAlgorithm,
-    pub key_material: SecretString,
-    pub audience: String,
-    pub max_ttl: Duration,
-    pub scope: Option<HashSet<Capability>>,
-    pub aliases: Option<AliasScope>,
-    pub max_request_microdollars: Option<u64>,
-}
-
-/// The process-independent portion of a compiled stateful snapshot.
-///
-/// Bootstrap configuration is intentionally not duplicated here: it remains
-/// owned by the deployment file. Only the durable projection and the values
-/// derived from it are recorded, which makes a cache restore obey the same
-/// boundary as ordinary convergence.
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedServingSnapshot {
-    pub(crate) revision: String,
-    pub(crate) generation: u64,
-    pub(crate) namespaces: Vec<CachedNamespace>,
-    pub(crate) providers: Vec<CachedProvider>,
-    pub(crate) models: Vec<CachedModel>,
-    pub(crate) credentials: Vec<CachedCredential>,
-    pub(crate) principals: Vec<CachedPrincipal>,
-    pub(crate) secrets: Vec<CachedSecret>,
-    pub(crate) pricing: Option<CachedPricing>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedNamespace {
-    pub(crate) id: String,
-    pub(crate) default: bool,
-    pub(crate) allow_platform_fallback: bool,
-    pub(crate) project: Option<CachedProjectIdentity>,
-    pub(crate) policy: Option<CachedPolicy>,
-    pub(crate) static_policy: Option<CachedStaticPolicy>,
-    pub(crate) token_epoch: Option<u64>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedProjectIdentity {
-    pub(crate) tenant: String,
-    pub(crate) project: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CachedPolicy {
-    pub(crate) scope: CachedPolicyScope,
-    pub(crate) epoch: u64,
-    pub(crate) subject_limit_microdollars: u64,
-    pub(crate) namespace_limit_microdollars: Option<u64>,
-    pub(crate) reservation_ttl_seconds: u64,
-    pub(crate) max_in_flight_per_subject: u64,
-    pub(crate) lease_ttl_seconds: u64,
-    pub(crate) minimum_token_epoch: u64,
-    pub(crate) content_middleware: Vec<CachedContentMiddleware>,
-    #[serde(default)]
-    pub(crate) buffered_response_routes: Vec<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CachedStaticPolicy {
-    pub(crate) content_middleware: Vec<CachedContentMiddleware>,
-    pub(crate) buffered_response_routes: Vec<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum CachedPolicyScope {
-    Namespace { resource: String },
-    Tenant { tenant: String },
-    Project { tenant: String, project: String },
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CachedContentMiddleware {
-    pub(crate) id: String,
-    pub(crate) scopes: Vec<gateway_core::MiddlewareScope>,
-    pub(crate) failure_posture: gateway_core::MiddlewareFailurePosture,
-    pub(crate) max_duration_milliseconds: u64,
-    #[serde(default)]
-    pub(crate) guardrail: Option<CachedContentGuardrail>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct CachedContentGuardrail {
-    pub(crate) key_env: String,
-    pub(crate) key_fingerprint: String,
-    pub(crate) rules: Vec<gateway_core::GuardrailRule>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedProvider {
-    pub(crate) id: String,
-    pub(crate) kind: String,
-    pub(crate) base_url: String,
-    #[serde(default)]
-    pub(crate) unpriced_models: crate::config::UnpricedModels,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedModel {
-    pub(crate) name: String,
-    pub(crate) namespace: Option<String>,
-    pub(crate) targets: Vec<CachedTarget>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedTarget {
-    pub(crate) provider: String,
-    pub(crate) model: String,
-    pub(crate) price: gateway_core::ModelPrice,
-    pub(crate) catalog: Option<CachedCatalogBinding>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedCatalogBinding {
-    pub(crate) provider: String,
-    pub(crate) model: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedCredential {
-    pub(crate) namespace: String,
-    pub(crate) provider: String,
-    pub(crate) env: Option<String>,
-    pub(crate) id: Option<String>,
-    pub(crate) weight: u32,
-    pub(crate) secret: Option<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedPrincipal {
-    pub(crate) namespace: String,
-    pub(crate) subject: String,
-    pub(crate) digest: String,
-    #[serde(default)]
-    pub(crate) all_namespaces: bool,
-    #[serde(default)]
-    pub(crate) namespaces: Vec<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedSecret {
-    pub(crate) reference: String,
-    pub(crate) binding: CachedSecretBinding,
-    /// This field is only present inside the encrypted cache payload. It must
-    /// never be written to the signed desired-state cache or an unencrypted
-    /// diagnostic.
-    pub(crate) material: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum CachedSecretBinding {
-    Legacy,
-    Namespace {
-        owner_namespace: String,
-        ciphertext_digest: String,
-        lifecycle: String,
-    },
-}
-
-impl Drop for CachedSecret {
-    fn drop(&mut self) {
-        self.material.zeroize();
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedPricing {
-    pub(crate) book: String,
-    pub(crate) checksum: String,
-    pub(crate) catalog: String,
-    pub(crate) catalog_version: Option<u64>,
-    pub(crate) approval: CachedApproval,
-    pub(crate) effective_from: u64,
-    pub(crate) effective_until: Option<u64>,
-    pub(crate) targets: Vec<CachedPriceTarget>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub(crate) enum CachedApproval {
-    Draft,
-    Approved {
-        actor: CachedActor,
-        at: u64,
-        citation: Option<String>,
-    },
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum CachedActor {
-    Human { issuer: String, subject: String },
-    Breakglass,
-    Workload { tenant: String, principal: String },
-    System { component: String },
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct CachedPriceTarget {
-    pub(crate) provider: String,
-    pub(crate) published_model_id: String,
-    pub(crate) price: gateway_core::ModelPrice,
-}
-
-impl ConfigSnapshot {
-    /// Whether this snapshot is flat-v2 and carries provider credential
-    /// material.
-    ///
-    /// Such snapshots are deliberately ineligible for cross-restart recovery
-    /// until an authenticated monotonic revision/tombstone floor can prove that
-    /// cached material has not since been revoked.
-    pub(crate) fn credential_bearing_flat_v2(&self) -> bool {
-        self.config.credential.iter().any(|credential| {
-            credential.secret.is_some()
-                && self.config.namespace.iter().any(|namespace| {
-                    namespace.id == credential.namespace && namespace.static_policy.is_some()
-                })
-        })
-    }
-
-    /// Capture the exact projection needed to rebuild a serving snapshot after
-    /// a process restart. The caller encrypts the returned structure before it
-    /// reaches disk; the cache writer explicitly zeroizes the temporary copy
-    /// after serialization.
-    pub(crate) fn cached_serving(&self, revision: RevisionId) -> CachedServingSnapshot {
-        let config = &self.config;
-        CachedServingSnapshot {
-            revision: revision.to_string(),
-            generation: self.generation,
-            namespaces: config
-                .namespace
-                .iter()
-                .map(|namespace| CachedNamespace {
-                    id: namespace.id.clone(),
-                    default: namespace.default,
-                    allow_platform_fallback: namespace.allow_platform_fallback,
-                    project: namespace.project.map(|identity| CachedProjectIdentity {
-                        tenant: identity.tenant.to_string(),
-                        project: identity.project.to_string(),
-                    }),
-                    policy: namespace.policy.as_ref().map(|policy| CachedPolicy {
-                        scope: match policy.body.scope() {
-                            PolicyScope::Namespace(resource) => CachedPolicyScope::Namespace {
-                                resource: resource.to_string(),
-                            },
-                            PolicyScope::Tenant(tenant) => CachedPolicyScope::Tenant {
-                                tenant: tenant.to_string(),
-                            },
-                            PolicyScope::Project { tenant, project } => {
-                                CachedPolicyScope::Project {
-                                    tenant: tenant.to_string(),
-                                    project: project.to_string(),
-                                }
-                            }
-                        },
-                        epoch: policy.body.epoch().get(),
-                        subject_limit_microdollars: policy
-                            .body
-                            .budget()
-                            .subject_limit_microdollars(),
-                        namespace_limit_microdollars: policy
-                            .body
-                            .budget()
-                            .namespace_limit_microdollars(),
-                        reservation_ttl_seconds: policy.body.budget().reservation_ttl_seconds(),
-                        max_in_flight_per_subject: policy
-                            .body
-                            .concurrency()
-                            .max_in_flight_per_subject(),
-                        lease_ttl_seconds: policy.body.concurrency().lease_ttl_seconds(),
-                        minimum_token_epoch: policy.body.revocation().minimum_token_epoch(),
-                        content_middleware: policy
-                            .body
-                            .content_middleware()
-                            .iter()
-                            .map(|registration| CachedContentMiddleware {
-                                id: registration.id().to_owned(),
-                                scopes: registration.scopes().to_vec(),
-                                failure_posture: registration.failure_posture(),
-                                max_duration_milliseconds: registration.max_duration_milliseconds(),
-                                guardrail: registration.guardrail().map(|guardrail| {
-                                    CachedContentGuardrail {
-                                        key_env: guardrail.key_env().to_owned(),
-                                        key_fingerprint: self
-                                            .middleware
-                                            .guardrail_key_fingerprint(&namespace.id)
-                                            .expect("a compiled guardrail has a key fingerprint")
-                                            .to_owned(),
-                                        rules: guardrail.rules().to_vec(),
-                                    }
-                                }),
-                            })
-                            .collect(),
-                        buffered_response_routes: policy
-                            .body
-                            .buffered_response_routes()
-                            .iter()
-                            .map(|route| route.as_str().to_owned())
-                            .collect(),
-                    }),
-                    static_policy: namespace.static_policy.as_ref().map(|policy| {
-                        CachedStaticPolicy {
-                            content_middleware: policy
-                                .content_middleware
-                                .iter()
-                                .map(|registration| CachedContentMiddleware {
-                                    id: registration.id().to_owned(),
-                                    scopes: registration.scopes().to_vec(),
-                                    failure_posture: registration.failure_posture(),
-                                    max_duration_milliseconds: registration
-                                        .max_duration_milliseconds(),
-                                    guardrail: registration.guardrail().map(|guardrail| {
-                                        CachedContentGuardrail {
-                                            key_env: guardrail.key_env().to_owned(),
-                                            key_fingerprint: self
-                                                .middleware
-                                                .guardrail_key_fingerprint(&namespace.id)
-                                                .expect(
-                                                    "a compiled guardrail has a key fingerprint",
-                                                )
-                                                .to_owned(),
-                                            rules: guardrail.rules().to_vec(),
-                                        }
-                                    }),
-                                })
-                                .collect(),
-                            buffered_response_routes: policy
-                                .buffered_response_routes
-                                .iter()
-                                .map(|route| route.as_str().to_owned())
-                                .collect(),
-                        }
-                    }),
-                    token_epoch: config
-                        .gateway_token_epoch
-                        .iter()
-                        .find(|epoch| epoch.namespace == namespace.id && epoch.subject.is_none())
-                        .map(|epoch| epoch.min_iat),
-                })
-                .collect(),
-            providers: config
-                .provider
-                .iter()
-                .map(|provider| CachedProvider {
-                    id: provider.id.clone(),
-                    kind: match provider.kind {
-                        ProviderKind::Openai => "openai",
-                        ProviderKind::Anthropic => "anthropic",
-                        ProviderKind::OpenaiCompatible => "openai-compatible",
-                    }
-                    .to_owned(),
-                    base_url: provider.base_url.clone(),
-                    unpriced_models: provider.unpriced_models,
-                })
-                .collect(),
-            models: Vec::new(),
-            credentials: config
-                .credential
-                .iter()
-                .map(|credential| CachedCredential {
-                    namespace: credential.namespace.clone(),
-                    provider: credential.provider.clone(),
-                    env: credential.env.clone(),
-                    id: credential.id.clone(),
-                    weight: credential.weight,
-                    secret: credential.secret.map(|reference| reference.to_string()),
-                })
-                .collect(),
-            principals: config
-                .projected_principals
-                .iter()
-                .map(|principal| CachedPrincipal {
-                    namespace: principal.namespace.clone(),
-                    subject: principal.subject.clone(),
-                    digest: principal.digest.to_string(),
-                    all_namespaces: principal
-                        .grant
-                        .as_ref()
-                        .is_some_and(crate::namespace::NamespaceGrant::is_all),
-                    namespaces: principal
-                        .grant
-                        .as_ref()
-                        .and_then(crate::namespace::NamespaceGrant::namespaces)
-                        .into_iter()
-                        .flat_map(|namespaces| namespaces.iter().map(ToString::to_string))
-                        .collect(),
-                })
-                .collect(),
-            secrets: self
-                .secrets
-                .references()
-                .into_iter()
-                .filter_map(|reference| {
-                    self.secrets.get(reference).map(|material| CachedSecret {
-                        reference: reference.to_string(),
-                        binding: match material.binding() {
-                            ResolvedSecretBinding::Legacy => CachedSecretBinding::Legacy,
-                            ResolvedSecretBinding::Namespace(request) => {
-                                CachedSecretBinding::Namespace {
-                                    owner_namespace: request.owner().to_string(),
-                                    ciphertext_digest: request.ciphertext_digest().to_string(),
-                                    lifecycle: request.lifecycle().as_str().to_owned(),
-                                }
-                            }
-                        },
-                        material: material.expose().to_owned(),
-                    })
-                })
-                .collect(),
-            pricing: self.pricing.as_ref().map(cached_pricing),
-        }
-    }
-}
-
-impl CachedServingSnapshot {
-    pub(crate) fn zeroize_secrets(&mut self) {
-        for secret in &mut self.secrets {
-            secret.material.zeroize();
-        }
-    }
-}
-
-fn cached_pricing(pricing: &PricingSnapshot) -> CachedPricing {
-    CachedPricing {
-        book: pricing.book().to_string(),
-        checksum: pricing.checksum().to_string(),
-        catalog: pricing.catalog().checksum().to_string(),
-        catalog_version: pricing.catalog_version().map(|version| version.get()),
-        approval: match pricing.approval() {
-            Approval::Draft => CachedApproval::Draft,
-            Approval::Approved { by, at, citation } => CachedApproval::Approved {
-                actor: cached_actor(by),
-                at: at.millis(),
-                citation: citation
-                    .as_ref()
-                    .map(|citation| citation.as_str().to_owned()),
-            },
-        },
-        effective_from: pricing.effective().starts().millis(),
-        effective_until: pricing.effective().ends().map(|instant| instant.millis()),
-        targets: pricing
-            .targets()
-            .map(|(target, price)| CachedPriceTarget {
-                provider: target.provider.to_string(),
-                published_model_id: target.published_model_id.clone(),
-                price: *price,
-            })
-            .collect(),
-    }
-}
-
-fn cached_actor(actor: &Actor) -> CachedActor {
-    match actor {
-        Actor::Human { issuer, subject } => CachedActor::Human {
-            issuer: issuer.clone(),
-            subject: subject.clone(),
-        },
-        Actor::Breakglass => CachedActor::Breakglass,
-        Actor::Workload { tenant, principal } => CachedActor::Workload {
-            tenant: tenant.to_string(),
-            principal: principal.to_string(),
-        },
-        Actor::System { component } => CachedActor::System {
-            component: component.clone(),
-        },
-    }
-}
-
-/// Why a config could not become a servable snapshot. Names the offending
-/// reference — an env-var name or path and a namespace — never a secret's value.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
     #[error(transparent)]
-    Middleware(#[from] MiddlewarePlanError),
-    #[error(transparent)]
     Credentials(#[from] CredentialError),
+    #[cfg(any(test, fuzzing))]
     #[error("store: {0}")]
     Store(String),
     #[error(
@@ -829,13 +110,6 @@ pub enum SnapshotError {
     EmptyGatewayKeyFile { namespace: String, path: String },
     #[error("gateway_key for namespace `{namespace}` file `{path}` is not valid UTF-8")]
     InvalidGatewayKeyFileUtf8 { namespace: String, path: String },
-    #[error(
-        "gateway_key for namespace `{namespace}` uses the reserved `{shape}` workload-key shape"
-    )]
-    ReservedGatewayKeyShape {
-        namespace: String,
-        shape: &'static str,
-    },
     #[error("gateway_key for namespace `{namespace}` must declare exactly one non-empty source")]
     InvalidGatewayKeySource { namespace: String },
     #[error(
@@ -847,40 +121,10 @@ pub enum SnapshotError {
         other_env: String,
         other_namespace: String,
     },
-    #[error(transparent)]
-    PrincipalShapes(#[from] PrincipalShapeError),
-    #[error(transparent)]
-    TokenVerifier(#[from] TokenVerifierBuildError),
     #[error(
         "no inbound gateway key resolved: inbound authentication fails closed and there is no keyless mode"
     )]
     NoInboundKeys,
-    #[error("gateway_minting signing key `{reference}` is invalid: {error}")]
-    MintingKey { reference: String, error: String },
-    #[error("gateway_minting references unknown verifier kid `{kid}`")]
-    MintingVerifierNotFound { kid: String },
-    #[error("gateway_minting must declare exactly one non-empty source")]
-    InvalidMintingSource,
-    #[error("gateway_minting references env var `{env}`, which is unset or empty")]
-    MissingMintingKey { env: String },
-    #[error("gateway_minting file `{path}` failed ({kind}): {error}")]
-    MintingKeyFile {
-        path: String,
-        kind: std::io::ErrorKind,
-        error: String,
-    },
-    #[error("gateway_minting file `{path}` is empty")]
-    EmptyMintingKeyFile { path: String },
-    #[error("gateway_minting file `{path}` is not valid UTF-8")]
-    InvalidMintingKeyFileUtf8 { path: String },
-    #[error("gateway_minting requires a non-empty gateway token audience")]
-    MissingMintingAudience,
-    #[error("gateway_minting aliases are invalid: {error}")]
-    InvalidMintingAliases { error: String },
-    #[error("gateway_minting scope contains invalid capability `{value}`")]
-    InvalidMintingCapability { value: String },
-    #[error("gateway_minting signing key `{reference}` does not match verifier `{kid}`")]
-    MintingKeyMismatch { kid: String, reference: String },
 }
 
 impl ConfigSnapshot {
@@ -894,70 +138,15 @@ impl ConfigSnapshot {
         env: &HashMap<String, String>,
         generation: u64,
     ) -> Result<Self, SnapshotError> {
-        Self::build_with(config, env, generation, ResolvedSecrets::default())
-    }
-
-    /// Build the keyless stateful bootstrap snapshot. It is intentionally not
-    /// a serving snapshot: the reconciler must replace it with a projected
-    /// snapshot containing inbound principals before authenticated traffic can
-    /// pass the convergence gate.
-    pub(crate) fn build_bootstrap(
-        config: Config,
-        env: &HashMap<String, String>,
-        generation: u64,
-    ) -> Result<Self, SnapshotError> {
-        Self::build_with_mode(config, env, generation, ResolvedSecrets::default(), true)
-    }
-
-    /// [`ConfigSnapshot::build`], taking ownership of durable material a
-    /// candidate's compilation already unwrapped.
-    ///
-    /// The stateless path is the same call with an empty set: `env:` and `file:`
-    /// references resolve here exactly as they did before typed credentials
-    /// existed, so a deployment with no secret store is unaffected by any of this.
-    pub fn build_with(
-        config: Config,
-        env: &HashMap<String, String>,
-        generation: u64,
-        secrets: ResolvedSecrets,
-    ) -> Result<Self, SnapshotError> {
-        Self::build_with_mode(config, env, generation, secrets, false)
-    }
-
-    /// Build a snapshot for a hydrated durable revision.
-    ///
-    /// The initial stateful bootstrap is allowed to be keyless while inference
-    /// is refused and the administrative surface comes up. A compiled candidate
-    /// is different: it may publish only when the revision supplied at least one
-    /// request-addressable inbound principal.
-    pub fn build_compiled_with(
-        config: Config,
-        env: &HashMap<String, String>,
-        generation: u64,
-        secrets: ResolvedSecrets,
-    ) -> Result<Self, SnapshotError> {
-        Self::build_with_mode(config, env, generation, secrets, false)
-    }
-
-    fn build_with_mode(
-        config: Config,
-        env: &HashMap<String, String>,
-        generation: u64,
-        secrets: ResolvedSecrets,
-        allow_keyless_bootstrap: bool,
-    ) -> Result<Self, SnapshotError> {
-        let gateway_token_epochs = configured_token_epochs(&config);
-        let middleware = MiddlewarePlan::compile(&config, env)?;
         // The one place both kinds of provider credential become one pool: env
         // references from the boot environment, projected ones from the material
         // this candidate resolved. Neither reaches a store from here.
-        let credentials = Credentials::resolve(&config, env, &secrets)?;
+        let credentials = Credentials::resolve(&config, env)?;
         let target_circuits = CircuitBreaker::new(
             config.failover.failure_threshold,
             Duration::from_secs(config.failover.cooldown_seconds),
         );
         let mut inbound_keys: Vec<GatewayKeyEntry> = Vec::new();
-        let mut gateway_key_fingerprints = HashMap::new();
         for k in &config.gateway_key {
             let source = k
                 .source()
@@ -991,18 +180,6 @@ impl ConfigSnapshot {
                     }
                 }
             })?;
-            if secret.starts_with(WorkloadKey::PREFIX) {
-                return Err(SnapshotError::ReservedGatewayKeyShape {
-                    namespace: k.namespace.clone(),
-                    shape: WorkloadKey::PREFIX,
-                });
-            }
-            if secret.starts_with("axt1.") {
-                return Err(SnapshotError::ReservedGatewayKeyShape {
-                    namespace: k.namespace.clone(),
-                    shape: "axt1.",
-                });
-            }
             // Two keys resolving to one secret is ambiguous authority — one
             // namespace would silently win — so reject it. Compared here on the
             // operator-supplied values at boot, never at request time.
@@ -1027,304 +204,41 @@ impl ConfigSnapshot {
                     authority: PrincipalAuthority::StaticKey,
                     signer_kid: None,
                     scope: None,
-                    alias_scope: None,
                     max_request_microdollars: None,
-                    can_mint: k.can_mint,
-                    jti: None,
                     namespace_grant: Some(crate::namespace::NamespaceGrant::all()),
                     attrs: None,
                 },
             });
-            gateway_key_fingerprints
-                .insert(label.to_owned(), key_material::fingerprint(label, &secret));
         }
         // Inbound authentication fails closed: there is no keyless deployment
-        // that serves inference. A stateful replica cannot declare
-        // `[[gateway_key]]` at all — the section is rejected by
-        // `Config::validate_stateful` — because its inbound principals arrive
-        // with a compiled revision instead of the file, and until that compiler
-        // exists the runtime answers every inference request with
-        // `ops::inference_refusal` instead of the snapshot. A keyless snapshot
-        // is therefore admissible exactly while that refusal stands, and the
-        // condition is asked of the refusal itself rather than of the mode: when
-        // the projection lands and `inference_refusal` returns `None`, this
-        // rejects the keyless snapshot again with no edit here, which is the
-        // only ordering that cannot serve inference from an empty snapshot.
-        let projected_principals = ProjectedPrincipals::new(config.projected_principals.clone());
-        if inbound_keys.is_empty()
-            && projected_principals.count() == 0
-            && !(allow_keyless_bootstrap && config.is_stateful())
-        {
+        // that serves inference (ADR 0013).
+        if inbound_keys.is_empty() {
             return Err(SnapshotError::NoInboundKeys);
         }
-        let inbound_keys: Arc<[GatewayKeyEntry]> = inbound_keys.into();
-        let config_principals = ConfigPrincipals::new(Arc::clone(&inbound_keys));
-        let verifier = TokenVerifier::build(&config, env)?;
-        let gateway_verifier_fingerprints = verifier
-            .as_ref()
-            .map(TokenVerifier::fingerprints)
-            .unwrap_or_default();
-        let gateway_minting = if let Some(minting) = config.gateway_minting.as_ref() {
-            let config_verifier = config
-                .gateway_verifier
-                .iter()
-                .find(|verifier| verifier.kid == minting.kid)
-                .ok_or_else(|| SnapshotError::MintingVerifierNotFound {
-                    kid: minting.kid.clone(),
-                })?;
-            let source = minting
-                .source()
-                .ok_or(SnapshotError::InvalidMintingSource)?;
-            let material = key_material::resolve(source, env).map_err(|error| match error {
-                KeyMaterialError::MissingEnv { name } => {
-                    SnapshotError::MissingMintingKey { env: name }
-                }
-                KeyMaterialError::FileRead { path, kind, error } => {
-                    SnapshotError::MintingKeyFile { path, kind, error }
-                }
-                KeyMaterialError::EmptyFile { path } => SnapshotError::EmptyMintingKeyFile { path },
-                KeyMaterialError::InvalidUtf8 { path } => {
-                    SnapshotError::InvalidMintingKeyFileUtf8 { path }
-                }
-            })?;
-            let algorithm = match config_verifier.alg {
-                GatewayVerifierAlgorithm::EdDsa => crate::mint::MintAlgorithm::EdDsa,
-                GatewayVerifierAlgorithm::Hs256 => crate::mint::MintAlgorithm::Hs256,
-            };
-            crate::mint::validate_signing_material(algorithm, &material, &minting.kid).map_err(
-                |error| SnapshotError::MintingKey {
-                    reference: minting.source_label().unwrap_or(&minting.kid).to_owned(),
-                    error: error.to_string(),
-                },
-            )?;
-            if !verifier.as_ref().is_some_and(|verifier| {
-                verifier.signing_material_matches(&minting.kid, config_verifier.alg, &material)
-            }) {
-                return Err(SnapshotError::MintingKeyMismatch {
-                    kid: minting.kid.clone(),
-                    reference: minting.source_label().unwrap_or(&minting.kid).to_owned(),
-                });
-            }
-            let audience = config
-                .gateway_token
-                .as_ref()
-                .map(|token| token.audience.trim())
-                .filter(|audience| !audience.is_empty())
-                .ok_or(SnapshotError::MissingMintingAudience)?
-                .to_owned();
-            let scope = minting
-                .scope
-                .as_ref()
-                .map(|values| {
-                    values
-                        .iter()
-                        .map(|value| {
-                            Capability::parse(value).ok_or_else(|| {
-                                SnapshotError::InvalidMintingCapability {
-                                    value: value.clone(),
-                                }
-                            })
-                        })
-                        .collect::<Result<HashSet<_>, _>>()
-                })
-                .transpose()?;
-            let aliases = minting
-                .aliases
-                .as_ref()
-                .map(|values| AliasScope::parse(values.iter().map(String::as_str)))
-                .transpose()
-                .map_err(|error| SnapshotError::InvalidMintingAliases {
-                    error: error.to_string(),
-                })?;
-            Some(ResolvedMinting {
-                kid: minting.kid.clone(),
-                algorithm,
-                key_material: SecretString::from(material),
-                audience,
-                max_ttl: minting.max_ttl.unwrap_or(config_verifier.max_ttl),
-                scope,
-                aliases,
-                max_request_microdollars: minting.max_request_microdollars,
-            })
-        } else {
-            None
-        };
-        let mut stores: Vec<Box<dyn crate::principals::PrincipalStore>> =
-            vec![Box::new(projected_principals)];
-        stores.extend(
-            verifier
-                .into_iter()
-                .map(|verifier| Box::new(verifier) as Box<dyn crate::principals::PrincipalStore>),
-        );
-        let principals = PrincipalStoreChain::new(stores, config_principals)?;
-        let gateway_minting_fingerprint = config
-            .gateway_minting
-            .as_ref()
-            .zip(gateway_minting.as_ref())
-            .map(|(minting, resolved)| {
-                key_material::fingerprint(
-                    minting.source_label().unwrap_or(&resolved.kid),
-                    resolved.key_material.expose_secret(),
-                )
-            });
+        let principals = ConfigPrincipals::new(inbound_keys.into());
         Ok(Self {
             config,
             credentials,
-            middleware,
             target_circuits,
             principals,
             generation,
-            gateway_key_fingerprints,
-            gateway_verifier_fingerprints,
-            gateway_minting_fingerprint,
-            gateway_minting,
-            gateway_token_epochs,
-            secrets,
-            // Never a populated index, and never an optimistic one: a snapshot is
-            // compiled from configuration, and availability is derived afterwards
-            // by whatever produced the evidence.
-            availability: None,
-            pricing: None,
-            admin_authorization: None,
         })
     }
 
-    /// The durable material this snapshot holds.
-    ///
-    /// A lookup by exact reference, never a resolution: nothing here can reach a
-    /// secret store, which is what makes "no request touches the store" a property
-    /// of the type rather than a convention.
-    pub const fn secrets(&self) -> &ResolvedSecrets {
-        &self.secrets
-    }
-
-    /// Content middleware selected by the policy governing `namespace` in this
-    /// exact serving generation.
-    pub(crate) fn middleware(&self, namespace: &str) -> &MiddlewareChain {
-        self.middleware.for_namespace(namespace)
-    }
-
-    /// The derived availability index this snapshot carries, if it derives one.
-    #[allow(dead_code)]
-    pub fn availability(&self) -> Option<&AvailabilityIndex> {
-        self.availability.as_deref()
-    }
-
-    /// The index as a handle, for carrying the evidence an outgoing snapshot holds
-    /// onto its replacement without cloning the records.
-    pub fn availability_handle(&self) -> Option<Arc<AvailabilityIndex>> {
-        self.availability.clone()
-    }
-
-    /// Project a derived availability index onto a snapshot that has not been
-    /// published yet.
-    ///
-    /// Consuming, deliberately: a published snapshot is immutable and replaced
-    /// whole ([`AppState::publish`]), so availability is attached on the way
-    /// to publication rather than mutated underneath a reader holding the `Arc`.
-    /// Nothing else about the snapshot changes — the config, the credential graph,
-    /// and the circuits are the ones compilation produced.
-    ///
-    /// # Reloads re-project, deliberately
-    ///
-    /// [`ConfigSnapshot::build`] derives no view at all, so a reload keeps
-    /// availability only by asking for it:
-    ///
-    /// ```ignore
-    /// let outgoing = state.snapshot();
-    /// let next = match outgoing.availability_handle() {
-    ///     Some(availability) => {
-    ///         ConfigSnapshot::build(config, &env, generation)?.with_availability(availability)
-    ///     }
-    ///     None => ConfigSnapshot::build(config, &env, generation)?,
-    /// };
-    /// ```
-    ///
-    /// Silent inheritance is the behaviour being refused, not an oversight: evidence
-    /// is derived against a particular catalogue, credential set, and set of
-    /// namespaces, so a reload that changed any of those would be carrying verdicts
-    /// about targets the new config may no longer declare. A reload therefore either
-    /// re-derives availability or re-projects the outgoing handle because it knows
-    /// nothing relevant changed — and either way the choice is visible at the call
-    /// site.
-    ///
-    /// The file reloader ([`crate::reload`]) makes the second choice, and can:
-    /// nothing availability is derived from is in the file. The four durable
-    /// dimensions come from the revision's enablements, connections, credentials,
-    /// and policy documents, the evidence from discovery, and health is overlaid
-    /// at read time from the serving snapshot's own circuits — so a reload can
-    /// neither invalidate a verdict nor restate one. Dropping or blanking the
-    /// index would make a `SIGHUP` the way an operator loses the answer to which
-    /// models a tenant can reach, and keep it lost: convergence compiles only
-    /// when desired state changes, which a file edit is not.
-    #[must_use]
-    pub fn with_availability(mut self, availability: Arc<AvailabilityIndex>) -> Self {
-        self.availability = Some(availability);
-        self
-    }
-
-    /// Attach the approved pricing a revision resolved to.
-    ///
-    /// Consuming rather than a setter: a published snapshot is immutable, so
-    /// pricing is attached while the snapshot is still owned by the compiler that
-    /// built it and never after it is visible to a request.
-    #[must_use]
-    pub fn with_pricing(mut self, pricing: PricingSnapshot) -> Self {
-        self.pricing = Some(pricing);
-        self
-    }
-
-    /// The approved pricing this snapshot serves under, if any.
-    pub const fn pricing(&self) -> Option<&PricingSnapshot> {
-        self.pricing.as_ref()
-    }
-
-    /// Attach the administrative authorization view before publication.
-    #[must_use]
-    pub fn with_admin_authorization(mut self, authorization: Arc<AuthorizationSnapshot>) -> Self {
-        self.admin_authorization = Some(authorization);
-        self
-    }
-
-    pub async fn resolve_principal(
-        &self,
-        presented: &Presented<'_>,
-    ) -> Result<Option<InboundKey>, crate::principals::PrincipalStoreError> {
-        self.principals.resolve(presented).await
-    }
-
-    pub fn principal_store_name(&self, presented: &Presented<'_>) -> &'static str {
-        self.principals.owner_name(presented)
-    }
-
-    /// What authenticating this credential will cost, before any of it is spent:
-    /// whether resolving it can reach a backend, or only memory.
-    pub fn diagnostic_credential(&self, presented: &Presented<'_>) -> DiagnosticCredential {
-        if self.principals.resolves_in_memory(presented) {
-            DiagnosticCredential::Local
-        } else {
-            DiagnosticCredential::Minted
-        }
+    pub fn resolve_principal(&self, presented: &Presented<'_>) -> Option<InboundKey> {
+        self.principals.resolve_static(presented.credential)
     }
 
     /// How many inbound gateway keys are enforced. For the boot log and reload
     /// metrics — the count is safe to surface, the secrets are not.
     pub fn inbound_key_count(&self) -> usize {
-        self.principals.config_count() + self.config.projected_principals.len()
-    }
-
-    pub fn token_verifier_count(&self) -> usize {
-        self.config.gateway_verifier.len()
-    }
-
-    pub(crate) fn gateway_token_epoch(&self, namespace: &str, subject: &str) -> Option<u64> {
-        resolve_token_epoch(&self.gateway_token_epochs, namespace, subject)
+        self.principals.count()
     }
 }
 
 impl AppState {
-    /// Fails when a declared credential's or gateway key's env var is missing or
-    /// empty — both are resolved at boot, not at request time.
+    /// A test state over a telemetry-grade usage fanout and a SQLite store
+    /// opened from the config.
     #[cfg(test)]
     pub fn new(
         config: Config,
@@ -1332,127 +246,48 @@ impl AppState {
         usage: UsageFanout,
         budget: Box<dyn BudgetStore>,
     ) -> Result<Self, SnapshotError> {
-        Self::new_with_rate_limiter(
-            config,
-            env,
-            usage,
-            budget,
-            Box::new(NoLimit),
-            Box::new(crate::revocation::NoDenylist),
-        )
-    }
-
-    /// Test-only: production builds go through [`AppState::new_with_policy`],
-    /// which threads the one [`PolicyRuntime`] the backends read and the
-    /// observability the mode it booted in decides.
-    #[cfg(test)]
-    pub fn new_with_rate_limiter(
-        config: Config,
-        env: &HashMap<String, String>,
-        usage: UsageFanout,
-        budget: Box<dyn BudgetStore>,
-        rate_limiter: Box<dyn RateLimiter>,
-        revocation: Box<dyn RevocationStore>,
-    ) -> Result<Self, SnapshotError> {
-        Self::new_with_observability(
-            config,
-            env,
-            usage,
-            budget,
-            rate_limiter,
-            revocation,
-            ReplicaObservability::stateless(),
-        )
-    }
-
-    /// What this replica serves, plus what it reports about itself, for a
-    /// deployment whose usage is telemetry-grade. The boot path builds its
-    /// delivery first and calls [`AppState::with_resources`].
-    #[cfg(test)]
-    pub fn new_with_observability(
-        config: Config,
-        env: &HashMap<String, String>,
-        usage: UsageFanout,
-        budget: Box<dyn BudgetStore>,
-        rate_limiter: Box<dyn RateLimiter>,
-        revocation: Box<dyn RevocationStore>,
-        observability: ReplicaObservability,
-    ) -> Result<Self, SnapshotError> {
         Self::with_resources(
             config,
             env,
             Arc::new(UsageDelivery::telemetry(usage)),
             budget,
-            rate_limiter,
-            revocation,
-            observability,
+            None,
         )
     }
 
-    /// Every process-level resource already connected, usage delivery included,
-    /// so a deployment that cannot reach a datastore it asked for has already
-    /// failed before this is called.
-    ///
-    /// The policy runtime is this replica's own, which is what makes this a
-    /// caller-without-a-runtime constructor rather than the boot path: the
-    /// serving binary builds its stores *reading* a runtime and must hand that
-    /// same one to [`AppState::new_with_policy`], since a state publishing into
-    /// a runtime its stores do not read enforces nothing.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A test state with every process-level resource supplied except the
+    /// store, which is opened synchronously from the config's SQLite path.
+    #[cfg(test)]
     pub fn with_resources(
         config: Config,
         env: &HashMap<String, String>,
         usage: Arc<UsageDelivery>,
         budget: Box<dyn BudgetStore>,
-        rate_limiter: Box<dyn RateLimiter>,
-        revocation: Box<dyn RevocationStore>,
-        observability: ReplicaObservability,
+        catalogue: Option<Arc<CatalogStatus>>,
     ) -> Result<Self, SnapshotError> {
-        let policy = Arc::new(PolicyRuntime::bootstrap(&config));
-        Self::new_with_policy(
-            config,
-            env,
-            usage,
-            budget,
-            rate_limiter,
-            revocation,
-            policy,
-            observability,
-            None,
-        )
+        let store = open_store_sync(&config)?;
+        Self::serving(config, env, usage, budget, catalogue, store)
     }
 
-    /// The serving constructor: the stores were built reading `policy`, so the
-    /// state that publishes into it must be the state they read.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_policy(
+    /// The serving constructor. Every process-level resource is already
+    /// connected, so a deployment that cannot reach a datastore it asked for
+    /// has already failed before this is called.
+    pub fn serving(
         config: Config,
         env: &HashMap<String, String>,
         usage: Arc<UsageDelivery>,
         budget: Box<dyn BudgetStore>,
-        rate_limiter: Box<dyn RateLimiter>,
-        revocation: Box<dyn RevocationStore>,
-        policy: Arc<PolicyRuntime>,
-        observability: ReplicaObservability,
-        store: Option<Arc<dyn crate::store::Store>>,
+        catalogue: Option<Arc<CatalogStatus>>,
+        store: Arc<dyn crate::store::Store>,
     ) -> Result<Self, SnapshotError> {
         // The transport bounds configure the shared client, so they are read
-        // once here: a reload validates a change and reports that it needs a
-        // restart rather than swapping the pool under in-flight requests.
+        // once here.
         let limits = config.transport.limits();
         let stream_terminal_grace =
             Duration::from_millis(config.transport.stream_terminal_grace_ms);
         let admission = AdmissionControl::from_config(&config.admission);
         let settlements = Settlements::from_config(&config.admission);
-        let snapshot = if config.is_stateful() {
-            ConfigSnapshot::build_bootstrap(config, env, 0)?
-        } else {
-            ConfigSnapshot::build(config, env, 0)?
-        };
-        let store = match store {
-            Some(store) => store,
-            None => open_store_sync(&snapshot.config)?,
-        };
+        let snapshot = ConfigSnapshot::build(config, env, 0)?;
         let index_settings = snapshot
             .config
             .storage
@@ -1470,17 +305,9 @@ impl AppState {
             budget,
             admission,
             settlements,
-            rate_limiter,
-            revocation,
-            policy,
             lifecycle: Arc::new(Lifecycle::new()),
-            status: observability.status,
-            revision: observability.revision,
-            catalogue: observability.catalogue,
+            catalogue,
             store,
-            #[cfg(test)]
-            middleware: MiddlewareChain::empty(),
-            middleware_runtime: MiddlewareRuntime::default(),
             config: ArcSwap::from_pointee(snapshot),
         })))
     }
@@ -1489,42 +316,9 @@ impl AppState {
         Some(&self.0.store)
     }
 
-    /// Install a test or boot-constructed content chain before the state is
-    /// shared with the router. Runtime policy delivery will replace this
-    /// constructor-only hook with a snapshot-owned chain.
-    #[cfg(test)]
-    pub fn with_middleware_chain(mut self, middleware: MiddlewareChain) -> Self {
-        Arc::get_mut(&mut self.0)
-            .expect("middleware chain must be installed before AppState is cloned")
-            .middleware = middleware;
-        self
-    }
-
     /// The process lifecycle: what readiness reports and what admission checks.
     pub fn lifecycle(&self) -> &Arc<Lifecycle> {
         &self.0.lifecycle
-    }
-
-    /// The cached dependency observations the authenticated status view projects.
-    pub fn status(&self) -> &Arc<CachedStatusRegistry> {
-        &self.0.status
-    }
-
-    /// This replica's convergence report, when it converges at all.
-    pub fn revision_report(&self) -> Option<RevisionReport> {
-        self.0.revision.as_ref().map(|status| status.report())
-    }
-
-    /// What the catalogue import last reported, when this deployment imports.
-    ///
-    /// `None` covers both "imports nothing" and "has not finished its first
-    /// attempt", which are the same thing to a caller: there is nothing to say
-    /// about a catalogue yet.
-    pub fn catalogue_report(&self) -> Option<CatalogReport> {
-        self.0
-            .catalogue
-            .as_ref()
-            .and_then(|catalogue| catalogue.report())
     }
 
     /// Compiled models.dev rates for this offering from the snapshot the
@@ -1546,50 +340,6 @@ impl AppState {
     pub fn config(&self) -> Arc<ConfigSnapshot> {
         self.0.config.load_full()
     }
-
-    /// Publish a new snapshot. In-flight requests keep the snapshot they already
-    /// hold; every request that starts after this call sees the new one.
-    ///
-    /// Seed durable namespaces, install policy, then swap the snapshot. A request
-    /// never observes a new snapshot under the previous policy. A seed failure
-    /// returns [`SnapshotError::Store`] and leaves both the previous snapshot and
-    /// the previous policy in place.
-    pub fn publish(&self, snapshot: ConfigSnapshot) -> Result<(), SnapshotError> {
-        self.0
-            .store
-            .seed_namespaces_blocking(&snapshot.config.namespace)
-            .map_err(|error| SnapshotError::Store(error.to_string()))?;
-        self.policy().install(PolicyView::of(&snapshot.config));
-        self.0.config.store(Arc::new(snapshot));
-        Ok(())
-    }
-
-    /// The stateful policy this replica enforces.
-    pub fn policy(&self) -> &Arc<PolicyRuntime> {
-        &self.0.policy
-    }
-}
-
-/// A replica answers availability questions from what it is already serving.
-///
-/// Both halves come from the loaded snapshot, and neither reaches a store: the
-/// index is the projection compilation attached to it, and the health is the
-/// circuits that snapshot's own requests have been tripping. Loaded once, so an
-/// answer cannot describe one revision's targets with another revision's
-/// circuits.
-///
-/// The health is [`CircuitBreaker::observed`] rather than
-/// [`CircuitBreaker::snapshot`]: the question this read answers is what the
-/// replica would do with the next request, so a target whose cooldown has
-/// elapsed reports as impaired rather than as refused. Reading still moves
-/// nothing — an operator looking at a target cannot spend its probe.
-impl AvailabilityReader for AppState {
-    fn read(&self) -> Option<(Arc<AvailabilityIndex>, RuntimeObservations)> {
-        let snapshot = self.config();
-        let index = snapshot.availability_handle()?;
-        let runtime = RuntimeObservations::of_circuits(snapshot.target_circuits.observed());
-        Some((index, runtime))
-    }
 }
 
 /// Build the zero-size adapter for a provider kind. Adapters carry no state,
@@ -1604,6 +354,7 @@ pub fn adapter_for(kind: ProviderKind) -> Box<dyn ProviderAdapter> {
     }
 }
 
+#[cfg(test)]
 fn open_store_sync(config: &Config) -> Result<Arc<dyn crate::store::Store>, SnapshotError> {
     let storage = config
         .storage
@@ -1628,21 +379,7 @@ fn open_store_sync(config: &Config) -> Result<Arc<dyn crate::store::Store>, Snap
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::availability::{AvailabilityKey, AvailabilityRecord, ScopeRef, TargetRef};
-    use crate::budget::NoBudget;
-    use crate::config::NamespacePolicy;
-    use crate::desired_state::ContentMiddlewareRegistration;
-    use crate::desired_state::fixtures::{policy_body, revision_id, tenant_id};
-    use crate::desired_state::policy::{
-        BufferedResponseRoute, ContentGuardrailRegistration, PolicyScope,
-    };
-    use crate::desired_state::{TenantId, Uuid7};
-    use crate::store::{Store, StoreError};
-    use crate::usage::UsageSink;
-    use async_trait::async_trait;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use ring::rand::SystemRandom;
-    use ring::signature::{Ed25519KeyPair, KeyPair};
+
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_file(contents: &[u8]) -> String {
@@ -1690,554 +427,6 @@ env = "AXOND_KEY"
 namespace = "platform"
 "#;
 
-    struct ScriptedSeedStore<F> {
-        seed: F,
-    }
-
-    #[async_trait]
-    impl<F> Store for ScriptedSeedStore<F>
-    where
-        F: Fn() -> Result<(), StoreError> + Send + Sync,
-    {
-        async fn put_namespace(
-            &self,
-            _ns: crate::store::NamespaceRecord,
-        ) -> Result<(), StoreError> {
-            Ok(())
-        }
-        async fn get_namespace(
-            &self,
-            _id: &str,
-        ) -> Result<Option<crate::store::NamespaceRecord>, StoreError> {
-            Ok(None)
-        }
-        async fn list_namespaces(
-            &self,
-            _cursor: Option<String>,
-            _limit: u32,
-        ) -> Result<(Vec<crate::store::NamespaceRecord>, Option<String>), StoreError> {
-            Ok((Vec::new(), None))
-        }
-        async fn update_namespace(
-            &self,
-            _id: &str,
-            _attrs: serde_json::Value,
-            _blocklist: Option<Vec<String>>,
-        ) -> Result<Option<crate::store::NamespaceRecord>, StoreError> {
-            Ok(None)
-        }
-        async fn delete_namespace(&self, _id: &str) -> Result<bool, StoreError> {
-            Ok(false)
-        }
-        fn seed_namespaces_blocking(
-            &self,
-            _namespaces: &[crate::config::Namespace],
-        ) -> Result<(), StoreError> {
-            (self.seed)()
-        }
-        async fn put_budget(
-            &self,
-            _: &str,
-            _: &str,
-            _: u64,
-        ) -> Result<crate::store::BudgetRecord, StoreError> {
-            Err(StoreError::Unavailable("unused".into()))
-        }
-        async fn get_budget(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<Option<crate::store::BudgetRecord>, StoreError> {
-            Ok(None)
-        }
-        async fn put_budget_policy(
-            &self,
-            _: &str,
-            _: crate::store::BudgetCadence,
-            _: u64,
-            _: &str,
-            _: Option<&str>,
-        ) -> Result<crate::store::BudgetPolicy, StoreError> {
-            Err(StoreError::Unavailable("down".into()))
-        }
-        async fn get_budget_policy(
-            &self,
-            _: &str,
-        ) -> Result<Option<crate::store::BudgetPolicy>, StoreError> {
-            Err(StoreError::Unavailable("down".into()))
-        }
-        async fn admit_budget(&self, _: &str) -> Result<crate::store::BudgetAdmit, StoreError> {
-            Err(StoreError::Unavailable("unused".into()))
-        }
-        async fn charge_budget(&self, _: &str, _: &str, _: i64, _: u64) -> Result<(), StoreError> {
-            Ok(())
-        }
-        async fn append_usage(&self, _: crate::store::UsageAppend) -> Result<(), StoreError> {
-            Ok(())
-        }
-        async fn append_usage_batch(
-            &self,
-            _: Vec<crate::store::UsageAppend>,
-        ) -> Result<(), StoreError> {
-            // In-memory fake: no durable prefix; a mid-batch failure cannot
-            // leave earlier rows committed.
-            Ok(())
-        }
-        fn append_usage_batch_sync(
-            &self,
-            _: &[crate::store::UsageAppend],
-        ) -> Result<(), StoreError> {
-            Ok(())
-        }
-        async fn summarize_usage(
-            &self,
-            _: &str,
-            _: &str,
-        ) -> Result<Vec<crate::store::UsageSummaryRow>, StoreError> {
-            Ok(Vec::new())
-        }
-    }
-
-    fn publish_test_state(
-        config: &Config,
-        env: &HashMap<String, String>,
-        store: Arc<dyn Store>,
-    ) -> AppState {
-        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
-        AppState::new_with_policy(
-            config.clone(),
-            env,
-            Arc::new(UsageDelivery::telemetry(UsageFanout::new(sinks))),
-            Box::new(NoBudget),
-            Box::new(NoLimit),
-            Box::new(crate::revocation::NoDenylist),
-            Arc::new(PolicyRuntime::bootstrap(config)),
-            ReplicaObservability::stateless(),
-            Some(store),
-        )
-        .expect("state")
-    }
-
-    fn platform_cap(state: &AppState) -> u64 {
-        state
-            .policy()
-            .active("platform")
-            .budget
-            .expect("platform is governed")
-            .subject_microdollars
-    }
-
-    #[tokio::test]
-    async fn publish_rejects_when_namespace_seed_fails() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let config = config_with(PLATFORM_KEY);
-        let state = publish_test_state(
-            &config,
-            &env,
-            Arc::new(ScriptedSeedStore {
-                seed: || Err(StoreError::Unavailable("seed refused".into())),
-            }),
-        );
-        let generation = state.config().generation;
-        let before = platform_cap(&state);
-        let mut next = config;
-        next.budget.limit_microdollars = 42;
-        let snapshot =
-            ConfigSnapshot::build(next, &env, generation + 1).expect("snapshot compiles");
-        let err = state.publish(snapshot).expect_err("seed fails");
-        assert!(matches!(err, SnapshotError::Store(_)), "{err:?}");
-        assert_eq!(state.config().generation, generation);
-        assert_eq!(platform_cap(&state), before);
-    }
-
-    #[tokio::test]
-    async fn publish_does_not_expose_new_snapshot_under_old_policy() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let config = config_with(PLATFORM_KEY);
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let release_rx = std::sync::Mutex::new(Some(release_rx));
-        let state = publish_test_state(
-            &config,
-            &env,
-            Arc::new(ScriptedSeedStore {
-                seed: move || {
-                    let _ = started_tx.send(());
-                    if let Some(release) = release_rx.lock().expect("not poisoned").take() {
-                        let _ = release.recv();
-                    }
-                    Ok(())
-                },
-            }),
-        );
-        let generation = state.config().generation;
-        let before = platform_cap(&state);
-        let mut next = config;
-        next.budget.limit_microdollars = 42;
-        let snapshot =
-            ConfigSnapshot::build(next, &env, generation + 1).expect("snapshot compiles");
-        let publisher = {
-            let state = state.clone();
-            std::thread::spawn(move || state.publish(snapshot))
-        };
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("seed started");
-        let during_generation = state.config().generation;
-        let during_cap = platform_cap(&state);
-        release_tx.send(()).expect("release seed");
-        publisher.join().expect("publisher").expect("publish");
-        assert_eq!(during_generation, generation);
-        assert_eq!(during_cap, before);
-        assert_eq!(state.config().generation, generation + 1);
-        assert_eq!(platform_cap(&state), 42);
-    }
-
-    #[tokio::test]
-    async fn publish_seeds_sqlite_namespaces() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
-        let mut config = config_with(PLATFORM_KEY);
-        config.namespace.push(crate::config::Namespace {
-            id: "wsp_x".into(),
-            default: false,
-            allow_platform_fallback: false,
-            project: None,
-            policy: None,
-            static_policy: None,
-        });
-        let state = AppState::new(
-            config.clone(),
-            &env,
-            UsageFanout::new(sinks),
-            Box::new(NoBudget),
-        )
-        .expect("state");
-        let store = Arc::clone(state.store().expect("store"));
-        let snapshot = ConfigSnapshot::build(config, &env, 1).expect("snapshot compiles");
-        state.publish(snapshot).expect("publish");
-        assert_eq!(state.config().generation, 1);
-        let got = store
-            .get_namespace("wsp_x")
-            .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(got.id, "wsp_x");
-        assert_eq!(got.attrs, serde_json::json!({}));
-    }
-
-    fn middleware_policy(epoch: u64, id: &str) -> NamespacePolicy {
-        let body = policy_body(PolicyScope::Tenant(tenant_id(1)), epoch)
-            .with_content_middleware(vec![
-                ContentMiddlewareRegistration::new(
-                    id,
-                    [gateway_core::MiddlewareScope::Request],
-                    gateway_core::MiddlewareFailurePosture::FailClosed,
-                    25,
-                )
-                .expect("valid registration"),
-            ])
-            .expect("registration attaches")
-            .with_buffered_response_routes([
-                BufferedResponseRoute::Responses,
-                BufferedResponseRoute::Messages,
-            ])
-            .expect("buffering routes attach");
-        let generation = body.generation(revision_id(epoch));
-        NamespacePolicy { body, generation }
-    }
-
-    fn redaction_policy(epoch: u64) -> NamespacePolicy {
-        let registration = ContentMiddlewareRegistration::new(
-            "axond.redact",
-            [
-                gateway_core::MiddlewareScope::Request,
-                gateway_core::MiddlewareScope::Response,
-                gateway_core::MiddlewareScope::StreamEvent,
-            ],
-            gateway_core::MiddlewareFailurePosture::FailClosed,
-            25,
-        )
-        .unwrap()
-        .with_guardrail(
-            ContentGuardrailRegistration::new(
-                "GW_GUARDRAIL_KEY",
-                vec![gateway_core::GuardrailRule {
-                    id: "email".to_owned(),
-                    pattern: r"[a-z]+@example\.com".to_owned(),
-                    action: gateway_core::GuardrailAction::Redact,
-                }],
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        let body = policy_body(PolicyScope::Tenant(tenant_id(1)), epoch)
-            .with_content_middleware(vec![registration])
-            .unwrap()
-            .with_buffered_response_routes([
-                BufferedResponseRoute::Responses,
-                BufferedResponseRoute::Messages,
-            ])
-            .unwrap();
-        let generation = body.generation(revision_id(epoch));
-        NamespacePolicy { body, generation }
-    }
-
-    #[tokio::test]
-    async fn middleware_policy_hot_reload_rollback_and_rejection_are_snapshot_atomic() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let sinks: Vec<Box<dyn UsageSink>> = Vec::new();
-        let state = AppState::new(
-            config_with(PLATFORM_KEY),
-            &env,
-            UsageFanout::new(sinks),
-            Box::new(NoBudget),
-        )
-        .expect("base state starts");
-
-        let mut added = config_with(PLATFORM_KEY);
-        added.namespace[0].policy = Some(middleware_policy(1, "test.policy-marker"));
-        state
-            .publish(ConfigSnapshot::build(added, &env, 1).expect("addition compiles"))
-            .expect("publish");
-        let held_added = state.config();
-        let mut request = gateway_core::ProviderRequest {
-            model: "alias".to_owned(),
-            body: serde_json::json!({}),
-        };
-        held_added
-            .middleware("platform")
-            .request(&state.0.middleware_runtime, &mut request)
-            .await
-            .expect("added chain runs");
-        assert_eq!(request.body["policy_middleware"], "test.policy-marker");
-
-        let removed = config_with(PLATFORM_KEY);
-        state
-            .publish(ConfigSnapshot::build(removed, &env, 2).expect("removal compiles"))
-            .expect("publish");
-        assert!(state.config().middleware("platform").is_empty());
-        assert_eq!(held_added.middleware("platform").len(), 1);
-
-        let mut invalid = config_with(PLATFORM_KEY);
-        invalid.namespace[0].policy = Some(middleware_policy(3, "test.not-compiled"));
-        assert!(matches!(
-            ConfigSnapshot::build(invalid, &env, 3),
-            Err(SnapshotError::Middleware(_))
-        ));
-        assert_eq!(state.config().generation, 2);
-        assert!(state.config().middleware("platform").is_empty());
-
-        let mut rollback = config_with(PLATFORM_KEY);
-        rollback.namespace[0].policy = Some(middleware_policy(4, "test.policy-marker"));
-        state
-            .publish(ConfigSnapshot::build(rollback, &env, 4).expect("rollback compiles"))
-            .expect("publish");
-        assert_eq!(state.config().middleware("platform").len(), 1);
-    }
-
-    #[test]
-    fn cached_guardrail_records_reject_unknown_nested_fields() {
-        let env = HashMap::from([
-            ("AXOND_KEY".to_owned(), "platform-secret".to_owned()),
-            ("GW_GUARDRAIL_KEY".to_owned(), STANDARD.encode([7_u8; 32])),
-        ]);
-        let mut config = config_with(PLATFORM_KEY);
-        config.namespace[0].policy = Some(redaction_policy(1));
-        let snapshot = ConfigSnapshot::build(config, &env, 7).expect("guardrail compiles");
-        let cached = snapshot.cached_serving(revision_id(7));
-
-        for path in ["middleware", "guardrail"] {
-            let mut value = serde_json::to_value(&cached).expect("cache serializes");
-            let registration = &mut value["namespaces"][0]["policy"]["content_middleware"][0];
-            let object = if path == "middleware" {
-                registration.as_object_mut().expect("middleware record")
-            } else {
-                registration["guardrail"]
-                    .as_object_mut()
-                    .expect("guardrail record")
-            };
-            object.insert("unknown".to_owned(), serde_json::json!(true));
-            assert!(
-                serde_json::from_value::<CachedServingSnapshot>(value).is_err(),
-                "unknown {path} field was ignored"
-            );
-        }
-    }
-
-    #[test]
-    fn encrypted_cache_round_trips_buffered_routes_and_old_payloads_default_empty() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "platform-secret".to_owned())]);
-        let mut config = config_with(PLATFORM_KEY);
-        config.namespace[0].policy = Some(middleware_policy(1, "test.policy-marker"));
-        let snapshot = ConfigSnapshot::build(config, &env, 7).expect("snapshot compiles");
-        let revision = revision_id(7);
-        let cache_path = temp_file(b"signed-cache-placeholder");
-        let cache = crate::convergence::LastKnownGood::new(&cache_path, &[0x59; 32])
-            .expect("cache key is valid");
-        let bytes = cache
-            .encode_compiled(&snapshot, revision)
-            .expect("compiled cache encrypts");
-        assert!(
-            !bytes
-                .windows("responses".len())
-                .any(|window| window == b"responses")
-        );
-        cache
-            .write_compiled(&bytes)
-            .expect("encrypted compiled cache writes");
-        let loaded = cache
-            .load_compiled()
-            .expect("encrypted compiled cache authenticates")
-            .expect("compiled cache exists");
-        assert_eq!(
-            loaded.namespaces[0]
-                .policy
-                .as_ref()
-                .unwrap()
-                .buffered_response_routes,
-            ["messages", "responses"]
-        );
-
-        let mut old_payload = serde_json::to_value(snapshot.cached_serving(revision)).unwrap();
-        old_payload["namespaces"][0]["policy"]
-            .as_object_mut()
-            .unwrap()
-            .remove("buffered_response_routes");
-        let old_payload: CachedServingSnapshot = serde_json::from_value(old_payload).unwrap();
-        assert!(
-            old_payload.namespaces[0]
-                .policy
-                .as_ref()
-                .unwrap()
-                .buffered_response_routes
-                .is_empty()
-        );
-
-        let _ = std::fs::remove_file(cache.compiled_path());
-        let _ = std::fs::remove_file(cache_path);
-    }
-
-    /// The production observation plan, not only the status route's projection,
-    /// must mark an enabled importer as configured. Otherwise the component
-    /// would remain `disabled` forever even though the background task is
-    /// running and the catalogue report is available to operators.
-    #[test]
-    fn catalogue_imports_enable_the_catalogue_status_component() {
-        let plan = ReplicaObservability::plan_with_catalogue(
-            None,
-            &crate::budget::NoBudget,
-            &crate::rate_limit::NoLimit,
-            &crate::revocation::NoDenylist,
-            Some(Arc::new(CatalogStatus::new())),
-        );
-
-        assert_eq!(plan.components(), &[Component::Catalogue]);
-        let (observability, refresher) = ReplicaObservability::observing(plan);
-        assert!(refresher.is_some());
-        let catalogue = observability
-            .status
-            .view()
-            .components
-            .into_iter()
-            .find(|observed| observed.component == Component::Catalogue)
-            .expect("the catalogue component is in every status view");
-        assert_eq!(
-            catalogue.state,
-            crate::status::ComponentState::Unavailable,
-            "enabled-but-not-yet-observed is not disabled"
-        );
-    }
-
-    /// Availability is projected onto a snapshot, not compiled into it: a built
-    /// snapshot knows nothing, and attaching an index leaves every config section
-    /// exactly as compilation produced it (#206).
-    #[test]
-    fn projecting_availability_leaves_the_config_untouched() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "secret".to_owned())]);
-        let snapshot =
-            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0).expect("the key resolves");
-        assert!(
-            snapshot.availability().is_none(),
-            "a compiled snapshot derives no view, which is not an empty one"
-        );
-
-        let scope = ScopeRef::tenant(TenantId::new(
-            Uuid7::from_parts(1, 0, 1).expect("a valid id"),
-        ));
-        let target = TargetRef::parse("openai", "gpt-4o-preview").expect("a well-formed target");
-        let index = AvailabilityIndex::builder()
-            .record(
-                AvailabilityKey::new(scope, target),
-                AvailabilityRecord::enabled(),
-            )
-            .build();
-
-        let models: Vec<String> = snapshot
-            .config
-            .model
-            .iter()
-            .map(|model| model.name.clone())
-            .collect();
-        let projected = snapshot.with_availability(Arc::new(index));
-        assert_eq!(
-            projected
-                .availability()
-                .expect("the projected snapshot derives a view")
-                .len(),
-            1
-        );
-        assert_eq!(
-            projected
-                .config
-                .model
-                .iter()
-                .map(|model| model.name.clone())
-                .collect::<Vec<_>>(),
-            models,
-            "an index describes reachability and can never enlarge what is served"
-        );
-        assert!(projected.config.model("gpt-4o-preview").is_none());
-    }
-
-    /// A rebuild starts from the empty index and carries evidence forward only when
-    /// it re-projects the outgoing handle: the reload/projection handoff is explicit
-    /// at the call site rather than an inheritance nobody wrote down (#206).
-    #[test]
-    fn a_rebuilt_snapshot_carries_availability_only_when_it_re_projects_it() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "secret".to_owned())]);
-        let scope = ScopeRef::tenant(TenantId::new(
-            Uuid7::from_parts(1, 0, 1).expect("a valid id"),
-        ));
-        let target = TargetRef::parse("openai", "gpt-4o").expect("a well-formed target");
-        let index = AvailabilityIndex::builder()
-            .record(
-                AvailabilityKey::new(scope, target),
-                AvailabilityRecord::enabled(),
-            )
-            .build();
-        let outgoing = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0)
-            .expect("the key resolves")
-            .with_availability(Arc::new(index));
-
-        let rebuilt =
-            ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 1).expect("the key resolves");
-        assert!(
-            rebuilt.availability().is_none(),
-            "a rebuild inherits no evidence it did not ask for"
-        );
-
-        let carried = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 1)
-            .expect("the key resolves")
-            .with_availability(
-                outgoing
-                    .availability_handle()
-                    .expect("the outgoing snapshot derives a view"),
-            );
-        assert_eq!(carried.availability(), outgoing.availability());
-        assert_eq!(carried.generation, 1);
-    }
-
     /// A declared key whose env var is unset or empty is a boot failure, not a
     /// silently dropped entry that would widen or empty the key table.
     #[test]
@@ -2260,241 +449,6 @@ namespace = "platform"
             // The message names the reference, never a value.
             assert!(err.to_string().contains("AXOND_KEY"), "{err}");
         }
-    }
-
-    #[test]
-    fn a_declared_gateway_verifier_without_its_env_var_refuses_to_resolve() {
-        let config = config_with(
-            r#"
-[[gateway_key]]
-env = "AXOND_KEY"
-namespace = "platform"
-
-[gateway_token]
-audience = "test"
-
-[[gateway_verifier]]
-kid = "test"
-alg = "HS256"
-env = "JWT_SECRET"
-namespaces = ["platform"]
-max_ttl = "15m"
-"#,
-        );
-        let Err(err) = ConfigSnapshot::build(
-            config,
-            &HashMap::from([("AXOND_KEY".to_owned(), "static-secret".to_owned())]),
-            0,
-        ) else {
-            panic!("the verifier cannot be resolved");
-        };
-        assert!(
-            matches!(
-                err,
-                SnapshotError::TokenVerifier(
-                    crate::principals::TokenVerifierBuildError::MissingKey { ref kid, ref env }
-                ) if kid == "test" && env == "JWT_SECRET"
-            ),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn minting_signing_material_fails_closed_without_disclosing_material() {
-        let config = Config::from_toml_str(
-            r#"
-[[namespace]]
-id = "platform"
-default = true
-
-[[gateway_key]]
-env = "AXOND_KEY"
-namespace = "platform"
-can_mint = true
-
-[gateway_token]
-audience = "test"
-
-[[gateway_verifier]]
-kid = "test"
-alg = "HS256"
-env = "JWT_SECRET"
-namespaces = ["platform"]
-max_ttl = "15m"
-
-[gateway_minting]
-kid = "test"
-env = "SIGNING_SECRET"
-scope = ["chat", "models"]
-"#,
-        )
-        .unwrap();
-        let env = HashMap::from([
-            ("AXOND_KEY".to_owned(), "static-secret".to_owned()),
-            (
-                "JWT_SECRET".to_owned(),
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            ),
-            ("SIGNING_SECRET".to_owned(), "too-short".to_owned()),
-        ]);
-        let Err(error) = ConfigSnapshot::build(config, &env, 0) else {
-            panic!("short HS256 signing material must fail");
-        };
-        let message = error.to_string();
-        assert!(message.contains("SIGNING_SECRET"));
-        assert!(!message.contains("too-short"));
-
-        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        let pair = Ed25519KeyPair::from_pkcs8(document.as_ref()).unwrap();
-        let config = Config::from_toml_str(
-            r#"
-[[namespace]]
-id = "platform"
-default = true
-
-[[gateway_key]]
-env = "AXOND_KEY"
-namespace = "platform"
-can_mint = true
-
-[gateway_token]
-audience = "test"
-
-[[gateway_verifier]]
-kid = "test"
-alg = "EdDSA"
-env = "VERIFYING_KEY"
-namespaces = ["platform"]
-max_ttl = "15m"
-
-[gateway_minting]
-kid = "test"
-env = "SIGNING_KEY"
-scope = ["chat", "models"]
-"#,
-        )
-        .unwrap();
-        let env = HashMap::from([
-            ("AXOND_KEY".to_owned(), "static-secret".to_owned()),
-            (
-                "VERIFYING_KEY".to_owned(),
-                STANDARD.encode(pair.public_key().as_ref()),
-            ),
-            ("SIGNING_KEY".to_owned(), "not-base64".to_owned()),
-        ]);
-        let Err(error) = ConfigSnapshot::build(config, &env, 0) else {
-            panic!("invalid Ed25519 signing material must fail");
-        };
-        let message = error.to_string();
-        assert!(message.contains("SIGNING_KEY"));
-        assert!(!message.contains("not-base64"));
-    }
-
-    #[test]
-    fn minting_signing_material_must_match_verifier_for_both_algorithms() {
-        let hs_config = Config::from_toml_str(
-            r#"
-[[namespace]]
-id = "platform"
-default = true
-[[gateway_key]]
-env = "AXOND_KEY"
-namespace = "platform"
-can_mint = true
-[gateway_token]
-audience = "test"
-[[gateway_verifier]]
-kid = "test"
-alg = "HS256"
-env = "JWT_SECRET"
-namespaces = ["platform"]
-max_ttl = "15m"
-[gateway_minting]
-kid = "test"
-env = "SIGNING_SECRET"
-scope = ["chat", "models"]
-"#,
-        )
-        .unwrap();
-        let hs_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned();
-        let mut hs_env = HashMap::from([
-            ("AXOND_KEY".to_owned(), "static-secret".to_owned()),
-            ("JWT_SECRET".to_owned(), hs_secret.clone()),
-            ("SIGNING_SECRET".to_owned(), hs_secret.clone()),
-        ]);
-        assert!(ConfigSnapshot::build(hs_config.clone(), &hs_env, 0).is_ok());
-        hs_env.insert(
-            "SIGNING_SECRET".to_owned(),
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
-        );
-        let Err(error) = ConfigSnapshot::build(hs_config, &hs_env, 0) else {
-            panic!("mismatched HS256 material must fail");
-        };
-        let message = error.to_string();
-        assert!(message.contains("SIGNING_SECRET"));
-        assert!(!message.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
-
-        let first = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        let first_pair = Ed25519KeyPair::from_pkcs8(first.as_ref()).unwrap();
-        let second = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
-        let config = Config::from_toml_str(
-            r#"
-[[namespace]]
-id = "platform"
-default = true
-[[gateway_key]]
-env = "AXOND_KEY"
-namespace = "platform"
-can_mint = true
-[gateway_token]
-audience = "test"
-[[gateway_verifier]]
-kid = "test"
-alg = "EdDSA"
-env = "VERIFYING_KEY"
-namespaces = ["platform"]
-max_ttl = "15m"
-[gateway_minting]
-kid = "test"
-env = "SIGNING_KEY"
-scope = ["chat", "models"]
-"#,
-        )
-        .unwrap();
-        let mut ed_env = HashMap::from([
-            ("AXOND_KEY".to_owned(), "static-secret".to_owned()),
-            (
-                "VERIFYING_KEY".to_owned(),
-                STANDARD.encode(first_pair.public_key().as_ref()),
-            ),
-            ("SIGNING_KEY".to_owned(), STANDARD.encode(first.as_ref())),
-        ]);
-        assert!(ConfigSnapshot::build(config.clone(), &ed_env, 0).is_ok());
-        ed_env.insert("SIGNING_KEY".to_owned(), STANDARD.encode(second.as_ref()));
-        let Err(error) = ConfigSnapshot::build(config, &ed_env, 0) else {
-            panic!("mismatched Ed25519 material must fail");
-        };
-        let message = error.to_string();
-        assert!(message.contains("SIGNING_KEY"));
-        assert!(!message.contains(&STANDARD.encode(second.as_ref())));
-    }
-
-    #[tokio::test]
-    async fn a_static_gateway_key_resolves_from_a_file_and_uses_its_path_as_subject() {
-        let path = temp_file(b"static-file-secret");
-        let config = config_with(&format!(
-            "[[gateway_key]]\nfile = \"{path}\"\nnamespace = \"platform\"\n"
-        ));
-        let snapshot = ConfigSnapshot::build(config, &HashMap::new(), 0).expect("resolves");
-        let principal = snapshot
-            .resolve_principal(&Presented {
-                credential: "static-file-secret",
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(principal.subject, path);
-        std::fs::remove_file(path).unwrap();
     }
 
     /// Two keys holding one secret cannot both be honoured: the table is keyed
@@ -2556,16 +510,24 @@ output_microdollars_per_million = 1
         std::fs::remove_file(failed).unwrap();
     }
 
-    #[tokio::test]
-    async fn a_resolved_key_is_bound_to_its_namespace_and_env_var() {
+    /// The secret is held as `SecretString`, so debugging or logging an entry
+    /// renders the redaction placeholder, never the key material.
+    #[test]
+    fn a_resolved_key_entry_never_renders_its_secret() {
+        let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
+        let snapshot = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0).expect("resolves");
+        let rendered = snapshot.principals.first_secret_debug();
+        assert!(!rendered.contains("inbound-secret"), "{rendered}");
+    }
+
+    #[test]
+    fn a_resolved_key_is_bound_to_its_namespace_and_env_var() {
         let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
         let snapshot = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0).expect("resolves");
         let key = snapshot
             .resolve_principal(&Presented {
                 credential: "inbound-secret",
             })
-            .await
-            .expect("principal resolution succeeds")
             .expect("the presented secret resolves its caller");
         assert_eq!(key.namespace, "platform");
         assert_eq!(key.subject, "AXOND_KEY");
@@ -2575,206 +537,23 @@ output_microdollars_per_million = 1
                 .resolve_principal(&Presented {
                     credential: "wrong-secret",
                 })
-                .await
-                .expect("principal resolution succeeds")
                 .is_none()
         );
     }
 
-    #[tokio::test]
-    async fn a_projected_workload_key_resolves_from_its_durable_digest() {
-        let key = crate::desired_state::fixtures::workload_key(0xd0);
-        let mut config = config_with(PLATFORM_KEY);
-        config.projected_principals = vec![crate::config::ProjectedPrincipal {
-            namespace: "platform".to_owned(),
-            subject: crate::desired_state::fixtures::principal_id(33).to_string(),
-            digest: crate::desired_state::Checksum::of(key.as_bytes()),
-            grant: None,
-        }];
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
-        let snapshot = ConfigSnapshot::build(config, &env, 0)
-            .expect("a digest-backed principal does not need secret material");
-        let principal = snapshot
-            .resolve_principal(&Presented { credential: &key })
-            .await
-            .expect("principal resolution succeeds")
-            .expect("the projected workload key resolves");
-        assert_eq!(principal.namespace, "platform");
-        assert_eq!(
-            principal.subject,
-            crate::desired_state::fixtures::principal_id(33).to_string()
-        );
-        assert_eq!(principal.authority, PrincipalAuthority::WorkloadKey);
-        assert_eq!(snapshot.inbound_key_count(), 2);
-        assert!(
-            snapshot
-                .resolve_principal(&Presented {
-                    credential: "axw1.not-a-key",
-                })
-                .await
-                .expect("malformed workload keys fail closed")
-                .is_none()
-        );
-    }
-
-    /// Issuance epochs belong only to minted tokens; the static breakglass key
-    /// remains resolvable when a namespace-wide epoch is configured.
-    #[tokio::test]
-    async fn a_static_gateway_key_ignores_token_epochs() {
+    #[test]
+    fn a_static_gateway_key_resolves_from_a_file_and_uses_its_path_as_subject() {
+        let path = temp_file(b"static-file-secret");
         let config = config_with(&format!(
-            "{PLATFORM_KEY}\n[[gateway_token_epoch]]\nnamespace = \"platform\"\nmin_iat = 9_999_999_999\n"
+            "[[gateway_key]]\nfile = \"{path}\"\nnamespace = \"platform\"\n"
         ));
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
-        let snapshot = ConfigSnapshot::build(config, &env, 0).expect("resolves");
-        assert_eq!(
-            snapshot
-                .resolve_principal(&Presented {
-                    credential: "inbound-secret",
-                })
-                .await
-                .expect("principal resolution succeeds")
-                .expect("static key resolves")
-                .namespace,
-            "platform"
-        );
-    }
-
-    /// A stateful deployment starts with a keyless bootstrap object, but that
-    /// object is not admissible as a serving snapshot.
-    #[test]
-    #[ignore = "ADR 0063: leftover control plane withdrawn"]
-    fn a_stateful_bootstrap_compiles_without_an_inbound_key() {
-        let env = HashMap::new();
-        let stateful = Config::from_toml_str(
-            r#"
-mode = "stateful"
-
-[control_plane]
-dsn_env = "GW_CONTROL_PLANE_DSN"
-
-[secret_store]
-kek_env = "GW_SECRET_STORE_KEK"
-
-[[admin_breakglass]]
-env = "GW_ADMIN_BREAKGLASS"
-"#,
-        )
-        .expect("valid stateful bootstrap");
-        let snapshot =
-            ConfigSnapshot::build_bootstrap(stateful, &env, 0).expect("compiles keyless bootstrap");
-        assert_eq!(snapshot.inbound_key_count(), 0);
-    }
-
-    #[test]
-    #[ignore = "ADR 0063: leftover control plane withdrawn"]
-    fn a_compiled_revision_without_a_request_addressable_principal_is_refused() {
-        let env = HashMap::new();
-        let stateful = Config::from_toml_str(
-            r#"
-mode = "stateful"
-
-[control_plane]
-dsn_env = "GW_CONTROL_PLANE_DSN"
-
-[secret_store]
-kek_env = "GW_SECRET_STORE_KEK"
-
-[[admin_breakglass]]
-env = "GW_ADMIN_BREAKGLASS"
-"#,
-        )
-        .expect("a valid stateful bootstrap");
-        let error = match ConfigSnapshot::build_compiled_with(
-            stateful,
-            &env,
-            1,
-            ResolvedSecrets::default(),
-        ) {
-            Ok(_) => panic!("a candidate without an inbound principal cannot serve"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, SnapshotError::NoInboundKeys));
-    }
-
-    #[test]
-    fn a_static_key_cannot_shadow_the_projected_workload_shape() {
-        let config = config_with(PLATFORM_KEY);
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "axw1.shadowed".to_owned())]);
-        let error = match ConfigSnapshot::build(config, &env, 0) {
-            Ok(_) => panic!("the reserved workload shape must remain unambiguous"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            SnapshotError::ReservedGatewayKeyShape { .. }
-        ));
-    }
-
-    #[test]
-    fn a_static_key_cannot_use_the_minted_token_prefix() {
-        let config = config_with(PLATFORM_KEY);
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "axt1.not-a-static-key".to_owned())]);
-        let error = match ConfigSnapshot::build(config, &env, 0) {
-            Ok(_) => panic!("the reserved minted-token shape must remain unambiguous"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            SnapshotError::ReservedGatewayKeyShape { shape: "axt1.", .. }
-        ));
-    }
-
-    /// The keyless snapshot above is admissible only because the runtime answers
-    /// inference with [`crate::ops::inference_refusal`] instead of that snapshot.
-    /// This is the coupling, asserted rather than described: a mode that would
-    /// serve inference from a snapshot has to have an inbound key, so a future
-    /// change that stops refusing stateful inference fails here instead of
-    /// authenticating callers against an empty key set.
-    /// A normal candidate build never permits a keyless stateful snapshot. The
-    /// explicit bootstrap constructor is the only keyless path.
-    #[test]
-    #[ignore = "ADR 0063: leftover control plane withdrawn"]
-    fn stateful_candidates_require_projected_inbound_keys() {
-        // A mode that serves inference has no keyless form to begin with:
-        // configuration refuses it before a snapshot is ever built.
-        let error = Config::from_toml_str(
-            r#"
-[[namespace]]
-id = "platform"
-default = true
-"#,
-        )
-        .expect_err("a keyless stateless bootstrap serves inference to nobody");
-        assert!(format!("{error}").contains("gateway_key"), "{error}");
-
-        let stateful = Config::from_toml_str(
-            r#"
-mode = "stateful"
-
-[control_plane]
-dsn_env = "GW_CONTROL_PLANE_DSN"
-
-[secret_store]
-kek_env = "GW_SECRET_STORE_KEK"
-
-[[admin_breakglass]]
-env = "GW_ADMIN_BREAKGLASS"
-"#,
-        )
-        .expect("a valid stateful bootstrap");
-        assert!(matches!(
-            ConfigSnapshot::build(stateful, &HashMap::new(), 0),
-            Err(SnapshotError::NoInboundKeys)
-        ));
-    }
-
-    /// The secret is held as `SecretString`, so debugging or logging an entry
-    /// renders the redaction placeholder, never the key material.
-    #[test]
-    fn a_resolved_key_entry_never_renders_its_secret() {
-        let env = HashMap::from([("AXOND_KEY".to_owned(), "inbound-secret".to_owned())]);
-        let snapshot = ConfigSnapshot::build(config_with(PLATFORM_KEY), &env, 0).expect("resolves");
-        let rendered = snapshot.principals.config_first_secret_debug();
-        assert!(!rendered.contains("inbound-secret"), "{rendered}");
+        let snapshot = ConfigSnapshot::build(config, &HashMap::new(), 0).expect("resolves");
+        let principal = snapshot
+            .resolve_principal(&Presented {
+                credential: "static-file-secret",
+            })
+            .unwrap();
+        assert_eq!(principal.subject, path);
+        std::fs::remove_file(path).unwrap();
     }
 }

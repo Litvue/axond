@@ -22,16 +22,9 @@
 //!   moves with it.
 //! - **A refresh is bounded in time and paced by its failures.** One attempt is
 //!   capped by [`RefreshSchedule::timeout`]; a refused one is retried on
-//!   [`convergence backoff`](crate::convergence::backoff), which is deterministic
+//!   [`backoff`](crate::backoff), which is deterministic
 //!   and saturating, so a week-long outage settles at one attempt per ceiling
 //!   instead of pinning a mirror.
-//! - **Nothing an upstream says activates anything.** A refresh admits
-//!   *observations*. An operator's enablements keep pointing at the snapshot
-//!   they were approved against — a pin is a digest, and admitting new content
-//!   does not move one — so a model that appears upstream is not usable and a
-//!   price that changes upstream is not charged. What a new catalogue *would*
-//!   mean for what operators enabled is reported by [`RefreshImpact`] and acted
-//!   on by a human.
 //!
 //! # Manual and scheduled refreshes are the same import
 //!
@@ -42,20 +35,18 @@
 //! backoff — is identical, so the path an operator exercises by hand is the path
 //! that runs unattended.
 
-use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 
 use super::catalog::{
-    Admission, CatalogContent, CatalogError, CatalogRefresh, CatalogReport, CatalogSnapshot,
-    CatalogSource, LastKnownGoodCatalog, RawPayload, Refreshed, Refusable, Refusal, RefusalReason,
+    Admission, CatalogError, CatalogRefresh, CatalogReport, CatalogSnapshot, CatalogSource,
+    LastKnownGoodCatalog, RawPayload, Refreshed, Refusable, Refusal, RefusalReason,
     SourceValidators,
 };
 use super::catalog_store::{
     CatalogStore, CatalogStoreError, HydrationError, RetainedCatalog, Retention, hydrate,
 };
 use super::models_dev::{SEED_PAYLOAD, seed_snapshot};
-use crate::convergence::backoff::{Backoff, BackoffPolicy, InvalidBackoff};
-use crate::desired_state::models::{ModelEnablementBody, OfferingId};
+use crate::backoff::{Backoff, BackoffPolicy, InvalidBackoff};
 
 /// How often a catalogue is refreshed, how long one attempt may take, and how a
 /// refused one is paced.
@@ -242,61 +233,6 @@ pub enum RefreshOutcome {
     /// A scheduled refresh that was not due. Never returned for
     /// [`RefreshTrigger::Manual`].
     NotDue { next_due: SystemTime },
-}
-
-/// What a newly imported catalogue would mean for what operators have enabled.
-///
-/// A report, and deliberately only a report. The catalogue is an observation and
-/// an enablement is a decision; a refresh that withdrew an enablement because an
-/// upstream stopped listing a model would be an upstream operating the
-/// deployment. So this names what a human should look at, and changes nothing:
-/// every enablement keeps its state, its approved price, and the snapshot it was
-/// approved against.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RefreshImpact {
-    /// Enablements still pinned to a catalogue that is no longer the active one.
-    /// Expected, not a fault: a pin moves when an operator republishes an
-    /// enablement against a newer snapshot.
-    pub pins_unmoved: usize,
-    /// Offerings an operator has enabled that the newly imported catalogue no
-    /// longer publishes. The set worth waking someone for — and still not
-    /// something a refresh may act on.
-    pub withdrawn: BTreeSet<OfferingId>,
-}
-
-impl RefreshImpact {
-    /// Compare `enablements` against newly imported `content`, which was parsed
-    /// from the payload `raw_digest` identifies.
-    ///
-    /// `raw_digest` rather than the content id because an enablement pins the
-    /// snapshot *blob* it was read from ([`CatalogOffering`]).
-    ///
-    /// [`CatalogOffering`]: crate::desired_state::models::CatalogOffering
-    pub fn of<'a>(
-        enablements: impl IntoIterator<Item = &'a ModelEnablementBody>,
-        content: &CatalogContent,
-        raw_digest: crate::desired_state::Checksum,
-    ) -> Self {
-        let published: BTreeSet<OfferingId> = content
-            .models()
-            .iter()
-            .flat_map(|model| model.offerings.iter())
-            .filter_map(|offering| {
-                OfferingId::of(offering.provider.as_str(), offering.model.as_str()).ok()
-            })
-            .collect();
-        let mut impact = Self::default();
-        for enablement in enablements {
-            let offering = enablement.offering();
-            if !offering.is_pinned_to(raw_digest) {
-                impact.pins_unmoved += 1;
-            }
-            if !published.contains(&offering.offering) {
-                impact.withdrawn.insert(offering.offering);
-            }
-        }
-        impact
-    }
 }
 
 /// The scheduler: one source, one store, and the last-known-good catalogue they
@@ -636,6 +572,7 @@ impl<S: CatalogSource, T: CatalogStore> CatalogRefresher<S, T> {
         self.catalogue.report(now)
     }
 
+    #[cfg(test)]
     pub const fn store(&self) -> &T {
         &self.store
     }
@@ -758,10 +695,6 @@ mod tests {
             "refusing"
         }
 
-        fn capabilities(&self) -> Capabilities {
-            Capabilities::NONE
-        }
-
         async fn load(&self) -> Result<StoredCatalogState, CatalogStoreError> {
             Ok(StoredCatalogState::default())
         }
@@ -769,13 +702,6 @@ mod tests {
         async fn retained(
             &self,
             _content_id: CatalogContentId,
-        ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
-            Ok(None)
-        }
-
-        async fn retained_by_raw_digest(
-            &self,
-            _digest: crate::desired_state::Checksum,
         ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
             Ok(None)
         }
@@ -831,10 +757,6 @@ mod tests {
             "hanging"
         }
 
-        fn capabilities(&self) -> Capabilities {
-            Capabilities::NONE
-        }
-
         async fn load(&self) -> Result<StoredCatalogState, CatalogStoreError> {
             Ok(StoredCatalogState::default())
         }
@@ -842,13 +764,6 @@ mod tests {
         async fn retained(
             &self,
             _content_id: CatalogContentId,
-        ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
-            Ok(None)
-        }
-
-        async fn retained_by_raw_digest(
-            &self,
-            _digest: crate::desired_state::Checksum,
         ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
             Ok(None)
         }
@@ -1608,84 +1523,6 @@ mod tests {
                 max: far.max,
                 interval: base.interval,
             })
-        );
-    }
-
-    /// An upstream cannot enable, disable, or reprice anything: it can only make
-    /// a human's list of things to look at longer.
-    #[tokio::test]
-    async fn a_refresh_reports_what_it_would_mean_for_operators_and_changes_nothing() {
-        use crate::desired_state::Checksum;
-        use crate::desired_state::fixtures::{resource_id, tenant_id};
-        use crate::desired_state::models::{
-            CatalogOffering, ModelEnablementBody, ModelLifecycle, ModelOwner, WireFamily,
-        };
-
-        let (first, first_payload) = imported(CATALOGUE, SourceValidators::etag("\"one\""));
-        let enabled = first.content.models()[0].offerings[0].clone();
-        let pinned = Checksum::of(first_payload.as_bytes());
-        let offering = CatalogOffering::new(
-            OfferingId::of(enabled.provider.as_str(), enabled.model.as_str()).expect("an id"),
-            pinned,
-        );
-        let enablement = ModelEnablementBody::new(
-            resource_id(1),
-            ModelOwner::tenant(tenant_id(1)),
-            offering,
-            WireFamily::OpenaiChat,
-        );
-
-        // The same catalogue, one price different: a new snapshot, a new blob.
-        let repriced = repriced();
-        let (second, second_payload) = imported(&repriced, SourceValidators::etag("\"two\""));
-        let impact = RefreshImpact::of(
-            [&enablement],
-            &second.content,
-            Checksum::of(second_payload.as_bytes()),
-        );
-        assert_eq!(
-            impact,
-            RefreshImpact {
-                pins_unmoved: 1,
-                withdrawn: BTreeSet::new(),
-            },
-            "a refresh does not move a pin, and the offering is still published"
-        );
-        assert_eq!(
-            enablement.state(),
-            ModelLifecycle::Enabled,
-            "and it changed nothing about the operator's decision"
-        );
-        assert!(enablement.billable_price().is_none());
-        assert!(enablement.offering().is_pinned_to(pinned));
-    }
-
-    #[tokio::test]
-    async fn an_offering_the_upstream_withdrew_is_reported_and_not_acted_on() {
-        use crate::desired_state::Checksum;
-        use crate::desired_state::fixtures::{resource_id, tenant_id};
-        use crate::desired_state::models::{
-            CatalogOffering, ModelEnablementBody, ModelOwner, WireFamily,
-        };
-
-        let (snapshot, payload) = imported(CATALOGUE, SourceValidators::etag("\"one\""));
-        let gone = OfferingId::of("openai", "a-model-that-was-withdrawn").expect("an id");
-        let enablement = ModelEnablementBody::new(
-            resource_id(2),
-            ModelOwner::tenant(tenant_id(1)),
-            CatalogOffering::new(gone, Checksum::of(payload.as_bytes())),
-            WireFamily::OpenaiChat,
-        );
-
-        let impact = RefreshImpact::of(
-            [&enablement],
-            &snapshot.content,
-            Checksum::of(payload.as_bytes()),
-        );
-        assert_eq!(impact.pins_unmoved, 0, "this enablement pins this snapshot");
-        assert_eq!(
-            impact.withdrawn,
-            [gone].into_iter().collect::<BTreeSet<_>>()
         );
     }
 

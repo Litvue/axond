@@ -9,16 +9,6 @@ mode matrix. Recovery, rollout, and stateful-endurance harnesses that existed
 only to prove that matrix are gone. Remaining evidence is SQLite +
 `/ns/{ns}/v1`.
 
-> **Architecture transition:**
-> [ADR 0062](../adr/0062-blob-backed-flat-namespace-control-plane.md) is itself
-> superseded by ADR 0063. Do not dispatch historical PostgreSQL stateful-v1
-> overlay drills as production evidence for the namespaced gateway. Overlay
-> drills remain behind `run_legacy_postgres_qualification=true`.
->
-> The blob-backed stateful-v2 gates remain **pending**. A green `CI Success`
-> proves the active software-change checks passed; it does not promote skipped
-> overlay drills into request-path qualification.
-
 ## Retired harnesses
 
 These trees were deleted rather than paused. They taught the removed tier
@@ -30,15 +20,8 @@ matrix as product evidence:
 - the ADR 0018 “no datastore” promise (the gate still boots; it now uses a temp
   SQLite file)
 
-Kubernetes overlay drills (`stateful-deploy-drill`,
-`stateful-persistent-drill`) are not those harnesses. They stay behind:
-
-```bash
-gh workflow run ci.yml --ref <branch> \
-  -f run_legacy_postgres_qualification=true
-```
-
-Request-path qualification does not use that input.
+The stateful Kubernetes overlays and their deploy drills were deleted with
+them.
 
 ## Remaining slices
 

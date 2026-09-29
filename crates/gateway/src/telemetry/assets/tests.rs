@@ -11,7 +11,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use super::*;
 
@@ -34,12 +33,11 @@ const DASHBOARDS: &[&str] = &[
 ];
 const RULES: &str = "ops/observability/alerts/axond-alerts.yml";
 const RUNBOOK: &str = "docs/operations/observability-runbook.md";
-const COLLECTOR: &str = "ops/observability/otel-collector.yaml";
 
 fn anchors() -> BTreeSet<String> {
     let anchors = runbook_anchors(&read(RUNBOOK));
     assert!(
-        anchors.len() >= 12,
+        anchors.len() >= 9,
         "the runbook documents {} failure modes, which is fewer than the operational surface it covers",
         anchors.len()
     );
@@ -85,123 +83,6 @@ fn every_documented_failure_mode_has_an_alert_and_every_alert_has_a_runbook() {
     let (failures, covered) = validate_rules(RULES, &read(RULES), &anchors);
     assert_eq!(failures, Vec::new());
     assert_eq!(uncovered_failure_modes(&anchors, &covered), Vec::new());
-}
-
-/// One shipped rule detects a stalled refresher as the *absence* of a series,
-/// and absence is the exporter's decision: the Prometheus exporter keeps
-/// exporting the last sample it saw for `metric_expiration`, so a gap only ever
-/// appears if that is shorter than the rule's lookback. The coupling is
-/// otherwise prose in two files that nothing reads together, and raising either
-/// number alone disables the rule *silently* — the failure mode it watches for
-/// is itself silence.
-#[test]
-fn the_shipped_pipeline_lets_the_stall_rule_see_a_gap() {
-    /// Minutes in a duration written as Prometheus and the collector both write
-    /// it. Anything else is a failure rather than a skip: an unparsed duration
-    /// is exactly the drift this checks for.
-    fn minutes(duration: &str, source: &str) -> u64 {
-        duration
-            .strip_suffix('m')
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| panic!("{source} states a duration in whole minutes: `{duration}`"))
-    }
-
-    let rules = read(RULES);
-    let lookback = rules
-        .split_once("absent_over_time(axond_status_refreshes[")
-        .and_then(|(_, rest)| rest.split_once(']'))
-        .map(|(window, _)| window)
-        .expect("AxondStatusRefresherStalled watches for the absence of the refresh counter");
-
-    let collector = read(COLLECTOR);
-    let expiration = collector
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("metric_expiration:"))
-        .map(str::trim)
-        .expect("the shipped pipeline states the expiration the rule depends on");
-
-    assert!(
-        minutes(expiration, COLLECTOR) < minutes(lookback, RULES),
-        "the exporter holds a series for {expiration} while the stall rule looks back {lookback}, \
-         so the series never lapses and the rule can never fire"
-    );
-}
-
-/// The other end of the same coupling: a refresher paced slower than the
-/// exporter holds a series for leaves the same hole in `axond_status_refreshes`
-/// that a refresher which *stopped* leaves, so the cap the live pacing is
-/// derived under has to stay below both windows. The cadence comes from operator
-/// configuration ([`crate::status::probes::ControlPlaneProbe::pacing`]), so
-/// without this the two assets and the code that feeds them drift apart
-/// silently — and silence is what the rule reads.
-#[test]
-fn the_derived_cadence_cannot_outrun_the_pipeline_that_watches_it() {
-    fn minutes(duration: &str, source: &str) -> u64 {
-        duration
-            .strip_suffix('m')
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| panic!("{source} states a duration in whole minutes: `{duration}`"))
-    }
-
-    let collector = read(COLLECTOR);
-    let expiration = collector
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("metric_expiration:"))
-        .map(str::trim)
-        .expect("the shipped pipeline states the expiration the rule depends on");
-    let rules = read(RULES);
-    let lookback = rules
-        .split_once("absent_over_time(axond_status_refreshes[")
-        .and_then(|(_, rest)| rest.split_once(']'))
-        .map(|(window, _)| window)
-        .expect("AxondStatusRefresherStalled watches for the absence of the refresh counter");
-
-    let cap = crate::status::probes::MAX_REFRESH_INTERVAL;
-    for (window, source) in [(expiration, COLLECTOR), (lookback, RULES)] {
-        assert!(
-            cap < Duration::from_secs(minutes(window, source) * 60),
-            "a refresher may be paced every {cap:?} while {source} works in {window} windows, so a \
-             healthy replica's series lapses and the stall rule pages"
-        );
-    }
-    assert!(
-        crate::status::probes::MAX_PROBE_TIMEOUT
-            < Duration::from_secs(minutes(expiration, COLLECTOR) * 60),
-        "a queue-aware probe may wait {:?} while the exporter retains samples for {expiration}, \
-         so a deep queue would make a live refresher look stalled",
-        crate::status::probes::MAX_PROBE_TIMEOUT
-    );
-
-    // The same cap against the other status rule: a round is allowed to take up
-    // to the cap, and the age gauge carries what the round took, so a threshold
-    // at or below it calls a slow-but-configured deployment stale.
-    let stale_expression = rules
-        .lines()
-        .find(|line| {
-            line.contains(
-                "axond_status_observation_age{axond_status_component=\\\"control_plane\\\"} > ",
-            )
-        })
-        .expect("AxondStatusObservationsStale is scoped to the control plane");
-    let stale_threshold: u64 = stale_expression
-        .split_once("} > ")
-        .and_then(|(_, rest)| rest.split_once('"'))
-        .and_then(|(threshold, _)| threshold.trim().parse().ok())
-        .expect("AxondStatusObservationsStale compares the control-plane age against a millisecond threshold");
-    assert!(
-        cap < Duration::from_millis(stale_threshold),
-        "a control-plane round may take {cap:?} while AxondStatusObservationsStale calls {stale_threshold}ms \
-         stale, so a deployment paced at the cap pages while observing normally"
-    );
-    // And the replica agrees with the rule about the word: an operator paged for
-    // a stale observation reads `stale` on the status page rather than an `ok`
-    // the registry still believes in.
-    assert!(
-        crate::status::probes::MAX_STALENESS_BUDGET <= Duration::from_millis(stale_threshold),
-        "the control-plane registry keeps an observation usable for \
-         {:?} while the rule pages at {stale_threshold}ms",
-        crate::status::probes::MAX_STALENESS_BUDGET
-    );
 }
 
 /// Cardinality, from the asset side: the only drill-downs offered are the four
@@ -347,7 +228,7 @@ fn the_rule_file_has_the_shape_prometheus_expects() {
         .get("groups")
         .and_then(Yaml::as_sequence)
         .expect("groups");
-    assert!(groups.len() >= 5, "rules are grouped by concern");
+    assert!(groups.len() >= 4, "rules are grouped by concern");
     for group in groups {
         assert!(group.get("name").and_then(Yaml::as_str).is_some());
         assert!(
@@ -437,21 +318,20 @@ fn a_histogram_is_selected_through_its_families() {
 
 #[test]
 fn a_label_the_instrument_does_not_declare_is_refused() {
-    let failures =
-        dashboard_failures("max(axond_status_component_state{axond_namespace=\"acme\"})");
+    let failures = dashboard_failures("max(axond_store_pool_sessions{axond_namespace=\"acme\"})");
     assert!(matches!(
         failures.as_slice(),
         [AssetError::Catalog {
             source: catalog::CatalogError::UndeclaredLabel { metric, key },
             ..
-        }] if metric == "axond.status.component_state" && key == "axond_namespace"
+        }] if metric == "axond.store.pool.sessions" && key == "axond_namespace"
     ));
 }
 
 #[test]
 fn a_value_outside_a_closed_vocabulary_is_refused() {
     let failures =
-        dashboard_failures("max(axond_status_component_state{axond_status_component=\"kafka\"})");
+        dashboard_failures("max(axond_store_pool_sessions{axond_store_backend=\"kafka\"})");
     assert!(matches!(
         failures.as_slice(),
         [AssetError::Catalog {
@@ -460,9 +340,7 @@ fn a_value_outside_a_closed_vocabulary_is_refused() {
         }] if value == "kafka"
     ));
     assert_eq!(
-        dashboard_failures(
-            "max(axond_status_component_state{axond_status_component=\"budget_store\"})"
-        ),
+        dashboard_failures("max(axond_store_pool_sessions{axond_store_backend=\"postgres\"})"),
         Vec::new()
     );
 }
@@ -484,7 +362,7 @@ fn a_matcher_against_a_dashboard_variable_is_accepted() {
 #[test]
 fn grouping_by_a_label_the_instrument_does_not_declare_is_refused() {
     let failures =
-        dashboard_failures("sum by (axond_namespace) (rate(axond_status_refreshes[5m]))");
+        dashboard_failures("sum by (axond_namespace) (rate(axond_store_operations[5m]))");
     assert!(matches!(
         failures.as_slice(),
         [AssetError::Catalog {
@@ -493,7 +371,7 @@ fn grouping_by_a_label_the_instrument_does_not_declare_is_refused() {
         }] if key == "axond_namespace"
     ));
     assert_eq!(
-        dashboard_failures("sum by (axond_status_component) (rate(axond_status_refreshes[5m]))"),
+        dashboard_failures("sum by (axond_store_backend) (rate(axond_store_operations[5m]))"),
         Vec::new()
     );
 }
@@ -502,12 +380,12 @@ fn grouping_by_a_label_the_instrument_does_not_declare_is_refused() {
 fn a_resource_instance_identity_can_split_fleet_series() {
     assert_eq!(
         dashboard_failures(
-            "max by (service_instance_id) (axond_revision_lag{service_instance_id=~\"$replica\"})"
+            "max by (service_instance_id) (axond_settlement_oldest_pending_age{service_instance_id=~\"$replica\"})"
         ),
         Vec::new()
     );
     assert_eq!(
-        dashboard_failures("max by (service_instance_id) (axond_status_component_state)"),
+        dashboard_failures("max by (service_instance_id) (axond_store_pool_sessions)"),
         Vec::new()
     );
 }
@@ -518,7 +396,7 @@ fn a_resource_instance_identity_is_a_bounded_dashboard_dimension() {
         validate_drill_down(
             "test dashboard",
             "replica",
-            "label_values(axond_revision_lag, service_instance_id)"
+            "label_values(axond_settlement_oldest_pending_age, service_instance_id)"
         ),
         Vec::new()
     );
@@ -530,7 +408,7 @@ fn a_resource_instance_identity_is_a_bounded_dashboard_dimension() {
 #[test]
 fn a_compound_expression_is_judged_arm_by_arm() {
     let failures = dashboard_failures(
-        "sum by (axond_namespace) (rate(axond_request_count[5m])) / sum by (axond_namespace) (rate(axond_status_refreshes[5m]))",
+        "sum by (axond_namespace) (rate(axond_request_count[5m])) / sum by (axond_namespace) (rate(axond_store_operations[5m]))",
     );
     assert!(
         matches!(
@@ -538,7 +416,7 @@ fn a_compound_expression_is_judged_arm_by_arm() {
             [AssetError::Catalog {
                 source: catalog::CatalogError::UndeclaredLabel { metric, key },
                 ..
-            }] if metric == "axond.status.refreshes" && key == "axond_namespace"
+            }] if metric == "axond.store.operations" && key == "axond_namespace"
         ),
         "{failures:?}"
     );
@@ -546,7 +424,7 @@ fn a_compound_expression_is_judged_arm_by_arm() {
     // it: the ungrouped arm is not asked to carry a label it never groups by.
     assert_eq!(
         dashboard_failures(
-            "sum by (axond_namespace) (rate(axond_request_count[5m])) / sum(rate(axond_status_refreshes[5m]))"
+            "sum by (axond_namespace) (rate(axond_request_count[5m])) / sum(rate(axond_store_operations[5m]))"
         ),
         Vec::new()
     );
@@ -565,7 +443,7 @@ fn grouping_over_series_we_do_not_catalogue_is_not_drift() {
     ));
     assert_eq!(
         dashboard_failures(
-            "sum by (axond_status_component) (rate(axond_status_refreshes[5m])) or on() vector(0)"
+            "sum by (axond_store_backend) (rate(axond_store_operations[5m])) or on() vector(0)"
         ),
         Vec::new()
     );
@@ -603,12 +481,12 @@ fn an_unbounded_drill_down_is_refused() {
     let failures = validate_drill_down(
         "drift",
         "component",
-        "label_values(axond_status_component_state, axond_status_component)",
+        "label_values(axond_store_pool_sessions, axond_store_backend)",
     );
     assert!(matches!(
         failures.as_slice(),
         [AssetError::UnboundedDrillDown { label, class, .. }]
-            if label == "axond.status.component" && *class == "closed"
+            if label == "axond.store.backend" && *class == "closed"
     ));
 }
 
@@ -621,7 +499,7 @@ fn rules_with(body: &str) -> String {
 #[test]
 fn an_alert_without_a_runbook_link_is_refused() {
     let source = rules_with(
-        "        expr: \"max(axond_revision_lag) > 1000\"\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n",
+        "        expr: \"max(axond_settlement_oldest_pending_age) > 1000\"\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n",
     );
     let (failures, covered) = validate_rules("drift", &source, &BTreeSet::new());
     assert!(covered.is_empty());
@@ -636,7 +514,7 @@ fn an_alert_without_a_runbook_link_is_refused() {
 #[test]
 fn an_alert_pointing_at_a_missing_runbook_section_is_refused() {
     let source = rules_with(&format!(
-        "        expr: \"max(axond_revision_lag) > 1000\"\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n          runbook_url: \"{RUNBOOK_URL}#a-section-nobody-wrote\"\n"
+        "        expr: \"max(axond_settlement_oldest_pending_age) > 1000\"\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n          runbook_url: \"{RUNBOOK_URL}#a-section-nobody-wrote\"\n"
     ));
     let (failures, _) = validate_rules("drift", &source, &BTreeSet::new());
     assert!(matches!(
@@ -653,7 +531,7 @@ fn an_alert_pointing_at_a_missing_runbook_section_is_refused() {
 #[test]
 fn an_alert_that_adds_two_counters_without_defaulting_them_is_refused() {
     let source = rules_with(&format!(
-        "        expr: \"sum(rate(axond_budget_capacity_denials[5m])) + sum(rate(axond_rate_limit_capacity_denials[5m])) > 0\"\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n          runbook_url: \"{RUNBOOK_URL}#a-dependency-is-impaired\"\n"
+        "        expr: \"sum(rate(axond_shutdown_abandoned_requests[5m])) + sum(rate(axond_shutdown_abandoned_settlements[5m])) > 0\"\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n          runbook_url: \"{RUNBOOK_URL}#a-dependency-is-impaired\"\n"
     ));
     let anchors = BTreeSet::from(["a-dependency-is-impaired".to_owned()]);
     let (failures, _) = validate_rules("drift", &source, &anchors);
@@ -667,8 +545,8 @@ fn an_alert_that_adds_two_counters_without_defaulting_them_is_refused() {
     // Defaulted, the same rule is accepted — and a comparison against a scalar
     // is not an addition at all.
     for expr in [
-        "(sum(rate(axond_budget_capacity_denials[5m])) or vector(0)) + (sum(rate(axond_rate_limit_capacity_denials[5m])) or vector(0)) > 0",
-        "max(axond_revision_lag) > 1000",
+        "(sum(rate(axond_shutdown_abandoned_requests[5m])) or vector(0)) + (sum(rate(axond_shutdown_abandoned_settlements[5m])) or vector(0)) > 0",
+        "max(axond_settlement_oldest_pending_age) > 1000",
     ] {
         let source = rules_with(&format!(
             "        expr: \"{expr}\"\n        for: 5m\n        labels:\n          severity: warning\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n          runbook_url: \"{RUNBOOK_URL}#a-dependency-is-impaired\"\n"
@@ -681,7 +559,7 @@ fn an_alert_that_adds_two_counters_without_defaulting_them_is_refused() {
 #[test]
 fn an_alert_without_a_hold_window_or_severity_is_refused() {
     let source = rules_with(
-        "        expr: \"max(axond_revision_lag) > 1000\"\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n",
+        "        expr: \"max(axond_settlement_oldest_pending_age) > 1000\"\n        annotations:\n          summary: \"s\"\n          description: \"d\"\n",
     );
     let (failures, _) = validate_rules("drift", &source, &BTreeSet::new());
     let text: Vec<String> = failures.iter().map(ToString::to_string).collect();
@@ -770,8 +648,8 @@ fn a_metric_matched_against_another_vector_is_still_validated() {
     // Including across a `group_left()`, whose empty argument list sits between
     // the labels and the series they apply to and must not absorb them.
     for expr in [
-        "axond_status_refreshes / on(axond_namespace) axond_request_count",
-        "axond_status_refreshes / on(axond_namespace) group_left() axond_request_count",
+        "axond_store_operations / on(axond_namespace) axond_request_count",
+        "axond_store_operations / on(axond_namespace) group_left() axond_request_count",
     ] {
         let failures = dashboard_failures(expr);
         assert!(
@@ -780,7 +658,7 @@ fn a_metric_matched_against_another_vector_is_still_validated() {
                 [AssetError::Catalog {
                     source: catalog::CatalogError::UndeclaredLabel { metric, key },
                     ..
-                }] if metric == "axond.status.refreshes" && key == "axond_namespace"
+                }] if metric == "axond.store.operations" && key == "axond_namespace"
             ),
             "{expr}: {failures:?}"
         );
@@ -794,23 +672,23 @@ fn a_metric_matched_against_another_vector_is_still_validated() {
 #[test]
 fn an_excluded_label_does_not_have_to_be_one_the_instrument_declares() {
     for expr in [
-        "sum without (axond_namespace) (rate(axond_status_refreshes[5m]))",
+        "sum without (axond_namespace) (rate(axond_store_operations[5m]))",
         "sum without (le) (rate(axond_request_duration_bucket[5m]))",
-        "axond_status_refreshes / ignoring(axond_namespace) axond_status_refreshes",
+        "axond_store_operations / ignoring(axond_namespace) axond_store_operations",
     ] {
         assert_eq!(dashboard_failures(expr), Vec::new(), "{expr}");
     }
     // The kept-label modifiers are unaffected: the same label under `by` is still
     // drift, since the result would carry a dimension the instrument has not got.
     let failures =
-        dashboard_failures("sum by (axond_namespace) (rate(axond_status_refreshes[5m]))");
+        dashboard_failures("sum by (axond_namespace) (rate(axond_store_operations[5m]))");
     assert!(
         matches!(
             failures.as_slice(),
             [AssetError::Catalog {
                 source: catalog::CatalogError::UndeclaredLabel { metric, .. },
                 ..
-            }] if metric == "axond.status.refreshes"
+            }] if metric == "axond.store.operations"
         ),
         "{failures:?}"
     );

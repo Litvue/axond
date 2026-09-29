@@ -85,29 +85,8 @@ struct Instruments {
     settlement_in_flight: UpDownCounter<i64>,
     settlement_queue_wait: Histogram<f64>,
     /// Held so the collection callback stays registered for the process lifetime.
-    #[allow(dead_code)]
-    settlement_oldest_pending_age: ObservableGauge<u64>,
+    _settlement_oldest_pending_age: ObservableGauge<u64>,
     settlement_failures: Counter<u64>,
-    config_reloads: Counter<u64>,
-    config_generation: Gauge<u64>,
-    revision_attempts: Counter<u64>,
-    revision_rejections: Counter<u64>,
-    revision_lag: Gauge<u64>,
-    revision_converged: Gauge<u64>,
-    revision_desired_at: Gauge<u64>,
-    revision_active_at: Gauge<u64>,
-    revision_convergence: Histogram<f64>,
-    revision_failures: Gauge<u64>,
-    last_known_good: Counter<u64>,
-    #[allow(dead_code)]
-    budget_capacity_denials: Counter<u64>,
-    #[allow(dead_code)]
-    budget_namespace_denials: Counter<u64>,
-    #[allow(dead_code)]
-    budget_retained_subjects: Gauge<u64>,
-    middleware_capacity_wait: Histogram<f64>,
-    middleware_capacity_timeouts: Counter<u64>,
-    middleware_buffering_duration: Histogram<f64>,
     admission_queue_depth: Histogram<u64>,
     store_acquire_wait: Histogram<f64>,
     store_query_duration: Histogram<f64>,
@@ -120,22 +99,10 @@ struct Instruments {
     usage_index_queue_wait: Histogram<f64>,
     admission_in_flight: UpDownCounter<i64>,
     admission_rejections: Counter<u64>,
-    rate_limit_denials: Counter<u64>,
-    rate_limit_capacity_denials: Counter<u64>,
-    rate_limit_unavailable_denials: Counter<u64>,
-    policy_unenforceable_denials: Counter<u64>,
-    revocation_denials: Counter<u64>,
-    revocation_unavailable_denials: Counter<u64>,
-    status_component_state: Gauge<u64>,
-    status_observation_age: Gauge<u64>,
-    status_refreshes: Counter<u64>,
     // Recorded by whoever schedules catalogue refresh, which `serve` does not
     // construct yet — the same reason `crate::backends` is contract only.
-    #[allow(dead_code)]
     catalog_refusals: Counter<u64>,
-    #[allow(dead_code)]
     catalog_active_age: Gauge<u64>,
-    #[allow(dead_code)]
     catalog_consecutive_refusals: Gauge<u64>,
 }
 
@@ -360,7 +327,7 @@ impl Instruments {
                      charge saw before it reached the Store.",
                 )
                 .build(),
-            settlement_oldest_pending_age: meter
+            _settlement_oldest_pending_age: meter
                 .u64_observable_gauge("axond.settlement.oldest_pending_age")
                 .with_unit("ms")
                 .with_description(
@@ -375,115 +342,6 @@ impl Instruments {
                 .with_description(
                     "Settlements that did not complete, by reason. None is retried: each is a \
                      charge that may be unrecorded.",
-                )
-                .build(),
-            config_reloads: meter
-                .u64_counter("axond.config.reloads")
-                .with_description("Config reload attempts, by trigger and outcome.")
-                .build(),
-            config_generation: meter
-                .u64_gauge("axond.config.generation")
-                .with_description(
-                    "Config generation this replica is serving: 0 at boot, +1 per applied reload.",
-                )
-                .build(),
-            revision_attempts: meter
-                .u64_counter("axond.revision.attempts")
-                .with_description("Stateful convergence attempts, by trigger and outcome (#142).")
-                .build(),
-            revision_rejections: meter
-                .u64_counter("axond.revision.rejections")
-                .with_description(
-                    "Desired revisions not applied, by reason; the active revision keeps serving.",
-                )
-                .build(),
-            revision_lag: meter
-                .u64_gauge("axond.revision.lag")
-                .with_unit("ms")
-                .with_description(
-                    "How long this replica's active revision has differed from the desired one.",
-                )
-                .build(),
-            revision_converged: meter
-                .u64_gauge("axond.revision.converged")
-                .with_description(
-                    "1 when the active revision equals the desired revision, 0 otherwise.",
-                )
-                .build(),
-            // Revision ids are UUIDv7, so their embedded millisecond timestamp is
-            // the one numeric projection a gauge can carry. It identifies a
-            // revision across replicas (publication order is time order) without
-            // pretending an id is a counter.
-            revision_desired_at: meter
-                .u64_gauge("axond.revision.desired_at")
-                .with_unit("ms")
-                .with_description(
-                    "Publication timestamp embedded in the desired revision's identifier.",
-                )
-                .build(),
-            revision_active_at: meter
-                .u64_gauge("axond.revision.active_at")
-                .with_unit("ms")
-                .with_description(
-                    "Publication timestamp embedded in the active revision's identifier.",
-                )
-                .build(),
-            revision_convergence: meter
-                .f64_histogram("axond.revision.convergence_duration")
-                .with_unit("ms")
-                .with_description(
-                    "Time from observing a desired revision to publishing its snapshot.",
-                )
-                .build(),
-            revision_failures: meter
-                .u64_gauge("axond.revision.consecutive_failures")
-                .with_description(
-                    "Consecutive failed convergence attempts, which set the backoff delay.",
-                )
-                .build(),
-            last_known_good: meter
-                .u64_counter("axond.revision.last_known_good")
-                .with_description(
-                    "Signed last-known-good cache operations, by outcome (exported, \
-                     export_failed, restored).",
-                )
-                .build(),
-            budget_capacity_denials: meter
-                .u64_counter("axond.budget.capacity_denials")
-                .with_description(
-                    "In-memory budget admissions denied because the ledger bound was exhausted.",
-                )
-                .build(),
-            budget_namespace_denials: meter
-                .u64_counter("axond.budget.namespace_denials")
-                .with_description(
-                    "Budget admissions denied by the namespace-wide cap rather than the subject's.",
-                )
-                .build(),
-            budget_retained_subjects: meter
-                .u64_gauge("axond.budget.retained_subjects")
-                .with_description(
-                    "In-memory budget ledgers retained after capacity-pressure pruning.",
-                )
-                .build(),
-            middleware_capacity_wait: meter
-                .f64_histogram("axond.middleware.capacity_wait")
-                .with_unit("ms")
-                .with_description(
-                    "Time request-path middleware waited for bounded blocking capacity.",
-                )
-                .build(),
-            middleware_capacity_timeouts: meter
-                .u64_counter("axond.middleware.capacity_timeouts")
-                .with_description(
-                    "Middleware invocations whose end-to-end bound expired waiting for capacity.",
-                )
-                .build(),
-            middleware_buffering_duration: meter
-                .f64_histogram("axond.middleware.response_buffering_duration")
-                .with_unit("ms")
-                .with_description(
-                    "Time spent fully buffering a stream for response-mutating middleware.",
                 )
                 .build(),
             admission_queue_depth: meter
@@ -575,49 +433,6 @@ impl Instruments {
                 .u64_counter("axond.admission.rejections")
                 .with_description("Requests shed by admission control, by resource and error type.")
                 .build(),
-            rate_limit_denials: meter
-                .u64_counter("axond.rate_limit.denials")
-                .with_description("Inbound concurrency admissions denied.")
-                .build(),
-            rate_limit_capacity_denials: meter
-                .u64_counter("axond.rate_limit.capacity_denials")
-                .with_description("Inbound rate-limit admissions denied by subject-map capacity.")
-                .build(),
-            rate_limit_unavailable_denials: meter
-                .u64_counter("axond.rate_limit.unavailable_denials")
-                .with_description("Rate-limit admissions denied because the store was unavailable.")
-                .build(),
-            policy_unenforceable_denials: meter
-                .u64_counter("axond.policy.unenforceable_denials")
-                .with_description(
-                    "Admissions denied because no published policy governs the namespace, or \
-                     because the active policy disagrees with the store's key layout.",
-                )
-                .build(),
-            revocation_denials: meter
-                .u64_counter("axond.revocation.denials")
-                .with_description("Minted tokens denied because their JTI was revoked.")
-                .build(),
-            revocation_unavailable_denials: meter
-                .u64_counter("axond.revocation.unavailable_denials")
-                .with_description("Tokens denied because the revocation store was unavailable.")
-                .build(),
-            status_component_state: meter
-                .u64_gauge("axond.status.component_state")
-                .with_description(
-                    "Last observed dependency state, by component: 0 disabled, 1 ok, \
-                     2 degraded, 3 unavailable.",
-                )
-                .build(),
-            status_observation_age: meter
-                .u64_gauge("axond.status.observation_age")
-                .with_unit("ms")
-                .with_description("Age of the cached observation behind each component's state.")
-                .build(),
-            status_refreshes: meter
-                .u64_counter("axond.status.refreshes")
-                .with_description("Background status refresh attempts, by component and outcome.")
-                .build(),
             catalog_refusals: meter
                 .u64_counter("axond.catalog.refusals")
                 .with_description(
@@ -641,21 +456,6 @@ impl Instruments {
                 )
                 .build(),
         }
-    }
-}
-
-/// Observe contention for the global or per-id blocking-middleware capacity bound.
-/// No middleware or tenant identifier is attached: policy-defined identifiers
-/// would turn one saturation signal into an unbounded-cardinality surface.
-pub(crate) fn record_middleware_capacity_wait(duration_ms: f64, timed_out: bool) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments
-        .middleware_capacity_wait
-        .record(duration_ms, &[]);
-    if timed_out {
-        instruments.middleware_capacity_timeouts.add(1, &[]);
     }
 }
 
@@ -751,18 +551,6 @@ pub(crate) fn record_upstream_ttft(target_provider: &str, target_model: &str, du
             KeyValue::new("axond.target.model", target_model.to_owned()),
         ],
     );
-}
-
-/// Gateway-added latency from an operator's explicit response-buffering
-/// policy. No route or tenant label is needed to distinguish it from provider
-/// TTFT, and keeping it label-free bounds cardinality.
-pub(crate) fn record_middleware_buffering_duration(duration_ms: f64) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments
-        .middleware_buffering_duration
-        .record(duration_ms, &[]);
 }
 
 /// Usage records a sink durably accepted. Counted by the batching fan-out, so
@@ -1064,125 +852,6 @@ pub fn record_settlement_failure(reason: &'static str) {
         .add(1, &[KeyValue::new("axond.settlement.reason", reason)]);
 }
 
-/// Publish a reload attempt and the generation now serving. A rejected
-/// candidate still reports the generation, so the pair says both "a reload was
-/// tried" and "this is what is actually running" (ADR 0011).
-pub fn record_config_reload(trigger: &'static str, outcome: &'static str, generation: u64) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.config_reloads.add(
-        1,
-        &[
-            KeyValue::new("axond.reload.trigger", trigger),
-            KeyValue::new("axond.reload.outcome", outcome),
-        ],
-    );
-    instruments.config_generation.record(generation, &[]);
-}
-
-/// Record one convergence attempt and everything the replica now reports about
-/// its revisions.
-///
-/// Emitted from one place so `lag`, `converged`, and the revision gauges cannot
-/// disagree with the attempt that produced them — the failure mode of recording
-/// them separately is a dashboard that shows a converged replica with rising lag.
-pub fn record_revision_attempt(
-    trigger: &'static str,
-    outcome: &'static str,
-    report: &crate::convergence::RevisionReport,
-) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.revision_attempts.add(
-        1,
-        &[
-            KeyValue::new("axond.revision.trigger", trigger),
-            KeyValue::new("axond.revision.outcome", outcome),
-        ],
-    );
-    instruments.revision_lag.record(
-        u64::try_from(report.lag.as_millis()).unwrap_or(u64::MAX),
-        &[],
-    );
-    instruments
-        .revision_converged
-        .record(u64::from(report.converged()), &[]);
-    instruments
-        .revision_failures
-        .record(u64::from(report.consecutive_failures), &[]);
-    if let Some(desired) = report.desired {
-        instruments
-            .revision_desired_at
-            .record(desired.uuid().timestamp_millis(), &[]);
-    }
-    if let Some(active) = report.active {
-        instruments
-            .revision_active_at
-            .record(active.uuid().timestamp_millis(), &[]);
-    }
-    if let Some(took) = report.last_convergence.filter(|_| outcome == "published") {
-        instruments
-            .revision_convergence
-            .record(took.as_secs_f64() * 1_000.0, &[]);
-    }
-    instruments.config_generation.record(report.generation, &[]);
-}
-
-/// Count a desired revision that was not applied, by the stage that refused it.
-pub fn record_revision_rejection(reason: &'static str) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments
-        .revision_rejections
-        .add(1, &[KeyValue::new("axond.revision.reason", reason)]);
-}
-
-/// Count a last-known-good cache operation. `export_failed` is a warning rather
-/// than an outage; `restored` means a replica booted from cached state and may be
-/// serving something older than desired.
-pub fn record_last_known_good(outcome: &'static str) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments
-        .last_known_good
-        .add(1, &[KeyValue::new("axond.revision.outcome", outcome)]);
-}
-
-/// Record an in-memory budget admission denied by the subject bound.
-#[allow(dead_code)]
-pub fn record_budget_capacity_denial() {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.budget_capacity_denials.add(1, &[]);
-}
-
-/// Record an admission denied by the namespace-wide spend cap rather than by
-/// the subject's own. Both answer `429`, so this is how an operator tells a
-/// tenant-wide exhaustion from one noisy key.
-#[allow(dead_code)]
-pub fn record_budget_namespace_denial() {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.budget_namespace_denials.add(1, &[]);
-}
-
-/// Record the retained in-memory ledger count after capacity-pressure pruning.
-#[allow(dead_code)]
-pub fn record_budget_retained_subjects(subjects: usize) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments
-        .budget_retained_subjects
-        .record(subjects as u64, &[]);
-}
-
 /// Admission capacity taken. `resource` is the closed vocabulary in
 /// [`crate::admission`], so saturation is observable without a tenant, subject,
 /// or request dimension — the gauge's cardinality is fixed at build time.
@@ -1360,99 +1029,6 @@ pub fn record_admission_rejection(resource: &'static str, code: &'static str) {
     );
 }
 
-pub fn record_rate_limit_denial() {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.rate_limit_denials.add(1, &[]);
-}
-
-pub fn record_rate_limit_capacity_denial() {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.rate_limit_capacity_denials.add(1, &[]);
-}
-
-pub fn record_rate_limit_unavailable_denial() {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.rate_limit_unavailable_denials.add(1, &[]);
-}
-
-/// Record an admission denied because this replica has no enforceable policy
-/// for the namespace — either nothing governs it, or the active document
-/// disagrees with the layout the store booted on.
-///
-/// The store is healthy in both cases, so these are counted apart from the
-/// unavailable-denial counters. The explanatory log is sampled
-/// (`crate::policy::ungoverned`); this is not.
-pub fn record_policy_unenforceable_denial(condition: &'static str, store: &'static str) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.policy_unenforceable_denials.add(
-        1,
-        &[
-            KeyValue::new("axond.policy.condition", condition),
-            KeyValue::new("axond.policy.store", store),
-        ],
-    );
-}
-
-pub fn record_revocation_denial() {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.revocation_denials.add(1, &[]);
-}
-
-pub fn record_revocation_unavailable_denial() {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.revocation_unavailable_denials.add(1, &[]);
-}
-
-/// Publish one component's cached status observation.
-///
-/// Component-scoped and nothing else: the status registry observes
-/// deployment-wide dependencies, so a namespace or subject dimension here would
-/// be both unbounded and a leak of the tenancy the redacted status response is
-/// careful not to carry.
-pub fn record_status_component(
-    component: &'static str,
-    state: crate::status::ComponentState,
-    age: std::time::Duration,
-) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    let attributes = [KeyValue::new("axond.status.component", component)];
-    instruments
-        .status_component_state
-        .record(state.gauge_value(), &attributes);
-    instruments.status_observation_age.record(
-        u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
-        &attributes,
-    );
-}
-
-/// Count one background refresh attempt.
-pub fn record_status_refresh(component: &'static str, outcome: &'static str) {
-    let Some(instruments) = INSTRUMENTS.get() else {
-        return;
-    };
-    instruments.status_refreshes.add(
-        1,
-        &[
-            KeyValue::new("axond.status.component", component),
-            KeyValue::new("axond.status.outcome", outcome),
-        ],
-    );
-}
-
 /// Count one refused catalogue import, by its bounded reason.
 ///
 /// The reason and nothing else: the pointer, source URL, and error text the
@@ -1464,7 +1040,6 @@ pub fn record_status_refresh(component: &'static str, outcome: &'static str) {
 /// [`Refreshed::Refused`](crate::backends::catalog::Refreshed::Refused), so a
 /// caller counting only its error branch would let the run climb without naming a
 /// reason.
-#[allow(dead_code)]
 pub fn record_catalog_refusal(reason: crate::backends::catalog::RefusalReason) {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;
@@ -1480,7 +1055,6 @@ pub fn record_catalog_refusal(reason: crate::backends::catalog::RefusalReason) {
 /// the gauges, the alert, and the status response cannot disagree. A deployment
 /// that has never imported reports no age rather than a zero one: an age of zero
 /// reads as "just refreshed", which is the opposite of the truth.
-#[allow(dead_code)]
 pub fn record_catalog_state(report: &crate::backends::catalog::CatalogReport) {
     let Some(instruments) = INSTRUMENTS.get() else {
         return;

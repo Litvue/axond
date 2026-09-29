@@ -15,7 +15,6 @@ use super::{
     UsageSummaryRow, admit_from_ledger, from_sql_amount, monthly_period_key, sql_amount,
     sql_amount_saturating, validate_timezone,
 };
-use crate::backends::health::{BackendHealth, PostgresHealth};
 use crate::telemetry::metrics;
 
 const BUDGET_DDL: &str = include_str!("../../sql/store_budget_v1.sql");
@@ -24,6 +23,7 @@ const USAGE_DDL: &str = include_str!("../../sql/store_usage_v1.sql");
 const MODELS_DDL: &str = include_str!("../../sql/store_provider_models_v1.sql");
 const CADENCE_DDL: &str = include_str!("../../sql/store_budget_cadence_v1.sql");
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
 /// Hard cap on live plus idle sessions. Fleet budget is this times replica count.
 const POOL_SIZE: usize = 32;
@@ -38,7 +38,6 @@ const _: () = assert!(IDLE_CAP <= POOL_SIZE);
 const POOL_WAIT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const POOL_WAIT: Duration = Duration::from_millis(50);
-const PROBE_BOUND: Duration = Duration::from_secs(CONNECT_TIMEOUT.as_secs() + 5);
 
 pub struct PostgresStore {
     config: tokio_postgres::Config,
@@ -48,7 +47,6 @@ pub struct PostgresStore {
     /// Caps live + idle sessions. Waiters queue here instead of opening more.
     slots: Arc<Semaphore>,
     stats: Arc<PoolStats>,
-    health: Arc<PostgresHealth>,
     clock: Arc<dyn BudgetClock>,
 }
 
@@ -73,7 +71,6 @@ impl PostgresStore {
         config.connect_timeout(CONNECT_TIMEOUT);
         config.application_name(crate::telemetry::SERVICE_NAME);
         let store = Self {
-            health: Arc::new(PostgresHealth::new("store", config.clone(), PROBE_BOUND)),
             config,
             idle: Mutex::new(Vec::new()),
             slots: Arc::new(Semaphore::new(POOL_SIZE)),
@@ -119,7 +116,6 @@ impl PostgresStore {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn with_clock(mut self, clock: Arc<dyn BudgetClock>) -> Self {
         self.clock = clock;
         self
@@ -774,6 +770,7 @@ async fn has_column(
         .is_some())
 }
 
+#[cfg(test)]
 /// Insert-only seed of addressable namespace ids.
 ///
 /// Publish is rare (reload / convergence). This path is `ON CONFLICT DO NOTHING`,
@@ -796,6 +793,7 @@ fn seed_on_dedicated_runtime(
     })
 }
 
+#[cfg(test)]
 async fn seed_namespaces(config: tokio_postgres::Config, ids: &[&str]) -> Result<(), StoreError> {
     let (client, connection) = config
         .connect(crate::usage::tls_connector())
@@ -980,10 +978,6 @@ async fn read_budget_policy(
 
 #[async_trait]
 impl Store for PostgresStore {
-    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
-        Some(Arc::clone(&self.health) as Arc<dyn BackendHealth>)
-    }
-
     async fn put_namespace(&self, ns: NamespaceRecord) -> Result<(), StoreError> {
         self.with_client(StoreOp::NamespaceWrite, async move |client| {
             let blocklist = ns
@@ -1136,6 +1130,7 @@ impl Store for PostgresStore {
         .await
     }
 
+    #[cfg(test)]
     fn seed_namespaces_blocking(
         &self,
         namespaces: &[crate::config::Namespace],
@@ -1344,6 +1339,7 @@ impl Store for PostgresStore {
         .await
     }
 
+    #[cfg(test)]
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError> {
         let cost = event.cost_microdollars.map(sql_amount_saturating);
         self.with_client(StoreOp::UsageAppend, async move |client| {
@@ -1869,7 +1865,6 @@ impl PostgresStore {
 
     fn test_store(config: tokio_postgres::Config, slots: Arc<Semaphore>) -> Self {
         Self {
-            health: Arc::new(PostgresHealth::new("store", config.clone(), PROBE_BOUND)),
             config,
             idle: Mutex::new(Vec::new()),
             slots,

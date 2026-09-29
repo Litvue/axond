@@ -39,7 +39,6 @@ use crate::backends::catalog::{
     CatalogContentId, ETag, HttpDate, RawPayload, RefusalReason, SchemaVersion, SourceSnapshot,
     SourceValidators,
 };
-use crate::backends::{Capabilities, Capability};
 use crate::desired_state::{BlobKind, BlobRef, Checksum};
 
 const BACKEND: &str = "postgres";
@@ -273,15 +272,6 @@ impl CatalogStore for PostgresCatalogStore {
         BACKEND
     }
 
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::new(&[
-            // Activation is one transaction, and retention conflicts on the
-            // content identity rather than writing a second copy.
-            Capability::TransactionalWrites,
-            Capability::IdempotentWrites,
-        ])
-    }
-
     async fn load(&self) -> Result<StoredCatalogState, CatalogStoreError> {
         self.run(|client| {
             Box::pin(async move {
@@ -352,6 +342,7 @@ impl CatalogStore for PostgresCatalogStore {
         .await
     }
 
+    #[cfg(test)]
     async fn retained(
         &self,
         content_id: CatalogContentId,
@@ -374,31 +365,7 @@ impl CatalogStore for PostgresCatalogStore {
         .await
     }
 
-    async fn retained_by_raw_digest(
-        &self,
-        digest: crate::desired_state::Checksum,
-    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
-        let digest = digest.to_string();
-        self.run(move |client| {
-            Box::pin(async move {
-                let row = client
-                    .query_opt(
-                        &format!(
-                            "SELECT {SNAPSHOT_COLUMNS} FROM axond_catalog_snapshot \
-                             WHERE raw_digest = $1"
-                        ),
-                        &[&digest],
-                    )
-                    .await
-                    .map_err(|error| {
-                        statement_failure("read a catalogue by payload digest", &error)
-                    })?;
-                row.as_ref().map(decode_snapshot).transpose()
-            })
-        })
-        .await
-    }
-
+    #[cfg(test)]
     async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
         let content_id = import.content_id().checksum().to_string();
         let raw_digest = import.source.raw.digest.to_string();
@@ -817,7 +784,7 @@ mod tests {
         let dsn = postgres_dsn()?;
         let schema = format!(
             "axond_catalog_test_{}",
-            crate::desired_state::Uuid7Generator::new()
+            crate::desired_state::ids::Uuid7Generator::new()
                 .next()
                 .to_string()
                 .replace('-', "")

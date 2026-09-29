@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 
-use crate::backends::health::BackendHealth;
 use crate::config::{StorageBackend, StorageConfig};
 use crate::namespace::NamespaceId;
 
@@ -65,6 +64,7 @@ pub enum StoreOp {
 
 impl StoreOp {
     /// Every kind, for the catalogue that enumerates the label's vocabulary.
+    #[cfg(test)]
     pub const ALL: [Self; 10] = [
         Self::NamespaceResolve,
         Self::NamespaceRead,
@@ -94,6 +94,7 @@ impl StoreOp {
     }
 }
 
+#[cfg(test)]
 const fn store_operation_names() -> [&'static str; StoreOp::ALL.len()] {
     let mut names = [""; StoreOp::ALL.len()];
     let mut index = 0;
@@ -104,20 +105,24 @@ const fn store_operation_names() -> [&'static str; StoreOp::ALL.len()] {
     names
 }
 
+#[cfg(test)]
 const STORE_OPERATION_NAMES: [&str; StoreOp::ALL.len()] = store_operation_names();
 
 /// The `axond.store.operation` label values, derived from [`StoreOp::ALL`] so
 /// the catalogue and the recorder cannot drift.
+#[cfg(test)]
 pub const STORE_OPERATIONS: &[&str] = &STORE_OPERATION_NAMES;
 
 /// The `axond.store.backend` label values.
 pub const STORE_BACKEND_SQLITE: &str = "sqlite";
 pub const STORE_BACKEND_POSTGRES: &str = "postgres";
+#[cfg(test)]
 pub const STORE_BACKENDS: &[&str] = &[STORE_BACKEND_SQLITE, STORE_BACKEND_POSTGRES];
 
 /// Occupancy of the Postgres session pool. SQLite does not record this gauge.
 pub const STORE_POOL_STATE_LIVE: &str = "live";
 pub const STORE_POOL_STATE_IDLE: &str = "idle";
+#[cfg(test)]
 pub const STORE_POOL_STATES: &[&str] = &[STORE_POOL_STATE_LIVE, STORE_POOL_STATE_IDLE];
 
 /// The `axond.store.outcome` label values: the call ran and returned `Ok`, ran
@@ -127,6 +132,7 @@ pub const STORE_POOL_STATES: &[&str] = &[STORE_POOL_STATE_LIVE, STORE_POOL_STATE
 pub const STORE_OUTCOME_OK: &str = "ok";
 pub const STORE_OUTCOME_ERROR: &str = "error";
 pub const STORE_OUTCOME_SATURATED: &str = "saturated";
+#[cfg(test)]
 pub const STORE_OUTCOMES: &[&str] = &[
     STORE_OUTCOME_OK,
     STORE_OUTCOME_ERROR,
@@ -432,6 +438,7 @@ pub trait Store: Send + Sync {
     /// from the previous occupant is a no-op. Missing id is `Ok(false)`.
     async fn delete_namespace(&self, id: &str) -> Result<bool, StoreError>;
     /// Seed addressable namespace ids without `spawn_blocking`.
+    #[cfg(test)]
     fn seed_namespaces_blocking(
         &self,
         namespaces: &[crate::config::Namespace],
@@ -479,16 +486,11 @@ pub trait Store: Send + Sync {
         actual_microdollars: u64,
     ) -> Result<(), StoreError>;
 
-    /// Reachability for the status refresher. SQLite has none; Postgres does.
-    fn health(&self) -> Option<Arc<dyn BackendHealth>> {
-        None
-    }
-
     /// Index one usage event for the management summary. Duplicate
     /// `request_id` is ignored (at-least-once). The usage-index worker writes
     /// through [`Self::append_usage_batch`]; this remains the single-row
     /// contract and the test surface.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError>;
 
     /// Index a batch of usage events in one write. Implementations **must** be
@@ -511,7 +513,7 @@ pub trait Store: Send + Sync {
     /// Insert one usage-index row on the caller's thread. SQLite only; must
     /// not schedule `spawn_blocking`. The usage-index worker writes through
     /// [`Self::append_usage_batch_sync`].
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn append_usage_sync(&self, event: UsageAppend) -> Result<(), StoreError> {
         let _ = event;
         Err(StoreError::Unavailable(
@@ -1904,17 +1906,6 @@ mod tests {
             0,
             "admit does not write reservation rows"
         );
-    }
-
-    #[tokio::test]
-    async fn postgres_store_exposes_health_sqlite_does_not() {
-        let sqlite = SqliteStore::open(":memory:").expect("sqlite");
-        assert!(sqlite.health().is_none());
-        let Some(dsn) = crate::test_services::postgres_dsn() else {
-            return;
-        };
-        let store = PostgresStore::connect(&dsn, true).await.expect("connect");
-        assert!(store.health().is_some());
     }
 
     /// Isolated schema on the shared test Postgres, with `search_path` set on

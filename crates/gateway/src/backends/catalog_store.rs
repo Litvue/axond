@@ -66,7 +66,8 @@ use super::catalog::{
     SourceValidators,
 };
 use super::models_dev::{ModelsDevAdapter, ModelsDevError};
-use super::{BackendFailure, Capabilities, FailureCategory};
+#[cfg(test)]
+use super::{BackendFailure, FailureCategory};
 use crate::backends::catalog::CatalogSnapshot;
 use crate::desired_state::BlobError;
 
@@ -163,6 +164,7 @@ impl CatalogStoreError {
     }
 }
 
+#[cfg(test)]
 impl BackendFailure for CatalogStoreError {
     fn category(&self) -> FailureCategory {
         match self {
@@ -190,8 +192,6 @@ impl Refusable for CatalogStoreError {
 pub trait CatalogStore: Send + Sync {
     fn name(&self) -> &'static str;
 
-    fn capabilities(&self) -> Capabilities;
-
     /// What this deployment has imported, as of now.
     ///
     /// The active record carries the validators and check time from the active
@@ -205,20 +205,10 @@ pub trait CatalogStore: Send + Sync {
     /// Nothing in this slice deletes, so this answers for every catalogue the
     /// deployment ever admitted. A retention policy is a later decision, and it
     /// is one that has to consider the pins.
+    #[cfg(test)]
     async fn retained(
         &self,
         content_id: CatalogContentId,
-    ) -> Result<Option<RetainedCatalog>, CatalogStoreError>;
-
-    /// A retained snapshot by the raw payload digest an enablement pins.
-    ///
-    /// Desired state carries the digest of the exact document an operator
-    /// approved, while the active catalogue is keyed by normalized content.
-    /// Keeping this lookup here preserves both identities instead of asking
-    /// convergence to guess one from the other.
-    async fn retained_by_raw_digest(
-        &self,
-        digest: crate::desired_state::Checksum,
     ) -> Result<Option<RetainedCatalog>, CatalogStoreError>;
 
     /// Checksum-addressed put that does **not** move the active pointer.
@@ -226,6 +216,7 @@ pub trait CatalogStore: Send + Sync {
     /// Local (operator-authored) snapshots use only this method. [`Self::activate`]
     /// remains the scheduled import path: a vLLM one-offering payload must never
     /// become `load().active`.
+    #[cfg(test)]
     async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError>;
 
     /// Retain `import` if it is new, and make it the active catalogue as of
@@ -272,14 +263,11 @@ impl<T: CatalogStore + ?Sized> CatalogStore for &T {
         (**self).name()
     }
 
-    fn capabilities(&self) -> Capabilities {
-        (**self).capabilities()
-    }
-
     async fn load(&self) -> Result<StoredCatalogState, CatalogStoreError> {
         (**self).load().await
     }
 
+    #[cfg(test)]
     async fn retained(
         &self,
         content_id: CatalogContentId,
@@ -287,13 +275,7 @@ impl<T: CatalogStore + ?Sized> CatalogStore for &T {
         (**self).retained(content_id).await
     }
 
-    async fn retained_by_raw_digest(
-        &self,
-        digest: crate::desired_state::Checksum,
-    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
-        (**self).retained_by_raw_digest(digest).await
-    }
-
+    #[cfg(test)]
     async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
         (**self).retain(import).await
     }
@@ -330,14 +312,11 @@ impl<T: CatalogStore + ?Sized> CatalogStore for std::sync::Arc<T> {
         (**self).name()
     }
 
-    fn capabilities(&self) -> Capabilities {
-        (**self).capabilities()
-    }
-
     async fn load(&self) -> Result<StoredCatalogState, CatalogStoreError> {
         (**self).load().await
     }
 
+    #[cfg(test)]
     async fn retained(
         &self,
         content_id: CatalogContentId,
@@ -345,13 +324,7 @@ impl<T: CatalogStore + ?Sized> CatalogStore for std::sync::Arc<T> {
         (**self).retained(content_id).await
     }
 
-    async fn retained_by_raw_digest(
-        &self,
-        digest: crate::desired_state::Checksum,
-    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
-        (**self).retained_by_raw_digest(digest).await
-    }
-
+    #[cfg(test)]
     async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
         (**self).retain(import).await
     }
@@ -505,6 +478,7 @@ impl InMemoryCatalogStore {
 
     /// How many distinct catalogues have been retained. The evidence that a
     /// re-import of unchanged content stored nothing.
+    #[cfg(test)]
     pub fn retained_count(&self) -> usize {
         self.state
             .lock()
@@ -522,10 +496,6 @@ impl InMemoryCatalogStore {
 impl CatalogStore for InMemoryCatalogStore {
     fn name(&self) -> &'static str {
         IN_MEMORY
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::NONE
     }
 
     async fn load(&self) -> Result<StoredCatalogState, CatalogStoreError> {
@@ -553,6 +523,7 @@ impl CatalogStore for InMemoryCatalogStore {
         })
     }
 
+    #[cfg(test)]
     async fn retained(
         &self,
         content_id: CatalogContentId,
@@ -560,18 +531,7 @@ impl CatalogStore for InMemoryCatalogStore {
         Ok(self.locked().retained.get(&content_id).cloned())
     }
 
-    async fn retained_by_raw_digest(
-        &self,
-        digest: crate::desired_state::Checksum,
-    ) -> Result<Option<RetainedCatalog>, CatalogStoreError> {
-        Ok(self
-            .locked()
-            .retained
-            .values()
-            .find(|retained| retained.source.raw.digest == digest)
-            .cloned())
-    }
-
+    #[cfg(test)]
     async fn retain(&self, import: &RetainedCatalog) -> Result<Retention, CatalogStoreError> {
         let mut state = self.locked();
         match state.retained.entry(import.content_id()) {

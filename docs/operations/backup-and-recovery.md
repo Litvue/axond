@@ -9,52 +9,34 @@ that used to execute them in CI was retired with the tier matrix
 
 | State | Where it lives | Loss costs |
 | --- | --- | --- |
-| Control-plane revisions, resource versions, blobs, mutations, audit events, idempotency records, head | PostgreSQL (`axond_cp_*`) | Configuration history and the audit trail. Not recoverable from anywhere else. |
-| Schema version and migration ledger | PostgreSQL (`axond_cp_schema_migration`) | The record of what was applied; without it a database is [`Unrecorded`](./control-plane-journal.md#schema-status-and-what-each-state-means) and a replica refuses it. |
-| Usage rows | PostgreSQL (`axond_usage`) | Billing and analytics history. |
-| Management usage index | PostgreSQL or SQLite (`axond_store_usage`) | Current-period `GET /api/v1/namespaces/{ns}/usage` summaries, not the billing warehouse. Operators prune rows older than 90 days (or whose `period` is no longer billed); the gateway does not auto-prune. |
-| Namespace and subject spend, reservations | PostgreSQL (`axond_budget*`) when a Postgres budget backend is configured | Accumulated spend against caps. |
-| Namespace period spend, reservations | PostgreSQL (`axond_store_budget*`) when `[storage] backend = "postgres"` | Accumulated spend against namespace period caps. Leftover `axond_budget*` from the withdrawn budget backend is not this ledger and is not migrated. |
-| Revocation entries | PostgreSQL (`axond_revocation`) | Denylisted token identifiers, which is a security regression, not just a data one. |
-| Rate-limit windows, budget reservations, revocation cache | Redis | Accuracy and availability of enforcement in flight — **not history**. |
-
-Redis is hot state and is deliberately outside the recovery objectives below. It
-is a cache and a coordination surface, not a source of record: losing it makes
-enforcement briefly less accurate (in-flight reservations vanish, windows reset)
-and, under `on_unavailable = "deny"`, makes it a fail-closed outage — but nothing
-that was true yesterday is lost with it. Restoring an RDB or AOF file is
-therefore optional; if you do, restore the layout markers with it rather than the
-counters alone, because a marker-less database reads as a different layout to the
-next boot. See [Stateful backends](../deployment/stateful-backends.md#redis).
+| Namespaces and their incarnations | Store: SQLite file or PostgreSQL | Every tenant. Inference to `/ns/{ns}/v1` refuses an unknown namespace. |
+| Namespace period spend, reservations, cadence budgets | Store (`axond_store_budget*`) | Accumulated spend against namespace caps. Leftover `axond_budget*` tables from the withdrawn budget backend are not this ledger and are not migrated. |
+| Management usage index | Store (`axond_store_usage`) | Current-period `GET /api/v1/namespaces/{ns}/usage` summaries, not the billing warehouse. Operators prune rows older than 90 days (or whose `period` is no longer billed); the gateway does not auto-prune. |
+| Usage rows | PostgreSQL (`axond_usage`) when a Postgres usage sink is configured | Billing and analytics history. |
+| Usage outbox | PostgreSQL, when `[usage_journal]` is configured | Undelivered billing events. See [usage outbox](./usage-outbox.md). |
 
 The HTTP process holds nothing durable besides its Store connection. Replicas
-are interchangeable. SQLite is a single-replica file: back up that file.
-Postgres HA is what this page's PITR drill is for. `mode = "stateless"` is a
-boot error; there is no config-only deployment.
+are interchangeable. SQLite is a single-replica file: back up that file, with
+the process stopped or with `sqlite3 .backup`, so the WAL is included.
 
 ## Objectives
 
-These are the objectives the drill demonstrates and the numbers a deployment is
-expected to meet or explicitly revise. They are per PostgreSQL cluster.
+These are the numbers a Postgres deployment is expected to meet or explicitly
+revise. They are per PostgreSQL cluster.
 
 | Objective | Target | What it takes to hold |
 | --- | --- | --- |
-| **RPO** — data a disaster may lose | **≤ 5 minutes** | Continuous WAL archiving with `archive_timeout = 300` (or streaming to a standby), plus a base backup no older than a week. Without WAL archiving the RPO is the age of the last dump, which is typically 24 hours. |
-| **RTO** — time to serving again | **≤ 30 minutes** for the control plane | A base backup restorable in place, WAL reachable from the restoring host, and the recovery target chosen before the restore starts rather than during it. |
-| **Audit and usage durability** | No committed revision, audit event, or usage row is lost inside the RPO window | The journal writes the manifest, resource versions, mutation, audit event, idempotency record, and head in one transaction, so a recovery never lands on a half-published revision. |
+| **RPO**: data a disaster may lose | **≤ 5 minutes** | Continuous WAL archiving with `archive_timeout = 300` (or streaming to a standby), plus a base backup no older than a week. Without WAL archiving the RPO is the age of the last dump, which is typically 24 hours. |
+| **RTO**: time to serving again | **≤ 30 minutes** | A base backup restorable in place, WAL reachable from the restoring host, and the recovery target chosen before the restore starts rather than during it. |
 
-Inference keeps serving during a control-plane outage on the snapshot each replica
-already holds, so the RTO above bounds *administrative* recovery, not availability
-of the request path. The exception is a cold boot: a replica that has not yet
-loaded a revision needs the control plane, so the RTO is a serving objective for
-any replica that restarts during the incident. See
-[during a Postgres outage](./control-plane-journal.md#during-a-postgres-outage).
+Every inference request reads its namespace from the Store, so the RTO bounds
+serving, not only administration.
 
 ## Backups
 
 Two mechanisms, because they answer different questions. Take both.
 
-### Continuous archiving — the RPO mechanism
+### Continuous archiving: the RPO mechanism
 
 ```ini
 # postgresql.conf
@@ -70,21 +52,21 @@ pg_basebackup -h "$PGHOST" -U "$PGUSER" -D /backups/base-$(date -u +%FT%TZ) -Fp 
 
 The archive is what makes a recovery target selectable. Alert on
 `pg_stat_archiver.last_failed_wal`: a failing archiver is a silent RPO
-regression — the database keeps accepting writes, and the WAL needed to replay
+regression. The database keeps accepting writes, and the WAL needed to replay
 them never leaves the host.
 
-### Logical dumps — the migration and corruption mechanism
+### Logical dumps: the migration and corruption mechanism
 
 ```bash
-pg_dump "$GW_CONTROL_PLANE_DSN" -Fc -f /backups/control-plane-$(date -u +%F).dump
+pg_dump "$AXOND_STORE_DSN" -Fc -f /backups/store-$(date -u +%F).dump
 ```
 
 A dump is portable across major versions and across clusters, and it is the only
 backup that survives a corrupt cluster the WAL would faithfully reproduce. It is
 a point in time nobody chose, though, so it bounds the RPO at its own age.
 
-Back up every database axond writes to, not only the control plane: usage,
-budget, and revocation may live in databases of their own.
+Back up every database axond writes to, not only the Store: usage sinks and the
+outbox may live in databases of their own.
 
 ## Restoring
 
@@ -92,16 +74,12 @@ budget, and revocation may live in databases of their own.
 
 ```bash
 createdb axond_restored
-pg_restore -d axond_restored --no-owner /backups/control-plane-2026-08-13.dump
-GW_CONTROL_PLANE_DSN='postgres://axond@db/axond_restored?sslmode=require' \
-  axond migrate status --config /etc/axond/axond.toml
+pg_restore -d axond_restored --no-owner /backups/store-2026-08-13.dump
 ```
 
-`axond migrate status` is the acceptance test, not a formality: it is the same
-check a replica makes before it serves, so a restore it rejects is a restore no
-replica would have accepted either. A restored database whose ledger came back
-empty is [`Unrecorded`](./control-plane-journal.md#schema-status-and-what-each-state-means) and needs an
-explicit baseline; that is the adoption path, not a migration.
+Point `[storage] dsn_env` at the restored database and boot one replica. Check
+that `GET /api/v1/namespaces` lists the namespaces you expect before rolling
+the rest.
 
 ### To a point in time
 
@@ -116,53 +94,27 @@ touch /var/lib/postgresql/restored/recovery.signal
 pg_ctl -D /var/lib/postgresql/restored start
 ```
 
-Choose the target before starting, from the audit trail
-(`SELECT recorded_at, event_kind, summary FROM axond_cp_audit_event ORDER BY recorded_at DESC`),
-and choose it *before* the mutation being undone. Then verify what recovery
-landed on, in this order:
-
-1. `SELECT pg_is_in_recovery()` returns `f` — the cluster promoted rather than
-   sitting in recovery waiting for WAL it cannot reach.
-2. `axond migrate status` reports the schema this build requires.
-3. `SELECT revision_id FROM axond_cp_head` is the revision you intended, and the
-   revision published after the target is **absent**. This asymmetry is the whole
-   point: a restore that replayed to the end of the WAL passes every "the rows are
-   there" check and still contains the change the incident was about.
-4. Roll replicas so they load the recovered head; a replica holding the
-   post-target snapshot keeps serving it until it does.
-
-Forward-only migrations mean a recovery to a point before an upgrade must be
-served by the binary of that time. See
-[Upgrades and rollback](./upgrades.md).
+Choose the target before starting, and choose it *before* the change being
+undone. Then check that `SELECT pg_is_in_recovery()` returns `f` (the cluster
+promoted rather than waiting for WAL it cannot reach), and that the change
+after the target is absent. A restore that replayed to the end of the WAL
+passes every "the rows are there" check and still contains the change the
+incident was about.
 
 ## Rehearsal
 
 <a id="the-drill"></a>
 
 Rehearse a logical dump and a point-in-time restore against *your* backups.
-The former CI qualification drill is gone with the tier matrix. The assertions
-that still matter:
-
-- a `pg_dump`/`pg_restore` round trip restores head, revisions, and usage;
-- a `pg_basebackup` plus archived WAL recovery to a target between two published
-  revisions keeps the first and drops the second.
-
-A restore that replayed the whole WAL passes every "the rows are there" check
-and still contains the change the incident was about. Only a restore of your
-archive proves your archive.
+Only a restore of your archive proves your archive.
 
 ## See also
 
-- [Control-plane revision journal](./control-plane-journal.md) — schema status,
-  migrations, and outage behaviour.
-- [Stateful backends](../deployment/stateful-backends.md) — supported versions,
-  DDL, and Redis's role.
-- [Upgrades and rollback](./upgrades.md) — forward-only migrations and rollback
+- [Store backends](../deployment/stateful-backends.md): supported versions and
+  DDL.
+- [Upgrades and rollback](./upgrades.md): forward-only migrations and rollback
   limits.
-- [Production checklist](../deployment/production-checklist.md) — the review this
+- [Production checklist](../deployment/production-checklist.md): the review this
   page is the recovery half of.
-- [Qualification packet](./qualification.md) — request-path evidence after the
-  recovery harness retired.
-- [ADR 0044](../adr/0044-recovery-objectives-and-supported-backends.md) — why
-  these objectives are numbers, why Redis is outside them, and what changing them
-  costs.
+- [ADR 0044](../adr/0044-recovery-objectives-and-supported-backends.md): why
+  these objectives are numbers.

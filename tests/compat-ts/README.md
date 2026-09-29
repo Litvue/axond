@@ -111,5 +111,5 @@ SDK's description of it — and the tests below the build are the ones to read.
 ## Scope
 
 Go is deliberately **not** covered: the Go SDKs' surface for these routes adds no
-wire coverage the two lanes here do not already have, and the case for a third
-runtime is the stateful/admin API, which is not stable yet. Revisit it then.
+wire coverage the two lanes here do not already have. Revisit it if the
+`/api/v1` management API gains a stable Go client.

@@ -69,7 +69,7 @@ impl BatchedSink {
 
     /// Records discarded so far — the observable cost of the contract. The
     /// operator-facing view of this is the `axond.usage.records_dropped` metric.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }

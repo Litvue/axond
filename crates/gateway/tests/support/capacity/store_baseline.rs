@@ -524,7 +524,9 @@ impl HistogramSummary {
 
 /// The Postgres DSN the full tier's Postgres arm needs, or `None` to skip it.
 pub fn postgres_dsn() -> Option<String> {
-    crate::support::stateful::postgres_dsn()
+    std::env::var("AXOND_TEST_POSTGRES_DSN")
+        .ok()
+        .filter(|dsn| !dsn.is_empty())
 }
 
 /// Whether the full tier was asked for.

@@ -188,6 +188,7 @@ impl SqliteStore {
     /// `#[tokio::test]` and plain `#[test]`). Going through the async `Store`
     /// trait would `block_on` a `spawn_blocking` future, which panics when no
     /// Tokio runtime is on the stack and can stall a worker when one is.
+    #[cfg(any(test, fuzzing))]
     pub fn seed_config_namespaces_sync(
         &self,
         namespaces: &[crate::config::Namespace],
@@ -832,6 +833,7 @@ impl Store for SqliteStore {
         .await
     }
 
+    #[cfg(test)]
     fn seed_namespaces_blocking(
         &self,
         namespaces: &[crate::config::Namespace],
@@ -1006,6 +1008,7 @@ impl Store for SqliteStore {
         .await
     }
 
+    #[cfg(test)]
     async fn append_usage(&self, event: UsageAppend) -> Result<(), StoreError> {
         self.with_conn(StoreOp::UsageAppend, move |conn| {
             insert_usage_batch(conn, std::slice::from_ref(&event))
@@ -1024,6 +1027,7 @@ impl Store for SqliteStore {
         true
     }
 
+    #[cfg(test)]
     fn append_usage_sync(&self, event: UsageAppend) -> Result<(), StoreError> {
         self.append_usage_batch_sync(std::slice::from_ref(&event))
     }
@@ -1846,9 +1850,6 @@ mod tests {
             id: id.to_owned(),
             default: false,
             allow_platform_fallback: false,
-            project: None,
-            policy: None,
-            static_policy: None,
         }
     }
 
@@ -1964,51 +1965,6 @@ mod tests {
         };
         assert_eq!((budget, active, reservations, usage), (0, 0, 0, 1));
         assert!(store.get_namespace("wsp_x").await.expect("get").is_none());
-    }
-
-    #[tokio::test]
-    async fn seed_restores_a_toml_listed_id_after_store_delete() {
-        let path = std::env::temp_dir().join(format!(
-            "axond-seed-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        let path_str = path.to_str().expect("utf8 path");
-        let store = SqliteStore::open(path_str).expect("open");
-        store
-            .put_namespace(NamespaceRecord {
-                id: "wsp_seed".into(),
-                attrs: serde_json::json!({}),
-                blocklist: None,
-            })
-            .await
-            .expect("put");
-        assert!(store.delete_namespace("wsp_seed").await.expect("delete"));
-        drop(store);
-        let store = SqliteStore::open(path_str).expect("reopen");
-        let toml_ns = crate::config::Namespace {
-            id: "wsp_seed".into(),
-            default: false,
-            allow_platform_fallback: false,
-            project: None,
-            policy: None,
-            static_policy: None,
-        };
-        super::super::seed_config_namespaces(&store, &[toml_ns])
-            .await
-            .expect("seed");
-        assert!(
-            store
-                .get_namespace("wsp_seed")
-                .await
-                .expect("get")
-                .is_some(),
-            "a TOML-listed id is restored on seed; HTTP DELETE of those ids is 409"
-        );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
@@ -3022,5 +2978,47 @@ mod tests {
                     .to_owned()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn seed_restores_a_toml_listed_id_after_store_delete() {
+        let path = std::env::temp_dir().join(format!(
+            "axond-seed-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let path_str = path.to_str().expect("utf8 path");
+        let store = SqliteStore::open(path_str).expect("open");
+        store
+            .put_namespace(NamespaceRecord {
+                id: "wsp_seed".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("put");
+        assert!(store.delete_namespace("wsp_seed").await.expect("delete"));
+        drop(store);
+        let store = SqliteStore::open(path_str).expect("reopen");
+        let toml_ns = crate::config::Namespace {
+            id: "wsp_seed".into(),
+            default: false,
+            allow_platform_fallback: false,
+        };
+        super::super::seed_config_namespaces(&store, &[toml_ns])
+            .await
+            .expect("seed");
+        assert!(
+            store
+                .get_namespace("wsp_seed")
+                .await
+                .expect("get")
+                .is_some(),
+            "a TOML-listed id is restored on seed; HTTP DELETE of those ids is 409"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

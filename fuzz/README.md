@@ -1,57 +1,21 @@
 # Fuzzing Axond
 
-Axond parses five kinds of untrusted input: what an operator's configuration
+Axond parses four kinds of untrusted input: what an operator's configuration
 file says, what a caller puts in a request, what a provider sends back, and what
-an upstream catalogue publishes, plus immutable ciphertext hydrated from object
-storage. This project fuzzes all five, on the parsers the process actually runs.
+an upstream catalogue publishes. This project fuzzes all four, on the parsers the process actually runs.
 
 | Target | What it drives | Why |
 | --- | --- | --- |
 | `config_toml` | `Config::from_toml_str` and the whole validation graph | Boot and every `SIGHUP` reload re-parse a file the gateway does not control |
-| `token_verify` | `axt1.` JWS decoding, key selection, signature, and every claim check | A minted token is the one credential an attacker can shape freely |
 | `credentials_query` | `GET /v1/credentials/status?namespaces=…` parsing | Hand-rolled percent-decoding, so malformed escapes, duplicate keys, empty values, and oversized inputs all land here |
-| `flat_v2_body` | Deployment, namespace, and inbound-grant v2 durable body decoding | Signed object-store and LKG hydration must distinguish malformed state from forward schema skew without panics or unbounded parsing |
 | `sse_decode` | `SseDecoder` on arbitrary bodies split at arbitrary chunk boundaries | A stream arrives in whatever pieces the network produced, and an event, a delimiter, or a character can straddle two of them |
 | `provider_stream` | The OpenAI, Foundry, and Anthropic stream decoders — translated and native | They interpret provider JSON mid-relay, where a panic loses a live response |
 | `provider_error` | `ProviderError::from_upstream`, `::transport`, and the classification behind them | An upstream failure body decides whether the gateway retries, fails over, or opens a circuit |
 | `catalog_import` | The models.dev import: decoding, schema validation, normalization, content identity, semantic classification, and admission | A third party publishes it, a background refresh imports it unattended, and what it says about prices and capabilities feeds routing and spend decisions |
-| `blob_secret_envelope` | The v2 bounded canonical-CBOR fixed-array decoder | Authenticated desired state names immutable bytes, but the storage object itself is untrusted until strict parsing and AEAD opening succeed |
-| `blob_secret_crypto` | Structured bounded v2 sealing, opening, context substitution, rotation, and mutation | Valid cryptographic states are too sparse for raw byte mutation alone |
-| `publication_parsers` | Signed head tuples, revision manifests, active-revision matching, and the final version fence | Durable object-store bytes are outside the process trust boundary and must fail closed without panics or unbounded parsing |
-
-Every `blob_secret_envelope` filename is pinned to one exact parser outcome.
-The crypto corpus owns a stable binary layout: scenario, primary and secondary
-key seed bytes, little-endian identity and version seeds, then the remaining
-bytes as material. It commits one file per crypto scenario plus empty,
-non-UTF-8, exact-multibyte-limit, and over-limit boundaries; smoke decodes each
-with `BlobSecretCryptoInput::arbitrary_take_rest` and asserts the exact outcome.
-
-The publication corpus is likewise pinned by filename to the exact sequence of
-head, manifest, and activation outcomes it documents. The smoke replay calls
-the same seam as the coverage-guided `publication_parsers` target, so removing
-or renaming a security vector cannot silently reduce coverage.
-
 The properties each target asserts live in [`src/lib.rs`](./src/lib.rs) and
 [`src/wire.rs`](./src/wire.rs): a parser returns rather than panicking, a
 refusal is a typed value the gateway could answer with, and what it accepts
-stays inside the bounds the request path relies on — including that a signature
-from one namespace's signer never verifies into another.
-
-The `flat_v2_body` smoke replay pins every committed filename to one exact
-semantic outcome through the same `flat_v2_body_target` entrypoint libFuzzer
-uses. The table is intentionally exhaustive in both directions, so adding,
-removing, or renaming a seed requires updating the asserted contract:
-
-| Seed | Expected outcome |
-| --- | --- |
-| `deployment-missing-field.json` | `incompatible` |
-| `deployment-unknown-field.json` | `incompatible` |
-| `deployment-unknown-variant.json` | `incompatible` |
-| `deployment-valid.json` | `accepted` |
-| `grant-semantic-invalid.json` | `invalid` |
-| `grant-valid.json` | `accepted` |
-| `namespace-valid.json` | `accepted` |
-| `namespace-wrong-schema-shape.json` | `incompatible` |
+stays inside the bounds the request path relies on.
 
 The wire targets add what a relay depends on: the decoder never holds more than
 its limit and never retains a complete event, decoding never expands its input,
@@ -121,7 +85,7 @@ asserts, it asserts:
 
 Runs are hermetic. The seam the targets call
 ([`crates/gateway/src/fuzz_seam.rs`](../crates/gateway/src/fuzz_seam.rs)) builds
-its verifiers from a configuration compiled into the binary with synthetic key
+its state from a configuration compiled into the binary with synthetic key
 material, so nothing here opens a socket, reads a file, or holds a real secret.
 The catalogue import is hermetic the same way and demonstrably so: it runs the
 real source — conditional fetch, strict parse, admission — against an in-memory
@@ -148,11 +112,9 @@ decision and what it costs.
 
 That flag reaches every dependency rather than just `axond` — Cargo has no
 per-crate rustflags, and it is what `cargo fuzz` sets anyway. Since a crate is
-allowed to weaken cryptography under it, the smoke's first act is
-`assert_signature_verification_is_real`: the seam mints a token, verifies it, and
-must then refuse that token with a bit flipped in each of its three JWS segments.
-That is the durable check; [`.cargo/config.toml`](./.cargo/config.toml) records
-the lockfile audit behind it.
+allowed to change behaviour under it, [`.cargo/config.toml`](./.cargo/config.toml)
+records the lockfile audit behind it, and the smoke's pinned valid fixtures prove
+the parsers still decode what they must.
 
 ## The smoke (stable, bounded, on every pull request)
 
@@ -160,14 +122,12 @@ the lockfile audit behind it.
 just fuzz-smoke
 ```
 
-Proves signature verification is live, and that pinned valid SSE fixtures still
-decode to the events they must under every boundary they can be split on — both
-are there because the other assertions are relative, and a parser that returned
+Proves that pinned valid SSE fixtures still decode to the events they must under
+every boundary they can be split on — that is there because the other assertions are relative, and a parser that returned
 nothing at all would satisfy them. Then it replays every seed plus fixed
-derivations — truncations, single-byte flips, one oversized repetition — a set
-of tokens minted at replay time, and a set of catalogue edits applied at replay
-time. The token scenarios, catalogue scenarios, and both blob-secret corpora are
-each pinned to the outcome they exist for by name, so a check that stopped being
+derivations — truncations, single-byte flips, one oversized repetition — and a
+set of catalogue edits applied at replay time. The catalogue scenarios are each
+pinned to the outcome they exist for by name, so a check that stopped being
 reachable fails the lane rather than being covered for by another scenario's
 class. It fails on a
 panic, on an input slower than its

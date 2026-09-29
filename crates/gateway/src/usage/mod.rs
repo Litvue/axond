@@ -61,7 +61,6 @@ pub use postgres::{PostgresSink, PostgresSinkSettings, tls_connector, validate_t
 /// by the delivery worker that writes it to a sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // Ok/UpstreamError wired now; the rest as streaming + cancellation land
 pub enum Status {
     Ok,
     UpstreamError,
@@ -583,6 +582,7 @@ impl IndexOutcome {
 
 /// Every [`IndexOutcome`], as the strings the metric catalogue enumerates. A
 /// test holds it to the enum.
+#[cfg(test)]
 pub const INDEX_OUTCOMES: &[&str] = &["accepted", "saturated", "closed", "failed", "timeout"];
 
 /// One event waiting for the index worker, stamped so the worker can report how

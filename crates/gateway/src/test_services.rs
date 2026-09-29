@@ -20,14 +20,6 @@ fn resolve(variable: &str, value: Option<String>, require_services: bool) -> Opt
     }
 }
 
-pub(crate) fn redis_url() -> Option<String> {
-    resolve(
-        "AXOND_TEST_REDIS_URL",
-        std::env::var("AXOND_TEST_REDIS_URL").ok(),
-        required(),
-    )
-}
-
 pub(crate) fn postgres_dsn() -> Option<String> {
     resolve(
         "AXOND_TEST_POSTGRES_DSN",

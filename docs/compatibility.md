@@ -192,30 +192,11 @@ describes is a public interface. Within `0.x`:
 
 Practically: the config that boots on `0.x.y` boots on `0.x.(y+1)`.
 
-**Operating modes do not change that promise.** `mode` selects which authority
-owns durable resources ([ADR 0027]): the default `stateless` is TOML as it is
-documented today, and the opt-in `stateful` bootstrap points at a Postgres
-control plane. Adding the key was additive under the rules above — nothing is
-renamed or removed and no default changed, so omitting `mode` still means exactly
-what it always meant.
+**Withdrawn sections.** `mode` and the control-plane sections were withdrawn
+by [ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md). A file that
+still names one fails to boot, and the diagnostic names the section; see
+[removed sections](./configuration.md#removed-sections).
 
-With one deliberate exception, stated rather than glossed: a stateless file that
-already contained `[control_plane]`, `[secret_store]`, or `[[admin_breakglass]]`
-used to boot, because unknown sections are tolerated, and is now a boot error.
-That is a tightening under the rules above. It is accepted because those names
-had no meaning before this release, so such a file was either hand-written
-against an unimplemented surface or a `mode = "stateful"` line short of what its
-author intended — and silently ignoring a control-plane reference is exactly the
-ambiguity the mode boundary exists to remove. The diagnostic names the section
-and the missing `mode`. No key that ever had a meaning became stricter.
-
-Stateful mode is a deliberate operator choice with its own bootstrap surface,
-and configuration valid in one mode is *not* expected to be valid in the other:
-each mode rejects the other's sections at boot rather than merging them. The
-stateful bootstrap surface is not under the `0.x` promise until the control plane
-it bootstraps exists; see [the reference](./configuration.md#operating-mode).
-
-[ADR 0027]: ./adr/0027-stateless-and-stateful-operating-modes.md
 [ADR 0031]: ./adr/0031-bounded-status-contract.md
 
 ### The usage schema
@@ -238,49 +219,9 @@ gateway's own version:
 - One table may hold rows from several gateway versions. Read `schema_version`;
   do not assume a deploy timeline.
 
-The budget schema ([`ops/postgres/budget_v1.sql`](../ops/postgres/budget_v1.sql))
+The Store budget schema ([`ops/postgres/store_budget_v1.sql`](../ops/postgres/store_budget_v1.sql))
 follows the same rule, but it is gateway-internal state rather than a reporting
 interface — read it at your own risk.
-
-### Desired-state schemas and approved price books
-
-Stateful mode's desired state is versioned by schema identifier per body, not by
-one revision format. A price book declares `axond.price-book.v2`
-([ADR 0046](./adr/0046-approved-price-books.md)), and a replica reads only the
-schemas its build knows:
-
-`axond.price-book.v1` remains readable as a legacy shape but is no longer
-written. It has no `catalog_version`, so a request charged from a retained v1
-book reports the compatibility value `catalog_version = 0` until the book is
-republished as v2.
-
-- Adding an optional field to a body **is** a schema bump. Bodies are read
-  strictly — an unknown schema, an unknown field, a missing field, a wrong type,
-  a currency, unit, precedence, or approval state this build does not know, or a
-  rate it cannot bill is **refused**, never partially applied.
-- A refusal of that kind is reported as an **incompatibility**, not as
-  corruption, and the replica keeps serving the revision it already converged
-  onto — including the pricing that revision carried. So a rolling upgrade in
-  either direction is safe: a replica running an older build refuses the newer
-  build's revision under a named reason and continues at its previous prices,
-  rather than serving a revision it half understands or falling back to no
-  pricing.
-- Rolling *back* is republication of a prior revision. Price books are immutable
-  per version, so no rollback rewrites a historical rate, and the price book a
-  request was billed against is identified in the snapshot that served it by
-  reference, canonical checksum, catalogue content id, and effective interval.
-- What is **not** promised: nothing forces a replica to be able to read a body a
-  newer build wrote. Mixed-version fleets converge at the oldest build's schema
-  support, and staleness is the visible signal.
-
-A configuration reload cannot change any of that either: `axond.toml` describes
-no price book, so a reload keeps the pricing the replica already serves on the
-snapshot it publishes. Approved pricing changes when a revision says so.
-
-Approved pricing is separate from imported catalogue metadata by construction:
-observed models.dev rates are metadata and never activate a billed rate, and a
-target no approved book names carries *no* price in the snapshot rather than a
-zero one — an unpriced model is not a free one.
 
 ### The HTTP surface
 
@@ -371,7 +312,7 @@ version 2 transition.
 - **`1.0` compatibility.** `1.0` is reserved for a real API commitment. Nothing
   here promises a `0.x` → `1.0` migration will be free.
 - **In-memory behaviour across replicas.** Circuit state, credential health, and
-  `backend = "in-memory"` budgets are per replica by design. Their exact
+  admission ceilings are per replica by design. Their exact
   thresholds and recovery timing may be tuned in any release.
 - **Pricing catalogue values.** Prices come from your config, not from us.
 - **Deferred features arriving on a date.** Cross-provider translation and
@@ -380,24 +321,13 @@ version 2 transition.
 - **The withdrawn control plane.** `mode`, `[control_plane]`, `[secret_store]`,
   `[[admin_breakglass]]`, and `/admin/v1` are boot errors or unmounted
   ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)). They are not
-  under the `0.x` HTTP promise. Historical pages remain under
-  [operations](./operations/admin-api.md).
+  under the `0.x` HTTP promise.
 
 ### Namespaced inference (ADR 0063)
 
 Canonical inference is `/ns/{namespace}/v1/...`. [ADR 0062](./adr/0062-blob-backed-flat-namespace-control-plane.md)
 proposed `/namespaces/{namespace}` and is superseded. That longer prefix is not
-served. Historical spelling for the blob-control-plane draft:
-
-```text
-/namespaces/{namespace}/v1/chat/completions
-/namespaces/{namespace}/v1/responses
-/namespaces/{namespace}/v1/embeddings
-/namespaces/{namespace}/v1/models
-/namespaces/{namespace}/v1/messages
-/namespaces/{namespace}/v1/credentials
-/namespaces/{namespace}/v1/tokens
-```
+served.
 
 Live clients use `/ns/{namespace}/v1` (OpenAI) or `/ns/{namespace}` (Anthropic).
 Redirects are not a migration mechanism for authenticated or streaming `POST`
