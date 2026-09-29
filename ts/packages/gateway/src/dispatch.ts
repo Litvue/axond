@@ -234,7 +234,11 @@ export async function callUpstream(input: {
     clearTimeout(headerTimer);
   }
   if (!response.ok) {
-    const text = await readLimited(response, input.transport.maxResponseBytes);
+    const text = await readErrorBody(
+      response,
+      input.transport.maxErrorBytes ?? 64 * 1024,
+      input.transport.bufferedBodyTimeoutMs,
+    );
     throw classifyUpstream(response.status, text);
   }
   if (!input.stream || response.body === null) {
@@ -384,9 +388,64 @@ function passHeaders(headers: Headers): Headers {
   return next;
 }
 
-async function readLimited(response: Response, limit: number): Promise<string> {
-  const bytes = await readLimitedBytes(response, limit, 30_000);
-  return new TextDecoder().decode(bytes);
+/**
+ * Best-effort provider error body. The status is already known, so a slow read
+ * yields an empty message and an oversized body is cut at `limit`. Neither
+ * case replaces the provider failure with a transport error.
+ */
+async function readErrorBody(response: Response, limit: number, timeoutMs: number): Promise<string> {
+  if (response.body === null) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const started = Date.now();
+  const finish = () => new TextDecoder().decode(concatBytes(chunks, total));
+  try {
+    for (;;) {
+      const remaining = timeoutMs - (Date.now() - started);
+      if (remaining <= 0) {
+        await reader.cancel().catch(() => undefined);
+        return "";
+      }
+      const chunk = await Promise.race([
+        reader.read(),
+        delay(remaining).then(() => "timeout" as const),
+      ]);
+      if (chunk === "timeout") {
+        await reader.cancel().catch(() => undefined);
+        return "";
+      }
+      if (chunk.done) {
+        return finish();
+      }
+      const room = limit - total;
+      if (room <= 0) {
+        await reader.cancel().catch(() => undefined);
+        return finish();
+      }
+      const slice = chunk.value.length > room ? chunk.value.subarray(0, room) : chunk.value;
+      chunks.push(slice);
+      total += slice.length;
+      if (total >= limit) {
+        await reader.cancel().catch(() => undefined);
+        return finish();
+      }
+    }
+  } catch {
+    return finish();
+  }
+}
+
+function concatBytes(chunks: Uint8Array[], total: number): Uint8Array {
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
 }
 
 async function readLimitedBytes(response: Response, limit: number, timeoutMs: number): Promise<Uint8Array> {

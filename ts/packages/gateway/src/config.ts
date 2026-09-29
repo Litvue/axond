@@ -92,6 +92,7 @@ const DEFAULT_TRANSPORT: TransportLimits = {
   bufferedBodyTimeoutMs: 30_000,
   streamIdleTimeoutMs: 120_000,
   maxResponseBytes: 32 * 1024 * 1024,
+  maxErrorBytes: 64 * 1024,
 };
 
 /**
@@ -290,11 +291,21 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
   if (!Number.isInteger(maxResponseBytes) || maxResponseBytes < 1) {
     throw configError("transport.max_response_bytes must be at least 1");
   }
+  const maxErrorBytes = numberField(transportRaw, "max_error_bytes", DEFAULT_TRANSPORT.maxErrorBytes ?? 64 * 1024);
+  if (!Number.isInteger(maxErrorBytes) || maxErrorBytes < 1) {
+    throw configError("transport.max_error_bytes must be at least 1");
+  }
+  if (maxErrorBytes > maxResponseBytes) {
+    throw configError(
+      "transport.max_error_bytes must not exceed transport.max_response_bytes: an error body is a response body",
+    );
+  }
   const transport: TransportLimits = {
     responseHeaderTimeoutMs: numberField(transportRaw, "response_header_timeout_ms", DEFAULT_TRANSPORT.responseHeaderTimeoutMs),
     bufferedBodyTimeoutMs: numberField(transportRaw, "buffered_body_timeout_ms", DEFAULT_TRANSPORT.bufferedBodyTimeoutMs),
     streamIdleTimeoutMs: numberField(transportRaw, "stream_idle_timeout_ms", DEFAULT_TRANSPORT.streamIdleTimeoutMs),
     maxResponseBytes,
+    maxErrorBytes,
   };
   const admissionRaw = asRecord(parsed["admission"]) ?? {};
   const maxRequestBytes = numberField(admissionRaw, "max_request_bytes", 2 * 1024 * 1024);

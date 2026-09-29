@@ -490,6 +490,92 @@ test("a header timeout is upstream_timeout", async () => {
   upstream.close();
 });
 
+test("an oversized provider error is truncated and keeps the provider status", async () => {
+  const store = await seeded();
+  const prefix = '{"error":{"message":"VISIBLE"}}';
+  const upstream = await listen((_req, res) => {
+    res.writeHead(500, { "content-type": "application/json" });
+    res.end(`${prefix}${"HIDDEN_TAIL_SENTINEL".repeat(20)}`);
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 1000,
+      bufferedBodyTimeoutMs: 1000,
+      streamIdleTimeoutMs: 1000,
+      maxResponseBytes: 4096,
+      maxErrorBytes: prefix.length,
+    },
+  });
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+  });
+  assert.equal(response.status, 502);
+  const text = await response.text();
+  assert.equal(text.includes("HIDDEN_TAIL_SENTINEL"), false);
+  assert.deepEqual(JSON.parse(text), {
+    error: { type: "provider_dependency_failed", message: "VISIBLE" },
+  });
+  upstream.close();
+});
+
+test("a stalled provider error body still returns the provider status", async () => {
+  const store = await seeded();
+  const upstream = await listen((_req, res) => {
+    res.writeHead(429, { "content-type": "application/json" });
+    res.flushHeaders();
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 1000,
+      bufferedBodyTimeoutMs: 80,
+      streamIdleTimeoutMs: 1000,
+      maxResponseBytes: 4096,
+      maxErrorBytes: 64,
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {
+      error: { type: "provider_dependency_failed", message: "upstream request failed" },
+    });
+  } finally {
+    upstream.close();
+  }
+});
+
 test("management routes match the compatibility contract", async () => {
   const store = await seeded();
   const app = createAxond({

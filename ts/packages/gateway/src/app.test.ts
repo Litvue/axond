@@ -374,6 +374,7 @@ namespace = "platform"
   const loaded = await loadConfig(toml, envSecretReader({ GW_KEY: "k" }, async () => ""));
   assert.deepEqual(loaded.shutdown, { drainGraceMs: 5_000, deadlineMs: 15_000, flushTimeoutMs: 5_000 });
   assert.equal(loaded.transport.maxResponseBytes, 32 * 1024 * 1024);
+  assert.equal(loaded.transport.maxErrorBytes, 64 * 1024);
   assert.equal(loaded.maxRequestBytes, 2 * 1024 * 1024);
   assert.equal(loaded.maxPromptTokens, 1_000_000);
   assert.equal(loaded.maxOutputTokens, 200_000);
@@ -494,11 +495,13 @@ env = "GW_KEY"
 namespace = "platform"
 [transport]
 max_response_bytes = 4096
+max_error_bytes = 128
 [admission]
 max_request_bytes = 64
 `;
   const loaded = await loadConfig(toml, envSecretReader({ GW_KEY: "k" }, async () => ""));
   assert.equal(loaded.transport.maxResponseBytes, 4096);
+  assert.equal(loaded.transport.maxErrorBytes, 128);
   assert.equal(loaded.maxRequestBytes, 64);
   await assert.rejects(
     () =>
@@ -508,6 +511,31 @@ max_request_bytes = 64
       ),
     (error: unknown) => {
       assert.match(error instanceof Error ? error.message : "", /transport\.max_response_bytes must be at least 1/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("max_error_bytes = 128", "max_error_bytes = 0"),
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(error instanceof Error ? error.message : "", /transport\.max_error_bytes must be at least 1/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        toml.replace("max_error_bytes = 128", "max_error_bytes = 8192"),
+        envSecretReader({ GW_KEY: "k" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.match(
+        error instanceof Error ? error.message : "",
+        /transport\.max_error_bytes must not exceed transport\.max_response_bytes/,
+      );
       return true;
     },
   );

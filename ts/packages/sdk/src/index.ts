@@ -332,6 +332,11 @@ export interface TransportLimits {
   bufferedBodyTimeoutMs: number;
   streamIdleTimeoutMs: number;
   maxResponseBytes: number;
+  /**
+   * Largest provider error body kept for the caller-visible message.
+   * A larger body is truncated. Absent uses 65536.
+   */
+  maxErrorBytes?: number;
 }
 
 export interface UsageRecord {
