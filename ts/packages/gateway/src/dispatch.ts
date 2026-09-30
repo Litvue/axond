@@ -262,8 +262,18 @@ export async function callUpstream(input: {
   /** Node client that enforces the connect bound. Absent means the runtime owns connect. */
   dispatcher?: object;
   onTimeout?: (kind: string, bound: string) => void;
-  /** An open stream outlived its duration cap before a terminal event. */
-  onStreamLimit?: () => void;
+  /** An open stream hit its duration or byte cap before a terminal event. */
+  onStreamLimit?: (limit: "duration" | "bytes") => void;
+  /**
+   * The socket failed. `phase` is `request` before headers, `stream` while
+   * relaying, or `closing` after a terminal event. The reason is a class, not
+   * the runtime message.
+   */
+  onTransport?: (
+    phase: "request" | "stream" | "closing",
+    reason: TransportFailureReason,
+    committed?: boolean,
+  ) => void;
   /**
    * OpenAI chat only. A rate-limit event before any byte is released asks for
    * another upstream. Null keeps the held event and ends the stream.
@@ -320,6 +330,7 @@ export async function callUpstream(input: {
     if (isConnectTimeout(error)) {
       throw timeoutFailure("connect", "phase", transport.connectTimeoutMs, input.onTimeout);
     }
+    input.onTransport?.("request", transportFailureReason(error));
     throw new GatewayFailure("upstream_transport", 502, "upstream transport failure");
   } finally {
     clearTimeout(headerTimer);
@@ -363,6 +374,7 @@ export async function callUpstream(input: {
     },
     input.onTimeout,
     input.onStreamLimit,
+    input.onTransport,
     input.onBeforeContentRateLimit,
     input.onCredentialRateLimit,
     input.estimatedInputTokens ?? 0,
@@ -415,7 +427,12 @@ function relayStream(
   usage: UsageTokens,
   onDone: (reason: "end" | "cancel" | "fail") => void,
   onTimeout?: (kind: string, bound: string) => void,
-  onStreamLimit?: () => void,
+  onStreamLimit?: (limit: "duration" | "bytes") => void,
+  onTransport?: (
+    phase: "request" | "stream" | "closing",
+    reason: TransportFailureReason,
+    committed?: boolean,
+  ) => void,
   onBeforeContentRateLimit?: () => Promise<Response | null>,
   onCredentialRateLimit?: () => void,
   estimatedInputTokens = 0,
@@ -559,10 +576,16 @@ function relayStream(
         ), durationAt, onTimeout);
       } catch (error) {
         if (terminalAt !== null) {
+          if (!(error instanceof GatewayFailure)) {
+            onTransport?.("closing", transportFailureReason(error));
+          }
           await reader.cancel().catch(() => undefined);
           finish("end");
           controller.close();
           return;
+        }
+        if (!(error instanceof GatewayFailure)) {
+          onTransport?.("stream", transportFailureReason(error), committed);
         }
         const message = error instanceof GatewayFailure ? error.message : "upstream stream failed";
         failBound(controller, message);
@@ -572,7 +595,7 @@ function relayStream(
         return;
       }
       if (value === "duration") {
-        onStreamLimit?.();
+        onStreamLimit?.("duration");
         failBound(controller, "stream exceeded the gateway's maximum stream duration");
         return;
       }
@@ -585,6 +608,7 @@ function relayStream(
         return;
       }
       if (!fits(value)) {
+        onStreamLimit?.("bytes");
         failBound(controller, "stream exceeded the gateway's maximum stream size");
         return;
       }
@@ -807,6 +831,59 @@ function timeoutFailure(
   error.timeoutKind = kind;
   error.timeoutBound = bound;
   return error;
+}
+
+export type TransportFailureReason = "dns" | "refused" | "reset" | "tls" | "other";
+
+const TRANSPORT_REASON_BY_CODE: Record<string, TransportFailureReason> = {
+  ENOTFOUND: "dns",
+  EAI_AGAIN: "dns",
+  EAI_NODATA: "dns",
+  ECONNREFUSED: "refused",
+  ConnectionRefused: "refused",
+  ECONNRESET: "reset",
+  EPIPE: "reset",
+  ECONNABORTED: "reset",
+  UND_ERR_SOCKET: "reset",
+  CERT_HAS_EXPIRED: "tls",
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: "tls",
+  DEPTH_ZERO_SELF_SIGNED_CERT: "tls",
+  ERR_TLS_CERT_ALTNAME_INVALID: "tls",
+  UNABLE_TO_GET_ISSUER_CERT: "tls",
+  UNABLE_TO_GET_ISSUER_CERT_LOCALLY: "tls",
+};
+
+/** Classify a socket failure without returning the runtime's message or address. */
+export function transportFailureReason(error: unknown): TransportFailureReason {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const record = current as { code?: unknown; cause?: unknown; message?: unknown };
+    if (typeof record.code === "string") {
+      const mapped = TRANSPORT_REASON_BY_CODE[record.code];
+      if (mapped) {
+        return mapped;
+      }
+    }
+    if (typeof record.message === "string") {
+      const text = record.message.toLowerCase();
+      if (text.includes("enotfound") || text.includes("getaddrinfo")) {
+        return "dns";
+      }
+      if (text.includes("econnrefused")) {
+        return "refused";
+      }
+      if (text.includes("econnreset") || text.includes("epipe") || text.includes("socket hang up")) {
+        return "reset";
+      }
+      if (text.includes("certificate") || text.includes("ssl routines") || text.includes(" tls")) {
+        return "tls";
+      }
+    }
+    current = record.cause;
+  }
+  return "other";
 }
 
 function isConnectTimeout(error: unknown): boolean {

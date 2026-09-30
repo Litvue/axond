@@ -106,13 +106,28 @@ export interface UpstreamTimeoutLog {
   bound: string;
 }
 
-/** An open stream outlived `admission.max_stream_duration_ms` before a terminal event. */
+/**
+ * The provider socket failed before a response could be classified.
+ * `reason` is a bounded class. The endpoint and the runtime's message stay off this line.
+ */
+export interface UpstreamTransportLog {
+  msg: "upstream_transport";
+  request_id: string;
+  provider: string;
+  model: string;
+  phase: "request" | "stream" | "closing";
+  reason: "dns" | "refused" | "reset" | "tls" | "other";
+  /** Present when the failure happened while a stream body was already open. */
+  committed?: boolean;
+}
+
+/** An open stream hit its duration or byte cap before a terminal event. */
 export interface StreamLimitLog {
   msg: "stream_limit";
   request_id: string;
   provider: string;
   model: string;
-  limit: "duration";
+  limit: "duration" | "bytes";
 }
 
 /** A catalogue fetch was stored, or refused without replacing the active document. */
@@ -127,6 +142,7 @@ export type AxondLog =
   | RequestLog
   | CredentialRateLimitLog
   | UpstreamTimeoutLog
+  | UpstreamTransportLog
   | StreamLimitLog
   | CatalogueImportLog;
 
@@ -352,9 +368,9 @@ export interface AxondOptions {
    * JSON logs on stdout. A request line is written when the handler returns.
    * A buffered charge includes status, tokens, and cost. A stream has been
    * routed but has not settled, so those fields are absent. A rate-limit
-   * rotation, an upstream timeout, a stream duration cap, and a catalogue
-   * import are separate lines. None of them carry a body, a credential, or a
-   * source URL.
+   * rotation, an upstream timeout, a transport failure, a stream duration or
+   * byte cap, and a catalogue import are separate lines. None of them carry a
+   * body, a credential, or a source URL.
    */
   onLog?: (record: AxondLog) => void;
   maxRequestBytes?: number;

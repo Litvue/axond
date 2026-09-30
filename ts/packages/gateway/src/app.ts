@@ -31,6 +31,7 @@ import {
   planCredentialWalk,
   targetAttemptCap,
   type CredentialPool,
+  type TransportFailureReason,
 } from "./dispatch.ts";
 import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors.ts";
 import { globMatch } from "./glob.ts";
@@ -847,13 +848,28 @@ async function dispatch(
         bound,
       });
     };
-    const noteStreamLimit = () => {
+    const noteStreamLimit = (limit: "duration" | "bytes") => {
       emitLog(opts, {
         msg: "stream_limit",
         request_id: axond.requestId,
         provider: provider.id,
         model: axond.target?.model ?? "",
-        limit: "duration",
+        limit,
+      });
+    };
+    const noteTransport = (
+      phase: "request" | "stream" | "closing",
+      reason: TransportFailureReason,
+      committed?: boolean,
+    ) => {
+      emitLog(opts, {
+        msg: "upstream_transport",
+        request_id: axond.requestId,
+        provider: provider.id,
+        model: axond.target?.model ?? "",
+        phase,
+        reason,
+        ...(committed === undefined ? {} : { committed }),
       });
     };
     const rotateStream = async (failedIndex: number): Promise<Response | null> => {
@@ -875,6 +891,7 @@ async function dispatch(
             dispatcher: opts.upstreamDispatcher,
             onTimeout: noteTimeout,
             onStreamLimit: noteStreamLimit,
+            onTransport: noteTransport,
             onUsage: (next) => copyUsage(usage, next),
             onStreamDone: (reason) => finishStream(nextCredential, reason),
             onDownstreamFirstToken: noteDownstreamFirstToken,
@@ -914,6 +931,7 @@ async function dispatch(
         dispatcher: opts.upstreamDispatcher,
         onTimeout: noteTimeout,
         onStreamLimit: noteStreamLimit,
+        onTransport: noteTransport,
         onUsage: (next) => copyUsage(usage, next),
         onStreamDone: (reason) => finishStream(credential, reason),
         onDownstreamFirstToken: stream ? noteDownstreamFirstToken : undefined,
@@ -1229,7 +1247,7 @@ function emitLog(opts: AxondOptions, record: Exclude<AxondLog, RequestLog>): voi
     return;
   }
   const secrets = secretValues(opts);
-  const safe: Record<string, string | number> = { ...record };
+  const safe: Record<string, string | number | boolean> = { ...record };
   for (const [key, value] of Object.entries(safe)) {
     if (key === "msg") {
       continue;

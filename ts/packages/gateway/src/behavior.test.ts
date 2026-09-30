@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { createServer as createNetServer } from "node:net";
 import test from "node:test";
 import { Agent } from "undici";
 
 import { createAdmission, defaultAdmission } from "./admission.ts";
 import { createAxond } from "./app.ts";
-import { isRateLimitPayload, targetAttemptCap } from "./dispatch.ts";
+import { isRateLimitPayload, targetAttemptCap, transportFailureReason } from "./dispatch.ts";
 import { createMemoryStore } from "./memory-store.ts";
 import { createMetrics } from "./metrics.ts";
 import { usageEvent } from "./usage.ts";
@@ -701,6 +702,236 @@ test("stream_limit_log_names_the_duration_cap", async () => {
     const limit = logs.find((line) => line.msg === "stream_limit");
     assert.ok(limit);
     assert.equal(limit.limit, "duration");
+    assert.equal(limit.provider, "fake-openai");
+    assert.equal(limit.model, "gpt-test");
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes("sk-live-secret"), false);
+    assert.equal(encoded.includes(KEY), false);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+    assert.equal(encoded.includes("COMPLETION_SENTINEL"), false);
+    assert.equal(encoded.includes(upstream.url), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("transport_failure_reason_is_a_bounded_class", () => {
+  const refused = Object.assign(new Error("fetch failed"), {
+    cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9"), { code: "ECONNREFUSED" }),
+  });
+  assert.equal(transportFailureReason(refused), "refused");
+  assert.equal(transportFailureReason(Object.assign(new Error("Unable to connect. Is the computer able to access the url?"), { code: "ConnectionRefused" })), "refused");
+  assert.equal(transportFailureReason(Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" })), "dns");
+  assert.equal(transportFailureReason(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })), "reset");
+  assert.equal(transportFailureReason(new Error("certificate has expired")), "tls");
+  assert.equal(transportFailureReason(new Error("mystery")), "other");
+});
+
+test("upstream_transport_log_names_the_reason_and_omits_the_address", async () => {
+  const store = await seeded();
+  const refusedUrl = await new Promise<string>((resolve, reject) => {
+    const server = createNetServer();
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        reject(new Error("no port"));
+        return;
+      }
+      const url = `http://127.0.0.1:${address.port}`;
+      server.close(() => resolve(url));
+    });
+  });
+  const logs: { msg: string; phase?: string; reason?: string; provider?: string; model?: string }[] = [];
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: refusedUrl }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream-openai", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "PROMPT_SENTINEL" }] }),
+  });
+  assert.equal(response.status, 502);
+  const body = await response.json() as { error: { type: string; message: string } };
+  assert.equal(body.error.type, "upstream_transport");
+  assert.equal(body.error.message, "upstream transport failure");
+  const line = logs.find((entry) => entry.msg === "upstream_transport");
+  assert.ok(line);
+  assert.equal(line.phase, "request");
+  assert.equal(line.reason, "refused");
+  assert.equal(line.provider, "fake-openai");
+  assert.equal(line.model, "gpt-test");
+  const encoded = JSON.stringify(logs);
+  assert.equal(encoded.includes(refusedUrl), false);
+  assert.equal(encoded.includes("127.0.0.1"), false);
+  assert.equal(encoded.includes("upstream-openai"), false);
+  assert.equal(encoded.includes(KEY), false);
+  assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+  assert.equal(encoded.includes("ECONNREFUSED"), false);
+});
+
+test("open_stream_transport_log_names_the_phase_and_omits_the_address", async () => {
+  const store = await seeded();
+  const logs: { msg: string; phase?: string; reason?: string; committed?: boolean }[] = [];
+  const records: UsageRecord[] = [];
+  let calls = 0;
+  const upstream = await listen((_req, res) => {
+    calls += 1;
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    if (calls === 1) {
+      res.write('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n', () => {
+        setTimeout(() => res.destroy(), 0);
+      });
+      return;
+    }
+    res.write('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\ndata: [DONE]\n\n', () => {
+      setTimeout(() => res.destroy(), 0);
+    });
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 30_000,
+      bufferedBodyTimeoutMs: 30_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 1_000,
+      maxResponseBytes: 1024 * 1024,
+    },
+    onLog: (record) => {
+      logs.push(record);
+    },
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  try {
+    const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+    const open = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        stream: true,
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(open.status, 200);
+    const openText = await open.text();
+    assert.equal(openText.includes("Hi"), true);
+    assert.equal(openText.includes("upstream stream failed"), true);
+    const reset = logs.find((entry) => entry.msg === "upstream_transport" && entry.phase === "stream");
+    assert.ok(reset);
+    assert.equal(reset.reason, "reset");
+    assert.equal(reset.committed, true);
+    const done = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        stream: true,
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(done.status, 200);
+    const doneText = await done.text();
+    assert.equal(doneText.includes("data: [DONE]"), true);
+    assert.equal(doneText.includes("upstream_stream_error"), false);
+    const closing = logs.find((entry) => entry.msg === "upstream_transport" && entry.phase === "closing");
+    assert.ok(closing);
+    assert.equal(closing.reason, "reset");
+    for (let attempt = 0; attempt < 20 && records.length < 2; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 2);
+    assert.equal(records[0]!.status, "upstream_error");
+    assert.equal(records[1]!.status, "ok");
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes(upstream.url), false);
+    assert.equal(encoded.includes("127.0.0.1"), false);
+    assert.equal(encoded.includes("sk-live-secret"), false);
+    assert.equal(encoded.includes(KEY), false);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+    assert.equal(encoded.includes("ECONNRESET"), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("stream_byte_limit_log_names_the_size_cap", async () => {
+  const store = await seeded();
+  const logs: { msg: string; limit?: string; provider?: string; model?: string }[] = [];
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"choices":[{"delta":{"content":"COMPLETION_SENTINEL"}}]}\n\n');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxStreamBytes: 8,
+    transport: {
+      responseHeaderTimeoutMs: 30_000,
+      bufferedBodyTimeoutMs: 30_000,
+      streamIdleTimeoutMs: 5_000,
+      maxResponseBytes: 1024 * 1024,
+    },
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        stream: true,
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text.includes("COMPLETION_SENTINEL"), false);
+    assert.equal(text.includes("stream exceeded the gateway's maximum stream size"), true);
+    const limit = logs.find((line) => line.msg === "stream_limit");
+    assert.ok(limit);
+    assert.equal(limit.limit, "bytes");
     assert.equal(limit.provider, "fake-openai");
     assert.equal(limit.model, "gpt-test");
     const encoded = JSON.stringify(logs);
