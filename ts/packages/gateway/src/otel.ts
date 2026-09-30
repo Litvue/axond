@@ -1,8 +1,10 @@
+import type { UsageRecord } from "@axond/sdk";
+
 /**
  * OTLP/HTTP JSON export. One `fetch` per signal at the end of a request, with
  * no timer thread and no exporter object kept across requests. The Rust
  * process speaks `http/protobuf`; this process speaks `application/json` on
- * the same `/v1/traces` and `/v1/metrics` paths.
+ * the same `/v1/traces`, `/v1/metrics`, and `/v1/logs` paths.
  */
 
 const SIGNALS = ["traces", "metrics", "logs"] as const;
@@ -147,9 +149,102 @@ export function metricPayload(points: readonly ExportedPoint[], resource: Record
   };
 }
 
+const I64_MAX = 9223372036854775807n;
+
+/**
+ * One usage record as an OTLP/HTTP JSON log. The event name is `axond.usage`.
+ * A null cost, period, signer, trace id, or price identity is omitted. Counts
+ * above the signed 64-bit max saturate the way the Rust sink clamps them.
+ */
+export function usageLogPayload(record: UsageRecord, resource: Record<string, string>, timeMs: number): unknown {
+  const traceId = usageTraceId(record.traceId);
+  return {
+    resourceLogs: [
+      {
+        resource: { attributes: keyValues(resource) },
+        scopeLogs: [
+          {
+            scope: { name: "axond" },
+            logRecords: [
+              {
+                timeUnixNano: unixNano(timeMs),
+                severityNumber: 9,
+                severityText: "INFO",
+                body: { stringValue: "axond.usage" },
+                eventName: "axond.usage",
+                attributes: usageLogAttributes(record),
+                ...(traceId ? { traceId } : {}),
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function usageLogAttributes(record: UsageRecord): { key: string; value: { stringValue: string } | { intValue: string } }[] {
+  const attributes: { key: string; value: { stringValue: string } | { intValue: string } }[] = [
+    intAttr("axond.schema_version", BigInt(record.schemaVersion)),
+    stringAttr("axond.request_id", record.requestId),
+    stringAttr("axond.namespace", record.namespace),
+    stringAttr("axond.subject", record.subject),
+    stringAttr("gen_ai.request.model", record.model),
+    stringAttr("axond.target.provider", record.targetProvider),
+    stringAttr("axond.target.model", record.targetModel),
+    stringAttr("axond.credential_source", record.credentialSource),
+    stringAttr("axond.credential_id", record.credentialId),
+    stringAttr("axond.status", record.status),
+    intAttr("gen_ai.usage.input_tokens", record.inputTokens),
+    intAttr("gen_ai.usage.cache_read_tokens", record.cacheReadTokens),
+    intAttr("gen_ai.usage.cache_write_tokens", record.cacheWriteTokens),
+    intAttr("gen_ai.usage.output_tokens", record.outputTokens),
+    intAttr("axond.catalog_version", BigInt(record.catalogVersion)),
+    intAttr("axond.latency_ms", BigInt(record.latencyMs)),
+  ];
+  if (record.costMicrodollars !== null) {
+    attributes.push(intAttr("axond.cost_microdollars", record.costMicrodollars));
+  }
+  if (record.traceId) {
+    attributes.push(stringAttr("axond.trace_id", record.traceId));
+  }
+  if (record.signerKid !== null) {
+    attributes.push(stringAttr("axond.signer_kid", record.signerKid));
+  }
+  if (record.priceBook !== null) {
+    attributes.push(stringAttr("axond.price_book", record.priceBook));
+  }
+  if (record.priceBookChecksum !== null) {
+    attributes.push(stringAttr("axond.price_book_checksum", record.priceBookChecksum));
+  }
+  if (record.priceCatalog !== null) {
+    attributes.push(stringAttr("axond.price_catalog", record.priceCatalog));
+  }
+  if (record.period !== null) {
+    attributes.push(stringAttr("axond.period", record.period));
+  }
+  return attributes;
+}
+
+function usageTraceId(traceId: string | null): string | null {
+  if (!traceId || !/^[0-9a-f]{32}$/i.test(traceId) || /^0+$/.test(traceId)) {
+    return null;
+  }
+  return traceId.toLowerCase();
+}
+
+function stringAttr(key: string, value: string): { key: string; value: { stringValue: string } } {
+  return { key, value: { stringValue: value } };
+}
+
+function intAttr(key: string, value: bigint): { key: string; value: { intValue: string } } {
+  const clamped = value > I64_MAX ? I64_MAX : value < 0n ? 0n : value;
+  return { key, value: { intValue: clamped.toString() } };
+}
+
 export async function postOtlp(
   endpoint: string,
-  signal: "traces" | "metrics",
+  signal: "traces" | "metrics" | "logs",
   body: unknown,
   fetchImpl: typeof fetch = fetch,
 ): Promise<void> {

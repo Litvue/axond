@@ -87,6 +87,36 @@ export interface LoadedConfig {
     failureThreshold: number;
     cooldownSeconds: number;
   };
+  /**
+   * Configured usage destinations. Empty means the stdout default: the CLI
+   * writes one JSON line per record and opens nothing else.
+   */
+  usageSinks: UsageSinkConfig[];
+}
+
+/** One `[[usage_sink]]` entry. Batching fields apply to `postgres` only. */
+export interface UsageSinkConfig {
+  kind: "stdout" | "postgres" | "otlp";
+  /** Env var name holding the Postgres DSN. Null for the other kinds. */
+  dsnEnv: string | null;
+  /** Destination table, including an optional schema qualifier. */
+  table: string;
+  createTable: boolean;
+  bufferCapacity: number;
+  maxBatch: number;
+  /** True when the file set `max_batch`, so a value above the buffer fails boot. */
+  maxBatchExplicit: boolean;
+  flushIntervalMs: number;
+}
+
+const DEFAULT_USAGE_TABLE = "axond_usage";
+const DEFAULT_USAGE_BUFFER = 10_000;
+const DEFAULT_USAGE_BATCH = 500;
+const DEFAULT_USAGE_FLUSH_MS = 1_000;
+
+/** Rows one flush writes. An omitted `max_batch` is clamped to the buffer. */
+export function usageBatchSize(sink: UsageSinkConfig): number {
+  return Math.min(sink.maxBatch, sink.bufferCapacity);
 }
 
 export interface SecretReader {
@@ -121,6 +151,7 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
   applyEnvOverrides(parsed, secrets);
   rejectWithdrawn(parsed);
   rejectCollisions(parsed);
+  rejectUsageJournal(parsed);
 
   const server = asRecord(parsed["server"]) ?? {};
   const bind = typeof server["bind"] === "string" ? server["bind"] : "0.0.0.0:8080";
@@ -420,6 +451,7 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     maxStreamBytes,
     admission,
     credentialPool,
+    usageSinks: loadUsageSinks(parsed["usage_sink"]),
   };
 }
 
@@ -503,6 +535,107 @@ function assertHttpsCatalog(sourceUrl: string): void {
   if (url.username.length > 0 || url.password.length > 0) {
     throw configError("a catalogue source url must have a host without credentials");
   }
+}
+
+function rejectUsageJournal(parsed: Record<string, unknown>): void {
+  const journal = asRecord(parsed["usage_journal"]);
+  if (!journal) {
+    return;
+  }
+  const backend = journal["backend"];
+  if (backend === undefined || backend === "none") {
+    return;
+  }
+  if (backend === "postgres") {
+    throw configError('`[usage_journal] backend = "postgres"` is not built (ADR 0049)');
+  }
+  throw configError('`[usage_journal] backend` must be `none` or `postgres`');
+}
+
+function loadUsageSinks(value: unknown): UsageSinkConfig[] {
+  return asArray(value).map((entry) => {
+    const row = asRecord(entry);
+    if (!row) {
+      throw configError("`[[usage_sink]]` must be a table");
+    }
+    const kind = row["kind"];
+    if (kind !== "stdout" && kind !== "postgres" && kind !== "otlp") {
+      throw configError(
+        `usage_sink kind: unknown variant \`${String(kind)}\`, expected \`stdout\`, \`postgres\`, or \`otlp\``,
+      );
+    }
+    const sink: UsageSinkConfig = {
+      kind,
+      dsnEnv: null,
+      table: typeof row["table"] === "string" && row["table"].length > 0 ? row["table"] : DEFAULT_USAGE_TABLE,
+      createTable: false,
+      bufferCapacity: DEFAULT_USAGE_BUFFER,
+      maxBatch: DEFAULT_USAGE_BATCH,
+      maxBatchExplicit: Object.hasOwn(row, "max_batch"),
+      flushIntervalMs: DEFAULT_USAGE_FLUSH_MS,
+    };
+    if (kind !== "postgres") {
+      return sink;
+    }
+    const createTable = row["create_table"];
+    if (createTable !== undefined && typeof createTable !== "boolean") {
+      throw configError("usage_sink `postgres`: `create_table` must be a boolean");
+    }
+    sink.createTable = createTable === true;
+    sink.bufferCapacity = usagePositiveInt(row, "buffer_capacity", DEFAULT_USAGE_BUFFER);
+    if (sink.maxBatchExplicit) {
+      sink.maxBatch = usagePositiveInt(row, "max_batch", DEFAULT_USAGE_BATCH);
+      if (sink.maxBatch > sink.bufferCapacity) {
+        throw configError(
+          `usage_sink \`postgres\`: max_batch (${sink.maxBatch}) must not exceed buffer_capacity (${sink.bufferCapacity})`,
+        );
+      }
+    }
+    sink.flushIntervalMs = usagePositiveInt(row, "flush_interval_ms", DEFAULT_USAGE_FLUSH_MS);
+    const dsnEnv = typeof row["dsn_env"] === "string" ? row["dsn_env"].trim() : "";
+    if (dsnEnv.length === 0) {
+      throw configError("usage_sink `postgres`: `dsn_env` must name the env var holding the connection string");
+    }
+    sink.dsnEnv = dsnEnv;
+    const tableError = usageTableError(sink.table);
+    if (tableError) {
+      throw configError(`usage_sink \`postgres\`: ${tableError}`);
+    }
+    return sink;
+  });
+}
+
+function usagePositiveInt(row: Record<string, unknown>, key: string, fallback: number): number {
+  if (!Object.hasOwn(row, key)) {
+    return fallback;
+  }
+  const value = row[key];
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw configError(`usage_sink \`postgres\`: ${key} must be an integer`);
+  }
+  if (value < 1) {
+    throw configError(`usage_sink \`postgres\`: ${key} must be at least 1`);
+  }
+  return value;
+}
+
+/** Same identifier rules as the Rust usage sink. The name is interpolated into SQL. */
+export function usageTableError(table: string): string | null {
+  const parts = table.split(".");
+  if (parts.length > 2) {
+    return `\`${table}\` is not a valid table name: at most one schema qualifier`;
+  }
+  for (const part of parts) {
+    const valid =
+      part.length > 0 &&
+      part.length <= 63 &&
+      /^[a-z_]/.test(part) &&
+      [...part].every((char) => /[a-z0-9_]/.test(char));
+    if (!valid) {
+      return `\`${table}\` is not a valid table name: use lowercase letters, digits, and underscores`;
+    }
+  }
+  return null;
 }
 
 function rejectWithdrawn(parsed: Record<string, unknown>): void {

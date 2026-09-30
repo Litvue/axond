@@ -14,8 +14,8 @@ import {
   envSecretReader,
   loadConfig,
   resolveTelemetry,
-  usageLine,
 } from "../../gateway/src/index.ts";
+import { openUsageDelivery } from "./usage-delivery.ts";
 import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
@@ -55,6 +55,15 @@ async function main(): Promise<void> {
     endpoint: process.env["OTEL_EXPORTER_OTLP_ENDPOINT"],
     protocol: process.env["OTEL_EXPORTER_OTLP_PROTOCOL"],
     instanceId: process.env["AXOND_INSTANCE_ID"],
+  });
+  const usageDelivery = await openUsageDelivery({
+    sinks: config.usageSinks,
+    env: process.env,
+    telemetry,
+    metrics,
+    onLog: (record) => {
+      process.stdout.write(`${JSON.stringify(record)}\n`);
+    },
   });
   let serving = true;
   let admitting = true;
@@ -104,7 +113,7 @@ async function main(): Promise<void> {
       process.stdout.write(`${JSON.stringify(record)}\n`);
     },
     onUsage: (record) => {
-      process.stdout.write(`${usageLine(record)}\n`);
+      usageDelivery.write(record);
     },
   });
   const listener = getRequestListener(app.fetch);
@@ -171,6 +180,7 @@ async function main(): Promise<void> {
       };
       writeLog(unsettled);
     }
+    await usageDelivery.flush(config.shutdown.flushTimeoutMs);
     process.exit(0);
   };
   const closeAdmission = () => {
