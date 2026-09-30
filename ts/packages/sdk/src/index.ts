@@ -721,8 +721,9 @@ export interface TransportLimits {
   /**
    * Failover walk budget from `failover.overall_timeout_ms`. Absent uses 30000.
    * It tightens the header and buffered-body waits and does not cut an open stream.
+   * A u64 above `Number.MAX_SAFE_INTEGER` stays a bigint.
    */
-  overallTimeoutMs?: number;
+  overallTimeoutMs?: number | bigint;
   /**
    * Target attempts for one request, from `failover.max_attempts`. Absent uses 3.
    * Credential rotation inside the one configured target is not counted.

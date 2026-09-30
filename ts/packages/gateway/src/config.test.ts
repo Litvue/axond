@@ -1480,6 +1480,26 @@ test("a later AXOND_ value replaces an earlier one and strings use figment escap
   );
 });
 
+test("a u64 overall timeout above 2^53 loads", async () => {
+  const u64Max = "18446744073709551615";
+  const wide = await loadConfig(
+    BASE,
+    envSecretReader({ GW_KEY: "k", AXOND_FAILOVER__OVERALL_TIMEOUT_MS: u64Max }, async () => ""),
+  );
+  assert.equal(wide.transport.overallTimeoutMs, BigInt(u64Max));
+  await assert.rejects(
+    () =>
+      loadConfig(
+        BASE,
+        envSecretReader({ GW_KEY: "k", AXOND_FAILOVER__OVERALL_TIMEOUT_MS: "0" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", "failover.overall_timeout_ms must be at least 1");
+      return true;
+    },
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),

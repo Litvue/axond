@@ -391,7 +391,7 @@ export async function callUpstream(input: {
   const now = input.now ?? Date.now;
   const usage = emptyUsage();
   const current = now();
-  const deadlineAt = input.deadlineAt ?? current + transport.overallTimeoutMs;
+  const deadlineAt = input.deadlineAt ?? failoverDeadline(current, transport.overallTimeoutMs);
   if (current >= deadlineAt) {
     throw timeoutFailure("overall", "walk_budget", 0, input.onTimeout);
   }
@@ -498,6 +498,20 @@ function withTransportDefaults(transport: TransportLimits): Required<TransportLi
     overallTimeoutMs: transport.overallTimeoutMs ?? 30_000,
     maxAttempts: transport.maxAttempts ?? 3,
   };
+}
+
+const MAX_TIMER_MS = 2_147_483_647;
+
+/**
+ * Absolute walk deadline. A u64 above the longest `setTimeout` delay keeps
+ * that delay, so the phase bound stays tighter and the timer does not
+ * collapse to 1ms.
+ */
+export function failoverDeadline(now: number, timeoutMs: number | bigint): number {
+  if (typeof timeoutMs === "bigint" && timeoutMs > BigInt(MAX_TIMER_MS)) {
+    return now + MAX_TIMER_MS;
+  }
+  return now + Number(timeoutMs);
 }
 
 /** The phase's own bound, or what is left of the failover budget when that is tighter. */

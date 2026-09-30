@@ -6,7 +6,7 @@ import { Agent } from "undici";
 
 import { createAdmission, defaultAdmission } from "./admission.ts";
 import { createAxond } from "./app.ts";
-import { chatRateLimitFailure, classifyUpstream, isRateLimitPayload, targetAttemptCap, transportFailureReason } from "./dispatch.ts";
+import { callUpstream, chatRateLimitFailure, classifyUpstream, failoverDeadline, isRateLimitPayload, targetAttemptCap, transportFailureReason } from "./dispatch.ts";
 import { StoreFailure } from "./errors.ts";
 import { createMemoryStore } from "./memory-store.ts";
 import { createMetrics } from "./metrics.ts";
@@ -5456,6 +5456,36 @@ test("native_messages_sequence_ends_an_invalid_stream", async () => {
     });
     const rows = (await status.json()).data as { credential_id: string; state: string }[];
     assert.equal(rows.find((row) => row.credential_id === "one")?.state, "healthy");
+  } finally {
+    upstream.close();
+  }
+});
+
+test("a u64 overall timeout above 2^53 still dispatches", async () => {
+  const budget = 18446744073709551615n;
+  assert.equal(failoverDeadline(1_000, 30_000), 31_000);
+  assert.equal(failoverDeadline(1_000, budget), 1_000 + 2_147_483_647);
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "ok", usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+  });
+  try {
+    const result = await callUpstream({
+      url: upstream.url,
+      headers: new Headers({ authorization: "Bearer sk-test" }),
+      body: new TextEncoder().encode("{}"),
+      transport: {
+        responseHeaderTimeoutMs: 30_000,
+        bufferedBodyTimeoutMs: 30_000,
+        streamIdleTimeoutMs: 30_000,
+        maxResponseBytes: 1024 * 1024,
+        overallTimeoutMs: budget,
+      },
+      stream: false,
+      route: "chat",
+      onUsage: () => {},
+    });
+    assert.equal(result.response.status, 200);
   } finally {
     upstream.close();
   }

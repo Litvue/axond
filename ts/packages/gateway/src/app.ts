@@ -25,6 +25,7 @@ import { ByteRequestBody } from "./body.ts";
 import {
   callUpstream,
   credentialPolicy,
+  failoverDeadline,
   credentialState,
   noteCredentialFailure,
   noteCredentialSuccess,
@@ -757,7 +758,7 @@ async function dispatch(
   const previous = payload["previous_response_id"];
   const continuation = pinned && typeof previous === "string" && previous.length > 0;
   const clock = opts.clock ?? Date.now;
-  const deadlineAt = clock() + (opts.transport?.overallTimeoutMs ?? 30_000);
+  const deadlineAt = failoverDeadline(clock(), opts.transport?.overallTimeoutMs ?? 30_000);
   const targetCap = targetAttemptCap(pinned, opts.transport?.maxAttempts);
   if (!Number.isInteger(targetCap) || targetCap < 1) {
     throw new GatewayFailure("bad_request", 400, "failover.max_attempts must be an integer of at least 1");

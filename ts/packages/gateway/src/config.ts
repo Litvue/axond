@@ -224,7 +224,7 @@ export async function loadConfig(
     "u64",
     300,
   );
-  if (discoveryIntervalSeconds < 1) {
+  if (asUint(discoveryIntervalSeconds) < 1n) {
     throw configError("discovery.refresh_interval_seconds must be at least 1");
   }
 
@@ -268,7 +268,10 @@ export async function loadConfig(
   readVariant(toml, "credential_pool", poolRaw, "strategy", ["round-robin", "weighted"], "SelectionStrategy");
   const strategyRaw = poolRaw["strategy"];
   const failureThreshold = atLeastOne(toml, "credential_pool", poolRaw, "failure_threshold", "u32", 2);
-  const cooldownSeconds = atLeastOne(toml, "credential_pool", poolRaw, "cooldown_seconds", "u64", 30);
+  const cooldownSeconds = timerCount(
+    atLeastOne(toml, "credential_pool", poolRaw, "cooldown_seconds", "u64", 30),
+    1000,
+  );
   const credentialPool: LoadedConfig["credentialPool"] = {
     strategy: strategyRaw === "weighted" ? "weighted" : "round-robin",
     failureThreshold,
@@ -363,19 +366,19 @@ export async function loadConfig(
     "u64",
     DEFAULT_TRANSPORT.maxErrorBytes ?? 64 * 1024,
   );
-  if (maxErrorBytes > maxResponseBytes) {
+  if (asUint(maxErrorBytes) > asUint(maxResponseBytes)) {
     throw configError(
       "transport.max_error_bytes must not exceed transport.max_response_bytes: an error body is a response body",
     );
   }
   const transport: TransportLimits = {
-    responseHeaderTimeoutMs,
-    bufferedBodyTimeoutMs,
-    streamIdleTimeoutMs,
-    connectTimeoutMs,
-    streamTerminalGraceMs,
-    maxResponseBytes,
-    maxErrorBytes,
+    responseHeaderTimeoutMs: timerCount(responseHeaderTimeoutMs),
+    bufferedBodyTimeoutMs: timerCount(bufferedBodyTimeoutMs),
+    streamIdleTimeoutMs: timerCount(streamIdleTimeoutMs),
+    connectTimeoutMs: timerCount(connectTimeoutMs),
+    streamTerminalGraceMs: timerCount(streamTerminalGraceMs),
+    maxResponseBytes: runtimeCount(maxResponseBytes),
+    maxErrorBytes: runtimeCount(maxErrorBytes),
     overallTimeoutMs,
     maxAttempts,
   };
@@ -499,7 +502,7 @@ export async function loadConfig(
     prices,
     blocklist,
     transport,
-    discoveryIntervalSeconds,
+    discoveryIntervalSeconds: timerCount(discoveryIntervalSeconds, 1000),
     shutdown,
     catalog,
     extensionsDir,
@@ -697,11 +700,15 @@ function loadShutdown(toml: string, row: Record<string, unknown>): LoadedConfig[
     ["deadline_ms", deadlineMs],
     ["flush_timeout_ms", flushTimeoutMs],
   ] as const) {
-    if (value < 1) {
+    if (asUint(value) < 1n) {
       throw configError(`shutdown.${field} must be at least 1: shutdown waits are bounded`);
     }
   }
-  return { drainGraceMs, deadlineMs, flushTimeoutMs };
+  return {
+    drainGraceMs: timerCount(drainGraceMs),
+    deadlineMs: timerCount(deadlineMs),
+    flushTimeoutMs: timerCount(flushTimeoutMs),
+  };
 }
 
 const MODELS_DEV_CATALOG_URL = "https://models.dev/catalog.json";
@@ -740,15 +747,15 @@ function validateCatalog(toml: string, row: Record<string, unknown>): LoadedConf
   const timeout = catalogInt(toml, row, "refresh_timeout_seconds", CATALOG_REFRESH_TIMEOUT_SECONDS, "u64");
   const initial = catalogInt(toml, row, "retry_initial_seconds", CATALOG_RETRY_INITIAL_SECONDS, "u64");
   const max = catalogInt(toml, row, "retry_max_seconds", CATALOG_RETRY_MAX_SECONDS, "u64");
-  if (timeout > interval) {
+  if (asUint(timeout) > asUint(interval)) {
     throw configError(
       `catalog: catalogue refresh timeout (${timeout}s) must not exceed the interval (${interval}s)`,
     );
   }
-  if (max < initial) {
+  if (asUint(max) < asUint(initial)) {
     throw configError(`catalog: backoff.max (${max}s) must be at least backoff.initial (${initial}s)`);
   }
-  if (max > interval) {
+  if (asUint(max) > asUint(interval)) {
     throw configError(
       `catalog: catalogue retry ceiling (${max}s) must not exceed the refresh interval (${interval}s): a refusing deployment would refresh less often than a healthy one`,
     );
@@ -771,9 +778,9 @@ function catalogInt(
   key: string,
   fallback: number,
   expected: "u64" | "usize",
-): number {
+): number | bigint {
   const value = readTypedInt(toml, "catalog", row, key, expected, fallback);
-  if (value < 1) {
+  if (asUint(value) < 1n) {
     throw configError(`catalog.${key} must be at least 1`);
   }
   return value;
@@ -1323,12 +1330,38 @@ function atLeastOne(
   key: string,
   expected: "u32" | "u64",
   fallback: number,
-): number {
+): number | bigint {
   const value = readTypedInt(toml, section, row, key, expected, fallback);
-  if (value < 1) {
+  if (asUint(value) < 1n) {
     throw configError(`${section}.${key} must be at least 1`);
   }
   return value;
+}
+
+function asUint(value: number | bigint): bigint {
+  return typeof value === "bigint" ? value : BigInt(value);
+}
+
+/** A counter held in a JS number. Values above 2^53 keep the largest safe integer. */
+function runtimeCount(value: number | bigint): number {
+  if (typeof value !== "bigint" || value <= BigInt(Number.MAX_SAFE_INTEGER)) {
+    return typeof value === "bigint" ? Number(value) : value;
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * A duration a `setTimeout` or `setInterval` will actually wait. `scale` is
+ * the multiplier applied to the stored unit (seconds become milliseconds).
+ * A number already in range is unchanged. A u64 past 2^53 is capped at the
+ * largest delay those timers accept, so the wait does not collapse to 1ms.
+ */
+function timerCount(value: number | bigint, scale = 1): number {
+  const max = BigInt(Math.floor(2_147_483_647 / scale));
+  if (typeof value === "bigint" && value > BigInt(Number.MAX_SAFE_INTEGER)) {
+    return Number(value > max ? max : value);
+  }
+  return runtimeCount(value);
 }
 
 const U32_MAX = 4294967295n;
@@ -2547,7 +2580,9 @@ function arrayEntryLiteral(toml: string, section: string, index: number, key: st
 
 /**
  * A value serde would reject while extracting a `u32` or `u64`. Zero stays a
- * number so the caller can report the Rust bound.
+ * number so the caller can report the Rust bound. A u64 above 2^53 stays a
+ * bigint: Figment already accepted it, and the only later bound is the
+ * caller's `at least 1` check.
  */
 function readTypedInt(
   toml: string,
@@ -2558,16 +2593,13 @@ function readTypedInt(
   fallback: number,
   figmentKey = `default.${section}.${key}`,
   literal: string | null | undefined = undefined,
-): number {
+): number | bigint {
   const marked = envMark(row, key);
   if (marked) {
     const integer = coerceEnvInt(marked, expected);
-    if (integer > BigInt(Number.MAX_SAFE_INTEGER)) {
-      throw configError(`\`${key}\` must be an integer`);
-    }
-    const number = Number(integer);
-    row[key] = number;
-    return number;
+    const stored = integer <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(integer) : integer;
+    row[key] = stored;
+    return stored;
   }
   const token = replacedByEnv(row) ? null : literal === undefined ? sectionFieldLiteral(toml, section, key) : literal;
   if (token !== null && isFloatToken(token)) {
@@ -2611,10 +2643,7 @@ function readTypedInt(
   if (integer > max) {
     throw configLoad("number too large to fit in target type");
   }
-  if (integer > BigInt(Number.MAX_SAFE_INTEGER)) {
-    throw configError(`\`${key}\` must be an integer`);
-  }
-  return Number(integer);
+  return integer <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(integer) : integer;
 }
 
 function sectionAssignment(toml: string, section: string, key: string): string | null {

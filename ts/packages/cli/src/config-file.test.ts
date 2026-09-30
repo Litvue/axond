@@ -978,6 +978,53 @@ namespace = "platform"
   }
 });
 
+test("u64_overall_timeout_boots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-u64-timeout-"));
+  const port = await freePort();
+  const config = join(root, "axond.toml");
+  await writeFile(
+    config,
+    `
+[server]
+bind = "127.0.0.1:${port}"
+[storage]
+backend = "sqlite"
+path = "${join(root, "axond.sqlite")}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`,
+  );
+  const served = spawn(BIN.pathname, {
+    cwd: root,
+    env: {
+      ...process.env,
+      AXOND_CONFIG: config,
+      GW_KEY: "k",
+      AXOND_FAILOVER__OVERALL_TIMEOUT_MS: "18446744073709551615",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  served.stderr?.on("data", (chunk: Buffer) => {
+    stderr += chunk.toString();
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${port}/healthz`);
+    const health = await fetch(`http://127.0.0.1:${port}/healthz`);
+    assert.equal(health.status, 200);
+    assert.equal(await health.text(), "ok");
+  } finally {
+    served.kill("SIGTERM");
+    await new Promise((resolve) => served.once("exit", resolve));
+    await rm(root, { recursive: true, force: true });
+  }
+  assert.equal(stderr, "", stderr);
+});
+
 test("admission_float_beats_a_later_failover_array", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-order-"));
   const db = join(root, "fresh.sqlite");
