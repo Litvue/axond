@@ -16,7 +16,7 @@ import {
   resolveTelemetry,
 } from "../../gateway/src/index.ts";
 import { cliArguments, parseArgv } from "./argv.ts";
-import { locateConfigFile } from "./config-file.ts";
+import { figmentFileSource, locateConfigFile, wantsFigmentLocation } from "./config-file.ts";
 import { createBackgroundDrain, remainingMs, settleShareMs as flushSettleShare } from "./shutdown-budget.ts";
 import { openUsageDelivery } from "./usage-delivery.ts";
 import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
@@ -41,7 +41,7 @@ async function main(): Promise<void> {
   const store =
     config.storage.backend === "sqlite"
       ? openSqliteStore(config.storage.path!, metrics)
-      : await openPostgres(config.storage.dsn!, metrics);
+      : await openPostgres(requirePostgresDsn(config.storage), metrics);
   await seedConfigNamespaces(store, config.namespaces);
   const extensions = await loadExtensionDir(config.extensionsDir ?? process.env["AXOND_EXTENSIONS_DIR"] ?? null);
   for (const extension of extensions) {
@@ -321,6 +321,14 @@ function assertMigrationPrefix(name: string, sql: string): void {
   }
 }
 
+function requirePostgresDsn(storage: { dsn?: string; dsnEnv?: string }): string {
+  const dsn = storage.dsn;
+  if (dsn === undefined || dsn.length === 0) {
+    throw new Error(`store: store unavailable: env \`${storage.dsnEnv ?? ""}\` is unset or empty`);
+  }
+  return dsn;
+}
+
 async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgresStore>[1]) {
   const setup = new Client({ connectionString: dsn });
   await setup.connect();
@@ -362,8 +370,9 @@ async function loadExtensionDir(dir: string | null): Promise<AxondExtension[]> {
 
 async function loadOperatorConfig(configPath: string) {
   let toml = "";
+  let located: string | null = null;
   try {
-    const located = await locateConfigFile(configPath);
+    located = await locateConfigFile(configPath);
     if (located) {
       toml = await readFile(located, "utf8");
     }
@@ -376,7 +385,11 @@ async function loadOperatorConfig(configPath: string) {
   } catch (error) {
     const message = error instanceof Error ? error.message : "invalid config";
     if (message.startsWith("config: ")) {
-      throw new Error(`failed to load config from \`${configPath}\`: config load: ${message.slice("config: ".length)}`);
+      let detail = message.slice("config: ".length);
+      if (located && wantsFigmentLocation(detail)) {
+        detail += ` in ${figmentFileSource(located)} TOML file`;
+      }
+      throw new Error(`failed to load config from \`${configPath}\`: config load: ${detail}`);
     }
     throw new Error(`failed to load config from \`${configPath}\`: invalid config: ${message}`);
   }

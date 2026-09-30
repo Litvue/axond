@@ -51,6 +51,9 @@ export interface LoadedConfig {
   storage: {
     backend: "sqlite" | "postgres";
     path?: string;
+    /** Env var name from `dsn_env`. The value is resolved separately. */
+    dsnEnv?: string;
+    /** Set when that env var is present and non-empty. */
     dsn?: string;
     createTable: boolean;
     onUnavailable: "deny" | "allow";
@@ -144,7 +147,7 @@ const DEFAULT_TRANSPORT: TransportLimits = {
 export async function loadConfig(toml: string, secrets: SecretReader): Promise<LoadedConfig> {
   let parsed: Record<string, unknown>;
   try {
-    parsed = parse(toml) as Record<string, unknown>;
+    parsed = parse(toml, { integersAsBigInt: "asNeeded" }) as Record<string, unknown>;
   } catch (error) {
     throw new GatewayFailure("bad_request", 400, `config: ${error instanceof Error ? error.message : "unreadable toml"}`);
   }
@@ -171,23 +174,38 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
   if (onUnavailable === null) {
     throw configError("`[storage] on_unavailable` must be `deny` or `allow`");
   }
+  validateUsageIndex(toml, storageRaw);
   let storage: LoadedConfig["storage"];
   if (backend === "sqlite") {
     const path = typeof storageRaw["path"] === "string" ? storageRaw["path"] : "";
-    if (path.length === 0) {
-      throw configError('`[storage] path` is required when `backend = "sqlite"`');
+    if (path.trim().length === 0) {
+      throw configError("`[storage]` sqlite requires a non-empty `path`");
+    }
+    if (path.trim() === ":memory:") {
+      throw configError("`[storage]` sqlite `:memory:` is not durable; use a file path");
+    }
+    const dsnEnv = typeof storageRaw["dsn_env"] === "string" ? storageRaw["dsn_env"] : "";
+    if (dsnEnv.trim().length > 0) {
+      throw configError('`[storage]` sqlite ignores `dsn_env`; omit it or use backend = "postgres"');
     }
     storage = { backend, path, createTable, onUnavailable };
   } else {
     const dsnEnv = typeof storageRaw["dsn_env"] === "string" ? storageRaw["dsn_env"] : "";
-    if (dsnEnv.length === 0) {
-      throw configError('`[storage] dsn_env` is required when `backend = "postgres"`');
+    if (dsnEnv.trim().length === 0) {
+      throw configError("`[storage]` postgres requires a non-empty `dsn_env`");
+    }
+    const path = typeof storageRaw["path"] === "string" ? storageRaw["path"] : "";
+    if (path.trim().length > 0) {
+      throw configError('`[storage]` postgres ignores `path`; omit it or use backend = "sqlite"');
     }
     const dsn = secrets.env(dsnEnv);
-    if (dsn === undefined || dsn.length === 0) {
-      throw configError(`\`[storage] dsn_env\` names \`${dsnEnv}\`, which is unset`);
-    }
-    storage = { backend, dsn, createTable, onUnavailable };
+    storage = {
+      backend,
+      dsnEnv,
+      ...(dsn !== undefined && dsn.length > 0 ? { dsn } : {}),
+      createTable,
+      onUnavailable,
+    };
   }
 
   const namespaces = asArray(parsed["namespace"]).map((entry) => {
@@ -784,10 +802,196 @@ function numberField(row: Record<string, unknown>, key: string, fallback: number
   if (value === undefined) {
     return fallback;
   }
+  if (typeof value === "bigint") {
+    if (value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)) {
+      return Number(value);
+    }
+    throw configError(`\`${key}\` must be an integer`);
+  }
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }
   throw configError(`\`${key}\` must be an integer`);
+}
+
+/** Tokio `Semaphore::MAX_PERMITS` (`usize::MAX >> 3` on 64-bit). */
+const MAX_USAGE_INDEX_BUFFER = 2305843009213693951n;
+const MAX_USAGE_INDEX_BATCH = 4096n;
+const MAX_USAGE_INDEX_FLUSH_MS = 86400000n;
+const TARGET_UINT_MAX = 18446744073709551615n;
+
+/**
+ * `[storage.usage_index]` is checked before the backend path. A value serde
+ * would reject is a config-load error. A parsed integer outside the Rust
+ * bounds is `invalid config`.
+ */
+function validateUsageIndex(toml: string, storageRaw: Record<string, unknown>): void {
+  const index = asRecord(storageRaw["usage_index"]) ?? {};
+  const buffer = readUsageIndexInt(toml, index, "buffer_capacity", "usize", 1024n);
+  const batch = readUsageIndexInt(toml, index, "max_batch", "usize", 256n);
+  const flush = readUsageIndexInt(toml, index, "flush_interval_ms", "u64", 50n);
+  if (buffer === 0n) {
+    throw configError("`[storage.usage_index]` buffer_capacity must be at least 1");
+  }
+  if (buffer > MAX_USAGE_INDEX_BUFFER) {
+    throw configError(
+      "`[storage.usage_index]` buffer_capacity (" + buffer + ") must not exceed " + MAX_USAGE_INDEX_BUFFER,
+    );
+  }
+  if (batch === 0n) {
+    throw configError("`[storage.usage_index]` max_batch must be at least 1");
+  }
+  if (batch > MAX_USAGE_INDEX_BATCH) {
+    throw configError("`[storage.usage_index]` max_batch (" + batch + ") must not exceed " + MAX_USAGE_INDEX_BATCH);
+  }
+  if (batch > buffer) {
+    throw configError(
+      "`[storage.usage_index]` max_batch (" + batch + ") must not exceed buffer_capacity (" + buffer + ")",
+    );
+  }
+  if (flush > MAX_USAGE_INDEX_FLUSH_MS) {
+    throw configError(
+      "`[storage.usage_index]` flush_interval_ms (" + flush + ") must not exceed " + MAX_USAGE_INDEX_FLUSH_MS + " (24h)",
+    );
+  }
+}
+
+function readUsageIndexInt(
+  toml: string,
+  index: Record<string, unknown>,
+  key: string,
+  expected: "usize" | "u64",
+  fallback: bigint,
+): bigint {
+  const literal = usageIndexLiteral(toml, key);
+  if (literal !== null && isFloatToken(literal)) {
+    throw configLoad(
+      `invalid type: found float \`${rustFloatText(literal)}\`, expected ${expected} for key "default.storage.usage_index.${key}"`,
+    );
+  }
+  if (!(key in index)) {
+    return fallback;
+  }
+  const value = index[key];
+  if (typeof value === "string") {
+    throw configLoad(
+      `invalid type: found string ${JSON.stringify(value)}, expected ${expected} for key "default.storage.usage_index.${key}"`,
+    );
+  }
+  if (typeof value === "boolean") {
+    throw configLoad(
+      `invalid type: found bool ${value}, expected ${expected} for key "default.storage.usage_index.${key}"`,
+    );
+  }
+  if (Array.isArray(value)) {
+    throw configLoad(`invalid type: found sequence, expected ${expected} for key "default.storage.usage_index.${key}"`);
+  }
+  if (value !== null && typeof value === "object") {
+    throw configLoad(`invalid type: found map, expected ${expected} for key "default.storage.usage_index.${key}"`);
+  }
+  let integer: bigint;
+  if (typeof value === "bigint") {
+    integer = value;
+  } else if (typeof value === "number" && Number.isInteger(value)) {
+    integer = BigInt(value);
+  } else if (typeof value === "number") {
+    throw configLoad(
+      `invalid type: found float \`${value}\`, expected ${expected} for key "default.storage.usage_index.${key}"`,
+    );
+  } else {
+    throw configLoad(`invalid type: found sequence, expected ${expected} for key "default.storage.usage_index.${key}"`);
+  }
+  if (integer < 0n) {
+    throw configLoad(
+      `invalid value signed int \`${integer}\`, expected ${expected} for key "default.storage.usage_index.${key}"`,
+    );
+  }
+  if (integer > TARGET_UINT_MAX) {
+    throw configLoad("number too large to fit in target type");
+  }
+  return integer;
+}
+
+function configLoad(message: string): GatewayFailure {
+  return new GatewayFailure("bad_request", 400, `config: ${message}`);
+}
+
+function usageIndexLiteral(toml: string, key: string): string | null {
+  let inSection = false;
+  let found: string | null = null;
+  for (const line of toml.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (/^\[storage\.usage_index\]\s*(?:#.*)?$/.test(trimmed)) {
+      inSection = true;
+      continue;
+    }
+    if (inSection && /^\s*\[/.test(line)) {
+      inSection = false;
+    }
+    const names = inSection ? [key, `"${key}"`, `'${key}'`] : [`storage.usage_index.${key}`];
+    for (const name of names) {
+      const assigned = assignmentValue(line, name);
+      if (assigned !== null) {
+        found = assigned;
+      }
+    }
+  }
+  return found;
+}
+
+function assignmentValue(line: string, key: string): string | null {
+  const match = new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*(.*)$`).exec(line);
+  if (!match) {
+    return null;
+  }
+  return tomlRhs(match[1] ?? "");
+}
+
+function tomlRhs(raw: string): string {
+  const text = raw.trim();
+  if (text.startsWith('"')) {
+    let index = 1;
+    while (index < text.length) {
+      if (text[index] === "\\") {
+        index += 2;
+        continue;
+      }
+      if (text[index] === '"') {
+        return text.slice(0, index + 1);
+      }
+      index += 1;
+    }
+    return text;
+  }
+  if (text.startsWith("'")) {
+    const end = text.indexOf("'", 1);
+    return end === -1 ? text : text.slice(0, end + 1);
+  }
+  const hash = text.indexOf("#");
+  return (hash === -1 ? text : text.slice(0, hash)).trim();
+}
+
+function isFloatToken(token: string): boolean {
+  return (
+    /^[+-]?(?:inf|nan)$/i.test(token) ||
+    /^[+-]?(?:\d[\d_]*)?\.\d[\d_]*(?:[eE][+-]?\d[\d_]*)?$/.test(token) ||
+    /^[+-]?\d[\d_]*[eE][+-]?\d[\d_]*$/.test(token) ||
+    /^[+-]?\d[\d_]*\.$/.test(token)
+  );
+}
+
+function rustFloatText(token: string): string {
+  const lower = token.toLowerCase().replace(/_/g, "");
+  if (lower === "inf" || lower === "+inf") {
+    return "inf";
+  }
+  if (lower === "-inf") {
+    return "-inf";
+  }
+  if (lower === "nan" || lower === "+nan" || lower === "-nan") {
+    return "NaN";
+  }
+  return String(Number(lower));
 }
 
 export function envSecretReader(

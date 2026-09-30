@@ -1,5 +1,5 @@
 import { stat } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 
 async function isFile(path: string): Promise<boolean> {
   try {
@@ -30,4 +30,30 @@ export async function locateConfigFile(operatorPath: string, cwd = process.cwd()
     }
     dir = parent;
   }
+}
+
+/**
+ * Figment's file source label. A path relative to `cwd` is used when it has
+ * fewer components than the absolute path.
+ */
+export function figmentFileSource(located: string, cwd = process.cwd()): string {
+  const rel = relative(cwd, located);
+  if (rel.length > 0 && pathComponents(rel) < pathComponents(located)) {
+    return rel;
+  }
+  return located;
+}
+
+/** A Figment extract failure names the file. A TOML parse error does not. */
+export function wantsFigmentLocation(detail: string): boolean {
+  return (
+    detail.startsWith("invalid type:") ||
+    detail.startsWith("invalid value ") ||
+    detail.startsWith("number too large to fit in target type")
+  );
+}
+
+function pathComponents(path: string): number {
+  const parts = path.split("/").filter((part) => part.length > 0);
+  return (path.startsWith("/") ? 1 : 0) + parts.length;
 }

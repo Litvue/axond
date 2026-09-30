@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { locateConfigFile } from "./config-file.ts";
+import { figmentFileSource, locateConfigFile } from "./config-file.ts";
 
 const BIN = new URL("../../../bin/axond", import.meta.url);
 const STORAGE =
@@ -80,11 +80,88 @@ namespace = "platform"
   }
 });
 
-function run(config: string, cwd: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+test("storage_boot_matches_the_rust_refusals", async () => {
+  assert.equal(figmentFileSource("/tmp/storage-probe.toml", "/tmp/storage-probe"), "../storage-probe.toml");
+  assert.equal(figmentFileSource("/tmp/storage-probe.toml", "/workspace"), "/tmp/storage-probe.toml");
+
+  const root = await mkdtemp(join(tmpdir(), "axond-storage-"));
+  try {
+    const memory = join(root, "memory.toml");
+    await writeFile(memory, '[storage]\nbackend = "sqlite"\npath = ":memory:"\n');
+    const memoryRun = await run(memory, root);
+    assert.equal(memoryRun.code, 1);
+    assert.equal(memoryRun.stdout, "");
+    assert.equal(
+      memoryRun.stderr,
+      "Error: failed to load config from `" +
+        memory +
+        "`: invalid config: `[storage]` sqlite `:memory:` is not durable; use a file path\n",
+    );
+
+    const bounds = join(root, "bounds.toml");
+    await writeFile(bounds, '[storage]\npath = "/tmp/axond.sqlite"\n[storage.usage_index]\nbuffer_capacity = 0\n');
+    const boundsRun = await run(bounds, root);
+    assert.equal(boundsRun.code, 1);
+    assert.equal(
+      boundsRun.stderr,
+      "Error: failed to load config from `" +
+        bounds +
+        "`: invalid config: `[storage.usage_index]` buffer_capacity must be at least 1\n",
+    );
+
+    const floated = join(root, "float.toml");
+    await writeFile(
+      floated,
+      '[storage]\npath = "/tmp/axond.sqlite"\n[storage.usage_index]\nbuffer_capacity = 1.5\n',
+    );
+    const floatRun = await run(floated, root);
+    assert.equal(floatRun.code, 1);
+    assert.equal(floatRun.stdout, "");
+    assert.equal(
+      floatRun.stderr,
+      "Error: failed to load config from `" +
+        floated +
+        '`: config load: invalid type: found float `1.5`, expected usize for key "default.storage.usage_index.buffer_capacity" in ' +
+        figmentFileSource(floated, root) +
+        " TOML file\n",
+    );
+
+    const postgres = join(root, "postgres.toml");
+    await writeFile(
+      postgres,
+      `
+[storage]
+backend = "postgres"
+dsn_env = "AXOND_STORAGE_BOOT_DSN"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_INBOUND_KEY"
+namespace = "platform"
+`,
+    );
+    const unset = await run(postgres, root, { GW_INBOUND_KEY: "k", AXOND_STORAGE_BOOT_DSN: "" });
+    assert.equal(unset.code, 1);
+    assert.equal(unset.stdout, "");
+    assert.equal(
+      unset.stderr,
+      "Error: store: store unavailable: env `AXOND_STORAGE_BOOT_DSN` is unset or empty\n",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+function run(
+  config: string,
+  cwd: string,
+  extra: Record<string, string> = {},
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(BIN.pathname, {
       cwd,
-      env: { ...process.env, AXOND_CONFIG: config },
+      env: { ...process.env, ...extra, AXOND_CONFIG: config },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";

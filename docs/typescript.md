@@ -27,6 +27,17 @@ config from \`…\`: invalid config: \`[storage]\` is required …`. A file that
 is not TOML uses the `config load:` prefix. Other boot failures use the same
 `Error:` line.
 
+SQLite `:memory:` is refused, including with surrounding whitespace. A SQLite
+file that sets `dsn_env`, or a Postgres file that sets `path`, fails boot with
+the Rust sentence. `[storage.usage_index]` uses the same bounds: `buffer_capacity`
+at least 1 and at most Tokio's permit limit, `max_batch` at least 1, at most
+4096, and no greater than the buffer, and `flush_interval_ms` at most 24h.
+`0` is a legal flush interval. A float, a negative, or a string in that table
+is `config load:` with Figment's type sentence and the file label. An integer
+above `u64` says `number too large to fit in target type`. A Postgres
+`dsn_env` whose value is unset or empty is not an invalid config: boot exits 1
+with `Error: store: store unavailable: env \`…\` is unset or empty`.
+
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
 directory of `.ts`, `.js`, or `.mjs` files. Each file's default export is an
