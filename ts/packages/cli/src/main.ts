@@ -19,7 +19,7 @@ import {
 import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
-import { createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
+import { applyPostgresMigration, createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
 import { openSqliteStore } from "./sqlite-store.ts";
 
 const { Client } = pg;
@@ -48,9 +48,13 @@ async function main(): Promise<void> {
   const extensions = await loadExtensionDir(config.extensionsDir ?? process.env["AXOND_EXTENSIONS_DIR"] ?? null);
   for (const extension of extensions) {
     for (const [index, sql] of (extension.migrations ?? []).entries()) {
+      assertMigrationPrefix(extension.name, sql);
+      const id = `${extension.name}:${index}`;
       if (config.storage.backend === "sqlite") {
         const { applyMigration } = await import("./sqlite-store.ts");
-        applyMigration(config.storage.path!, `${extension.name}:${index}`, sql);
+        applyMigration(config.storage.path!, id, sql);
+      } else {
+        await applyPostgresMigration(config.storage.dsn!, id, sql);
       }
     }
   }
@@ -280,6 +284,16 @@ function connectDispatcher(connectTimeoutMs: number): object | undefined {
     connectTimeout: connectTimeoutMs,
     connect: { autoSelectFamily: false },
   });
+}
+
+function assertMigrationPrefix(name: string, sql: string): void {
+  const prefix = `axond_ext_${name}_`;
+  for (const match of sql.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?([a-zA-Z0-9_]+)/gi)) {
+    const table = match[1]!;
+    if (!table.startsWith(prefix)) {
+      throw new Error(`extension ${name} migration creates \`${table}\` outside \`${prefix}\``);
+    }
+  }
 }
 
 async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgresStore>[1]) {

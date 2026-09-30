@@ -18,7 +18,7 @@ There is no usage-row migration. SQLite and Postgres keep `axond_store_usage`, a
 
 The TypeScript process adds two columns on `axond_namespace`, `allow_platform_fallback` and `from_config`, and a table `axond_catalog_streak` that holds the catalogue refusal count. Those are not in the Rust `ops/postgres` scripts. Rust does not read `axond_catalog_streak`. Opening the same SQLite file from the Rust binary leaves the table in place.
 
-Postgres schema application is `CREATE TABLE IF NOT EXISTS`, so a second boot does not rebuild existing rows.
+Postgres schema application is `CREATE TABLE IF NOT EXISTS`, so a second boot does not rebuild existing rows. Extension migrations run at process start on SQLite and on Postgres. Each statement is recorded in `axond_schema_migrations` and a second boot skips that id. A failed statement is rolled back and is not recorded. The error names the migration id and omits the driver text.
 
 ## What core no longer does
 

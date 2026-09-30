@@ -5,7 +5,7 @@ import pg from "pg";
 
 import { StoreFailure } from "../../gateway/src/errors.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
-import { createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
+import { applyPostgresMigration, createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
 import type { Store } from "@axond/sdk";
 
 const dsn = process.env["AXOND_TEST_POSTGRES"];
@@ -217,6 +217,39 @@ test("applying the postgres schema twice is idempotent", { skip: !dsn }, async (
   await opened.client.query(POSTGRES_SCHEMA);
   await opened.client.query(POSTGRES_SCHEMA);
   await opened.release();
+});
+
+test("postgres_extension_migration_applies_once_and_omits_the_driver_text", { skip: !dsn }, async () => {
+  await reset();
+  const secret = "sk-migration-sentinel";
+  const id = "demo:0";
+  await applyPostgresMigration(dsn!, id, "CREATE TABLE axond_ext_demo_note (id text primary key)");
+  await applyPostgresMigration(dsn!, id, "CREATE TABLE axond_ext_demo_note (id text primary key)");
+  const opened = await connect();
+  try {
+    const rows = await opened.client.query("SELECT id FROM axond_schema_migrations WHERE id = $1", [id]);
+    assert.equal(rows.rows.length, 1);
+    const table = await opened.client.query("SELECT to_regclass('axond_ext_demo_note') AS name");
+    assert.equal(table.rows[0]?.["name"], "axond_ext_demo_note");
+  } finally {
+    await opened.client.query("DROP TABLE IF EXISTS axond_ext_demo_note");
+    await opened.release();
+  }
+  const bad = `SELECT '${secret}'::int`;
+  await assert.rejects(() => applyPostgresMigration(dsn!, "demo:1", bad), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal(error.message, "extension migration demo:1 failed");
+    assert.equal(error.message.includes(secret), false);
+    assert.equal(error.message.includes(dsn!), false);
+    return true;
+  });
+  const check = await connect();
+  try {
+    const missing = await check.client.query("SELECT id FROM axond_schema_migrations WHERE id = $1", ["demo:1"]);
+    assert.equal(missing.rows.length, 0);
+  } finally {
+    await check.release();
+  }
 });
 
 test("postgres provider models keep the last payload and reject a different fresh source", { skip: !dsn }, async () => {

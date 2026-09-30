@@ -217,7 +217,9 @@ and a Cloudflare account are not part of this repository's test environment.
 ## Store
 
 SQLite is the default. Postgres uses `dsn_env` and the schema in
-`createPostgresStore`. The two extra namespace columns
+`createPostgresStore`. Extension migrations apply once on either store:
+a recorded id is skipped, and a failed statement names that id without the
+driver text. The two extra namespace columns
 `allow_platform_fallback` and `from_config` are applied by the TypeScript
 process; they are not in the Rust `ops/postgres` scripts. Catalogue refusal
 counts live in `axond_catalog_streak`. The Rust process does not read that

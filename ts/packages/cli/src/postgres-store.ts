@@ -1,3 +1,5 @@
+import pg from "pg";
+
 import type {
   BudgetLedger,
   BudgetPolicyWrite,
@@ -467,6 +469,54 @@ function namespaceFrom(row: Record<string, unknown>): NamespaceWrite {
     allowPlatformFallback: Boolean(row["allow_platform_fallback"]),
     fromConfig: Boolean(row["from_config"]),
   };
+}
+
+/**
+ * Apply one extension migration if its id is not already recorded.
+ * A second call leaves the database unchanged. A failed statement is rolled
+ * back and is not recorded. The thrown error names the id and omits the
+ * driver text.
+ */
+export async function applyPostgresMigration(dsn: string, id: string, sql: string): Promise<void> {
+  const client = new pg.Client({ connectionString: dsn });
+  try {
+    await client.connect();
+    await applyPostgresMigrationOn(
+      {
+        query: async (statement, params) => {
+          const result = params === undefined ? await client.query(statement) : await client.query(statement, [...params]);
+          const row = Array.isArray(result) ? result[result.length - 1] : result;
+          return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
+        },
+      },
+      id,
+      sql,
+    );
+  } catch (error) {
+    if (error instanceof Error && error.message === `extension migration ${id} failed`) {
+      throw error;
+    }
+    throw new Error(`extension migration ${id} failed`);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/** Run one migration on an open client. The caller owns connect and close. */
+export async function applyPostgresMigrationOn(client: SqlExecutor, id: string, sql: string): Promise<void> {
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1::text)::bigint)", [id]);
+    const existing = await client.query("SELECT id FROM axond_schema_migrations WHERE id = $1", [id]);
+    if (existing.rows.length === 0) {
+      await client.query(sql);
+      await client.query("INSERT INTO axond_schema_migrations (id) VALUES ($1)", [id]);
+    }
+    await client.query("COMMIT");
+  } catch {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw new Error(`extension migration ${id} failed`);
+  }
 }
 
 function modelFrom(row: Record<string, unknown>): ProviderModelCache {

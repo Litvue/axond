@@ -2,10 +2,10 @@ import { Client } from "pg";
 
 import { createAdmission, createAxond, createMetrics, defaultAdmission, resolveTelemetry } from "@axond/gateway";
 import { rateLimitExtension } from "@axond/rate-limit";
-import type { CredentialConfig, ProviderConfig, Store } from "@axond/sdk";
+import type { AxondExtension, CredentialConfig, ProviderConfig, Store } from "@axond/sdk";
 
 import { discoverOnce, type CatalogMetrics } from "../../cli/src/discovery.ts";
-import { createPostgresStore, POSTGRES_SCHEMA } from "../../cli/src/postgres-store.ts";
+import { applyPostgresMigrationOn, createPostgresStore, POSTGRES_SCHEMA } from "../../cli/src/postgres-store.ts";
 
 export interface WorkerEnv {
   HYPERDRIVE: { connectionString: string };
@@ -35,11 +35,12 @@ let admission = createAdmission(defaultAdmission());
 export function createHandler(env: WorkerEnv) {
   metrics ??= createMetrics([env.GATEWAY_KEY]);
   let schema: Promise<void> | null = null;
+  const extensions = [rateLimitExtension({ limit: 60, windowMs: 60_000, mode: "isolate" })];
   const store = createPostgresStore(async () => {
     const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
     await client.connect();
     if (schema === null) {
-      schema = client.query(POSTGRES_SCHEMA).then(() => undefined);
+      schema = prepareWorkerSchema(client, extensions);
     }
     await schema;
     return {
@@ -80,7 +81,7 @@ export function createHandler(env: WorkerEnv) {
         gatewayKey: env.GATEWAY_KEY,
         defaultNamespace: "platform",
         providers,
-        extensions: [rateLimitExtension({ limit: 60, windowMs: 60_000, mode: "isolate" })],
+        extensions,
         waitUntil: (promise) => ctx.waitUntil(promise),
         admissionControl: admission,
         metrics,
@@ -102,6 +103,22 @@ export default {
     createHandler(env).scheduled(ctx);
   },
 };
+
+async function prepareWorkerSchema(client: Client, extensions: readonly AxondExtension[]): Promise<void> {
+  await client.query(POSTGRES_SCHEMA);
+  const executor = {
+    query: async (sql: string, params?: readonly unknown[]) => {
+      const result = params === undefined ? await client.query(sql) : await client.query(sql, [...params]);
+      const row = Array.isArray(result) ? result[result.length - 1] : result;
+      return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
+    },
+  };
+  for (const extension of extensions) {
+    for (const [index, sql] of (extension.migrations ?? []).entries()) {
+      await applyPostgresMigrationOn(executor, `${extension.name}:${index}`, sql);
+    }
+  }
+}
 
 function workerCatalog(env: WorkerEnv): { source: "none" | "models-dev" | "seed"; sourceUrl: string | null } {
   const source = env.CATALOG_SOURCE === "models-dev" || env.CATALOG_SOURCE === "seed" ? env.CATALOG_SOURCE : "none";
