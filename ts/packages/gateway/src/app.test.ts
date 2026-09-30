@@ -107,6 +107,28 @@ test("rewrite keeps duplicate keys and large integers", () => {
   assert.equal(next, '{"model":"chat","n":9007199254740993,"a":1,"a":2}');
 });
 
+test("a buffered chat forwards duplicate keys, field order, and integers above 2^53", async () => {
+  const { app, upstream } = await gateway();
+  const raw = '{"z":1,"model": "fake-openai/gpt-test","n":9007199254740993,"a":1,"a":2}';
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: raw,
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    const sent = upstream.requests.at(-1)!;
+    assert.equal(sent.body, '{"z":1,"model": "gpt-test","n":9007199254740993,"a":1,"a":2}');
+    assert.equal(sent.authorization, "Bearer upstream-openai");
+    const parsed = JSON.parse(sent.body) as { n: number; a: number };
+    assert.equal(parsed.n, 9007199254740992);
+    assert.equal(parsed.a, 2);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("a buffered chat completion rewrites the model and forwards the provider credential", async () => {
   const { app, store, upstream } = await gateway();
   const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
