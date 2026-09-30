@@ -27,7 +27,7 @@ Boot errors name references and identifiers, not secret values.
 | `404 unknown_namespace` | Path namespace missing or deleted. | `GET /api/v1/namespaces/{ns}`; same body for never-existed and deleted. |
 | `400 model_unprefixed` / `unknown_provider` | Request `model` is not `provider-id/model-id`. | Prefix with a configured provider id. |
 | `400 unsupported_wire` | Route and alias provider family differ. | Keep every alias target in one wire family and use the matching route. |
-| `400 bad_request` | Invalid request or query shape. | Error message; repeated/invalid `namespaces` values are rejected deliberately. |
+| `400 bad_request` | Invalid request or query shape. A non-boolean `stream`, a `previous_response_id` that is not a string or null, and `stream: true` on embeddings are refused before the provider is called. The message does not echo the value. | Error message; repeated/invalid `namespaces` values are rejected deliberately. |
 | `429 budget_exceeded` | Namespace spend cap: `spent >= limit`, or no budget row. | `GET /api/v1/namespaces/{ns}/budgets/{period}`. |
 | `429 tenant_concurrency_exceeded` | The caller's namespace is at `admission.max_in_flight_per_tenant` on this replica. | `axond.admission.in_flight`; whether the tenant's own concurrency, not the replica, is the cause. |
 | `413 request_too_large` / `413 prompt_too_large` | Inbound body over `admission.max_request_bytes`, or estimated input over `admission.max_prompt_tokens`. | The caller's payload size; raise the bound only if the workload genuinely needs it. |

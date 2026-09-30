@@ -551,12 +551,19 @@ async function prepareInference(
     throw new GatewayFailure("request_too_large", 413, "request body exceeds the configured inbound limit");
   }
   const parsed = await axond.body.json<Record<string, unknown>>();
+  if (parsed["stream"] !== undefined && typeof parsed["stream"] !== "boolean") {
+    throw badRequest("`stream` must be a boolean when present");
+  }
+  const previous = parsed["previous_response_id"];
+  if (previous !== undefined && previous !== null && typeof previous !== "string") {
+    throw badRequest("`previous_response_id` must be a string or null when present");
+  }
+  if (parsed["stream"] === true && axond.route === "embeddings") {
+    throw badRequest("/v1/embeddings does not support streaming");
+  }
   const model = parsed["model"];
   if (typeof model !== "string" || model.length === 0) {
     throw badRequest("missing `model`");
-  }
-  if (parsed["stream"] !== undefined && typeof parsed["stream"] !== "boolean") {
-    throw badRequest("`stream` must be a boolean when present");
   }
   const slash = model.indexOf("/");
   if (slash <= 0 || slash === model.length - 1) {

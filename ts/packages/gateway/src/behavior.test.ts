@@ -4032,3 +4032,92 @@ test("provider_refusals_keep_their_class_and_export_bounded_attempt_diagnostics"
     collector.close();
   }
 });
+
+test("malformed_responses_controls_never_reach_the_provider", async () => {
+  const secret = "malformed-control@example.com";
+  let hits = 0;
+  const upstream = await listen((_req, res) => {
+    hits += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: "resp_ok", output: [], usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const store = await seeded();
+  const logs: unknown[] = [];
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-control", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const refused: Array<{ path: string; body: unknown; message: string }> = [
+    {
+      path: "/ns/platform/v1/responses",
+      body: { model: "fake-openai/gpt-test", input: "ordinary", stream: secret },
+      message: "`stream` must be a boolean when present",
+    },
+    {
+      path: "/ns/platform/v1/chat/completions",
+      body: { model: "fake-openai/gpt-test", messages: [], previous_response_id: { value: secret } },
+      message: "`previous_response_id` must be a string or null when present",
+    },
+    {
+      path: "/ns/platform/v1/responses",
+      body: { model: "fake-openai/gpt-test", input: "ordinary", stream: true, previous_response_id: { value: secret } },
+      message: "`previous_response_id` must be a string or null when present",
+    },
+    {
+      path: "/ns/platform/v1/embeddings",
+      body: { model: "fake-openai/gpt-test", input: "hello", stream: true },
+      message: "/v1/embeddings does not support streaming",
+    },
+  ];
+  try {
+    for (const item of refused) {
+      hits = 0;
+      const response = await app.request(`http://127.0.0.1${item.path}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(item.body),
+      });
+      const text = await response.text();
+      assert.equal(response.status, 400, item.path);
+      const body = JSON.parse(text) as { error: { type: string; message: string } };
+      assert.equal(body.error.type, "bad_request", item.path);
+      assert.equal(body.error.message, item.message, item.path);
+      assert.equal(text.includes(secret), false, item.path);
+      assert.equal(hits, 0, item.path);
+    }
+    for (const body of [
+      { model: "fake-openai/gpt-test", input: "ordinary", stream: false, previous_response_id: null },
+      { model: "fake-openai/gpt-test", input: "ordinary", previous_response_id: "resp_1" },
+    ]) {
+      const before = hits;
+      const response = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 200);
+      await response.text();
+      assert.equal(hits, before + 1);
+    }
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes(secret), false);
+    assert.equal(encoded.includes(KEY), false);
+  } finally {
+    upstream.close();
+  }
+});

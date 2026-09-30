@@ -250,6 +250,9 @@ checks actual upstream status, error classification, OpenTelemetry error
 status, the UTF-8 byte bound, and credential omission across buffered and
 streamed OpenAI and Anthropic calls. The TypeScript test of that name records
 attempt `axond.status` as `error` on the same matrix.
+`malformed_responses_controls_never_reach_the_provider` refuses a non-boolean
+`stream` and a non-string `previous_response_id` before the provider is called,
+and the error omits the value.
 
 **Regression tests.** The two copies of the shipped DDL are gated by
 `every_shipped_ddl_file_exists_in_both_locations` and
