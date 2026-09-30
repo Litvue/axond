@@ -5,7 +5,37 @@ import test from "node:test";
 
 import { createMemoryStore } from "../../gateway/src/memory-store.ts";
 
-import { createHandler, discoverOnSchedule, handlerFor } from "./index.ts";
+import { createHandler, discoverOnSchedule, handlerFor, schemaAttempt } from "./index.ts";
+
+test("worker_schema_attempt_retries_after_rejection", async () => {
+  const gate = schemaAttempt();
+  let calls = 0;
+  await assert.rejects(
+    () => gate.run(async () => {
+      calls += 1;
+      throw new Error("pool");
+    }),
+    /pool/,
+  );
+  let release = (): void => {};
+  const started = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const first = gate.run(async () => {
+    calls += 1;
+    await started;
+  });
+  const second = gate.run(async () => {
+    calls += 1;
+  });
+  assert.equal(calls, 2);
+  release();
+  await Promise.all([first, second]);
+  await gate.run(async () => {
+    calls += 1;
+  });
+  assert.equal(calls, 2);
+});
 
 test("the worker handler is a static bundle of the gateway and an extension", async () => {
   const source = await readFile(new URL("./index.ts", import.meta.url), "utf8");

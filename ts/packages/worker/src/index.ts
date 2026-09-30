@@ -30,6 +30,8 @@ interface WaitContext {
  * them. The process binary loads the same contract from `AXOND_EXTENSIONS_DIR`
  * at startup instead. Hyperdrive supplies the Postgres connection string;
  * each call opens one client and closes it, with no session-level SET.
+ * A failed schema apply is not kept, so the next request can retry. A
+ * successful apply stays for the isolate.
  * `PRICES_JSON` is the price list a chat uses when it settles.
  * One gateway lives for the isolate, so a parked credential stays parked.
  * Settlement is bound to the request that owns it.
@@ -38,17 +40,44 @@ let metrics: ReturnType<typeof createMetrics> | undefined;
 let admission = createAdmission(defaultAdmission());
 const handlers = new Map<string, ReturnType<typeof createHandler>>();
 
+/**
+ * One in-flight attempt. A rejection is dropped so the next caller can try
+ * again. A success stays, including for callers that arrived while it ran.
+ */
+export function schemaAttempt(): { run(apply: () => Promise<void>): Promise<void> } {
+  let pending: Promise<void> | null = null;
+  return {
+    async run(apply) {
+      if (pending === null) {
+        const attempt = apply().then(
+          () => undefined,
+          (error: unknown) => {
+            if (pending === attempt) {
+              pending = null;
+            }
+            throw error;
+          },
+        );
+        pending = attempt;
+      }
+      await pending;
+    },
+  };
+}
+
 export function createHandler(env: WorkerEnv, storeOverride?: Store) {
   metrics ??= createMetrics([env.GATEWAY_KEY]);
-  let schema: Promise<void> | null = null;
+  const schema = schemaAttempt();
   const extensions = [rateLimitExtension({ limit: 60, windowMs: 60_000, mode: "isolate" })];
   const store = storeOverride ?? createPostgresStore(async () => {
     const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
     await client.connect();
-    if (schema === null) {
-      schema = prepareWorkerSchema(client, extensions);
+    try {
+      await schema.run(() => prepareWorkerSchema(client, extensions));
+    } catch (error) {
+      await client.end().catch(() => undefined);
+      throw error;
     }
-    await schema;
     return {
       client: {
         query: async (sql: string, params?: readonly unknown[]) => {
