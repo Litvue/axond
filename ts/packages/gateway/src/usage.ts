@@ -1,5 +1,7 @@
 import type { UsageRecord, UsageTokens } from "@axond/sdk";
 
+import { encodeAttrs } from "./strict-json.ts";
+
 export function emptyUsage(): UsageTokens {
   return {
     inputTokens: 0n,
@@ -270,6 +272,7 @@ export function usageEvent(record: UsageRecord): Record<string, unknown> {
     request_id: record.requestId,
     ...(record.traceId ? { trace_id: record.traceId } : {}),
     namespace: record.namespace,
+    ...(record.attrs !== undefined ? { attrs: JSON.parse(encodeAttrs(record.attrs)) as unknown } : {}),
     period: record.period,
     subject: record.subject,
     signer_kid: record.signerKid,
@@ -292,6 +295,24 @@ export function usageEvent(record: UsageRecord): Record<string, unknown> {
     attempts: record.attempts,
   };
   return line;
+}
+
+/**
+ * One stdout usage line. `attrs` is spliced from the management encoding so a
+ * float such as `1.0` stays the bytes a management read would write.
+ */
+export function usageLine(record: UsageRecord): string {
+  if (record.attrs === undefined) {
+    return JSON.stringify(usageEvent(record));
+  }
+  const encoded = encodeAttrs(record.attrs);
+  const text = JSON.stringify(usageEvent({ ...record, attrs: undefined }));
+  const marker = ',"period":';
+  const at = text.indexOf(marker);
+  if (at < 0) {
+    return text;
+  }
+  return `${text.slice(0, at)},"attrs":${encoded}${text.slice(at)}`;
 }
 
 export function assignUsage(target: UsageTokens, next: UsageTokens): void {

@@ -57,7 +57,12 @@ The stdout and OTLP sinks carry the same fields, minus `id` and
 omitted when absent), and the OTLP sink emits it as an OTel log record with
 `event_name = axond.usage` and `axond.*` / `gen_ai.*` attributes. OTLP omits
 `axond.cost_microdollars` when cost is NULL so unpriced traffic is not
-exported as zero; `Some(0)` is still emitted.
+exported as zero; `Some(0)` is still emitted. Stdout also includes `attrs`
+when the request was admitted under a namespace: the opaque JSON copied at
+admission ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)), between
+`namespace` and `period`, encoded the same way a management read encodes it.
+A request with no namespace omits the field. `attrs` is not a column of the
+usage table, and the OTLP usage log does not repeat it.
 
 ## Versioning policy
 

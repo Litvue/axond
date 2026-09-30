@@ -10,7 +10,7 @@ import { chatRateLimitFailure, classifyUpstream, isRateLimitPayload, targetAttem
 import { StoreFailure } from "./errors.ts";
 import { createMemoryStore } from "./memory-store.ts";
 import { createMetrics } from "./metrics.ts";
-import { usageEvent } from "./usage.ts";
+import { usageEvent, usageLine } from "./usage.ts";
 import type { AxondOptions, Store, UsageRecord } from "@axond/sdk";
 
 const KEY = "test-inbound-key";
@@ -203,6 +203,83 @@ test("a cancelled stream still settles the delivered request", async () => {
     const rows = await store.summarizeUsage("platform", "compat");
     assert.equal(rows.length, 1);
     assert.equal(rows[0]!.status, "client_cancelled");
+  } finally {
+    upstream.close();
+  }
+});
+
+test("usage_event_copies_admission_attrs", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  try {
+    const created = await app.request("http://127.0.0.1/api/v1/namespaces", {
+      method: "POST",
+      headers,
+      body: '{"id":"wsp_attrs","attrs":{"z":1,"a":"acme","n":1.0}}',
+    });
+    assert.equal(created.status, 201);
+    await store.putBudget("wsp_attrs", "compat", 1_000_000n);
+    const chat = await app.request("http://127.0.0.1/ns/wsp_attrs/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "PROMPT_SENTINEL" }] }),
+    });
+    assert.equal(chat.status, 200);
+    await chat.text();
+    const replaced = await app.request("http://127.0.0.1/api/v1/namespaces/wsp_attrs", {
+      method: "PUT",
+      headers,
+      body: '{"attrs":{"org":"later"}}',
+    });
+    assert.equal(replaced.status, 200);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    const line = usageLine(records[0]!);
+    assert.equal(
+      line.includes('"namespace":"wsp_attrs","attrs":{"a":"acme","n":1.0,"z":1},"period":"compat"'),
+      true,
+    );
+    assert.equal(line.includes("later"), false);
+    assert.equal(line.includes("sk-live-secret"), false);
+    assert.equal(line.includes(KEY), false);
+    assert.equal(line.includes("PROMPT_SENTINEL"), false);
+    const platform = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(platform.status, 200);
+    await platform.text();
+    for (let attempt = 0; attempt < 20 && records.length < 2; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 2);
+    assert.equal(usageLine(records[1]!).includes('"namespace":"platform","attrs":{},"period":"compat"'), true);
   } finally {
     upstream.close();
   }

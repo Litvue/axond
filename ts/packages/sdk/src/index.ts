@@ -730,6 +730,12 @@ export interface UsageRecord {
   /** Inbound W3C trace id. Null when the request carried no valid traceparent. */
   traceId: string | null;
   namespace: string;
+  /**
+   * Namespace attrs copied at admission (ADR 0063). Absent when the request
+   * had no namespace. The stdout line places this value between `namespace`
+   * and `period` and encodes it the way a management read does.
+   */
+  attrs?: unknown;
   /** Budget period at admission. Null when the request was not held. */
   period: string | null;
   subject: string;

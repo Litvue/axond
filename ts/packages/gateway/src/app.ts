@@ -36,7 +36,7 @@ import {
 import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors.ts";
 import { globMatch, validateGlob } from "./glob.ts";
 import { isJsonContentType } from "./content-type.ts";
-import { encodeAttrs, readStrictObject, type StrictField } from "./strict-json.ts";
+import { encodeAttrs, readStrictObject, serdeValue, type StrictField } from "./strict-json.ts";
 import { budgetPolicyBody, budgetRecordBody, usageSummaryBody } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, namespaceIdMessage, validatePeriod, validateTimezone } from "./namespace.ts";
 import { beginTrace, childTrace, formatTraceparent, metricPayload, parseTraceparent, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
@@ -1419,6 +1419,11 @@ function serverSpanAttributes(axond: MutableContext | undefined, endedMs: number
   return attributes;
 }
 
+/** Attrs as they were at admission, including the management encoding of `1.0`. */
+function admittedAttrs(attrs: unknown): unknown {
+  return serdeValue(encodeAttrs(attrs));
+}
+
 function scheduleSettle(
   opts: AxondOptions,
   axond: MutableContext,
@@ -1558,6 +1563,7 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
     signerKid: null,
     latencyMs: Math.max(0, Date.now() - axond.startedMs),
     attempts: axond.upstreamAttempts,
+    ...(axond.namespace ? { attrs: admittedAttrs(axond.namespace.attrs) } : {}),
   };
   opts.onUsage?.(record);
   recordSettlementMetrics(opts, axond, usage, status, cost);

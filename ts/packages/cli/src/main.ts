@@ -14,7 +14,7 @@ import {
   envSecretReader,
   loadConfig,
   resolveTelemetry,
-  usageEvent,
+  usageLine,
 } from "../../gateway/src/index.ts";
 import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
 
@@ -104,7 +104,7 @@ async function main(): Promise<void> {
       process.stdout.write(`${JSON.stringify(record)}\n`);
     },
     onUsage: (record) => {
-      process.stdout.write(`${JSON.stringify(usageEvent(record))}\n`);
+      process.stdout.write(`${usageLine(record)}\n`);
     },
   });
   const listener = getRequestListener(app.fetch);

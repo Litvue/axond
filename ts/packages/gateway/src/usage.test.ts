@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { applyObservedCharge, emptyUsage, noteSseChunk, relayedTextChars, sseTerminalSeen, usageEvent, usageFromJson } from "./usage.ts";
+import { serdeValue } from "./strict-json.ts";
+import { applyObservedCharge, emptyUsage, noteSseChunk, relayedTextChars, sseTerminalSeen, usageEvent, usageFromJson, usageLine } from "./usage.ts";
 
 test("openai cached prompt tokens are billed once", () => {
   const usage = usageFromJson("chat", {
@@ -146,10 +147,15 @@ test("usage event names the serving credential and omits an absent trace", () =>
   assert.equal(plain.period, "compat");
   assert.equal(plain.cache_read_tokens, "2");
   assert.equal(plain.price_catalog, null);
+  assert.equal(Object.hasOwn(plain, "attrs"), false);
   const traced = usageEvent({ ...base, traceId: "0123456789abcdef0123456789abcdef" });
   assert.equal(traced.trace_id, "0123456789abcdef0123456789abcdef");
   const keys = Object.keys(traced);
   assert.equal(keys.indexOf("trace_id"), keys.indexOf("request_id") + 1);
+  const attrs = serdeValue('{"a":"acme","n":1.0,"z":1}');
+  const line = usageLine({ ...base, attrs });
+  assert.equal(line.includes('"namespace":"platform","attrs":{"a":"acme","n":1.0,"z":1},"period":"compat"'), true);
+  assert.equal(usageLine(base).includes('"attrs"'), false);
 });
 
 test("observed stream text fills a charge when the provider sent no usage", () => {
