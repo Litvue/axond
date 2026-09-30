@@ -50,14 +50,15 @@ export interface ObservedUsage {
 
 export interface UsageDelivery {
   write(record: UsageRecord): void;
-  flush(timeoutMs: number): Promise<void>;
+  /** True when every sink finished inside the shared bound. */
+  flush(timeoutMs: number): Promise<boolean>;
 }
 
 type Metrics = ReturnType<typeof createMetrics>;
 
 interface BufferedSink {
   write(record: UsageRecord, observedAt: Date): void;
-  flush(timeoutMs: number): Promise<void>;
+  flush(timeoutMs: number): Promise<boolean>;
   readonly dropped: number;
 }
 
@@ -81,7 +82,7 @@ export async function openUsageDelivery(input: {
       process.stdout.write(line);
     });
     if (sink.kind === "stdout") {
-      writers.push(immediateWriter("stdout", input.metrics, (record) => {
+      writers.push(immediateWriter("stdout", input.metrics, input.onLog, (record) => {
         writeStdout(`${usageLine(record)}\n`);
       }));
       continue;
@@ -94,7 +95,7 @@ export async function openUsageDelivery(input: {
       }
       const telemetry = input.telemetry;
       const fetchImpl = input.fetchImpl ?? fetch;
-      writers.push(immediateWriter("otlp", input.metrics, (record, observedAt) => {
+      writers.push(immediateWriter("otlp", input.metrics, input.onLog, (record, observedAt) => {
         const body = usageLogPayload(record, resourceAttributes(telemetry.instanceId), observedAt.getTime());
         void postOtlp(telemetry.endpoint, "logs", body, fetchImpl).catch(() => undefined);
       }));
@@ -111,9 +112,12 @@ export async function openUsageDelivery(input: {
     },
     async flush(timeoutMs) {
       const deadline = Date.now() + timeoutMs;
+      let complete = true;
       for (const writer of writers) {
-        await writer.flush(Math.max(0, deadline - Date.now()));
+        const finished = await writer.flush(Math.max(0, deadline - Date.now()));
+        complete = complete && finished;
       }
+      return complete;
     },
   };
 }
@@ -134,6 +138,7 @@ function stdoutSink(): UsageSinkConfig {
 function immediateWriter(
   name: "stdout" | "otlp",
   metrics: Metrics,
+  onLog: (record: unknown) => void,
   emit: (record: UsageRecord, observedAt: Date) => void,
 ): BufferedSink {
   return {
@@ -143,6 +148,8 @@ function immediateWriter(
     },
     async flush() {
       metrics.record("axond.usage.flushes", 1, { "axond.usage_sink": name, "axond.flush_outcome": "flushed" });
+      onLog({ msg: "usage_flush", sink: name, outcome: "flushed", records: 0 });
+      return true;
     },
   };
 }
@@ -213,7 +220,11 @@ export function createBufferedUsageSink(input: {
   let chain: Promise<void> = Promise.resolve();
   let closed = false;
 
-  const noteDrop = (reason: "buffer_full" | "shutdown" | "sink_error", count: number) => {
+  const noteDrop = (
+    reason: "buffer_full" | "shutdown" | "sink_error",
+    count: number,
+    log: "sampled" | "batch" | "silent",
+  ) => {
     if (count <= 0) {
       return;
     }
@@ -222,9 +233,21 @@ export function createBufferedUsageSink(input: {
       "axond.usage_sink": "postgres",
       "axond.drop_reason": reason,
     });
-    if (reason === "buffer_full" && (dropped === count || dropped % 1_000 < count)) {
+    if (log === "batch") {
+      input.onLog({ msg: "usage_dropped", sink: "postgres", reason, records: count });
+      return;
+    }
+    if (log === "sampled" && (dropped === count || dropped % 1_000 < count)) {
       input.onLog({ msg: "usage_dropped", sink: "postgres", reason, dropped });
     }
+  };
+
+  const logFlush = (outcome: "flushed" | "failed" | "timeout", count: number) => {
+    if (outcome === "timeout") {
+      input.onLog({ msg: "usage_flush", sink: "postgres", outcome, abandoned: count });
+      return;
+    }
+    input.onLog({ msg: "usage_flush", sink: "postgres", outcome, records: count });
   };
 
   const writeRows = (rows: readonly ObservedUsage[]) => {
@@ -236,7 +259,7 @@ export function createBufferedUsageSink(input: {
         await input.insert(rows);
         input.metrics.record("axond.usage.records_written", rows.length, { "axond.usage_sink": "postgres" });
       } catch {
-        noteDrop("sink_error", rows.length);
+        noteDrop("sink_error", rows.length, "batch");
       }
     });
   };
@@ -258,7 +281,7 @@ export function createBufferedUsageSink(input: {
     },
     write(record, observedAt) {
       if (closed || queue.length >= input.capacity) {
-        noteDrop(closed ? "shutdown" : "buffer_full", 1);
+        noteDrop(closed ? "shutdown" : "buffer_full", 1, "sampled");
         return;
       }
       queue.push({ record, observedAt });
@@ -291,29 +314,28 @@ export function createBufferedUsageSink(input: {
           input.metrics.record("axond.usage.records_written", pending.length, { "axond.usage_sink": "postgres" });
         } catch {
           failed = true;
-          noteDrop("sink_error", pending.length);
+          noteDrop("sink_error", pending.length, "batch");
         }
         settled = true;
       });
-      const timedOut = await Promise.race([
-        work.then(() => false),
-        delay(timeoutMs).then(() => true),
-      ]);
-      if (!settled || timedOut) {
-        if (!settled) {
-          noteDrop("shutdown", pending.length);
-        }
+      await Promise.race([work.then(() => undefined), delay(timeoutMs).then(() => undefined)]);
+      if (!settled) {
+        noteDrop("shutdown", pending.length, "silent");
         input.metrics.record("axond.usage.flushes", 1, {
           "axond.usage_sink": "postgres",
           "axond.flush_outcome": "timeout",
         });
-        return;
+        logFlush("timeout", pending.length);
+        return false;
       }
+      const outcome = failed ? "failed" : "flushed";
       input.metrics.record("axond.usage.flushes", 1, {
         "axond.usage_sink": "postgres",
-        "axond.flush_outcome": failed ? "failed" : "flushed",
+        "axond.flush_outcome": outcome,
       });
+      logFlush(outcome, pending.length);
       await input.close?.();
+      return !failed;
     },
   };
   return sink;

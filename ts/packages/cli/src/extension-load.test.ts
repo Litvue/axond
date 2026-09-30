@@ -321,6 +321,8 @@ test("drain_grace_ms of 0 closes admission on the first signal", async () => {
     assert.equal(records.some((record) => record.phase === "admission_closed"), true);
     assert.equal(records.some((record) => record.phase === "second_signal"), false);
     assert.equal(records.some((record) => record.phase === "spend_unsettled"), false);
+    const stopped = records.find((record) => record.phase === "stopped");
+    assert.equal(stopped?.usage_flushed, true);
     assert.equal(JSON.stringify(records).includes("test-inbound-key"), false);
   } finally {
     await child.stop();
@@ -741,6 +743,7 @@ function shutdownRecords(text: string): Array<{
   settlements_reserved?: number;
   oldest_settlement_ms?: number;
   settle_share_ms?: number;
+  usage_flushed?: boolean;
 }> {
   const records = [];
   for (const line of text.split("\n")) {
@@ -760,6 +763,7 @@ function shutdownRecords(text: string): Array<{
       settlements_reserved?: number;
       oldest_settlement_ms?: number;
       settle_share_ms?: number;
+      usage_flushed?: boolean;
     };
     if (parsed.msg === "shutdown") {
       records.push(parsed);

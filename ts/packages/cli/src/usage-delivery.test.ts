@@ -87,21 +87,87 @@ test("a full usage buffer drops the record instead of waiting", async () => {
   assert.equal(sink.dropped, 1);
   assert.deepEqual(logs, [{ msg: "usage_dropped", sink: "postgres", reason: "buffer_full", dropped: 1 }]);
   release();
-  await sink.flush(1_000);
+  assert.equal(await sink.flush(1_000), true);
   assert.deepEqual(written, ["first"]);
+  assert.deepEqual(logs, [
+    { msg: "usage_dropped", sink: "postgres", reason: "buffer_full", dropped: 1 },
+    { msg: "usage_flush", sink: "postgres", outcome: "flushed", records: 1 },
+  ]);
   const dropped = metrics.points.find((point) => point.name === "axond.usage.records_dropped");
   assert.equal(dropped?.attributes["axond.drop_reason"], "buffer_full");
+});
+
+test("usage_flush_names_the_outcome_and_omits_the_driver_text", async () => {
+  const secret = "dsn-secret-sentinel";
+  const metrics = createMetrics([]);
+  const logs = [];
+  const rejected = createBufferedUsageSink({
+    capacity: 10,
+    maxBatch: 500,
+    flushIntervalMs: 60_000,
+    metrics,
+    onLog: (record) => logs.push(record),
+    insert: async () => {
+      throw new Error(`connect ${secret} failed`);
+    },
+  });
+  rejected.write(sample("bad"), new Date());
+  assert.equal(await rejected.flush(1_000), false);
+  assert.deepEqual(logs, [
+    { msg: "usage_dropped", sink: "postgres", reason: "sink_error", records: 1 },
+    { msg: "usage_flush", sink: "postgres", outcome: "failed", records: 1 },
+  ]);
+  assert.equal(JSON.stringify(logs).includes(secret), false);
+
+  const lateLogs = [];
+  const closed = createBufferedUsageSink({
+    capacity: 10,
+    maxBatch: 500,
+    flushIntervalMs: 60_000,
+    metrics: createMetrics([]),
+    onLog: (record) => lateLogs.push(record),
+    insert: async () => undefined,
+  });
+  assert.equal(await closed.flush(1_000), true);
+  closed.write(sample("late"), new Date());
+  assert.deepEqual(lateLogs, [
+    { msg: "usage_flush", sink: "postgres", outcome: "flushed", records: 0 },
+    { msg: "usage_dropped", sink: "postgres", reason: "shutdown", dropped: 1 },
+  ]);
+
+  let release = () => {};
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const hungLogs = [];
+  const hung = createBufferedUsageSink({
+    capacity: 10,
+    maxBatch: 500,
+    flushIntervalMs: 60_000,
+    metrics: createMetrics([]),
+    onLog: (record) => hungLogs.push(record),
+    insert: async () => {
+      await gate;
+    },
+  });
+  hung.write(sample("held"), new Date());
+  assert.equal(await hung.flush(30), false);
+  assert.deepEqual(hungLogs, [{ msg: "usage_flush", sink: "postgres", outcome: "timeout", abandoned: 1 }]);
+  release();
 });
 
 test("usage_sink_replaces_stdout_and_postgres_inserts_one_row", async () => {
   const metrics = createMetrics([]);
   const lines = [];
+  const sinkLogs = [];
   const stdoutOnly = await openUsageDelivery({
     sinks: [],
     env: {},
     telemetry: null,
     metrics,
-    onLog: () => undefined,
+    onLog: (record) => {
+      sinkLogs.push(record);
+    },
     writeStdout: (line) => {
       lines.push(line);
     },
@@ -109,7 +175,8 @@ test("usage_sink_replaces_stdout_and_postgres_inserts_one_row", async () => {
   stdoutOnly.write(sample("req_stdout"));
   assert.match(lines[0], /"request_id":"req_stdout"/);
   assert.match(lines[0], /"input_tokens":4/);
-  await stdoutOnly.flush(100);
+  assert.equal(await stdoutOnly.flush(100), true);
+  assert.deepEqual(sinkLogs, [{ msg: "usage_flush", sink: "stdout", outcome: "flushed", records: 0 }]);
 
   const posts = [];
   const stdout = [];

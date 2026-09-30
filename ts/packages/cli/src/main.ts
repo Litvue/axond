@@ -180,7 +180,8 @@ async function main(): Promise<void> {
       };
       writeLog(unsettled);
     }
-    await usageDelivery.flush(config.shutdown.flushTimeoutMs);
+    const usageFlushed = await usageDelivery.flush(config.shutdown.flushTimeoutMs);
+    writeLog({ msg: "shutdown", phase: "stopped", usage_flushed: usageFlushed });
     process.exit(0);
   };
   const closeAdmission = () => {
