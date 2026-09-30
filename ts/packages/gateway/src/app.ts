@@ -617,6 +617,9 @@ async function prepareInference(
   axond.alias = model;
   axond.target = { provider: provider.id, model: modelId };
   axond.body.setModel(modelId);
+  if (parsed["stream"] === true && axond.route === "chat") {
+    (axond.body as ByteRequestBody).forceIncludeUsage();
+  }
   (axond as MutableContext & { provider?: ProviderConfig; priced?: boolean }).provider = provider;
   (axond as MutableContext & { priced?: boolean }).priced = Boolean(price);
   void record;

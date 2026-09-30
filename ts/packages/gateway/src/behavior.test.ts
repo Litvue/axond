@@ -4121,3 +4121,92 @@ test("malformed_responses_controls_never_reach_the_provider", async () => {
     upstream.close();
   }
 });
+
+test("chat_stream_forces_include_usage_and_keeps_other_bytes", async () => {
+  const seen: string[] = [];
+  const upstream = await listen(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    seen.push(Buffer.concat(chunks).toString("utf8"));
+    const path = req.url ?? "";
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+    if (path.endsWith("/messages")) {
+      res.end('event: message_stop\ndata: {"type":"message_stop","usage":{"input_tokens":1,"output_tokens":1}}\n\n');
+      return;
+    }
+    if (path.endsWith("/responses")) {
+      res.end(
+        'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+      );
+      return;
+    }
+    res.end('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n');
+  });
+  const store = await seeded();
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [
+      { id: "fake-openai", kind: "openai", baseUrl: upstream.url },
+      { id: "fake-anthropic", kind: "anthropic", baseUrl: upstream.url },
+    ],
+    credentials: [
+      { namespace: "platform", provider: "fake-openai", secret: "sk-usage", id: "one" },
+      { namespace: "platform", provider: "fake-anthropic", secret: "sk-usage-anthropic", id: "two" },
+    ],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+      {
+        provider: "fake-anthropic",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  try {
+    const chat = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: '{"z":1,"model": "fake-openai/gpt-test","n":9007199254740993,"a":1,"a":2,"stream":true,"stream_options":{"future_option":"keep","include_usage":false}}',
+    });
+    assert.equal(chat.status, 200);
+    await chat.text();
+    assert.equal(
+      seen[0],
+      '{"z":1,"model": "gpt-test","n":9007199254740993,"a":1,"a":2,"stream":true,"stream_options":{"future_option":"keep","include_usage":true}}',
+    );
+    const responses = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+      method: "POST",
+      headers,
+      body: '{"model":"fake-openai/gpt-test","input":"ordinary","stream":true,"n":9007199254740993}',
+    });
+    assert.equal(responses.status, 200);
+    await responses.text();
+    assert.equal(
+      seen[1],
+      '{"model":"gpt-test","input":"ordinary","stream":true,"n":9007199254740993}',
+    );
+    const messages = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers,
+      body: '{"model":"fake-anthropic/claude","messages":[],"stream":true,"max_tokens":16}',
+    });
+    assert.equal(messages.status, 200);
+    await messages.text();
+    assert.equal(seen[2], '{"model":"claude","messages":[],"stream":true,"max_tokens":16}');
+    assert.equal(seen.some((body) => body.includes("sk-usage")), false);
+    assert.equal(seen.some((body) => body.includes(KEY)), false);
+  } finally {
+    upstream.close();
+  }
+});

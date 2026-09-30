@@ -6,7 +6,7 @@ import { Hono } from "hono";
 
 import { createAxond } from "./app.ts";
 import { StoreFailure } from "./errors.ts";
-import { rewriteTopLevelModel } from "./body.ts";
+import { forceChatIncludeUsage, rewriteTopLevelModel } from "./body.ts";
 import { loadConfig, envSecretReader } from "./config.ts";
 import { createMemoryStore } from "./memory-store.ts";
 import { createMetrics } from "./metrics.ts";
@@ -113,6 +113,41 @@ test("rewrite keeps duplicate keys and large integers", () => {
   const raw = new TextEncoder().encode('{"model":"fake-openai/chat","n":9007199254740993,"a":1,"a":2}');
   const next = new TextDecoder().decode(rewriteTopLevelModel(raw, "chat"));
   assert.equal(next, '{"model":"chat","n":9007199254740993,"a":1,"a":2}');
+});
+
+test("chat stream usage splice keeps unrelated bytes", () => {
+  const encode = (value: string) => new TextEncoder().encode(value);
+  const decode = (value: Uint8Array) => new TextDecoder().decode(value);
+  assert.equal(
+    decode(
+      forceChatIncludeUsage(
+        encode(
+          '{"z":1,"model":"gpt-test","n":9007199254740993,"a":1,"a":2,"stream":true,"messages":[{"stream_options":{"include_usage":false}}]}',
+        ),
+      ),
+    ),
+    '{"z":1,"model":"gpt-test","n":9007199254740993,"a":1,"a":2,"stream":true,"messages":[{"stream_options":{"include_usage":false}}]},"stream_options":{"include_usage":true}}',
+  );
+  assert.equal(
+    decode(
+      forceChatIncludeUsage(
+        encode(
+          '{"stream":true,"n":9007199254740993,"stream_options":{"future_option":"keep","nested":{"include_usage":false},"include_usage":false}}',
+        ),
+      ),
+    ),
+    '{"stream":true,"n":9007199254740993,"stream_options":{"future_option":"keep","nested":{"include_usage":false},"include_usage":true}}',
+  );
+  assert.equal(
+    decode(forceChatIncludeUsage(encode('{"stream":false,"stream":true,"stream_options":[]}'))),
+    '{"stream":false,"stream":true,"stream_options":{"include_usage":true}}',
+  );
+  assert.equal(
+    decode(forceChatIncludeUsage(encode('{"stream":true,"stream":false,"n":9007199254740993}'))),
+    '{"stream":true,"stream":false,"n":9007199254740993}',
+  );
+  const already = '{"stream":true,"stream_options":{"include_usage":true,"future_option":"keep"}}';
+  assert.equal(decode(forceChatIncludeUsage(encode(already))), already);
 });
 
 test("a buffered chat forwards duplicate keys, field order, and integers above 2^53", async () => {
