@@ -1,4 +1,5 @@
 import { GatewayFailure } from "./errors.ts";
+import { ianaOffsetSeconds } from "./tzdb.ts";
 
 const MAX_LEN = 128;
 
@@ -82,24 +83,22 @@ export function validatePeriod(period: string): void {
 }
 
 export function monthlyPeriod(nowMs: number, timeZone: string): string {
-  validateTimezone(timeZone);
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-  }).formatToParts(new Date(nowMs));
-  const year = parts.find((part) => part.type === "year")?.value;
-  const month = parts.find((part) => part.type === "month")?.value;
-  if (!year || !month) {
-    throw new GatewayFailure("bad_request", 400, `unknown timezone \`${timeZone}\``);
-  }
-  return `${year}-${month}`;
+  const offset = offsetSeconds(timeZone, nowMs);
+  const local = new Date(nowMs + offset * 1000);
+  const year = local.getUTCFullYear();
+  const month = String(local.getUTCMonth() + 1).padStart(2, "0");
+  const yearText = year >= 0 ? String(year).padStart(4, "0") : `-${String(-year).padStart(4, "0")}`;
+  return `${yearText}-${month}`;
 }
 
 export function validateTimezone(timeZone: string): void {
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone }).format(0);
-  } catch {
+  offsetSeconds(timeZone, 0);
+}
+
+function offsetSeconds(timeZone: string, nowMs: number): number {
+  const offset = ianaOffsetSeconds(timeZone, Math.floor(nowMs / 1000));
+  if (offset === null) {
     throw new GatewayFailure("bad_request", 400, `unknown timezone \`${timeZone}\``);
   }
+  return offset;
 }
