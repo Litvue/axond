@@ -1589,6 +1589,107 @@ test("an admission ceiling above the semaphore limit names every digit", async (
   assert.equal(wideBytes.maxRequestBytes, Number.MAX_SAFE_INTEGER);
 });
 
+test("a tenant ceiling that cannot isolate a tenant is refused before the semaphore bound", async () => {
+  const exceed = (per: string, global: string) =>
+    `admission.max_in_flight_per_tenant (${per}) must not exceed admission.max_in_flight (${global}): a per-tenant ceiling above the global one cannot isolate a tenant`;
+  const tenants = "admission.max_tenants must be at least 1 when max_in_flight_per_tenant is set";
+  const absurd = "2305843009213693952";
+  await assert.rejects(
+    () => loadConfig(`${BASE}\n[admission]\nmax_in_flight = 16\nmax_in_flight_per_tenant = 32\n`, secrets),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", exceed("32", "16"));
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${BASE}\n[admission]\nmax_in_flight = 16\nmax_in_flight_per_tenant = 32\nmax_in_flight_streams = 64\n`,
+        secrets,
+      ),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", exceed("32", "16"));
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => loadConfig(`${BASE}\n[admission]\nmax_tenants = 0\n`, secrets),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", tenants);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${BASE}\n[admission]\nmax_in_flight = 16\nmax_in_flight_per_tenant = 4\nmax_tenants = 0\n`,
+        secrets,
+      ),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", tenants);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => loadConfig(`${BASE}\n[admission]\nmax_in_flight = 257\nmax_tenants = 0\n`, secrets),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", tenants);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(`${BASE}\n[admission]\nmax_in_flight = 16\nmax_in_flight_per_tenant = ${absurd}\n`, secrets),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", exceed(absurd, "16"));
+      return true;
+    },
+  );
+  const lowered = await loadConfig(`${BASE}\n[admission]\nmax_in_flight = 16\n`, secrets);
+  assert.equal(lowered.admission.maxInFlight, 16);
+  const isolated = await loadConfig(
+    `${BASE}\n[admission]\nmax_in_flight = 16\nmax_in_flight_per_tenant = 4\n`,
+    secrets,
+  );
+  assert.equal(isolated.admission.maxInFlight, 16);
+  const disabled = await loadConfig(
+    `${BASE}\n[admission]\nmax_in_flight = 16\nmax_in_flight_per_tenant = 0\nmax_tenants = 0\n`,
+    secrets,
+  );
+  assert.equal(disabled.admission.maxInFlight, 16);
+  const turnedOff = await loadConfig(
+    `${BASE}\n[admission]\nmax_in_flight = 16\nmax_tenants = 0\n`,
+    secrets,
+  );
+  assert.equal(turnedOff.admission.maxInFlight, 16);
+  const atGlobal = await loadConfig(
+    `${BASE}\n[admission]\nmax_in_flight = 256\nmax_tenants = 0\n`,
+    secrets,
+  );
+  assert.equal(atGlobal.admission.maxInFlight, 256);
+  const env: Record<string, string> = {};
+  env["AXOND_ADMISSION__MAX_IN_FLIGHT"] = "16";
+  env["AXOND_ADMISSION__MAX_IN_FLIGHT_PER_TENANT"] = "32";
+  await assert.rejects(
+    () => loadConfig(BASE, envSecretReader({ GW_KEY: "k", ...env }, async () => "")),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", exceed("32", "16"));
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        BASE,
+        envSecretReader({ GW_KEY: "k", AXOND_ADMISSION__MAX_TENANTS: "0" }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", tenants);
+      return true;
+    },
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),

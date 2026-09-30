@@ -639,6 +639,31 @@ function validateBlocklist(parsed: Record<string, unknown>): void {
 
 function loadAdmission(row: Record<string, unknown>): AdmissionLimits {
   const maxInFlight = admissionAtLeastZero(row, "max_in_flight", 1024);
+  // A defaulted tenant ceiling that reaches the global one is turned off.
+  // A written ceiling above that global one, or any tenant ceiling with
+  // max_tenants at 0, is refused here. The values stay off AdmissionLimits.
+  const perTenantExplicit = Object.hasOwn(row, "max_in_flight_per_tenant");
+  const perTenantWritten = perTenantExplicit
+    ? admissionAtLeastZero(row, "max_in_flight_per_tenant", 0)
+    : null;
+  const maxTenants = admissionAtLeastZero(row, "max_tenants", 1024);
+  const defaultPerTenant = 256n;
+  const perTenant =
+    perTenantWritten !== null
+      ? perTenantWritten
+      : asUint(maxInFlight) > 0n && defaultPerTenant >= asUint(maxInFlight)
+        ? 0
+        : 256;
+  if (asUint(perTenant) > 0n && asUint(maxTenants) === 0n) {
+    throw configError(
+      "admission.max_tenants must be at least 1 when max_in_flight_per_tenant is set",
+    );
+  }
+  if (asUint(maxInFlight) > 0n && perTenantExplicit && asUint(perTenant) > asUint(maxInFlight)) {
+    throw configError(
+      `admission.max_in_flight_per_tenant (${asUint(perTenant)}) must not exceed admission.max_in_flight (${asUint(maxInFlight)}): a per-tenant ceiling above the global one cannot isolate a tenant`,
+    );
+  }
   const streamsExplicit = Object.hasOwn(row, "max_in_flight_streams");
   const maxInFlightStreams = streamsExplicit
     ? admissionAtLeastZero(row, "max_in_flight_streams", 512)

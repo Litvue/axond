@@ -1066,6 +1066,55 @@ max_batch = 18446744073709551615
   }
 });
 
+test("tenant_ceiling_above_the_global_one_is_refused_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-tenant-ceiling-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "admission.toml");
+  const header = `
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[admission]
+`;
+  try {
+    await writeFile(
+      config,
+      `${header}max_in_flight = 16\nmax_in_flight_per_tenant = 2305843009213693952\n`,
+    );
+    const above = await run(config, root, { GW_KEY: "k" });
+    assert.equal(above.code, 1);
+    assert.equal(above.stdout, "");
+    assert.equal(
+      above.stderr,
+      "Error: failed to load config from `" +
+        config +
+        "`: invalid config: admission.max_in_flight_per_tenant (2305843009213693952) must not exceed admission.max_in_flight (16): a per-tenant ceiling above the global one cannot isolate a tenant\n",
+    );
+    await assert.rejects(() => stat(db));
+    await writeFile(config, `${header}max_tenants = 0\n`);
+    const tenants = await run(config, root, { GW_KEY: "k" });
+    assert.equal(tenants.code, 1);
+    assert.equal(tenants.stdout, "");
+    assert.equal(
+      tenants.stderr,
+      "Error: failed to load config from `" +
+        config +
+        "`: invalid config: admission.max_tenants must be at least 1 when max_in_flight_per_tenant is set\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("admission_ceiling_above_the_semaphore_is_refused_before_the_store_opens", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-admit-ceiling-"));
   const db = join(root, "fresh.sqlite");
