@@ -1705,6 +1705,81 @@ test("management_json_attrs_match_serde_reserialization", async () => {
   assert.equal((await kept.text()).includes('"attrs":{"\uFFFD":1,"😀":2}'), true);
 });
 
+test("management_json_trailing_characters_match_serde", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [],
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const utf8 = (...parts: Array<string | number>) => {
+    const out: number[] = [];
+    for (const part of parts) {
+      if (typeof part === "number") {
+        out.push(part);
+      } else {
+        for (const byte of new TextEncoder().encode(part)) {
+          out.push(byte);
+        }
+      }
+    }
+    return Uint8Array.from(out);
+  };
+  const call = (path: string, method: string, body?: Uint8Array) =>
+    app.request(`http://127.0.0.1${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+  const parse = "Failed to parse the request body as JSON: trailing characters";
+  const created = await call("/api/v1/namespaces", "POST", utf8('{"id":"wsp_trail","attrs":{"z":1}} \n'));
+  assert.equal(created.status, 201);
+  assert.equal(await created.text(), '{"id":"wsp_trail","attrs":{"z":1}}');
+  const bad = async (path: string, method: string, body: Uint8Array, message: string) => {
+    const response = await call(path, method, body);
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+  };
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}x'), `${parse} at line 1 column 11`);
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}é'), `${parse} at line 1 column 11`);
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}€'), `${parse} at line 1 column 11`);
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}😀'), `${parse} at line 1 column 11`);
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"} é'), `${parse} at line 1 column 12`);
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}', 0xc2, 0xa0), `${parse} at line 1 column 11`);
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}', 0xff), `${parse} at line 1 column 11`);
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}éx'), `${parse} at line 1 column 11`);
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}\nx'), `${parse} at line 2 column 1`);
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}\n é'), `${parse} at line 2 column 2`);
+  await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}\r\nx'), `${parse} at line 2 column 1`);
+  await bad("/api/v1/namespaces", "POST", utf8('["wsp_x", {}, []]é'), `${parse} at line 1 column 18`);
+  await bad("/api/v1/namespaces/wsp_trail", "PUT", utf8("{}x"), `${parse} at line 1 column 3`);
+  await bad("/api/v1/namespaces/wsp_trail", "PUT", utf8("{}é"), `${parse} at line 1 column 3`);
+  await bad(
+    "/api/v1/namespaces/wsp_trail/budgets/2026-09",
+    "PUT",
+    utf8('{"limit_microdollars":1}é'),
+    `${parse} at line 1 column 25`,
+  );
+  await bad(
+    "/api/v1/namespaces/wsp_trail/budget",
+    "PUT",
+    utf8('{"cadence":"monthly","limit_microdollars":1}😀'),
+    `${parse} at line 1 column 45`,
+  );
+  const missing = await call("/api/v1/namespaces/a", "GET");
+  assert.equal(missing.status, 404);
+  const kept = await call("/api/v1/namespaces/wsp_trail", "GET");
+  assert.equal(kept.status, 200);
+  assert.equal(await kept.text(), '{"id":"wsp_trail","attrs":{"z":1}}');
+  const budget = await call("/api/v1/namespaces/wsp_trail/budgets/2026-09", "GET");
+  assert.equal(budget.status, 404);
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });

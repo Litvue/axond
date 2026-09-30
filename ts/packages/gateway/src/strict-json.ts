@@ -306,8 +306,7 @@ function finish(cur: Cursor, fields: readonly StrictField[], seen: Set<string>, 
   }
   cur.skipWs();
   if (cur.peek() !== "") {
-    cur.bump();
-    fail(`Failed to parse the request body as JSON: trailing characters ${at(cur.loc())}`);
+    fail(`Failed to parse the request body as JSON: trailing characters ${at(peekLoc(cur))}`);
   }
   for (const field of fields) {
     if (field.kind === "u64" && seen.has(field.name)) {
