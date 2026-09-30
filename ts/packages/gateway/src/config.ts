@@ -1165,6 +1165,12 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
       `default.credential.${index}.weight`,
       arrayEntryLiteral(toml, "credential", index, "weight"),
     );
+    // Required keys are checked after present keys, in declaration order.
+    for (const key of ["namespace", "provider"] as const) {
+      if (!(key in row)) {
+        throw configLoad(`missing field \`${key}\` for key "default.credential.${index}"`);
+      }
+    }
   });
   const pool = asRecord(parsed["credential_pool"]) ?? {};
   readTypedInt(toml, "credential_pool", pool, "cooldown_seconds", "u64", 30);
@@ -1185,6 +1191,9 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
     for (const key of ["env", "file", "namespace"] as const) {
       readEntryString(toml, "gateway_key", index, row, key);
     }
+    if (!("namespace" in row)) {
+      throw configLoad(`missing field \`namespace\` for key "default.gateway_key.${index}"`);
+    }
   });
   asArray(parsed["namespace"]).forEach((entry, index) => {
     const row = asRecord(entry);
@@ -1194,6 +1203,9 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
     readEntryBool(toml, "namespace", index, row, "allow_platform_fallback");
     readEntryBool(toml, "namespace", index, row, "default");
     readEntryString(toml, "namespace", index, row, "id");
+    if (!("id" in row)) {
+      throw configLoad(`missing field \`id\` for key "default.namespace.${index}"`);
+    }
   });
   asArray(parsed["price"]).forEach((entry, index) => {
     const row = asRecord(entry);
@@ -1391,6 +1403,11 @@ function rejectPriceExtract(toml: string, index: number, row: Record<string, unk
       "u64",
       `default.price.${index}`,
     );
+  }
+  for (const key of ["input_microdollars_per_million", "output_microdollars_per_million"]) {
+    if (!(key in row)) {
+      throw configLoad(`missing field \`${key}\` for key "default.price.${index}"`);
+    }
   }
 }
 

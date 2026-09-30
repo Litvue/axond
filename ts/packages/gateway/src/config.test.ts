@@ -300,7 +300,7 @@ test("credential and gateway key graph matches the rust refusals", async () => {
     "failover.failure_threshold must be at least 1",
   );
   await reject(
-    `${GRAPH}[[price]]\nprovider = "nope"\nmodel = "a*b"\n`,
+    `${GRAPH}[[price]]\nprovider = "nope"\nmodel = "a*b"\ninput_microdollars_per_million = 1\noutput_microdollars_per_million = 1\n`,
     "`[[price]]` references undefined provider `nope`",
   );
   await reject(
@@ -308,7 +308,7 @@ test("credential and gateway key graph matches the rust refusals", async () => {
     'config: missing field `provider` for key "default.price.0"',
   );
   await reject(
-    `${GRAPH}[[price]]\nprovider = "openai"\nmodel = "a*b"\n`,
+    `${GRAPH}[[price]]\nprovider = "openai"\nmodel = "a*b"\ninput_microdollars_per_million = 1\noutput_microdollars_per_million = 1\n`,
     "`[[price]]` model glob `a*b` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
   );
   await reject(
@@ -1111,6 +1111,64 @@ test("blocklist price provider and usage keys follow figment order", async () =>
     `${BASE}[[usage_sink]]\nbuffer_capacity = 8\n`,
     'config: missing field `kind` for key "default.usage_sink.0"',
   );
+});
+
+test("required credential gateway_key namespace and price fields follow figment order", async () => {
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const typed = (found: string, expected: string, key: string) =>
+    `config: invalid type: found ${found}, expected ${expected} for key "${key}"`;
+  const missing = (field: string, key: string) => `config: missing field \`${field}\` for key "${key}"`;
+  await reject(
+    `${BASE}[[price]]\nprovider = "openai"\nmodel = "gpt"\ninput_microdollars_per_million = 1.5\n[[credential]]\nprovider = "openai"\n`,
+    missing("namespace", "default.credential.0"),
+  );
+  await reject(
+    `${BASE}[[credential]]\nnamespace = "platform"\nweight = 1\n`,
+    missing("provider", "default.credential.0"),
+  );
+  await reject(`${BASE}[[credential]]\n`, missing("namespace", "default.credential.0"));
+  await reject(
+    BASE.replace('namespace = "platform"\n', "").replace('bind = "127.0.0.1:9"', "bind = 1"),
+    missing("namespace", "default.gateway_key.0"),
+  );
+  await reject(
+    BASE.replace('namespace = "platform"', 'namespace = ""'),
+    "gateway_key `GW_KEY` references undefined namespace ``",
+  );
+  await reject(
+    BASE.replace('id = "platform"\n', "").replace('bind = "127.0.0.1:9"', "bind = 1"),
+    missing("id", "default.namespace.0"),
+  );
+  await reject(
+    BASE.replace('bind = "127.0.0.1:9"', "bind = 1") + '[[price]]\nprovider = "openai"\nmodel = "gpt"\n',
+    missing("input_microdollars_per_million", "default.price.0"),
+  );
+  await reject(
+    `${BASE}[[provider]]\nid = "openai"\nkind = "openai"\nbase_url = "http://127.0.0.1:9"\n[[price]]\nprovider = "openai"\nmodel = "*"\ninput_microdollars_per_million = 1\n`,
+    missing("output_microdollars_per_million", "default.price.0"),
+  );
+  await reject(
+    `${BASE}[[price]]\nprovider = "openai"\nmodel = "gpt"\nreasoning_microdollars_per_million = 1.5\n`,
+    typed("float `1.5`", "u64", "default.price.0"),
+  );
+  await reject(
+    `${BASE}[[provider]]\nid = "openai"\nkind = "openai"\nbase_url = "http://127.0.0.1:9"\n[[price]]\nprovider = ""\nmodel = "gpt"\ninput_microdollars_per_million = 1\noutput_microdollars_per_million = 1\n`,
+    "`[[price]]` requires a non-empty `provider` and `model` glob",
+  );
+  const priced = await loadConfig(
+    `${BASE}[[provider]]\nid = "openai"\nkind = "openai"\nbase_url = "http://127.0.0.1:9"\n[[price]]\nprovider = "openai"\nmodel = "*"\ninput_microdollars_per_million = 0\noutput_microdollars_per_million = 0\n`,
+    secrets,
+  );
+  assert.equal(priced.prices[0]?.inputMicrodollarsPerMillion, 0n);
+  assert.equal(priced.prices[0]?.outputMicrodollarsPerMillion, 0n);
 });
 
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {

@@ -204,7 +204,8 @@ namespace = "platform"
       structural.replace(
         'namespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"',
         'namespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"',
-      ) + "[[price]]\nprovider = \"nope\"\nmodel = \"gpt\"\n",
+      ) +
+        '[[price]]\nprovider = "nope"\nmodel = "gpt"\ninput_microdollars_per_million = 1\noutput_microdollars_per_million = 1\n',
     );
     const priceRun = await run(priced, root, { GW_KEY: "k", OPENAI_KEY: "sk" });
     assert.equal(priceRun.code, 1);
@@ -506,6 +507,47 @@ source_url = "http://models.dev/catalog.json"
       "Error: failed to load config from `" +
         config +
         '`: config load: invalid type: found float `1.5`, expected usize for key "default.admission.max_request_bytes" in ' +
+        figmentFileSource(config, root) +
+        " TOML file\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("gateway_key_missing_namespace_beats_a_bad_bind", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-gateway-key-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "gateway-key.toml");
+  await writeFile(
+    config,
+    `
+[server]
+bind = 1
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[price]]
+provider = "openai"
+model = "gpt"
+input_microdollars_per_million = 1.5
+[[gateway_key]]
+env = "GW_KEY"
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        '`: config load: missing field `namespace` for key "default.gateway_key.0" in ' +
         figmentFileSource(config, root) +
         " TOML file\n",
     );

@@ -110,7 +110,13 @@ A price `input_microdollars_per_million = 1.5` is `expected u64` at
 `[usage_journal] connect_timeout_ms = 1.5` is reported before
 `create_schema = 1.5` when `backend = "none"`. `[[usage_sink]]
 buffer_capacity = 1.5` is reported before `create_table = 1.5` on a stdout
-sink.
+sink. `[[gateway_key]]` without `namespace` is `missing field \`namespace\``
+before `server.bind = 1`. A credential that names `provider` and omits
+`namespace` is that sentence before a price float. A `[[price]]` row with
+`provider` and `model` but no `input_microdollars_per_million` is
+`missing field \`input_microdollars_per_million\`` at `default.price.0`.
+`output_microdollars_per_million` is required next. `[[namespace]]` without
+`id` is `missing field \`id\`` before a bad bind.
 `failover = [0]` is `failover.max_attempts must be at least 1`
 before a ghost credential. `failover = [1.5]` is `expected u32` at
 `default.failover.0`. `storage = []` still requires a SQLite path.
