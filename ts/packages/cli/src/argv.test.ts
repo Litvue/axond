@@ -148,6 +148,16 @@ test("argv_matches_clap_before_config_load", async () => {
     "/tmp/axond-ts/axond",
     "/some/main.ts",
   ]);
+  assert.deepEqual(cliArguments(["bun", "/$bunfs/root/axond", "--version"], "/tmp/axond-ts/axond"), [
+    "axond",
+    "--version",
+  ]);
+  assert.deepEqual(cliArguments(["bun", "/$bunfs/root/axond", "mint"], "/opt/bin/axond"), ["axond", "mint"]);
+  assert.deepEqual(parseArgv(cliArguments(["bun", "/$bunfs/root/axond", "--help"], "/tmp/axond-ts/axond")), {
+    action: "stdout",
+    code: 0,
+    text: helpText("axond"),
+  });
 
   const missing = "/no/such/axond.toml";
   const versionRun = await run([BIN.pathname, "--version"], missing);

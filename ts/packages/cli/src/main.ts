@@ -28,7 +28,7 @@ import { openSqliteStore } from "./sqlite-store.ts";
 const { Client } = pg;
 
 async function main(): Promise<void> {
-  const argv = parseArgv(cliArguments(process.argv));
+  const argv = parseArgv(cliArguments(process.argv, process.execPath));
   if (argv.action !== "serve") {
     const stream = argv.action === "stdout" ? process.stdout : process.stderr;
     stream.write(argv.text);
