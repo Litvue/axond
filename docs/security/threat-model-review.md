@@ -394,6 +394,10 @@ redaction pattern; `unsupported_extension_api_version_is_refused_at_mount` and
 extension whose apiVersion is not 1;
 `extension_migration_outside_its_prefix_is_refused` refuses a migration that
 creates a table outside that extension's table prefix.
+`sse_config_and_body_rewrite_are_stable_under_arbitrary_splits` holds that an
+SSE identity transform is insensitive to chunk boundaries, a model rewrite
+changes only top-level model strings, and loading one config text twice agrees
+while omitting secret values.
 
 **Threat model and ADRs.** [ADR 0066](../adr/0066-typescript-hono-extension-contract.md)
 is the decision: extensions are operator and first-party code with no
