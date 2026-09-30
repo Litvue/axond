@@ -36,8 +36,8 @@ import {
 import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors.ts";
 import { globMatch, validateGlob } from "./glob.ts";
 import { isJsonContentType } from "./content-type.ts";
-import { readStrictObject, type StrictField } from "./strict-json.ts";
-import { budgetJson, money, namespaceJson } from "./memory-store.ts";
+import { encodeAttrs, readStrictObject, type StrictField } from "./strict-json.ts";
+import { budgetJson, money } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, namespaceIdMessage, validatePeriod, validateTimezone } from "./namespace.ts";
 import { beginTrace, childTrace, formatTraceparent, metricPayload, parseTraceparent, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
 import { sanitizeAttributes } from "./metrics.ts";
@@ -1735,10 +1735,9 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   if (c.req.method === "GET" && path === "/api/v1/namespaces") {
     const listQuery = readListQuery(url.searchParams);
     const page = await opts.store.listNamespaces(listQuery.cursor, listQuery.limit);
-    c.res = Response.json({
-      data: page.data.map(namespaceJson),
-      ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
-    });
+    const rows = page.data.map((row) => namespaceRecordBody(row)).join(",");
+    const cursor = page.nextCursor ? `,"next_cursor":${JSON.stringify(page.nextCursor)}` : "";
+    c.res = jsonBody(`{"data":[${rows}]${cursor}}`);
     return;
   }
   if (c.req.method === "POST" && path === "/api/v1/namespaces") {
@@ -1760,9 +1759,10 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
     if (created === "exists") {
       throw new GatewayFailure("namespace_conflict", 409, "namespace already exists");
     }
-    c.res = Response.json(namespaceJson({ id, attrs, blocklist, allowPlatformFallback: true, fromConfig: false }), {
-      status: 201,
-    });
+    c.res = jsonBody(
+      namespaceRecordBody({ id, attrs, blocklist }),
+      201,
+    );
     return;
   }
   const one = path.match(/^\/api\/v1\/namespaces\/([^/]+)$/);
@@ -1773,7 +1773,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
       if (!row) {
         throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
       }
-      c.res = Response.json(namespaceJson(row));
+      c.res = jsonBody(namespaceRecordBody(row));
       return;
     }
     if (c.req.method === "PUT") {
@@ -1782,7 +1782,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
       if (!row) {
         throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
       }
-      c.res = Response.json(namespaceJson(row));
+      c.res = jsonBody(namespaceRecordBody(row));
       return;
     }
     if (c.req.method === "DELETE") {
@@ -1882,7 +1882,19 @@ function asAttrs(value: unknown): Record<string, unknown> {
 }
 
 function jsonUtf8Length(value: unknown): number {
-  return new TextEncoder().encode(JSON.stringify(value)).length;
+  return new TextEncoder().encode(encodeAttrs(value)).length;
+}
+
+function namespaceRecordBody(record: { id: string; attrs: unknown; blocklist: string[] | null }): string {
+  let body = `{"id":${JSON.stringify(record.id)},"attrs":${encodeAttrs(record.attrs)}`;
+  if (record.blocklist !== null) {
+    body += `,"blocklist":${JSON.stringify(record.blocklist)}`;
+  }
+  return `${body}}`;
+}
+
+function jsonBody(body: string, status = 200): Response {
+  return new Response(body, { status, headers: { "content-type": "application/json" } });
 }
 
 function asBlocklist(value: unknown): string[] | null {

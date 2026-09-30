@@ -11,6 +11,7 @@ import type {
 } from "@axond/sdk";
 
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
+import { encodeAttrs } from "../../gateway/src/strict-json.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 import {
   recordConnectionDiscarded,
@@ -130,7 +131,7 @@ export function createPostgresStore(
            ON CONFLICT (id) DO NOTHING`,
           [
             record.id,
-            JSON.stringify(record.attrs),
+            encodeAttrs(record.attrs),
             record.blocklist === null ? null : JSON.stringify(record.blocklist),
             record.allowPlatformFallback,
             record.fromConfig,
@@ -149,7 +150,7 @@ export function createPostgresStore(
       return withClient("namespace_write", async (client) => {
         const result = await client.query(
           `UPDATE axond_namespace SET attrs = $2::jsonb, blocklist = $3::jsonb WHERE id = $1 RETURNING *`,
-          [id, JSON.stringify(attrs), blocklist === null ? null : JSON.stringify(blocklist)],
+          [id, encodeAttrs(attrs), blocklist === null ? null : JSON.stringify(blocklist)],
         );
         return result.rows[0] ? namespaceFrom(result.rows[0]) : null;
       });

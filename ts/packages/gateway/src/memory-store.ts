@@ -14,6 +14,7 @@ import type {
 
 import { GatewayFailure } from "./errors.ts";
 import { monthlyPeriod } from "./namespace.ts";
+import { serdeCanonical, serdeValue } from "./strict-json.ts";
 
 const I64_MAX = 9223372036854775807n;
 
@@ -30,6 +31,10 @@ interface PolicyRow {
 }
 
 function copyAttrs(attrs: NamespaceWrite["attrs"]): NamespaceWrite["attrs"] {
+  const canonical = serdeCanonical(attrs);
+  if (canonical !== null) {
+    return serdeValue(canonical) as NamespaceWrite["attrs"];
+  }
   if (Array.isArray(attrs) || (attrs !== null && typeof attrs === "object")) {
     return JSON.parse(JSON.stringify(attrs)) as NamespaceWrite["attrs"];
   }

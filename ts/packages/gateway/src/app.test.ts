@@ -1614,6 +1614,97 @@ test("management_json_invalid_utf8_matches_serde", async () => {
   }
 });
 
+test("management_json_attrs_match_serde_reserialization", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [],
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const call = (path: string, method: string, body?: string) =>
+    app.request(`http://127.0.0.1${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+  const parse = "Failed to parse the request body as JSON";
+  const created = await call("/api/v1/namespaces", "POST", '{"id":"wsp_ser","attrs":{"z":1,"a":2}}');
+  assert.equal(created.status, 201);
+  assert.equal(await created.text(), '{"id":"wsp_ser","attrs":{"a":2,"z":1}}');
+  const put = async (body: string, attrs: string) => {
+    const response = await call("/api/v1/namespaces/wsp_ser", "PUT", body);
+    assert.equal(response.status, 200, body);
+    const text = await response.text();
+    assert.equal(text, `{"id":"wsp_ser","attrs":${attrs}}`, body);
+    const again = await call("/api/v1/namespaces/wsp_ser", "GET");
+    assert.equal(again.status, 200);
+    assert.equal(await again.text(), text);
+  };
+  await put('{"attrs":{"n":9007199254740993}}', '{"n":9007199254740993}');
+  await put('{"attrs":{"n":1.0}}', '{"n":1.0}');
+  await put('{"attrs":{"n":1e2}}', '{"n":100.0}');
+  await put('{"attrs":1.0}', "1.0");
+  await put('{"attrs":9007199254740993}', "9007199254740993");
+  await put('{"attrs":{"b":1,"a":{"z":1,"m":2}}}', '{"a":{"m":2,"z":1},"b":1}');
+  await put('{"attrs":{"n":-0}}', '{"n":-0.0}');
+  await put('{"attrs":{"n":18446744073709551615}}', '{"n":18446744073709551615}');
+  await put('{"attrs":{"n":18446744073709551616}}', '{"n":1.8446744073709552e+19}');
+  await put('{"attrs":{"n":-9223372036854775809}}', '{"n":-9.223372036854776e+18}');
+  await put('{"attrs":{"n":1E21}}', '{"n":1e+21}');
+  await put('{"attrs":{"k":"a","k":"b"}}', '{"k":"b"}');
+  await put('{"attrs":{"é":1,"a":2}}', '{"a":2,"é":1}');
+  await put('{"attrs":1e-400}', "0.0");
+  await put('{"attrs":1e308}', "1e+308");
+  await put('{"attrs":[1.0,9007199254740993]}', "[1.0,9007199254740993]");
+  await put('{"attrs":{"\\uFFFD":1,"😀":2}}', '{"\uFFFD":1,"😀":2}');
+  const bad = async (path: string, method: string, body: string, message: string) => {
+    const response = await call(path, method, body);
+    assert.equal(response.status, 400, body);
+    assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+  };
+  await bad(
+    "/api/v1/namespaces",
+    "POST",
+    '{"id":"a","attrs":1e309}',
+    `${parse}: attrs: number out of range at line 1 column 23`,
+  );
+  await bad(
+    "/api/v1/namespaces",
+    "POST",
+    '{"id":"a","attrs":{"n":1e309}}',
+    `${parse}: attrs.n: number out of range at line 1 column 28`,
+  );
+  await bad(
+    "/api/v1/namespaces",
+    "POST",
+    '{"id":"a","attrs":-1e309}',
+    `${parse}: attrs: number out of range at line 1 column 24`,
+  );
+  await bad("/api/v1/namespaces", "POST", '{"id":1e309}', `${parse}: id: number out of range at line 1 column 11`);
+  await bad(
+    "/api/v1/namespaces/wsp_ser/budgets/2026-09",
+    "PUT",
+    '{"limit_microdollars":1e309}',
+    `${parse}: limit_microdollars: number out of range at line 1 column 27`,
+  );
+  await bad(
+    "/api/v1/namespaces/wsp_ser/budget",
+    "PUT",
+    '{"cadence":{"monthly":1e309},"limit_microdollars":1}',
+    `${parse}: cadence.monthly: number out of range at line 1 column 27`,
+  );
+  const missing = await call("/api/v1/namespaces/a", "GET");
+  assert.equal(missing.status, 404);
+  const kept = await call("/api/v1/namespaces/wsp_ser", "GET");
+  assert.equal(kept.status, 200);
+  assert.equal((await kept.text()).includes('"attrs":{"\uFFFD":1,"😀":2}'), true);
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });

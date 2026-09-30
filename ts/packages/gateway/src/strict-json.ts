@@ -2,8 +2,10 @@ import { badRequest } from "./errors.ts";
 
 const DESERIALIZE = "Failed to deserialize the JSON body into the target type";
 const PARSE = "Failed to parse the request body as JSON";
+const I64_MIN = -9223372036854775808n;
 const I64_MAX = 9223372036854775807n;
 const U64_MAX = 18446744073709551615n;
+const CANONICAL = Symbol.for("axond.serdeCanonical");
 
 export type StrictField = {
   name: string;
@@ -342,6 +344,10 @@ function readField(cur: Cursor, field: StrictField, key: string): unknown {
   if (field.kind === "strings") {
     return readStringList(cur, key);
   }
+  if (cur.peek() === "n") {
+    readLiteral(cur, "null");
+    return null;
+  }
   return jsonValue(cur, key);
 }
 
@@ -420,6 +426,7 @@ function readUnit(cur: Cursor, path: string): void {
   }
   if (peek === "-" || (peek >= "0" && peek <= "9")) {
     const token = readUnitNumber(cur, path);
+    rejectOutOfRange(token, path, cur.loc());
     const kind = token.includes(".") || token.includes("e") || token.includes("E")
       ? `floating point \`${formatRustFloat(token)}\``
       : `integer \`${token}\``;
@@ -516,6 +523,7 @@ function readU64(cur: Cursor, key: string): bigint {
   }
   const token = readNumber(cur);
   const loc = cur.loc();
+  rejectOutOfRange(token, key, loc);
   if (token.includes(".") || token.includes("e") || token.includes("E")) {
     fail(`${DESERIALIZE}: ${key}: invalid type: floating point \`${formatRustFloat(token)}\`, expected u64 ${at(loc)}`);
   }
@@ -613,6 +621,7 @@ function describeOther(cur: Cursor, path = ""): string {
   }
   if (peek === "-" || (peek >= "0" && peek <= "9")) {
     const token = readNumber(cur);
+    rejectOutOfRange(token, path, cur.loc());
     if (token.includes(".") || token.includes("e") || token.includes("E")) {
       return `floating point \`${formatRustFloat(token)}\``;
     }
@@ -632,17 +641,7 @@ function asciiSlice(cur: Cursor, start: number, end: number): string {
 function jsonValue(cur: Cursor, path: string): unknown {
   const start = cur.i;
   skipValue(cur, path);
-  let text: string;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(cur.bytes.subarray(start, cur.i));
-  } catch {
-    syntax(cur, path);
-  }
-  try {
-    return JSON.parse(text) as unknown;
-  } catch {
-    syntax(cur, path);
-  }
+  return serdeValue(canonicalJson(cur.bytes.subarray(start, cur.i)));
 }
 
 const CONTROL_IN_STRING = "control character (\\u0000-\\u001F) found while parsing a string";
@@ -815,8 +814,10 @@ function skipValue(cur: Cursor, path = ""): Loc {
     return readLiteral(cur, "null");
   }
   if (peek === "-" || (peek >= "0" && peek <= "9")) {
-    readNumber(cur);
-    return cur.loc();
+    const token = readNumber(cur);
+    const loc = cur.loc();
+    rejectOutOfRange(token, path, loc);
+    return loc;
   }
   if (peek === "{") {
     cur.bump();
@@ -879,6 +880,199 @@ function skipValue(cur: Cursor, path = ""): Loc {
     syntax(cur);
   }
   syntax(cur, path);
+}
+
+function rejectOutOfRange(token: string, path: string, loc: Loc): void {
+  if (Number.isFinite(Number(token))) {
+    return;
+  }
+  const prefix = path.length === 0 ? "" : `${path}: `;
+  parseFail(`${prefix}number out of range`, loc);
+}
+
+/**
+ * JSON value carried with the bytes serde_json would write.
+ * A class instance stringifies as an object, so callers use `encodeAttrs`.
+ */
+export class SerdeDoc {
+  canonical: string;
+  constructor(canonical: string) {
+    this.canonical = canonical;
+  }
+}
+
+export function serdeCanonical(value: unknown): string | null {
+  if (value instanceof SerdeDoc) {
+    return value.canonical;
+  }
+  if (value !== null && typeof value === "object" && CANONICAL in value) {
+    return (value as { [CANONICAL]: string })[CANONICAL];
+  }
+  return null;
+}
+
+/** Parse `canonical` for field access and keep those bytes for the wire. */
+export function serdeValue(canonical: string): unknown {
+  const parsed = JSON.parse(canonical) as unknown;
+  if (parsed !== null && typeof parsed === "object") {
+    Object.defineProperty(parsed, CANONICAL, { value: canonical, enumerable: false });
+    return parsed;
+  }
+  return new SerdeDoc(canonical);
+}
+
+export function encodeAttrs(value: unknown): string {
+  const canonical = serdeCanonical(value);
+  if (canonical !== null) {
+    return canonical;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalJson(bytes: Uint8Array): string {
+  const cur = new Cursor(bytes);
+  cur.skipWs();
+  return canonicalValue(cur);
+}
+
+function canonicalValue(cur: Cursor): string {
+  const peek = cur.peek();
+  if (peek === '"') {
+    return JSON.stringify(readString(cur));
+  }
+  if (peek === "t") {
+    readLiteral(cur, "true");
+    return "true";
+  }
+  if (peek === "f") {
+    readLiteral(cur, "false");
+    return "false";
+  }
+  if (peek === "n") {
+    readLiteral(cur, "null");
+    return "null";
+  }
+  if (peek === "-" || (peek >= "0" && peek <= "9")) {
+    return canonicalNumber(readNumber(cur));
+  }
+  if (peek === "{") {
+    cur.bump();
+    cur.skipWs();
+    const entries = new Map<string, string>();
+    if (cur.peek() !== "}") {
+      while (cur.peek() !== "") {
+        const key = readString(cur);
+        cur.skipWs();
+        if (cur.bump() !== ":") {
+          syntax(cur);
+        }
+        cur.skipWs();
+        entries.set(key, canonicalValue(cur));
+        cur.skipWs();
+        if (cur.peek() === ",") {
+          cur.bump();
+          cur.skipWs();
+          continue;
+        }
+        break;
+      }
+    }
+    if (cur.bump() !== "}") {
+      syntax(cur);
+    }
+    const keys = [...entries.keys()].sort(compareUtf8);
+    return `{${keys.map((key) => `${JSON.stringify(key)}:${entries.get(key)}`).join(",")}}`;
+  }
+  if (peek === "[") {
+    cur.bump();
+    cur.skipWs();
+    const items: string[] = [];
+    if (cur.peek() !== "]") {
+      while (cur.peek() !== "") {
+        items.push(canonicalValue(cur));
+        cur.skipWs();
+        if (cur.peek() === ",") {
+          cur.bump();
+          cur.skipWs();
+          continue;
+        }
+        break;
+      }
+    }
+    if (cur.bump() !== "]") {
+      syntax(cur);
+    }
+    return `[${items.join(",")}]`;
+  }
+  syntax(cur);
+}
+
+function compareUtf8(left: string, right: string): number {
+  const encoded = new TextEncoder();
+  const a = encoded.encode(left);
+  const b = encoded.encode(right);
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i += 1) {
+    if (a[i] !== b[i]) {
+      return a[i]! - b[i]!;
+    }
+  }
+  return a.length - b.length;
+}
+
+function canonicalNumber(token: string): string {
+  if (/^-?(0|[1-9][0-9]*)$/.test(token)) {
+    if (token === "-0") {
+      return "-0.0";
+    }
+    const n = BigInt(token);
+    if (n >= 0n && n <= U64_MAX) {
+      return n.toString();
+    }
+    if (n < 0n && n >= I64_MIN) {
+      return n.toString();
+    }
+    return formatSerdeF64(Number(token));
+  }
+  return formatSerdeF64(Number(token));
+}
+
+function scientific(abs: number): string {
+  for (let p = 0; p <= 17; p += 1) {
+    const raw = abs.toExponential(p);
+    if (Number(raw) !== abs) {
+      continue;
+    }
+    let body = raw.replace(/(\.\d*?)0+e/, "$1e").replace(/\.e/, "e");
+    if (/e\d/.test(body)) {
+      body = body.replace("e", "e+");
+    }
+    body = body.replace("e+-", "e-");
+    if (Number(body) === abs) {
+      return body;
+    }
+  }
+  return abs.toExponential();
+}
+
+/** serde_json 1.0 finite f64 text (zmij), including `1.0` and `-0.0`. */
+function formatSerdeF64(n: number): string {
+  if (Object.is(n, -0)) {
+    return "-0.0";
+  }
+  if (n === 0) {
+    return "0.0";
+  }
+  const neg = n < 0;
+  const abs = Math.abs(n);
+  const sign = neg ? "-" : "";
+  if (Number.isInteger(abs) && abs < 1e16) {
+    return `${sign}${abs.toFixed(0)}.0`;
+  }
+  if (abs >= 1e16 || abs < 1e-5) {
+    return sign + scientific(abs);
+  }
+  return sign + JSON.stringify(abs);
 }
 
 function formatRustFloat(token: string): string {

@@ -15,6 +15,7 @@ import type {
 } from "@axond/sdk";
 
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
+import { encodeAttrs, serdeValue } from "../../gateway/src/strict-json.ts";
 import { budgetJson } from "../../gateway/src/memory-store.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 import { recordStoreCall, type StoreMetrics, type StoreOperation } from "../../gateway/src/store-metrics.ts";
@@ -163,7 +164,7 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
           "INSERT INTO axond_namespace (id, attrs, blocklist, allow_platform_fallback, from_config) VALUES (?, ?, ?, ?, ?)",
         ).run(
           record.id,
-          JSON.stringify(record.attrs),
+          encodeAttrs(record.attrs),
           record.blocklist === null ? null : JSON.stringify(record.blocklist),
           record.allowPlatformFallback ? 1 : 0,
           record.fromConfig ? 1 : 0,
@@ -181,7 +182,7 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
           return null;
         }
         db.prepare("UPDATE axond_namespace SET attrs = ?, blocklist = ? WHERE id = ?").run(
-          JSON.stringify(attrs),
+          encodeAttrs(attrs),
           blocklist === null ? null : JSON.stringify(blocklist),
           id,
         );
@@ -483,6 +484,11 @@ function readBudget(db: DatabaseSync, namespace: string, period: string): Budget
   };
 }
 
+function storedAttrs(text: string): Record<string, unknown> {
+  JSON.parse(text);
+  return serdeValue(text) as Record<string, unknown>;
+}
+
 function readNamespace(db: DatabaseSync, id: string): NamespaceWrite | null {
   const row = one(db, "SELECT * FROM axond_namespace WHERE id = ?", [id]);
   if (!row) {
@@ -490,7 +496,7 @@ function readNamespace(db: DatabaseSync, id: string): NamespaceWrite | null {
   }
   return {
     id: String(row["id"]),
-    attrs: JSON.parse(String(row["attrs"])) as Record<string, unknown>,
+    attrs: storedAttrs(String(row["attrs"])),
     blocklist: row["blocklist"] === null ? null : (JSON.parse(String(row["blocklist"])) as string[]),
     allowPlatformFallback: Number(row["allow_platform_fallback"]) === 1,
     fromConfig: Number(row["from_config"]) === 1,
