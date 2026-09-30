@@ -19,6 +19,7 @@ import {
 import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
+import { seedConfigNamespaces } from "./seed-namespaces.ts";
 import { applyPostgresMigration, createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
 import { openSqliteStore } from "./sqlite-store.ts";
 
@@ -36,15 +37,7 @@ async function main(): Promise<void> {
     config.storage.backend === "sqlite"
       ? openSqliteStore(config.storage.path!, metrics)
       : await openPostgres(config.storage.dsn!, metrics);
-  for (const namespace of config.namespaces) {
-    await store.putNamespace({
-      id: namespace.id,
-      attrs: {},
-      blocklist: null,
-      allowPlatformFallback: namespace.allowPlatformFallback,
-      fromConfig: true,
-    });
-  }
+  await seedConfigNamespaces(store, config.namespaces);
   const extensions = await loadExtensionDir(config.extensionsDir ?? process.env["AXOND_EXTENSIONS_DIR"] ?? null);
   for (const extension of extensions) {
     for (const [index, sql] of (extension.migrations ?? []).entries()) {

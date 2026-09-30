@@ -6,7 +6,6 @@ import { clampStreams, defaultPending, validateAdmission, type AdmissionLimits }
 
 import { GatewayFailure } from "./errors.ts";
 import { validateGlob } from "./glob.ts";
-import { parseNamespaceId } from "./namespace.ts";
 
 export const WITHDRAWN_SECTIONS = [
   "admin_breakglass",
@@ -162,8 +161,10 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
 
   const namespaces = asArray(parsed["namespace"]).map((entry) => {
     const row = asRecord(entry) ?? {};
-    const id = typeof row["id"] === "string" ? row["id"] : "";
-    parseNamespaceId(id);
+    if (typeof row["id"] !== "string") {
+      throw configError("namespace `id` must be a string");
+    }
+    const id = row["id"];
     return {
       id,
       default: row["default"] === true,

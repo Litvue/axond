@@ -5,7 +5,9 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
+import { envSecretReader, loadConfig } from "../../gateway/src/config.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
+import { seedConfigNamespaces } from "./seed-namespaces.ts";
 import { applyMigration, openSqliteStore } from "./sqlite-store.ts";
 
 test("sqlite settlement is exactly once per request_id and survives reopen", async () => {
@@ -240,6 +242,41 @@ test("sqlite store operations record wait and query duration without the namespa
       false,
     );
     assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("config_seed_skips_invalid_namespace_ids", async () => {
+  const toml = `
+[storage]
+backend = "sqlite"
+path = "/tmp/axond.sqlite"
+[[namespace]]
+id = "wsp_ok"
+default = true
+[[namespace]]
+id = "acme/core"
+[[namespace]]
+id = ""
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "wsp_ok"
+`;
+  const loaded = await loadConfig(toml, envSecretReader({ GW_KEY: "k" }, async () => ""));
+  assert.deepEqual(
+    loaded.namespaces.map((namespace) => namespace.id),
+    ["wsp_ok", "acme/core", ""],
+  );
+  const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-seed-"));
+  try {
+    const store = openSqliteStore(join(directory, "axond.sqlite"));
+    await seedConfigNamespaces(store, loaded.namespaces);
+    await seedConfigNamespaces(store, loaded.namespaces);
+    assert.equal((await store.getNamespace("wsp_ok"))?.id, "wsp_ok");
+    assert.equal((await store.getNamespace("wsp_ok"))?.fromConfig, true);
+    assert.equal(await store.getNamespace("acme/core"), null);
+    assert.equal(await store.getNamespace(""), null);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
