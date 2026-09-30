@@ -894,7 +894,7 @@ test("storage enums and unknown shutdown fields are figment extract errors", asy
   );
   await reject(
     `${BASE}[shutdown]\nnope = 1\n[admission]\nmax_request_bytes = 1.5\n[failover]\nmax_attempts = 0\n`,
-    unknown("nope"),
+    'config: invalid type: found float `1.5`, expected usize for key "default.admission.max_request_bytes"',
   );
   await reject(`${BASE}[shutdown]\nnope = 1\naaa = 1\n`, unknown("aaa"));
   await reject(
@@ -902,16 +902,46 @@ test("storage enums and unknown shutdown fields are figment extract errors", asy
     'config: invalid type: found float `1.5`, expected u64 for key "default.shutdown.drain_grace_ms"',
   );
   await reject(
+    `${BASE}[shutdown]\naaa = 1\ndrain_grace_ms = 1.5\n`,
+    unknown("aaa"),
+  );
+  await reject(
+    `${BASE}[shutdown]\ndrain_grace_ms = 1.5\ndeadline_ms = 1.5\n`,
+    'config: invalid type: found float `1.5`, expected u64 for key "default.shutdown.deadline_ms"',
+  );
+  await reject(
     `${BASE}[failover]\nmax_attempts = 1.5\n[shutdown]\nnope = 1\n`,
     'config: invalid type: found float `1.5`, expected u32 for key "default.failover.max_attempts"',
   );
   await reject(
     `${BASE}[transport]\nconnect_timeout_ms = 1.5\n[shutdown]\nnope = 1\n[admission]\nmax_request_bytes = 0\n`,
-    'config: invalid type: found float `1.5`, expected u64 for key "default.transport.connect_timeout_ms"',
+    unknown("nope"),
+  );
+  await reject(
+    `${BASE}[transport]\nbuffered_body_timeout_ms = 1.5\nconnect_timeout_ms = 1.5\n`,
+    'config: invalid type: found float `1.5`, expected u64 for key "default.transport.buffered_body_timeout_ms"',
   );
   await reject(
     `${BASE}[transport]\nmax_response_bytes = 1.5\nconnect_timeout_ms = 1.0\n`,
     'config: invalid type: found float `1`, expected u64 for key "default.transport.connect_timeout_ms"',
+  );
+  await reject(
+    BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", "[server]\nbind = 1\n").replace(
+      'path = "/tmp/axond.sqlite"\n',
+      'path = "/tmp/axond.sqlite"\ncreate_table = 1.5\n',
+    ) + "[shutdown]\nnope = 1\n",
+    'config: invalid type: found signed int `1`, expected socket address for key "default.server.bind"',
+  );
+  await reject(
+    BASE.replace('path = "/tmp/axond.sqlite"\n', "path = 1\ncreate_table = 1.5\n"),
+    'config: invalid type: found float `1.5`, expected a boolean for key "default.storage.create_table"',
+  );
+  await reject(
+    BASE.replace(
+      'path = "/tmp/axond.sqlite"\n',
+      'path = "/tmp/axond.sqlite"\n[storage.usage_index]\nbuffer_capacity = 8\nflush_interval_ms = 1.5\nmax_batch = 1.5\n',
+    ),
+    'config: invalid type: found float `1.5`, expected u64 for key "default.storage.usage_index.flush_interval_ms"',
   );
   await reject(
     `${BASE}[failover]\nmax_attempts = 1.5\n[transport]\nconnect_timeout_ms = 1.5\n`,

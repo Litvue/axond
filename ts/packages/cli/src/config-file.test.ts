@@ -515,7 +515,7 @@ source_url = "http://models.dev/catalog.json"
   }
 });
 
-test("transport_float_beats_a_shutdown_field", async () => {
+test("shutdown_unknown_field_beats_a_transport_float", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-transport-"));
   const db = join(root, "fresh.sqlite");
   const config = join(root, "transport.toml");
@@ -551,7 +551,7 @@ max_request_bytes = 0
       result.stderr,
       "Error: failed to load config from `" +
         config +
-        '`: config load: invalid type: found float `1.5`, expected u64 for key "default.transport.connect_timeout_ms" in ' +
+        '`: config load: unknown field: found `nope`, expected `one of `drain_grace_ms`, `deadline_ms`, `flush_timeout_ms`` for key "default.shutdown.nope" in ' +
         figmentFileSource(config, root) +
         " TOML file\n",
     );

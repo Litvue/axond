@@ -159,6 +159,7 @@ export async function loadConfig(
   applyEnvOverrides(parsed, secrets);
   rejectExtractTypes(toml, parsed);
   const bind = readServerBind(toml, parsed, secrets);
+  rejectAfterServerExtract(toml, parsed);
   rejectSectionShapes(toml, parsed, SECTIONS_AFTER_SERVER);
   projectPositional(toml, parsed, POSITIONAL_AFTER_SERVER);
   rejectWithdrawn(parsed);
@@ -1142,8 +1143,6 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
   readTypedInt(toml, "failover", failover, "failure_threshold", "u32", 3);
   readTypedInt(toml, "failover", failover, "max_attempts", "u32", 3);
   readTypedInt(toml, "failover", failover, "overall_timeout_ms", "u64", 30_000);
-  rejectTransportExtract(toml, parsed);
-  rejectShutdownExtract(toml, parsed);
   const admission = asRecord(parsed["admission"]) ?? {};
   for (const [key, expected, fallback] of [
     ["max_in_flight", "usize", 1024],
@@ -1181,74 +1180,106 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
   readTypedInt(toml, "discovery", discovery, "refresh_interval_seconds", "u64", 300);
 }
 
-const SHUTDOWN_FIELDS = ["drain_grace_ms", "deadline_ms", "flush_timeout_ms"] as const;
-
 /**
- * Storage enums and `create_table` fail while Figment extracts, before a
- * missing path and before a later zero bound. `backend` is before
- * `on_unavailable`, which is before `create_table`.
+ * Figment stores tables in a `BTreeMap`, so serde visits keys in sorted order.
+ * `server` is before `shutdown`, `storage`, and `transport`. Inside a table,
+ * the same order interleaves `deny_unknown_fields` with typed fields.
  */
-function rejectStorageExtract(toml: string, parsed: Record<string, unknown>): void {
-  const storage = asRecord(parsed["storage"]);
-  if (!storage) {
+function rejectAfterServerExtract(toml: string, parsed: Record<string, unknown>): void {
+  extractStruct(toml, parsed, "shutdown", "Shutdown", (row) => rejectShutdownExtract(toml, row));
+  extractStruct(toml, parsed, "storage", "StorageConfig", (row) => rejectStorageExtract(toml, row));
+  extractStruct(toml, parsed, "transport", "Transport", (row) => rejectTransportExtract(toml, row));
+}
+
+function extractStruct(
+  toml: string,
+  parsed: Record<string, unknown>,
+  key: string,
+  structName: string,
+  visit: (row: Record<string, unknown>) => void,
+): void {
+  if (!Object.hasOwn(parsed, key) || parsed[key] === undefined) {
     return;
   }
+  if (Array.isArray(parsed[key])) {
+    const fields = POSITIONAL_AFTER_SERVER.find((entry) => entry[0] === key)?.[1];
+    if (fields) {
+      projectPositional(toml, parsed, [[key, fields]]);
+    }
+    return;
+  }
+  const record = asRecord(parsed[key]);
+  if (!record) {
+    const literal = topLevelAssignment(toml, key);
+    throw configLoad(
+      `invalid type: found ${foundPhrase(parsed[key], literal)}, expected struct ${structName} for key "default.${key}"`,
+    );
+  }
+  visit(record);
+}
+
+/**
+ * Storage keys sort `backend`, `create_table`, `dsn_env`, `on_unavailable`,
+ * `path`, then `usage_index`. A float on `create_table` is reported before a
+ * bad `path`.
+ */
+function rejectStorageExtract(toml: string, storage: Record<string, unknown>): void {
   readVariant(toml, "storage", storage, "backend", ["sqlite", "postgres"], "StorageBackend");
-  readString(toml, "storage", storage, "path");
+  readBool(toml, "storage", storage, "create_table");
   readString(toml, "storage", storage, "dsn_env");
   readVariant(toml, "storage", storage, "on_unavailable", ["deny", "allow"], "StoreUnavailable");
-  readBool(toml, "storage", storage, "create_table");
+  readString(toml, "storage", storage, "path");
+  if (Array.isArray(storage["usage_index"])) {
+    storage["usage_index"] = structFromSequence(
+      storage["usage_index"] as unknown[],
+      USAGE_INDEX_FIELDS,
+      sectionFieldLiteral(toml, "storage", "usage_index"),
+      "default.storage.usage_index",
+    );
+  }
   const index = asRecord(storage["usage_index"]);
   if (index) {
     readUsageIndexInt(toml, index, "buffer_capacity", "usize", 1024n);
-    readUsageIndexInt(toml, index, "max_batch", "usize", 256n);
     readUsageIndexInt(toml, index, "flush_interval_ms", "u64", 50n);
+    readUsageIndexInt(toml, index, "max_batch", "usize", 256n);
   }
 }
 
-/** Transport is extracted after failover and before shutdown. */
-function rejectTransportExtract(toml: string, parsed: Record<string, unknown>): void {
-  const row = asRecord(parsed["transport"]);
-  if (!row) {
-    return;
-  }
+/** Transport keys are visited in sorted order, after `shutdown`. */
+function rejectTransportExtract(toml: string, row: Record<string, unknown>): void {
   const fields = [
-    ["connect_timeout_ms", DEFAULT_TRANSPORT.connectTimeoutMs ?? 5_000],
-    ["response_header_timeout_ms", DEFAULT_TRANSPORT.responseHeaderTimeoutMs],
     ["buffered_body_timeout_ms", DEFAULT_TRANSPORT.bufferedBodyTimeoutMs],
+    ["connect_timeout_ms", DEFAULT_TRANSPORT.connectTimeoutMs ?? 5_000],
+    ["max_error_bytes", DEFAULT_TRANSPORT.maxErrorBytes ?? 64 * 1024],
+    ["max_response_bytes", DEFAULT_TRANSPORT.maxResponseBytes],
+    ["response_header_timeout_ms", DEFAULT_TRANSPORT.responseHeaderTimeoutMs],
     ["stream_idle_timeout_ms", DEFAULT_TRANSPORT.streamIdleTimeoutMs],
     ["stream_terminal_grace_ms", DEFAULT_TRANSPORT.streamTerminalGraceMs ?? 1_000],
-    ["max_response_bytes", DEFAULT_TRANSPORT.maxResponseBytes],
-    ["max_error_bytes", DEFAULT_TRANSPORT.maxErrorBytes ?? 64 * 1024],
   ] as const;
   for (const [key, fallback] of fields) {
     readTypedInt(toml, "transport", row, key, "u64", fallback);
   }
 }
 
-/**
- * Shutdown is extracted before admission. Known fields are typed first, in
- * declaration order, then `deny_unknown_fields` names the alphabetically
- * first leftover key.
- */
-function rejectShutdownExtract(toml: string, parsed: Record<string, unknown>): void {
-  const row = asRecord(parsed["shutdown"]);
-  if (!row) {
-    return;
+/** `[shutdown]` walks sorted keys, so an earlier unknown name wins over a later float. */
+function rejectShutdownExtract(toml: string, row: Record<string, unknown>): void {
+  for (const field of Object.keys(row).sort()) {
+    if (field === "deadline_ms") {
+      readTypedInt(toml, "shutdown", row, "deadline_ms", "u64", 15_000);
+      continue;
+    }
+    if (field === "drain_grace_ms") {
+      readTypedInt(toml, "shutdown", row, "drain_grace_ms", "u64", 5_000);
+      continue;
+    }
+    if (field === "flush_timeout_ms") {
+      readTypedInt(toml, "shutdown", row, "flush_timeout_ms", "u64", 5_000);
+      continue;
+    }
+    throw configLoad(
+      `unknown field: found \`${field}\`, expected \`one of \`drain_grace_ms\`, \`deadline_ms\`, \`flush_timeout_ms\`\` for key "default.shutdown.${field}"`,
+    );
   }
-  readTypedInt(toml, "shutdown", row, "drain_grace_ms", "u64", 5_000);
-  readTypedInt(toml, "shutdown", row, "deadline_ms", "u64", 15_000);
-  readTypedInt(toml, "shutdown", row, "flush_timeout_ms", "u64", 5_000);
-  const unknown = Object.keys(row)
-    .filter((key) => !SHUTDOWN_FIELDS.includes(key as (typeof SHUTDOWN_FIELDS)[number]))
-    .sort();
-  const field = unknown[0];
-  if (field === undefined) {
-    return;
-  }
-  throw configLoad(
-    `unknown field: found \`${field}\`, expected \`one of \`drain_grace_ms\`, \`deadline_ms\`, \`flush_timeout_ms\`\` for key "default.shutdown.${field}"`,
-  );
 }
 
 function readString(toml: string, section: string, row: Record<string, unknown>, key: string): void {
