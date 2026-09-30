@@ -28,7 +28,11 @@ export const DEFAULT_CREDENTIAL_POLICY: CredentialPoolPolicy = {
   cooldownMs: 30_000,
 };
 
-const KEEPALIVE = new TextEncoder().encode(": keepalive\n\n");
+const textEncoder = new TextEncoder();
+const KEEPALIVE = textEncoder.encode(": keepalive\n\n");
+/** Rust `SseDecoder` default. The failure names this limit, not the buffered length. */
+const SSE_BUFFER_LIMIT = 1024 * 1024;
+const SSE_BUFFER_EXCEEDED = `SSE buffer exceeded ${SSE_BUFFER_LIMIT} bytes`;
 
 export function credentialPolicy(input?: {
   strategy?: "round-robin" | "weighted";
@@ -529,6 +533,7 @@ function relayStream(
   let reader = upstream.getReader();
   const decoder = new TextDecoder();
   let pending = "";
+  let openBytes = 0;
   let inflight: Promise<ReadableStreamReadResult<Uint8Array>> | null = null;
   let sawChunkAt = Date.now();
   let terminalAt: number | null = null;
@@ -638,7 +643,8 @@ function relayStream(
       terminalAt = Date.now();
     }
     note(pending + text);
-    pending = tail(pending + text);
+    pending = terminalAt === null ? tail(pending + text) : "";
+    openBytes = pending === "" ? 0 : incompleteByteLength(pending);
     markDownstream();
     controller.enqueue(merged);
     held.length = 0;
@@ -742,6 +748,12 @@ function relayStream(
         heldBytes += value.length;
         decoder.decode(value, { stream: true });
         const text = new TextDecoder().decode(concatBytes(held, heldBytes));
+        // The cap is the pre-drain buffer. One read larger than 1 MiB fails here,
+        // before the 64 KiB release, and the provider bytes stay on the wire.
+        if (utf8ByteLength(text) > SSE_BUFFER_LIMIT) {
+          failBound(controller, SSE_BUFFER_EXCEEDED);
+          return;
+        }
         markUpstream(text);
         const first = firstCompleteData(text);
         if (first === undefined && heldBytes < 64 * 1024) {
@@ -779,6 +791,14 @@ function relayStream(
         return;
       }
       const piece = decoder.decode(value, { stream: true });
+      // Match SseDecoder::push_inner: append, then refuse before draining events.
+      // A terminal already observed skips the decoder, so a later tail is relayed.
+      if (terminalAt === null && openBytes + utf8ByteLength(piece) > SSE_BUFFER_LIMIT) {
+        markDownstream();
+        controller.enqueue(value);
+        failBound(controller, SSE_BUFFER_EXCEEDED);
+        return;
+      }
       const buffered = pending + piece;
       const limited = consider(piece);
       if (terminalAt === null && sseTerminalSeen(route, buffered)) {
@@ -786,7 +806,13 @@ function relayStream(
       }
       markUpstream(buffered);
       note(buffered);
-      pending = tail(buffered);
+      if (terminalAt === null) {
+        openBytes = openBytesAfter(pending, openBytes, piece);
+        pending = tail(buffered);
+      } else {
+        pending = "";
+        openBytes = 0;
+      }
       markDownstream();
       controller.enqueue(value);
       if (await closeRateLimit(controller, limited)) {
@@ -887,7 +913,55 @@ function streamFailureFrame(route: string, message: string): Uint8Array {
   if (route === "chat") {
     text += "data: [DONE]\n\n";
   }
-  return new TextEncoder().encode(text);
+  return textEncoder.encode(text);
+}
+
+/** UTF-8 length. A string longer than the cap is already over it. */
+function utf8ByteLength(text: string): number {
+  if (text.length > SSE_BUFFER_LIMIT) {
+    return text.length;
+  }
+  return textEncoder.encode(text).byteLength;
+}
+
+/**
+ * Bytes still held after the last drained event. `pending` keeps that event's
+ * delimiter; the decoder's buffer does not.
+ */
+function eventBreakEnd(text: string): number {
+  const lf = text.lastIndexOf("\n\n");
+  const crlf = text.lastIndexOf("\r\n\r\n");
+  if (lf === -1 && crlf === -1) {
+    return -1;
+  }
+  if (crlf > lf) {
+    return crlf + 4;
+  }
+  return lf + 2;
+}
+
+function incompleteByteLength(pending: string): number {
+  const end = eventBreakEnd(pending);
+  return utf8ByteLength(end === -1 ? pending : pending.slice(end));
+}
+
+/**
+ * Byte length of the unfinished event after `piece` joins `pendingBefore`.
+ * A delimiter inside the new text drops everything in front of it, so an open
+ * event is not re-encoded on every chunk.
+ */
+function openBytesAfter(pendingBefore: string, openBefore: number, piece: string): number {
+  const inPiece = eventBreakEnd(piece);
+  if (inPiece !== -1) {
+    return utf8ByteLength(piece.slice(inPiece));
+  }
+  const head = pendingBefore.slice(-3);
+  const span = head + piece;
+  const spanBreak = eventBreakEnd(span);
+  if (spanBreak === -1) {
+    return openBefore + utf8ByteLength(piece);
+  }
+  return utf8ByteLength(span.slice(spanBreak));
 }
 
 function tail(text: string): string {
@@ -895,7 +969,7 @@ function tail(text: string): string {
   const crlf = text.lastIndexOf("\r\n\r\n");
   const at = Math.max(lf, crlf);
   if (at === -1) {
-    return text.length > 1_000_000 ? text.slice(-1024) : text;
+    return text;
   }
   return text.slice(at);
 }

@@ -2258,6 +2258,231 @@ test("chat_eof_names_an_incomplete_event_and_a_split_character", async () => {
   }
 });
 
+test("sse_buffer_limit_fails_an_unterminated_event_and_keeps_a_finished_stream", async () => {
+  const limit = 1024 * 1024;
+  const over = "x".repeat(limit + 1);
+  const exact = "y".repeat(limit);
+  const frame = 'data: {"choices":[{"delta":{"content":"a"}}]}\n\n';
+  const chunk = frame.repeat(Math.ceil(700_000 / frame.length));
+  assert.ok(Buffer.byteLength(chunk) < limit);
+  assert.ok(Buffer.byteLength(chunk) * 2 > limit);
+  const euros = "€".repeat(400_000);
+  assert.ok(euros.length < limit);
+  assert.ok(Buffer.byteLength(euros) > limit);
+
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const overUp = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(over);
+  });
+  const exactUp = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(exact);
+  });
+  const euroUp = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(euros);
+  });
+  let releaseMany: () => void = () => undefined;
+  const manyGate = new Promise<void>((resolve) => {
+    releaseMany = resolve;
+  });
+  const manyUp = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.flushHeaders();
+    res.write(chunk);
+    void manyGate.then(() => {
+      res.write(chunk);
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+  let releaseTail: () => void = () => undefined;
+  const tailGate = new Promise<void>((resolve) => {
+    releaseTail = resolve;
+  });
+  const tail = "z".repeat(limit + 1);
+  const tailUp = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.flushHeaders();
+    res.write(CHAT_DONE);
+    void tailGate.then(() => {
+      res.end(tail);
+    });
+  });
+  const messagesUp = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(over);
+  });
+  const seen: string[] = [];
+  const heldUp = await listen((req, res) => {
+    seen.push(req.headers.authorization ?? "");
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(over);
+  });
+
+  const chatBody = JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const waitUsage = async () => {
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+  };
+  const readGated = async (response: Response, ready: (got: number) => boolean, release: () => void) => {
+    const reader = response.body!.getReader();
+    const parts: Uint8Array[] = [];
+    let got = 0;
+    try {
+      for (;;) {
+        const part = await reader.read();
+        if (part.done) {
+          break;
+        }
+        parts.push(part.value);
+        got += part.value.byteLength;
+        if (ready(got)) {
+          release();
+        }
+      }
+    } finally {
+      release();
+    }
+    return Buffer.concat(parts);
+  };
+
+  try {
+    const overApp = chatDoneApp(store, overUp.url, records);
+    const overResponse = await overApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: chatBody,
+    });
+    assert.equal(overResponse.status, 200);
+    const overBody = Buffer.from(await overResponse.arrayBuffer());
+    assert.equal(overBody.subarray(0, over.length).toString(), over);
+    assert.equal(overBody.includes(Buffer.from("SSE buffer exceeded 1048576 bytes")), true);
+    assert.equal(overBody.includes(Buffer.from("data: [DONE]\n\n")), true);
+    assert.equal(overBody.includes(Buffer.from("sk-live-secret")), false);
+    assert.equal(overBody.includes(Buffer.from(KEY)), false);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+
+    records.length = 0;
+    const exactApp = chatDoneApp(store, exactUp.url, records);
+    const exactResponse = await exactApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: chatBody,
+    });
+    assert.equal(exactResponse.status, 200);
+    const exactBody = Buffer.from(await exactResponse.arrayBuffer());
+    assert.equal(exactBody.subarray(0, exact.length).toString(), exact);
+    assert.equal(exactBody.includes(Buffer.from("SSE buffer exceeded")), false);
+    assert.equal(exactBody.includes(Buffer.from("stream ended with an incomplete SSE event")), true);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+
+    records.length = 0;
+    const euroApp = chatDoneApp(store, euroUp.url, records);
+    const euroResponse = await euroApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: chatBody,
+    });
+    assert.equal(euroResponse.status, 200);
+    const euroBody = Buffer.from(await euroResponse.arrayBuffer());
+    const euroMark = euroBody.indexOf("event: error\n");
+    assert.ok(euroMark > limit);
+    assert.equal(euroBody.subarray(0, euroMark).equals(Buffer.from(euros).subarray(0, euroMark)), true);
+    assert.equal(euroBody.includes(Buffer.from("SSE buffer exceeded 1048576 bytes")), true);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+
+    records.length = 0;
+    const manyApp = chatDoneApp(store, manyUp.url, records);
+    const manyResponse = await manyApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: chatBody,
+    });
+    assert.equal(manyResponse.status, 200);
+    const manyBody = await readGated(manyResponse, (got) => got >= Buffer.byteLength(chunk), releaseMany);
+    assert.equal(manyBody.includes(Buffer.from(chunk)), true);
+    assert.equal(manyBody.includes(Buffer.from(`${chunk}${chunk}`)), true);
+    assert.equal(manyBody.includes(Buffer.from("data: [DONE]\n\n")), true);
+    assert.equal(manyBody.includes(Buffer.from("SSE buffer exceeded")), false);
+    assert.equal(manyBody.includes(Buffer.from("upstream_stream_error")), false);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+
+    records.length = 0;
+    const tailApp = chatDoneApp(store, tailUp.url, records);
+    const tailResponse = await tailApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: chatBody,
+    });
+    assert.equal(tailResponse.status, 200);
+    const tailBody = await readGated(tailResponse, (got) => got >= Buffer.byteLength(CHAT_DONE), releaseTail);
+    assert.equal(tailBody.subarray(0, Buffer.byteLength(CHAT_DONE)).toString(), CHAT_DONE);
+    assert.equal(tailBody.includes(tail), true);
+    assert.equal(tailBody.includes(Buffer.from("SSE buffer exceeded")), false);
+    assert.equal(tailBody.includes(Buffer.from("upstream_stream_error")), false);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.outputTokens, 1n);
+
+    records.length = 0;
+    const nativeApp = messagesApp(store, messagesUp.url, records);
+    const native = await nativeApp.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "fake-anthropic/claude-test", stream: true, messages: [], max_tokens: 16 }),
+    });
+    assert.equal(native.status, 200);
+    const nativeBody = Buffer.from(await native.arrayBuffer());
+    assert.equal(nativeBody.subarray(0, over.length).toString(), over);
+    assert.equal(nativeBody.includes(Buffer.from("SSE buffer exceeded 1048576 bytes")), true);
+    assert.equal(nativeBody.includes(Buffer.from("data: [DONE]")), false);
+    assert.equal(nativeBody.includes(Buffer.from("sk-live-secret")), false);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+
+    const heldApp = poolApp(store, heldUp.url, {
+      credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
+    });
+    const held = await heldApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: chatBody,
+    });
+    assert.equal(held.status, 200);
+    const heldBody = Buffer.from(await held.arrayBuffer());
+    assert.equal(heldBody.subarray(0, over.length).toString(), over);
+    assert.equal(heldBody.includes(Buffer.from("SSE buffer exceeded 1048576 bytes")), true);
+    assert.equal(heldBody.includes(Buffer.from("bad-key")), false);
+    assert.equal(heldBody.includes(Buffer.from("good-key")), false);
+    assert.deepEqual(seen, ["Bearer bad-key"]);
+  } finally {
+    releaseMany();
+    releaseTail();
+    overUp.close();
+    exactUp.close();
+    euroUp.close();
+    manyUp.close();
+    tailUp.close();
+    messagesUp.close();
+    heldUp.close();
+  }
+});
+
 test(
   "a connect timeout is upstream_timeout and hides the address",
   { skip: process.versions.bun !== undefined && "Bun fetch does not enforce connect_timeout_ms" },
