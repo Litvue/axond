@@ -133,7 +133,7 @@ export function createAdmission(limits: AdmissionLimits) {
       stage(metrics, "executing", 1);
       return Promise.resolve(true);
     }
-    const started = Date.now();
+    const started = Math.floor(performance.now());
     stage(metrics, "queued", 1);
     return new Promise((resolve) => {
       let settled = false;
@@ -146,7 +146,7 @@ export function createAdmission(limits: AdmissionLimits) {
           clearTimeout(timer);
         }
         stage(metrics, "queued", -1);
-        record(metrics, "axond.settlement.queue_wait", Date.now() - started);
+        record(metrics, "axond.settlement.queue_wait", Math.max(0, Math.floor(performance.now()) - started));
         if (granted) {
           executing += 1;
           stage(metrics, "executing", 1);
@@ -157,13 +157,24 @@ export function createAdmission(limits: AdmissionLimits) {
       executionWaiters.push(waiter);
       let timer: ReturnType<typeof setTimeout> | undefined;
       if (executionWaitMs !== null) {
-        timer = setTimeout(() => {
+        // setTimeout can run early, and Date.now can step backward. Re-arm
+        // until the monotonic deadline so a dropped charge waited the bound.
+        const deadline = Math.floor(performance.now()) + executionWaitMs;
+        const arm = () => {
+          const remaining = deadline - Math.floor(performance.now());
+          if (remaining > 0) {
+            timer = setTimeout(arm, remaining);
+            const unref = timer as { unref?: () => void };
+            unref.unref?.();
+            return;
+          }
           const index = executionWaiters.indexOf(waiter);
           if (index >= 0) {
             executionWaiters.splice(index, 1);
           }
           finish(false);
-        }, executionWaitMs);
+        };
+        timer = setTimeout(arm, executionWaitMs);
         const unref = timer as { unref?: () => void };
         unref.unref?.();
       }

@@ -1447,7 +1447,7 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
   const hold = admissionHolds.get(axond);
   hold?.claimSettlement();
   hold?.beginSpawned(opts.metrics);
-  const queuedAt = Date.now();
+  const queuedAt = Math.floor(performance.now());
   try {
   const granted = hold ? await hold.acquireExecution(opts.metrics) : true;
   if (!granted) {
@@ -1456,7 +1456,7 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
       msg: "settlement_failure",
       request_id: axond.requestId,
       reason: "queue_timeout",
-      waited_ms: Date.now() - queuedAt,
+      waited_ms: Math.max(0, Math.floor(performance.now()) - queuedAt),
     });
     hold?.releaseSettlement();
     return;
@@ -1464,15 +1464,24 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutMs = hold?.settlementTimeoutMs ?? 0;
   if (timeoutMs > 0) {
-    timer = setTimeout(() => {
+    const deadline = Math.floor(performance.now()) + timeoutMs;
+    const arm = () => {
+      const remaining = deadline - Math.floor(performance.now());
+      if (remaining > 0) {
+        timer = setTimeout(arm, remaining);
+        const unref = timer as { unref?: () => void };
+        unref.unref?.();
+        return;
+      }
       opts.metrics?.record("axond.settlement.failures", 1, { "axond.settlement.reason": "execution_timeout" });
       emitLog(opts, {
         msg: "settlement_failure",
         request_id: axond.requestId,
         reason: "execution_timeout",
-        waited_ms: Date.now() - queuedAt,
+        waited_ms: Math.max(0, Math.floor(performance.now()) - queuedAt),
       });
-    }, timeoutMs);
+    };
+    timer = setTimeout(arm, timeoutMs);
     const unref = timer as { unref?: () => void };
     unref.unref?.();
   }
