@@ -154,7 +154,11 @@ and `resolves_file_bytes_without_trimming`. Outbound description:
 for the one finding of the security review. A provider error that echoes the
 outbound credential is returned with that value replaced by `[REDACTED]`.
 `provider_error_replaces_the_echoed_credential` covers the caller body for both
-the Bearer key and the Anthropic `x-api-key`. Attribution without disclosure:
+the Bearer key and the Anthropic `x-api-key`.
+`messages_wire_headers_default_the_version_and_keep_the_caller_pin` sends
+`anthropic-version` (the caller pin, or `2023-06-01` when omitted) and
+`x-api-key`, and does not copy the gateway `Authorization` or a caller `Accept`.
+Attribution without disclosure:
 `fallback_status_hides_default_platform_label_but_keeps_explicit_id`.
 
 A new `expose_secret` call site is a review item in its own right: the security

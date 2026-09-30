@@ -4210,3 +4210,126 @@ test("chat_stream_forces_include_usage_and_keeps_other_bytes", async () => {
     upstream.close();
   }
 });
+
+test("messages_wire_headers_default_the_version_and_keep_the_caller_pin", async () => {
+  const store = await seeded();
+  const seen: Array<{
+    version?: string;
+    beta?: string;
+    accept?: string;
+    apiKey?: string;
+    authorization?: string;
+  }> = [];
+  const upstream = await listen((req, res) => {
+    const one = (name: string): string | undefined => {
+      const value = req.headers[name];
+      return Array.isArray(value) ? value[0] : value;
+    };
+    seen.push({
+      version: one("anthropic-version"),
+      beta: one("anthropic-beta"),
+      accept: one("accept"),
+      apiKey: one("x-api-key"),
+      authorization: one("authorization"),
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"id":"ok","usage":{"input_tokens":1,"output_tokens":1,"prompt_tokens":1,"completion_tokens":1}}');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [
+      { id: "fake-anthropic", kind: "anthropic", baseUrl: upstream.url },
+      { id: "fake-openai", kind: "openai", baseUrl: upstream.url },
+    ],
+    credentials: [
+      { namespace: "platform", provider: "fake-anthropic", secret: "sk-wire-anthropic", id: "anthropic" },
+      { namespace: "platform", provider: "fake-openai", secret: "sk-wire-openai", id: "openai" },
+    ],
+    prices: [
+      {
+        provider: "fake-anthropic",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+  });
+  const base = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const messages = JSON.stringify({
+    model: "fake-anthropic/claude-test",
+    max_tokens: 8,
+    messages: [],
+  });
+  try {
+    const omitted = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers: base,
+      body: messages,
+    });
+    assert.equal(omitted.status, 200);
+    await omitted.text();
+    assert.equal(seen[0]?.version, "2023-06-01");
+    assert.equal(seen[0]?.beta, undefined);
+    assert.equal(seen[0]?.apiKey, "sk-wire-anthropic");
+    assert.equal(seen[0]?.authorization, undefined);
+    assert.notEqual(seen[0]?.accept, "text/plain");
+
+    const pinned = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers: {
+        ...base,
+        "anthropic-version": "2099-01-01",
+        "anthropic-beta": "thinking-2025",
+        accept: "text/plain",
+      },
+      body: messages,
+    });
+    assert.equal(pinned.status, 200);
+    await pinned.text();
+    assert.equal(seen[1]?.version, "2099-01-01");
+    assert.equal(seen[1]?.beta, "thinking-2025");
+    assert.equal(seen[1]?.apiKey, "sk-wire-anthropic");
+    assert.equal(seen[1]?.authorization, undefined);
+    assert.notEqual(seen[1]?.accept, "text/plain");
+
+    const blank = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers: { ...base, "anthropic-version": "", "anthropic-beta": "" },
+      body: messages,
+    });
+    assert.equal(blank.status, 200);
+    await blank.text();
+    assert.equal(seen[2]?.version, "");
+    assert.equal(seen[2]?.beta, "");
+
+    const chat = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        ...base,
+        "anthropic-version": "2099-01-01",
+        "anthropic-beta": "thinking-2025",
+        accept: "text/plain",
+      },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(chat.status, 200);
+    await chat.text();
+    assert.equal(seen[3]?.version, undefined);
+    assert.equal(seen[3]?.beta, undefined);
+    assert.equal(seen[3]?.authorization, "Bearer sk-wire-openai");
+    assert.equal(seen[3]?.apiKey, undefined);
+    assert.notEqual(seen[3]?.accept, "text/plain");
+    assert.equal(seen.some((headers) => headers.authorization?.includes(KEY)), false);
+    assert.equal(seen.some((headers) => headers.apiKey === KEY), false);
+  } finally {
+    upstream.close();
+  }
+});

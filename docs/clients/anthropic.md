@@ -43,7 +43,9 @@ with client.messages.stream(
 ## curl
 
 Anthropic clients normally send `x-api-key`; Axond accepts it alongside bearer
-authentication:
+authentication. An omitted `anthropic-version` is sent upstream as
+`2023-06-01`. A caller-supplied `anthropic-version` or `anthropic-beta` is the
+value the provider sees:
 
 ```bash
 curl http://localhost:8080/ns/platform/v1/messages \

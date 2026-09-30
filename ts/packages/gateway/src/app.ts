@@ -51,6 +51,8 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 200_000;
 const DEFAULT_MAX_STREAM_DURATION_MS = 3_600_000;
 const DEFAULT_MAX_STREAM_BYTES = 64 * 1024 * 1024;
 const OUTPUT_ALLOWANCE_FIELDS = ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const;
+/** Anthropic's stable Messages wire. A caller pin replaces this; an omission does not. */
+const ANTHROPIC_VERSION = "2023-06-01";
 const requestTrace = new WeakMap<Request, TraceContext>();
 const requestAttempts = new WeakMap<Request, ExportedSpan[]>();
 
@@ -769,10 +771,15 @@ async function dispatch(
   const headersFor = (served: CredentialConfig): Headers => {
     const built = new Headers();
     built.set("content-type", "application/json");
-    for (const name of ["anthropic-version", "anthropic-beta", "accept"]) {
-      const value = c.req.header(name);
-      if (value) {
-        built.set(name, value);
+    // Messages always sends anthropic-version. The caller pin wins, including
+    // an empty value. anthropic-beta travels only when the caller sent it.
+    // Other routes do not copy those headers or Accept.
+    if (axond.route === "messages") {
+      const version = c.req.header("anthropic-version");
+      built.set("anthropic-version", version === undefined ? ANTHROPIC_VERSION : version);
+      const beta = c.req.header("anthropic-beta");
+      if (beta !== undefined) {
+        built.set("anthropic-beta", beta);
       }
     }
     if (provider.kind === "anthropic") {
