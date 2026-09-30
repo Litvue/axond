@@ -2556,6 +2556,7 @@ test("a responses stream does not rotate on a rate-limit event", async () => {
   assert.equal(response.status, 200);
   const body = await response.text();
   assert.match(body, /rate_limit_exceeded/);
+  assert.match(body, /provider stream was rate limited: OpenAI stream rate limited/);
   assert.deepEqual(seen, ["Bearer bad-key"]);
   const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
   const rows = (await status.json()).data as { credential_id: string; state: string }[];
@@ -4330,6 +4331,59 @@ test("messages_wire_headers_default_the_version_and_keep_the_caller_pin", async 
     assert.notEqual(seen[3]?.accept, "text/plain");
     assert.equal(seen.some((headers) => headers.authorization?.includes(KEY)), false);
     assert.equal(seen.some((headers) => headers.apiKey === KEY), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("responses_sequence_ends_an_invalid_stream", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const upstreamBytes = 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1"}}\n\n';
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(upstreamBytes);
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-responses-sequence", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/responses", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, input: "hi" }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text.startsWith(upstreamBytes), true);
+    assert.match(text, /provider stream was invalid: response.completed is missing status=completed/);
+    assert.equal(text.includes("sk-responses-sequence"), false);
+    assert.equal(text.includes(KEY), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+    const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", {
+      headers: { authorization: `Bearer ${KEY}` },
+    });
+    const rows = (await status.json()).data as { credential_id: string; state: string }[];
+    assert.equal(rows.find((row) => row.credential_id === "one")?.state, "healthy");
   } finally {
     upstream.close();
   }
