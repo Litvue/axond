@@ -285,6 +285,124 @@ test("usage_event_copies_admission_attrs", async () => {
   }
 });
 
+test("usage_event_omits_null_price_identity", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}');
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const prices = [
+    {
+      provider: "fake-openai",
+      model: "*",
+      inputMicrodollarsPerMillion: 1n,
+      outputMicrodollarsPerMillion: 1n,
+    },
+  ];
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices,
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  try {
+    const chat = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(chat.status, 200);
+    await chat.text();
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    const held = usageLine(records[0]!);
+    assert.equal(held.includes('"namespace":"platform","attrs":{},"period":"compat"'), true);
+    assert.equal(held.includes('"signer_kid"'), false);
+    assert.equal(held.includes('"price_book"'), false);
+    assert.equal(held.includes('"price_book_checksum"'), false);
+    assert.equal(held.includes('"price_catalog"'), false);
+
+    const unpriced = createAxond({
+      store,
+      gatewayKey: KEY,
+      defaultNamespace: "platform",
+      providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url, unpricedModels: "allow" }],
+      credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+      onUsage: (record) => {
+        records.push(record);
+      },
+    });
+    const open = await unpriced.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { ...headers, "x-request-id": "unpriced-cost" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(open.status, 200);
+    await open.text();
+    for (let attempt = 0; attempt < 20 && records.length < 2; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 2);
+    assert.equal(records[1]!.costMicrodollars, null);
+    const unpricedLine = usageLine(records[1]!);
+    assert.equal(unpricedLine.includes('"cost_microdollars":null'), true);
+    assert.equal(unpricedLine.includes('"period":"compat"'), true);
+    assert.equal(unpricedLine.includes('"price_catalog"'), false);
+
+    const down = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === "resolveNamespace") {
+          return async () => {
+            throw new StoreFailure();
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const allowed = createAxond({
+      store: down,
+      gatewayKey: KEY,
+      defaultNamespace: "platform",
+      onStoreUnavailable: "allow",
+      providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+      credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+      prices,
+      onUsage: (record) => {
+        records.push(record);
+      },
+    });
+    const unheld = await allowed.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { ...headers, "x-request-id": "unheld-period" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(unheld.status, 200);
+    await unheld.text();
+    for (let attempt = 0; attempt < 20 && records.length < 3; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 3);
+    assert.equal(records[2]!.period, null);
+    const line = usageLine(records[2]!);
+    assert.equal(line.includes('"period"'), false);
+    assert.equal(line.includes('"namespace":"platform","attrs":{},"subject":'), true);
+    assert.equal(line.includes('"signer_kid"'), false);
+    assert.equal(line.includes('"price_book"'), false);
+  } finally {
+    upstream.close();
+  }
+});
+
 const MINTED_REQUEST_ID = /^req_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 test("minted_request_id_is_a_uuid7", async () => {

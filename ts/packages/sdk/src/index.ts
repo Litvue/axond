@@ -733,7 +733,8 @@ export interface UsageRecord {
   /**
    * Namespace attrs copied at admission (ADR 0063). Absent when the request
    * had no namespace. The stdout line places this value between `namespace`
-   * and `period` and encodes it the way a management read does.
+   * and `period` when a period was held, and before `subject` when `period`
+   * is omitted. It encodes the value the way a management read does.
    */
   attrs?: unknown;
   /** Budget period at admission. Null when the request was not held. */

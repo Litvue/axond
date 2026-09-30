@@ -265,7 +265,12 @@ function textChars(text: string): number {
   return [...text].length;
 }
 
-/** The stdout usage event. `trace_id` is omitted when the request had no inbound trace. */
+/**
+ * The stdout usage event. Absent optionals are omitted the way serde skips
+ * `None`: `trace_id`, `attrs`, `period`, `signer_kid`, `price_book`,
+ * `price_book_checksum`, and `price_catalog`. A null cost stays
+ * `cost_microdollars: null`.
+ */
 export function usageEvent(record: UsageRecord): Record<string, unknown> {
   const line: Record<string, unknown> = {
     schema_version: record.schemaVersion,
@@ -273,9 +278,9 @@ export function usageEvent(record: UsageRecord): Record<string, unknown> {
     ...(record.traceId ? { trace_id: record.traceId } : {}),
     namespace: record.namespace,
     ...(record.attrs !== undefined ? { attrs: JSON.parse(encodeAttrs(record.attrs)) as unknown } : {}),
-    period: record.period,
+    ...(record.period !== null ? { period: record.period } : {}),
     subject: record.subject,
-    signer_kid: record.signerKid,
+    ...(record.signerKid !== null ? { signer_kid: record.signerKid } : {}),
     model: record.model,
     target_provider: record.targetProvider,
     target_model: record.targetModel,
@@ -288,9 +293,9 @@ export function usageEvent(record: UsageRecord): Record<string, unknown> {
     output_tokens: record.outputTokens.toString(),
     cost_microdollars: record.costMicrodollars?.toString() ?? null,
     catalog_version: record.catalogVersion,
-    price_book: record.priceBook,
-    price_book_checksum: record.priceBookChecksum,
-    price_catalog: record.priceCatalog,
+    ...(record.priceBook !== null ? { price_book: record.priceBook } : {}),
+    ...(record.priceBookChecksum !== null ? { price_book_checksum: record.priceBookChecksum } : {}),
+    ...(record.priceCatalog !== null ? { price_catalog: record.priceCatalog } : {}),
     latency_ms: record.latencyMs,
     attempts: record.attempts,
   };
@@ -307,7 +312,7 @@ export function usageLine(record: UsageRecord): string {
   }
   const encoded = encodeAttrs(record.attrs);
   const text = JSON.stringify(usageEvent({ ...record, attrs: undefined }));
-  const marker = ',"period":';
+  const marker = record.period !== null ? ',"period":' : ',"subject":';
   const at = text.indexOf(marker);
   if (at < 0) {
     return text;

@@ -146,7 +146,11 @@ test("usage event names the serving credential and omits an absent trace", () =>
   assert.equal(plain.latency_ms, 12);
   assert.equal(plain.period, "compat");
   assert.equal(plain.cache_read_tokens, "2");
-  assert.equal(plain.price_catalog, null);
+  assert.equal(plain.cost_microdollars, "5");
+  assert.equal(Object.hasOwn(plain, "signer_kid"), false);
+  assert.equal(Object.hasOwn(plain, "price_book"), false);
+  assert.equal(Object.hasOwn(plain, "price_book_checksum"), false);
+  assert.equal(Object.hasOwn(plain, "price_catalog"), false);
   assert.equal(Object.hasOwn(plain, "attrs"), false);
   const traced = usageEvent({ ...base, traceId: "0123456789abcdef0123456789abcdef" });
   assert.equal(traced.trace_id, "0123456789abcdef0123456789abcdef");
@@ -156,6 +160,15 @@ test("usage event names the serving credential and omits an absent trace", () =>
   const line = usageLine({ ...base, attrs });
   assert.equal(line.includes('"namespace":"platform","attrs":{"a":"acme","n":1.0,"z":1},"period":"compat"'), true);
   assert.equal(usageLine(base).includes('"attrs"'), false);
+  const unheld = usageEvent({ ...base, period: null, costMicrodollars: null });
+  assert.equal(Object.hasOwn(unheld, "period"), false);
+  assert.equal(unheld.cost_microdollars, null);
+  const unheldLine = usageLine({ ...base, period: null, attrs });
+  assert.equal(
+    unheldLine.includes('"namespace":"platform","attrs":{"a":"acme","n":1.0,"z":1},"subject":"gateway-key"'),
+    true,
+  );
+  assert.equal(unheldLine.includes('"period"'), false);
 });
 
 test("observed stream text fills a charge when the provider sent no usage", () => {
