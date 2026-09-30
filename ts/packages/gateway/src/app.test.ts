@@ -847,6 +847,32 @@ test("an absent namespace is unknown and an unprefixed model is refused", async 
   upstream.close();
 });
 
+test("empty_model_segments_match_the_rust_split", async () => {
+  const { app, upstream } = await gateway();
+  const post = (model: string) => app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ model, messages: [] }),
+  });
+  const leading = await post("/gpt-test");
+  assert.equal(leading.status, 400);
+  assert.deepEqual(await leading.json(), {
+    error: { type: "unknown_provider", message: "unknown provider ``" },
+  });
+  const onlySlash = await post("/");
+  assert.equal(onlySlash.status, 400);
+  assert.deepEqual(await onlySlash.json(), {
+    error: { type: "unknown_provider", message: "unknown provider ``" },
+  });
+  const trailing = await post("fake-openai/");
+  assert.equal(trailing.status, 400);
+  assert.deepEqual(await trailing.json(), {
+    error: { type: "bad_request", message: "model id after `/` must not be empty" },
+  });
+  assert.equal(upstream.requests.length, 0);
+  upstream.close();
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });

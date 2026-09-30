@@ -568,11 +568,17 @@ async function prepareInference(
     throw badRequest("missing `model`");
   }
   const slash = model.indexOf("/");
-  if (slash <= 0 || slash === model.length - 1) {
+  if (slash < 0) {
     throw new GatewayFailure("model_unprefixed", 400, `model \`${model}\` is not prefixed as \`provider-id/model-id\``);
   }
   const providerId = model.slice(0, slash);
   const modelId = model.slice(slash + 1);
+  if (providerId.length === 0) {
+    throw new GatewayFailure("unknown_provider", 400, "unknown provider ``");
+  }
+  if (modelId.length === 0) {
+    throw badRequest("model id after `/` must not be empty");
+  }
   const providers = await loadProviders(opts);
   const provider = providers.find((item) => item.id === providerId);
   if (!provider) {
