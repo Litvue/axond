@@ -378,6 +378,11 @@ test("worker_price_charges_one_request_id_once", async () => {
       }),
       wait,
     );
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map((part) => String(part)).join(" "));
+  };
   try {
     const first = await chat();
     assert.equal(first.status, 200, await first.text());
@@ -390,7 +395,23 @@ test("worker_price_charges_one_request_id_once", async () => {
     assert.equal(summary.length, 1);
     assert.equal(summary[0]?.count, 1);
     assert.equal(summary[0]?.cost_microdollars, 2);
+    const usage = lines
+      .map((line) => {
+        try {
+          return JSON.parse(line) as { schema_version?: number; request_id?: string; input_tokens?: unknown; output_tokens?: unknown; cost_microdollars?: unknown; period?: unknown };
+        } catch {
+          return null;
+        }
+      })
+      .filter((row) => row?.schema_version === 2 && row.request_id === "worker-price-once");
+    assert.equal(usage.length, 2);
+    assert.equal(usage[0]?.input_tokens, 1);
+    assert.equal(usage[0]?.output_tokens, 1);
+    assert.equal(usage[0]?.cost_microdollars, 2);
+    assert.equal(usage[0]?.period, "compat");
+    assert.equal(JSON.stringify(usage[0]).includes('"input_tokens":"'), false);
   } finally {
+    console.log = original;
     upstream.close();
   }
 });

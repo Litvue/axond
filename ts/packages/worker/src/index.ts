@@ -1,6 +1,6 @@
 import { Client } from "pg";
 
-import { createAdmission, createAxond, createMetrics, defaultAdmission, resolveTelemetry } from "@axond/gateway";
+import { createAdmission, createAxond, createMetrics, defaultAdmission, resolveTelemetry, usageLine } from "@axond/gateway";
 import { rateLimitExtension } from "@axond/rate-limit";
 import type { AxondExtension, CredentialConfig, PriceRule, ProviderConfig, Store } from "@axond/sdk";
 
@@ -113,6 +113,9 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
     telemetry: telemetry ?? undefined,
     onLog: (record) => {
       console.log(JSON.stringify(record));
+    },
+    onUsage: (record) => {
+      console.log(usageLine(record));
     },
   });
   return {
