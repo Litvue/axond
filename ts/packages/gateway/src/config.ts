@@ -990,39 +990,154 @@ function rejectCollisions(parsed: Record<string, unknown>): void {
   }
 }
 
-function applyEnvOverrides(parsed: Record<string, unknown>, secrets: SecretReader): void {
-  const bag = secrets.entries();
-  for (const [name, value] of bag) {
-    if (!name.startsWith("AXOND_") || value === undefined) {
-      continue;
+const ENV_LOC = " in `AXOND_` environment variable(s)";
+const SEQUENCE_OVERRIDE_KEYS = [
+  "credential",
+  "gateway_key",
+  "namespace",
+  "price",
+  "provider",
+  "usage_sink",
+] as const;
+
+type EnvLeaf = { key: string; scalar: FigmentScalar };
+
+const envMarks = new WeakMap<object, Map<string, EnvLeaf>>();
+
+function markEnv(row: object, field: string, leaf: EnvLeaf): void {
+  let marks = envMarks.get(row);
+  if (!marks) {
+    marks = new Map();
+    envMarks.set(row, marks);
+  }
+  marks.set(field, leaf);
+}
+
+function envMark(row: object, field: string): EnvLeaf | undefined {
+  return envMarks.get(row)?.get(field);
+}
+
+function envFound(scalar: FigmentScalar): string {
+  switch (scalar.kind) {
+    case "string":
+      return `string ${JSON.stringify(scalar.text)}`;
+    case "bool":
+      return `bool ${scalar.value}`;
+    case "float":
+      return `float \`${scalar.text}\``;
+    case "uint":
+      return `unsigned int \`${scalar.text}\``;
+    case "int":
+      return `signed int \`${scalar.text}\``;
+    case "sequence":
+      return "sequence";
+    case "map":
+      return "map";
+  }
+}
+
+function coerceEnvInt(leaf: EnvLeaf, expected: "u32" | "u64" | "usize"): bigint {
+  const scalar = leaf.scalar;
+  const max = expected === "u32" ? U32_MAX : TARGET_UINT_MAX;
+  if (scalar.kind === "int") {
+    const integer = BigInt(scalar.text);
+    if (integer < 0n || (expected === "u32" && integer > max)) {
+      throw configLoad(
+        `invalid value signed int \`${scalar.text}\`, expected ${expected} for key "${leaf.key}"${ENV_LOC}`,
+      );
     }
-    const field = name.slice("AXOND_".length).toLowerCase();
-    if ((OVERRIDE_KEYS as readonly string[]).includes(field)) {
-      continue;
+    return integer;
+  }
+  if (scalar.kind === "uint") {
+    const integer = BigInt(scalar.text);
+    if (integer > max) {
+      throw configLoad(
+        `invalid value unsigned int \`${scalar.text}\`, expected ${expected} for key "${leaf.key}"${ENV_LOC}`,
+      );
     }
-    const parts = field.split("__").filter((part) => part.length > 0);
-    if (parts.length < 2) {
-      continue;
-    }
-    const [head, ...rest] = parts;
-    if (!(OVERRIDE_KEYS as readonly string[]).includes(head!)) {
-      continue;
-    }
-    let cursor = parsed[head!] as Record<string, unknown> | undefined;
-    if (!cursor || typeof cursor !== "object" || Array.isArray(cursor)) {
-      cursor = {};
-      parsed[head!] = cursor;
-    }
-    let target = cursor;
-    for (let index = 0; index < rest.length - 1; index += 1) {
-      const key = rest[index]!;
-      const next = target[key];
-      if (!next || typeof next !== "object" || Array.isArray(next)) {
-        target[key] = {};
+    return integer;
+  }
+  throw configLoad(
+    `invalid type: found ${envFound(scalar)}, expected ${expected} for key "${leaf.key}"${ENV_LOC}`,
+  );
+}
+
+function jsFromEnvScalar(scalar: FigmentScalar): unknown {
+  switch (scalar.kind) {
+    case "string":
+      return scalar.text;
+    case "bool":
+      return scalar.value;
+    case "float":
+      return Number(scalar.text);
+    case "uint":
+    case "int": {
+      const integer = BigInt(scalar.text);
+      if (integer >= BigInt(Number.MIN_SAFE_INTEGER) && integer <= BigInt(Number.MAX_SAFE_INTEGER)) {
+        return Number(integer);
       }
-      target = target[key] as Record<string, unknown>;
+      return integer;
     }
-    target[rest[rest.length - 1]!] = value;
+    case "sequence":
+      return (scalar.items ?? []).map((item) => jsFromEnvScalar(item));
+    case "map":
+      return {};
+  }
+}
+
+function assignEnvLeaf(
+  root: Record<string, unknown>,
+  parts: string[],
+  scalar: FigmentScalar,
+  keyPath: string[],
+): void {
+  if (scalar.kind === "map") {
+    let cursor = root;
+    for (const part of parts) {
+      const row = asRecord(cursor[part]) ?? {};
+      cursor[part] = row;
+      cursor = row;
+    }
+    for (const entry of scalar.entries ?? []) {
+      assignEnvLeaf(cursor, [entry.key], entry.value, [...keyPath, entry.key.toUpperCase()]);
+    }
+    return;
+  }
+  let cursor = root;
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const part = parts[index]!;
+    const row = asRecord(cursor[part]) ?? {};
+    cursor[part] = row;
+    cursor = row;
+  }
+  const leaf = parts[parts.length - 1]!;
+  cursor[leaf] = jsFromEnvScalar(scalar);
+  markEnv(cursor, leaf, { key: keyPath.join("."), scalar });
+}
+
+/**
+ * Figment's `AXOND_` env provider parses values with TOML-like syntax and
+ * merges them over the file. A type error cites the upper-case key in the
+ * environment, and a later file error does not hide an earlier env value.
+ */
+function applyEnvOverrides(parsed: Record<string, unknown>, secrets: SecretReader): void {
+  for (const [name, value] of secrets.entries()) {
+    if (value === undefined || !name.toLowerCase().startsWith("axond_")) {
+      continue;
+    }
+    const parts = name.slice(6).toLowerCase().split("__").filter((part) => part.length > 0);
+    const head = parts[0];
+    if (!head || !(OVERRIDE_KEYS as readonly string[]).includes(head)) {
+      continue;
+    }
+    const scalar = figmentEnvValue(value);
+    if ((SEQUENCE_OVERRIDE_KEYS as readonly string[]).includes(head) && scalar.kind !== "sequence") {
+      const found: FigmentScalar = parts.length > 1 || scalar.kind === "map" ? { kind: "map" } : scalar;
+      parsed[head] = found.kind === "map" ? {} : jsFromEnvScalar(found);
+      markEnv(parsed, head, { key: head.toUpperCase(), scalar: found });
+      continue;
+    }
+    assignEnvLeaf(parsed, parts, scalar, parts.map((part) => part.toUpperCase()));
   }
 }
 
@@ -1363,6 +1478,25 @@ function rejectUsageSinkExtract(toml: string, index: number, row: Record<string,
 
 /** `[blocklist] models` is a sequence of strings, visited before `catalog`. */
 function rejectBlocklistExtract(toml: string, row: Record<string, unknown>): void {
+  const marked = envMark(row, "models");
+  if (marked) {
+    if (marked.scalar.kind !== "sequence") {
+      throw configLoad(
+        `invalid type: found ${envFound(marked.scalar)}, expected a sequence for key "${marked.key}"${ENV_LOC}`,
+      );
+    }
+    const items = marked.scalar.items ?? [];
+    items.forEach((item, index) => {
+      if (item.kind === "string") {
+        return;
+      }
+      throw configLoad(
+        `invalid type: found ${envFound(item)}, expected a string for key "${marked.key}.${index}"${ENV_LOC}`,
+      );
+    });
+    row["models"] = items.map((item) => (item.kind === "string" ? item.text : ""));
+    return;
+  }
   if (!("models" in row)) {
     return;
   }
@@ -1547,13 +1681,26 @@ function rejectShutdownExtract(toml: string, row: Record<string, unknown>): void
       readTypedInt(toml, "shutdown", row, "flush_timeout_ms", "u64", 5_000);
       continue;
     }
+    const marked = envMark(row, field);
+    const figmentKey = marked ? marked.key : `default.shutdown.${field}`;
+    const loc = marked ? ENV_LOC : "";
     throw configLoad(
-      `unknown field: found \`${field}\`, expected \`one of \`drain_grace_ms\`, \`deadline_ms\`, \`flush_timeout_ms\`\` for key "default.shutdown.${field}"`,
+      `unknown field: found \`${field}\`, expected \`one of \`drain_grace_ms\`, \`deadline_ms\`, \`flush_timeout_ms\`\` for key "${figmentKey}"${loc}`,
     );
   }
 }
 
 function readString(toml: string, section: string, row: Record<string, unknown>, key: string): void {
+  const marked = envMark(row, key);
+  if (marked) {
+    if (marked.scalar.kind === "string") {
+      row[key] = marked.scalar.text;
+      return;
+    }
+    throw configLoad(
+      `invalid type: found ${envFound(marked.scalar)}, expected a string for key "${marked.key}"${ENV_LOC}`,
+    );
+  }
   if (!(key in row)) {
     return;
   }
@@ -1568,6 +1715,16 @@ function readString(toml: string, section: string, row: Record<string, unknown>,
 }
 
 function readBool(toml: string, section: string, row: Record<string, unknown>, key: string): void {
+  const marked = envMark(row, key);
+  if (marked) {
+    if (marked.scalar.kind === "bool") {
+      row[key] = marked.scalar.value;
+      return;
+    }
+    throw configLoad(
+      `invalid type: found ${envFound(marked.scalar)}, expected a boolean for key "${marked.key}"${ENV_LOC}`,
+    );
+  }
   if (!(key in row)) {
     return;
   }
@@ -1591,6 +1748,18 @@ function rejectSectionShapes(
       continue;
     }
     const value = parsed[key];
+    const marked = envMark(parsed, key);
+    if (marked) {
+      const structShaped =
+        shape.form === "struct" &&
+        (marked.scalar.kind === "map" || marked.scalar.kind === "sequence" || asRecord(value) !== null || Array.isArray(value));
+      if (!structShaped) {
+        const expected = shape.form === "struct" ? `struct ${shape.name}` : "a sequence";
+        throw configLoad(
+          `invalid type: found ${envFound(marked.scalar)}, expected ${expected} for key "${marked.key}"${ENV_LOC}`,
+        );
+      }
+    }
     const literal = topLevelAssignment(toml, key);
     if (shape.form === "struct") {
       if (asRecord(value) || Array.isArray(value)) {
@@ -1945,6 +2114,25 @@ function readVariant(
   variants: readonly string[],
   enumName: string,
 ): void {
+  const marked = envMark(row, key);
+  if (marked) {
+    if (marked.scalar.kind === "string") {
+      row[key] = marked.scalar.text;
+      if (variants.includes(marked.scalar.text)) {
+        return;
+      }
+      const list =
+        variants.length === 2
+          ? `\`${variants[0]}\` or \`${variants[1]}\``
+          : `one of ${variants.map((item) => `\`${item}\``).join(", ")}`;
+      throw configLoad(
+        `unknown variant: found \`${marked.scalar.text}\`, expected \`${list}\` for key "${marked.key}"${ENV_LOC}`,
+      );
+    }
+    throw configLoad(
+      `invalid type: found ${envFound(marked.scalar)}, expected enum ${enumName} for key "${marked.key}"${ENV_LOC}`,
+    );
+  }
   if (!(key in row)) {
     return;
   }
@@ -2032,6 +2220,16 @@ function readTypedInt(
   figmentKey = `default.${section}.${key}`,
   literal: string | null | undefined = undefined,
 ): number {
+  const marked = envMark(row, key);
+  if (marked) {
+    const integer = coerceEnvInt(marked, expected);
+    if (integer > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw configError(`\`${key}\` must be an integer`);
+    }
+    const number = Number(integer);
+    row[key] = number;
+    return number;
+  }
   const token = literal === undefined ? sectionFieldLiteral(toml, section, key) : literal;
   if (token !== null && isFloatToken(token)) {
     throw configLoad(
@@ -2200,6 +2398,12 @@ function readUsageIndexInt(
   expected: "usize" | "u64",
   fallback: bigint,
 ): bigint {
+  const marked = envMark(index, key);
+  if (marked) {
+    const integer = coerceEnvInt(marked, expected);
+    index[key] = integer <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(integer) : integer;
+    return integer;
+  }
   const literal = usageIndexLiteral(toml, key);
   if (literal !== null && isFloatToken(literal)) {
     throw configLoad(
@@ -2270,6 +2474,12 @@ function readServerBind(toml: string, parsed: Record<string, unknown>, secrets: 
   if (override !== null) {
     return finishBind(figmentEnvValue(override), BIND_ENV_KEY, BIND_ENV_LOC);
   }
+  const marked = envMark(parsed, "server");
+  if (marked && marked.scalar.kind !== "map" && marked.scalar.kind !== "sequence") {
+    throw configLoad(
+      `invalid type: found ${envFound(marked.scalar)}, expected struct Server for key "${marked.key}"${ENV_LOC}`,
+    );
+  }
   if (!Object.hasOwn(parsed, "server") || parsed["server"] === undefined) {
     return "0.0.0.0:8080";
   }
@@ -2283,6 +2493,10 @@ function readServerBind(toml: string, parsed: Record<string, unknown>, secrets: 
     throw configLoad(
       `invalid type: found ${foundPhrase(server, literal)}, expected struct Server for key "default.server"`,
     );
+  }
+  const bindMark = envMark(record, "bind");
+  if (bindMark) {
+    return finishBind(bindMark.scalar, bindMark.key, ENV_LOC);
   }
   if (!("bind" in record)) {
     return "0.0.0.0:8080";
@@ -2433,8 +2647,8 @@ type FigmentScalar =
   | { kind: "float"; text: string }
   | { kind: "uint"; text: string }
   | { kind: "int"; text: string }
-  | { kind: "sequence" }
-  | { kind: "map" };
+  | { kind: "sequence"; items?: FigmentScalar[] }
+  | { kind: "map"; entries?: { key: string; value: FigmentScalar }[] };
 
 function finishBind(value: FigmentScalar, key: string, loc: string): string {
   const head = `expected socket address for key "${key}"${loc}`;
@@ -2664,22 +2878,24 @@ function parseEnvAt(raw: string, index: number): { value: FigmentScalar; end: nu
 }
 
 function parseEnvArray(raw: string, index: number): { value: FigmentScalar; end: number } | null {
+  const items: FigmentScalar[] = [];
   let cursor = skipAscii(raw, index + 1);
   if (raw[cursor] === "]") {
-    return { value: { kind: "sequence" }, end: skipAscii(raw, cursor + 1) };
+    return { value: { kind: "sequence", items }, end: skipAscii(raw, cursor + 1) };
   }
   while (cursor < raw.length) {
     const item = parseEnvAt(raw, cursor);
     if (!item) {
       return null;
     }
+    items.push(item.value);
     cursor = skipAscii(raw, item.end);
     if (raw[cursor] === ",") {
       cursor = skipAscii(raw, cursor + 1);
       continue;
     }
     if (raw[cursor] === "]") {
-      return { value: { kind: "sequence" }, end: skipAscii(raw, cursor + 1) };
+      return { value: { kind: "sequence", items }, end: skipAscii(raw, cursor + 1) };
     }
     return null;
   }
@@ -2687,45 +2903,52 @@ function parseEnvArray(raw: string, index: number): { value: FigmentScalar; end:
 }
 
 function parseEnvDict(raw: string, index: number): { value: FigmentScalar; end: number } | null {
+  const entries: { key: string; value: FigmentScalar }[] = [];
   let cursor = skipAscii(raw, index + 1);
   if (raw[cursor] === "}") {
-    return { value: { kind: "map" }, end: skipAscii(raw, cursor + 1) };
+    return { value: { kind: "map", entries }, end: skipAscii(raw, cursor + 1) };
   }
   while (cursor < raw.length) {
-    const keyEnd = readEnvKey(raw, cursor);
-    if (keyEnd === null || raw[keyEnd] !== "=") {
+    const keyStart = skipAscii(raw, cursor);
+    let key: string;
+    let keyEnd: number;
+    if (raw[keyStart] === '"') {
+      const quoted = parseEnvString(raw, keyStart);
+      if (!quoted) {
+        return null;
+      }
+      key = quoted.text;
+      keyEnd = skipAscii(raw, quoted.end);
+    } else {
+      let end = keyStart;
+      while (end < raw.length && /[A-Za-z0-9_-]/.test(raw[end]!)) {
+        end += 1;
+      }
+      if (end === keyStart) {
+        return null;
+      }
+      key = raw.slice(keyStart, end);
+      keyEnd = skipAscii(raw, end);
+    }
+    if (raw[keyEnd] !== "=") {
       return null;
     }
     const item = parseEnvAt(raw, keyEnd + 1);
     if (!item) {
       return null;
     }
+    entries.push({ key, value: item.value });
     cursor = skipAscii(raw, item.end);
     if (raw[cursor] === ",") {
       cursor = skipAscii(raw, cursor + 1);
       continue;
     }
     if (raw[cursor] === "}") {
-      return { value: { kind: "map" }, end: skipAscii(raw, cursor + 1) };
+      return { value: { kind: "map", entries }, end: skipAscii(raw, cursor + 1) };
     }
     return null;
   }
   return null;
-}
-
-function readEnvKey(raw: string, index: number): number | null {
-  let cursor = skipAscii(raw, index);
-  if (raw[cursor] === '"') {
-    return parseEnvString(raw, cursor)?.end ?? null;
-  }
-  const start = cursor;
-  while (cursor < raw.length && /[A-Za-z0-9_-]/.test(raw[cursor]!)) {
-    cursor += 1;
-  }
-  if (cursor === start) {
-    return null;
-  }
-  return skipAscii(raw, cursor);
 }
 
 function parseEnvString(raw: string, index: number): { text: string; end: number } | null {

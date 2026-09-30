@@ -1171,6 +1171,110 @@ test("required credential gateway_key namespace and price fields follow figment 
   assert.equal(priced.prices[0]?.outputMicrodollarsPerMillion, 0n);
 });
 
+test("axond env overrides are figment values and cite the environment", async () => {
+  const reject = async (extra: Record<string, string>, message: string, toml = BASE) => {
+    await assert.rejects(
+      () => loadConfig(toml, envSecretReader({ GW_KEY: "k", ...extra }, async () => "")),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const envTyped = (found: string, expected: string, key: string) =>
+    `config: invalid type: found ${found}, expected ${expected} for key "${key}" in \`AXOND_\` environment variable(s)`;
+  await reject(
+    { AXOND_FAILOVER__MAX_ATTEMPTS: "1.5" },
+    envTyped("float `1.5`", "u32", "FAILOVER.MAX_ATTEMPTS"),
+    `${BASE}[[price]]\nprovider = "openai"\nmodel = "gpt"\ninput_microdollars_per_million = 1.5\noutput_microdollars_per_million = 1\n`,
+  );
+  await reject(
+    { AXOND_FAILOVER__MAX_ATTEMPTS: "0" },
+    "failover.max_attempts must be at least 1",
+  );
+  await reject(
+    { AXOND_FAILOVER__MAX_ATTEMPTS: "-1" },
+    'config: invalid value signed int `-1`, expected u32 for key "FAILOVER.MAX_ATTEMPTS" in `AXOND_` environment variable(s)',
+  );
+  await reject(
+    { AXOND_FAILOVER__MAX_ATTEMPTS: "4294967296" },
+    'config: invalid value unsigned int `4294967296`, expected u32 for key "FAILOVER.MAX_ATTEMPTS" in `AXOND_` environment variable(s)',
+  );
+  await reject(
+    { AXOND_FAILOVER__MAX_ATTEMPTS: '"3"' },
+    envTyped('string "3"', "u32", "FAILOVER.MAX_ATTEMPTS"),
+  );
+  await reject({ AXOND_FAILOVER: "1.5" }, envTyped("float `1.5`", "struct Failover", "FAILOVER"));
+  await reject(
+    { AXOND_FAILOVER: "{max_attempts=1.5}" },
+    envTyped("float `1.5`", "u32", "FAILOVER.MAX_ATTEMPTS"),
+  );
+  await reject(
+    { AXOND_ADMISSION__MAX_REQUEST_BYTES: "1.5", AXOND_SHUTDOWN__NOPE: "1" },
+    envTyped("float `1.5`", "usize", "ADMISSION.MAX_REQUEST_BYTES"),
+  );
+  await reject(
+    { AXOND_FAILOVER__MAX_ATTEMPTS: "1.5" },
+    'config: invalid type: found float `1.5`, expected usize for key "default.admission.max_request_bytes"',
+    `${BASE}[admission]\nmax_request_bytes = 1.5\n`,
+  );
+  await reject(
+    { AXOND_CREDENTIAL__0__WEIGHT: "1.5" },
+    envTyped("map", "a sequence", "CREDENTIAL"),
+  );
+  await reject(
+    { AXOND_CATALOG__SOURCE: "nope" },
+    'config: unknown variant: found `nope`, expected `one of `none`, `models-dev`, `seed`` for key "CATALOG.SOURCE" in `AXOND_` environment variable(s)',
+  );
+  await reject(
+    { AXOND_CREDENTIAL_POOL__STRATEGY: "nope" },
+    'config: unknown variant: found `nope`, expected ``round-robin` or `weighted`` for key "CREDENTIAL_POOL.STRATEGY" in `AXOND_` environment variable(s)',
+  );
+  await reject(
+    { AXOND_SHUTDOWN__NOPE: "1" },
+    'config: unknown field: found `nope`, expected `one of `drain_grace_ms`, `deadline_ms`, `flush_timeout_ms`` for key "SHUTDOWN.NOPE" in `AXOND_` environment variable(s)',
+  );
+  await reject(
+    { AXOND_SHUTDOWN__DRAIN_GRACE_MS: "1.5", AXOND_SHUTDOWN__NOPE: "1" },
+    envTyped("float `1.5`", "u64", "SHUTDOWN.DRAIN_GRACE_MS"),
+  );
+  await reject(
+    { AXOND_TRANSPORT__CONNECT_TIMEOUT_MS: "1.5" },
+    'config: unknown field: found `nope`, expected `one of `drain_grace_ms`, `deadline_ms`, `flush_timeout_ms`` for key "default.shutdown.nope"',
+    `${BASE}[shutdown]\nnope = 1\n`,
+  );
+  await reject({ AXOND_STORAGE__PATH: "1" }, envTyped("unsigned int `1`", "a string", "STORAGE.PATH"));
+  await reject(
+    { AXOND_STORAGE__CREATE_TABLE: "1.5" },
+    envTyped("float `1.5`", "a boolean", "STORAGE.CREATE_TABLE"),
+  );
+  await reject(
+    { AXOND_STORAGE__USAGE_INDEX__BUFFER_CAPACITY: "1.5" },
+    envTyped("float `1.5`", "usize", "STORAGE.USAGE_INDEX.BUFFER_CAPACITY"),
+  );
+  await reject(
+    { AXOND_DISCOVERY__REFRESH_INTERVAL_SECONDS: "1.5" },
+    envTyped("float `1.5`", "u64", "DISCOVERY.REFRESH_INTERVAL_SECONDS"),
+  );
+  await reject(
+    { AXOND_DISCOVERY__REFRESH_INTERVAL_SECONDS: "0" },
+    "discovery.refresh_interval_seconds must be at least 1",
+  );
+  await reject(
+    { AXOND_BLOCKLIST__MODELS: "[1]" },
+    envTyped("unsigned int `1`", "a string", "BLOCKLIST.MODELS.0"),
+  );
+  await reject({ AXOND_BLOCKLIST__MODELS: "gpt" }, envTyped('string "gpt"', "a sequence", "BLOCKLIST.MODELS"));
+  await reject({ AXOND_SERVER: "1.5" }, envTyped("float `1.5`", "struct Server", "SERVER"));
+  const raised = await loadConfig(BASE, envSecretReader({ GW_KEY: "k", AXOND_FAILOVER__MAX_ATTEMPTS: "+8" }, async () => ""));
+  assert.equal(raised.transport.maxAttempts, 8);
+  const replaced = await loadConfig(
+    `${BASE}[failover]\nmax_attempts = 1.5\n`,
+    envSecretReader({ GW_KEY: "k", AXOND_FAILOVER__MAX_ATTEMPTS: "3" }, async () => ""),
+  );
+  assert.equal(replaced.transport.maxAttempts, 3);
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),

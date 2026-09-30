@@ -857,6 +857,47 @@ max_attempts = 0
   }
 });
 
+test("env_failover_float_beats_a_price_float", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-env-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "failover.toml");
+  await writeFile(
+    config,
+    `
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[[price]]
+provider = "openai"
+model = "gpt"
+input_microdollars_per_million = 1.5
+output_microdollars_per_million = 1
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k", AXOND_FAILOVER__MAX_ATTEMPTS: "1.5" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        '`: config load: invalid type: found float `1.5`, expected u32 for key "FAILOVER.MAX_ATTEMPTS" in `AXOND_` environment variable(s)\n',
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function run(
   config: string,
   cwd: string,
