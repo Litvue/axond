@@ -1422,6 +1422,64 @@ namespace = "platform"
   );
 });
 
+test("a later AXOND_ value replaces an earlier one and strings use figment escapes", async () => {
+  const envTyped = (found: string, expected: string, key: string) =>
+    `config: invalid type: found ${found}, expected ${expected} for key "${key}" in \`AXOND_\` environment variable(s)`;
+  const weight = '[{namespace="platform",provider="openai",weight=1.5}]';
+  const arrayLater: Record<string, string> = {};
+  arrayLater["AXOND_CREDENTIAL__0__WEIGHT"] = "1.5";
+  arrayLater["AXOND_CREDENTIAL"] = weight;
+  await assert.rejects(
+    () => loadConfig(BASE, envSecretReader({ GW_KEY: "k", ...arrayLater }, async () => "")),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", envTyped("float `1.5`", "u32", "CREDENTIAL.0.WEIGHT"));
+      return true;
+    },
+  );
+  const mapLater: Record<string, string> = {};
+  mapLater["AXOND_CREDENTIAL"] = weight;
+  mapLater["AXOND_CREDENTIAL__0__WEIGHT"] = "1.5";
+  await assert.rejects(
+    () => loadConfig(BASE, envSecretReader({ GW_KEY: "k", ...mapLater }, async () => "")),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", envTyped("map", "a sequence", "CREDENTIAL"));
+      return true;
+    },
+  );
+  const leafLater: Record<string, string> = {};
+  leafLater["AXOND_FAILOVER"] = "[4, 9]";
+  leafLater["AXOND_FAILOVER__MAX_ATTEMPTS"] = "8";
+  const replaced = await loadConfig(BASE, envSecretReader({ GW_KEY: "k", ...leafLater }, async () => ""));
+  assert.equal(replaced.transport.maxAttempts, 8);
+  assert.equal(replaced.transport.overallTimeoutMs, 30_000);
+  const sequenceLater: Record<string, string> = {};
+  sequenceLater["AXOND_FAILOVER__MAX_ATTEMPTS"] = "8";
+  sequenceLater["AXOND_FAILOVER"] = "[4, 9]";
+  const filled = await loadConfig(BASE, envSecretReader({ GW_KEY: "k", ...sequenceLater }, async () => ""));
+  assert.equal(filled.transport.maxAttempts, 4);
+  assert.equal(filled.transport.overallTimeoutMs, 9);
+  const decoded = await loadConfig(
+    BASE,
+    envSecretReader({ GW_KEY: "k", AXOND_STORAGE__PATH: '"hi\\u0041"' }, async () => ""),
+  );
+  assert.equal(decoded.storage.path, "hiA");
+  const rawEscape = await loadConfig(
+    BASE,
+    envSecretReader({ GW_KEY: "k", AXOND_STORAGE__PATH: '"hi\\q"' }, async () => ""),
+  );
+  assert.equal(rawEscape.storage.path, '"hi\\q"');
+  await assert.rejects(
+    () => loadConfig(BASE, envSecretReader({ GW_KEY: "k", AXOND_NAMESPACE: '[{id="a\\0",default=true}]' }, async () => "")),
+    (error: unknown) => {
+      assert.equal(
+        error instanceof Error ? error.message : "",
+        envTyped("string \"[{id=\\\"a\\\\0\\\",default=true}]\"", "a sequence", "NAMESPACE"),
+      );
+      return true;
+    },
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),

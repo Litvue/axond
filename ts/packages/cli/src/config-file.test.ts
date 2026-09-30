@@ -939,6 +939,45 @@ output_microdollars_per_million = 1
   }
 });
 
+test("later_credential_array_replaces_an_earlier_nested_weight", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-env-order-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "credential.toml");
+  await writeFile(
+    config,
+    `
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`,
+  );
+  const extra: Record<string, string> = { GW_KEY: "k" };
+  extra["AXOND_CREDENTIAL__0__WEIGHT"] = "1.5";
+  extra["AXOND_CREDENTIAL"] = '[{namespace="platform",provider="openai",weight=1.5}]';
+  try {
+    const result = await run(config, root, extra);
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        '`: config load: invalid type: found float `1.5`, expected u32 for key "CREDENTIAL.0.WEIGHT" in `AXOND_` environment variable(s)\n',
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("admission_float_beats_a_later_failover_array", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-order-"));
   const db = join(root, "fresh.sqlite");

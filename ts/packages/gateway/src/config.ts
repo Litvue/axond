@@ -1023,6 +1023,10 @@ function markEnv(row: object, field: string, leaf: EnvLeaf): void {
   marks.set(field, leaf);
 }
 
+function unmarkEnv(row: object, field: string): void {
+  envMarks.get(row)?.delete(field);
+}
+
 function envMark(row: object, field: string): EnvLeaf | undefined {
   return envMarks.get(row)?.get(field);
 }
@@ -1153,6 +1157,16 @@ function applyEnvOverrides(parsed: Record<string, unknown>, secrets: SecretReade
       applyEnvSequence(parsed, head, scalar);
       continue;
     }
+    // A dict merged over an array replaces that array. A sequence fill is an
+    // array, so a later leaf starts from an empty table.
+    const existing = parsed[head];
+    if (
+      existing !== null &&
+      typeof existing === "object" &&
+      envMark(existing, ENV_WHOLE)?.scalar.kind === "sequence"
+    ) {
+      parsed[head] = {};
+    }
     assignEnvLeaf(parsed, parts, scalar, parts.map((part) => part.toUpperCase()));
   }
 }
@@ -1164,6 +1178,8 @@ function applyEnvOverrides(parsed: Record<string, unknown>, secrets: SecretReade
  * named field. Flattened price integers keep the parent key.
  */
 function applyEnvSequence(parsed: Record<string, unknown>, head: string, scalar: FigmentScalar): void {
+  // A later array replaces an earlier nested map, including its shape mark.
+  unmarkEnv(parsed, head);
   const items = scalar.items ?? [];
   const sectionKey = head.toUpperCase();
   if (head === "server") {
@@ -3285,22 +3301,54 @@ function parseEnvString(raw: string, index: number): { text: string; end: number
   let cursor = index + 1;
   let text = "";
   while (cursor < raw.length) {
-    const char = raw[cursor]!;
-    if (char === "\\") {
+    const code = raw.codePointAt(cursor);
+    if (code === undefined) {
+      return null;
+    }
+    if (code === 0x5c) {
       const next = raw[cursor + 1];
-      const mapped: Record<string, string> = { n: "\n", t: "\t", r: "\r", "\\": "\\", '"': '"', "0": "\0" };
-      if (next === undefined || !(next in mapped)) {
+      if (next === undefined) {
         return null;
       }
-      text += mapped[next];
-      cursor += 2;
-      continue;
+      const simple: Record<string, string> = {
+        '"': '"',
+        "\\": "\\",
+        b: "\u0008",
+        f: "\u000c",
+        n: "\n",
+        r: "\r",
+        t: "\t",
+      };
+      if (next in simple) {
+        text += simple[next];
+        cursor += 2;
+        continue;
+      }
+      if (next === "u" || next === "U") {
+        const len = next === "u" ? 4 : 8;
+        const hex = raw.slice(cursor + 2, cursor + 2 + len);
+        if (!/^[0-9A-Fa-f]+$/.test(hex) || hex.length !== len) {
+          return null;
+        }
+        const point = Number.parseInt(hex, 16);
+        if (point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff)) {
+          return null;
+        }
+        text += String.fromCodePoint(point);
+        cursor += 2 + len;
+        continue;
+      }
+      return null;
     }
-    if (char === '"') {
+    if (code === 0x22) {
       return { text, end: cursor + 1 };
     }
-    text += char;
-    cursor += 1;
+    // Figment's string escape rejects controls other than tab, and DEL.
+    if (code !== 0x09 && (code < 0x20 || code === 0x7f)) {
+      return null;
+    }
+    text += String.fromCodePoint(code);
+    cursor += code > 0xffff ? 2 : 1;
   }
   return null;
 }
