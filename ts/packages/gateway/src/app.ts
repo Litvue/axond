@@ -1565,7 +1565,7 @@ async function listModels(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   const data: { id: string; object: "model" }[] = [];
   for (const provider of providers) {
     const row = cached.find((item) => item.provider === provider.id);
-    const models = row && row.source === provider.baseUrl ? row.data : row?.source == null ? row?.data ?? [] : [];
+    const models = row?.source === provider.baseUrl ? row.data : [];
     for (const model of models) {
       const id = model && typeof model === "object" ? (model as { id?: unknown }).id : undefined;
       if (typeof id !== "string") {
@@ -1826,12 +1826,14 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
 }
 
 function providerModelsJson(provider: ProviderConfig, row: { fetchedAt: string | null; stale: boolean; data: unknown[]; source: string | null } | null) {
-  const stale = row === null || row.source !== provider.baseUrl || row.stale;
+  if (row === null) {
+    return { provider: provider.id, stale: true, data: [] as unknown[] };
+  }
   return {
     provider: provider.id,
-    ...(row?.fetchedAt && !stale ? { fetched_at: row.fetchedAt } : row?.fetchedAt ? { fetched_at: row.fetchedAt } : {}),
-    stale: row === null ? true : row.source !== null && row.source !== provider.baseUrl ? true : row.stale,
-    data: row?.data ?? [],
+    ...(row.fetchedAt ? { fetched_at: row.fetchedAt } : {}),
+    stale: row.source !== provider.baseUrl || row.stale,
+    data: row.data,
   };
 }
 

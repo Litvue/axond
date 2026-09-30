@@ -3327,6 +3327,81 @@ test("metrics drop secret and content sentinels", () => {
   assert.deepEqual(metrics.points[0]!.attributes, { namespace: "platform" });
 });
 
+test("provider_model_cache_follows_the_rust_source", async () => {
+  const { app, store, upstream } = await gateway();
+  const auth = { authorization: `Bearer ${KEY}` };
+  const empty = await app.request("http://127.0.0.1/api/v1/providers/fake-openai/models", { headers: auth });
+  assert.equal(empty.status, 200);
+  assert.deepEqual(await empty.json(), { provider: "fake-openai", stale: true, data: [] });
+
+  await store.upsertProviderModels({
+    provider: "fake-openai",
+    fetchedAt: "2026-09-30T00:00:00Z",
+    stale: false,
+    data: [{ id: "gpt-test" }],
+    source: upstream.url,
+  });
+  const listed = await app.request("http://127.0.0.1/ns/platform/v1/models", { headers: auth });
+  assert.equal(listed.status, 200);
+  assert.deepEqual(await listed.json(), {
+    object: "list",
+    data: [{ id: "fake-openai/gpt-test", object: "model" }],
+  });
+  const fresh = await app.request("http://127.0.0.1/api/v1/providers/fake-openai/models", { headers: auth });
+  assert.deepEqual(await fresh.json(), {
+    provider: "fake-openai",
+    fetched_at: "2026-09-30T00:00:00Z",
+    stale: false,
+    data: [{ id: "gpt-test" }],
+  });
+
+  await store.markProviderModelsStale("fake-openai");
+  const stillListed = await app.request("http://127.0.0.1/ns/platform/v1/models", { headers: auth });
+  assert.deepEqual(await stillListed.json(), {
+    object: "list",
+    data: [{ id: "fake-openai/gpt-test", object: "model" }],
+  });
+  const marked = await app.request("http://127.0.0.1/api/v1/providers/fake-openai/models", { headers: auth });
+  assert.deepEqual(await marked.json(), {
+    provider: "fake-openai",
+    fetched_at: "2026-09-30T00:00:00Z",
+    stale: true,
+    data: [{ id: "gpt-test" }],
+  });
+
+  await store.upsertProviderModels({
+    provider: "fake-openai",
+    fetchedAt: "2026-09-30T00:00:01Z",
+    stale: false,
+    data: [{ id: "moved" }],
+    source: "https://other.example/v1",
+  });
+  await store.upsertProviderModels({
+    provider: "fake-anthropic",
+    fetchedAt: "2026-09-30T00:00:02Z",
+    stale: false,
+    data: [{ id: "legacy" }],
+    source: null,
+  });
+  const omitted = await app.request("http://127.0.0.1/ns/platform/v1/models", { headers: auth });
+  assert.deepEqual(await omitted.json(), { object: "list", data: [] });
+  const foreign = await app.request("http://127.0.0.1/api/v1/providers/fake-openai/models", { headers: auth });
+  assert.deepEqual(await foreign.json(), {
+    provider: "fake-openai",
+    fetched_at: "2026-09-30T00:00:01Z",
+    stale: true,
+    data: [{ id: "moved" }],
+  });
+  const missingSource = await app.request("http://127.0.0.1/api/v1/providers/fake-anthropic/models", { headers: auth });
+  assert.deepEqual(await missingSource.json(), {
+    provider: "fake-anthropic",
+    fetched_at: "2026-09-30T00:00:02Z",
+    stale: true,
+    data: [{ id: "legacy" }],
+  });
+  upstream.close();
+});
+
 test("openapi is 3.1 and lists the management routes", async () => {
   const { app, upstream } = await gateway();
   const response = await app.request("http://127.0.0.1/api/v1/openapi.json", {
