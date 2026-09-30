@@ -20,6 +20,13 @@ Both finish before the config file is opened. Any other argument, including
 `mint`, `keygen`, `revoke`, `check`, `migrate`, `admin`, and `budget`, exits 2
 and does not boot.
 
+`AXOND_CONFIG` defaults to `axond.toml`. A relative path is sought from the
+working directory upward, the same walk Figment uses. A missing file or a
+directory is an empty document: boot exits 1 with `Error: failed to load
+config from \`…\`: invalid config: \`[storage]\` is required …`. A file that
+is not TOML uses the `config load:` prefix. Other boot failures use the same
+`Error:` line.
+
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
 directory of `.ts`, `.js`, or `.mjs` files. Each file's default export is an

@@ -16,6 +16,7 @@ import {
   resolveTelemetry,
 } from "../../gateway/src/index.ts";
 import { cliArguments, parseArgv } from "./argv.ts";
+import { locateConfigFile } from "./config-file.ts";
 import { createBackgroundDrain, remainingMs, settleShareMs as flushSettleShare } from "./shutdown-budget.ts";
 import { openUsageDelivery } from "./usage-delivery.ts";
 import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
@@ -35,11 +36,7 @@ async function main(): Promise<void> {
     process.exit(argv.code);
   }
   const configPath = process.env["AXOND_CONFIG"] ?? "axond.toml";
-  const toml = await readFile(configPath, "utf8");
-  const config = await loadConfig(
-    toml,
-    envSecretReader(process.env, readGatewayKeyFile),
-  );
+  const config = await loadOperatorConfig(configPath);
   const metrics = createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []);
   const store =
     config.storage.backend === "sqlite"
@@ -363,8 +360,30 @@ async function loadExtensionDir(dir: string | null): Promise<AxondExtension[]> {
   return extensions;
 }
 
+async function loadOperatorConfig(configPath: string) {
+  let toml = "";
+  try {
+    const located = await locateConfigFile(configPath);
+    if (located) {
+      toml = await readFile(located, "utf8");
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "unreadable";
+    throw new Error(`failed to load config from \`${configPath}\`: config load: ${detail}`);
+  }
+  try {
+    return await loadConfig(toml, envSecretReader(process.env, readGatewayKeyFile));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid config";
+    if (message.startsWith("config: ")) {
+      throw new Error(`failed to load config from \`${configPath}\`: config load: ${message.slice("config: ".length)}`);
+    }
+    throw new Error(`failed to load config from \`${configPath}\`: invalid config: ${message}`);
+  }
+}
+
 main().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : "boot failed";
-  process.stderr.write(`${message}\n`);
+  process.stderr.write(`Error: ${message}\n`);
   process.exit(1);
 });
