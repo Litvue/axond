@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -147,6 +147,164 @@ namespace = "platform"
     assert.equal(
       unset.stderr,
       "Error: store: store unavailable: env `AXOND_STORAGE_BOOT_DSN` is unset or empty\n",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("credential_graph_matches_the_rust_boot_refusals", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-graph-"));
+  const db = join(root, "axond.sqlite");
+  const base = `
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "http://127.0.0.1:9"
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "OPENAI_KEY"
+id = "primary"
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`;
+  const fresh = join(root, "fresh.sqlite");
+  const structural = base.replaceAll(db, fresh);
+  try {
+    const missingNs = join(root, "missing-ns.toml");
+    await writeFile(
+      missingNs,
+      structural.replace(
+        'namespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+        'namespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+      ),
+    );
+    const missingRun = await run(missingNs, root, { GW_KEY: "k", OPENAI_KEY: "sk" });
+    assert.equal(missingRun.code, 1);
+    assert.equal(missingRun.stdout, "");
+    assert.equal(
+      missingRun.stderr,
+      "Error: failed to load config from `" +
+        missingNs +
+        "`: invalid config: credential references undefined namespace `ghost`\n",
+    );
+    await assert.rejects(() => stat(fresh));
+
+    const priced = join(root, "price.toml");
+    await writeFile(
+      priced,
+      structural.replace(
+        'namespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+        'namespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+      ) + "[[price]]\nprovider = \"nope\"\nmodel = \"gpt\"\n",
+    );
+    const priceRun = await run(priced, root, { GW_KEY: "k", OPENAI_KEY: "sk" });
+    assert.equal(priceRun.code, 1);
+    assert.equal(
+      priceRun.stderr,
+      "Error: failed to load config from `" +
+        priced +
+        "`: invalid config: `[[price]]` references undefined provider `nope`\n",
+    );
+
+    const failover = join(root, "failover.toml");
+    await writeFile(
+      failover,
+      structural.replace(
+        'namespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+        'namespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+      ) + "[failover]\nfailure_threshold = 0\n",
+    );
+    const failoverRun = await run(failover, root, { GW_KEY: "k", OPENAI_KEY: "sk" });
+    assert.equal(failoverRun.code, 1);
+    assert.equal(
+      failoverRun.stderr,
+      "Error: failed to load config from `" +
+        failover +
+        "`: invalid config: failover.failure_threshold must be at least 1\n",
+    );
+    await assert.rejects(() => stat(fresh));
+
+    const unset = join(root, "unset.toml");
+    await writeFile(unset, base);
+    const unsetRun = await run(unset, root, { GW_KEY: "k", OPENAI_KEY: "" });
+    assert.equal(unsetRun.code, 1);
+    assert.equal(unsetRun.stdout, "");
+    assert.equal(
+      unsetRun.stderr,
+      "Error: config resolution failed: credential `primary` for namespace `platform` provider `openai` references env var `OPENAI_KEY`, which is unset or empty\n",
+    );
+    await stat(db);
+
+    const keyPath = join(root, "gateway-key");
+    const fileBase = base.replace(
+      '[[gateway_key]]\nenv = "GW_KEY"\nnamespace = "platform"',
+      `[[gateway_key]]\nfile = "${keyPath}"\nnamespace = "platform"`,
+    );
+    const missingKey = join(root, "missing-key.toml");
+    await writeFile(missingKey, fileBase);
+    const missingKeyRun = await run(missingKey, root, { OPENAI_KEY: "sk" });
+    assert.equal(missingKeyRun.code, 1);
+    assert.equal(missingKeyRun.stdout, "");
+    assert.equal(
+      missingKeyRun.stderr,
+      "Error: config resolution failed: gateway_key for namespace `platform` file `" +
+        keyPath +
+        "` failed (entity not found): No such file or directory (os error 2)\n",
+    );
+
+    await writeFile(keyPath, "");
+    await chmod(keyPath, 0o600);
+    const emptyKey = join(root, "empty-key.toml");
+    await writeFile(emptyKey, fileBase);
+    const emptyRun = await run(emptyKey, root, { OPENAI_KEY: "sk" });
+    assert.equal(emptyRun.code, 1);
+    assert.equal(emptyRun.stdout, "");
+    assert.equal(
+      emptyRun.stderr,
+      "Error: config resolution failed: gateway_key for namespace `platform` file `" + keyPath + "` is empty\n",
+    );
+
+    await writeFile(keyPath, Buffer.from([0xff, 0xfe]));
+    await chmod(keyPath, 0o600);
+    const badKey = join(root, "bad-key.toml");
+    await writeFile(badKey, fileBase);
+    const badRun = await run(badKey, root, { OPENAI_KEY: "sk" });
+    assert.equal(badRun.code, 1);
+    assert.equal(badRun.stdout, "");
+    assert.equal(
+      badRun.stderr,
+      "Error: config resolution failed: gateway_key for namespace `platform` file `" +
+        keyPath +
+        "` is not valid UTF-8\n",
+    );
+
+    const keyDir = join(root, "key-dir");
+    await mkdir(keyDir);
+    const dirToml = join(root, "dir-key.toml");
+    await writeFile(
+      dirToml,
+      base.replace(
+        '[[gateway_key]]\nenv = "GW_KEY"\nnamespace = "platform"',
+        `[[gateway_key]]\nfile = "${keyDir}"\nnamespace = "platform"`,
+      ),
+    );
+    const dirRun = await run(dirToml, root, { OPENAI_KEY: "sk" });
+    assert.equal(dirRun.code, 1);
+    assert.equal(dirRun.stdout, "");
+    assert.equal(
+      dirRun.stderr,
+      "Error: config resolution failed: gateway_key for namespace `platform` file `" +
+        keyDir +
+        "` failed (is a directory): Is a directory (os error 21)\n",
     );
   } finally {
     await rm(root, { recursive: true, force: true });

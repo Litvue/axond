@@ -697,6 +697,8 @@ export interface CredentialConfig {
   explicitId?: boolean;
   /** Share of traffic when the pool strategy is `weighted`. Absent means 1. */
   weight?: number;
+  /** Env var the secret is read from. Set for file-declared credentials. */
+  env?: string;
 }
 
 export interface TransportLimits {

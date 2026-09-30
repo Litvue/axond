@@ -38,6 +38,16 @@ above `u64` says `number too large to fit in target type`. A Postgres
 `dsn_env` whose value is unset or empty is not an invalid config: boot exits 1
 with `Error: store: store unavailable: env \`…\` is unset or empty`.
 
+A credential or gateway key that names an unknown namespace or provider, a
+duplicate credential id, a weight of 0, an empty `env`, or both `env` and
+`file` on one gateway key is `invalid config` with the Rust sentence. That
+check runs before the store opens. An unset credential env, or a gateway key
+file that is missing, empty, a directory, or not UTF-8, is
+`Error: config resolution failed: …` after the store is open. The file error
+uses Rust's `entity not found`, `is a directory`, and `not valid UTF-8`
+wording. A price row that names an unknown provider, and
+`failover.failure_threshold = 0`, are reported before a bad credential.
+
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
 directory of `.ts`, `.js`, or `.mjs` files. Each file's default export is an

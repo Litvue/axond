@@ -64,6 +64,7 @@ export interface LoadedConfig {
   gatewayKey: string;
   /** Env var name or file path. Usage records use this as the subject. */
   gatewayKeySubject: string;
+  gatewayKeySource: "env" | "file";
   gatewayKeyNamespace: string;
   defaultNamespace: string;
   prices: PriceRule[];
@@ -144,7 +145,11 @@ const DEFAULT_TRANSPORT: TransportLimits = {
  * Load post-#499 axond.toml. Withdrawn sections fail the boot by name.
  * Secret values are never copied into an error.
  */
-export async function loadConfig(toml: string, secrets: SecretReader): Promise<LoadedConfig> {
+export async function loadConfig(
+  toml: string,
+  secrets: SecretReader,
+  options?: { resolveSecrets?: boolean },
+): Promise<LoadedConfig> {
   let parsed: Record<string, unknown>;
   try {
     parsed = parse(toml, { integersAsBigInt: "asNeeded" }) as Record<string, unknown>;
@@ -242,33 +247,8 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     };
   });
 
-  const credentials: CredentialConfig[] = [];
-  for (const entry of asArray(parsed["credential"])) {
-    const row = asRecord(entry) ?? {};
-    const namespace = stringField(row, "namespace");
-    const provider = stringField(row, "provider");
-    const envName = typeof row["env"] === "string" ? row["env"] : "";
-    if (envName.length === 0) {
-      throw configError(`credential for \`${namespace}\`/\`${provider}\` must declare \`env\``);
-    }
-    const secret = secrets.env(envName);
-    if (secret === undefined || secret.length === 0) {
-      throw configError(`credential env \`${envName}\` is unset`);
-    }
-    const weight = numberField(row, "weight", 1);
-    if (!Number.isInteger(weight) || weight < 1) {
-      throw configError("credential weight must be at least 1");
-    }
-    const explicitId = typeof row["id"] === "string" && row["id"].length > 0;
-    credentials.push({
-      namespace,
-      provider,
-      secret,
-      id: explicitId ? String(row["id"]) : envName,
-      ...(explicitId ? {} : { explicitId: false as const }),
-      weight,
-    });
-  }
+  validatePriceBook(parsed, providers);
+  validateBlocklist(parsed);
   const poolRaw = asRecord(parsed["credential_pool"]) ?? {};
   const strategyRaw = poolRaw["strategy"];
   if (strategyRaw !== undefined && strategyRaw !== "round-robin" && strategyRaw !== "weighted") {
@@ -287,6 +267,61 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     failureThreshold,
     cooldownSeconds,
   };
+  const failoverEarly = asRecord(parsed["failover"]) ?? {};
+  const targetFailures = numberField(failoverEarly, "failure_threshold", 3);
+  if (!Number.isInteger(targetFailures) || targetFailures < 1) {
+    throw configError("failover.failure_threshold must be at least 1");
+  }
+  const targetCooldown = numberField(failoverEarly, "cooldown_seconds", 30);
+  if (!Number.isInteger(targetCooldown) || targetCooldown < 1) {
+    throw configError("failover.cooldown_seconds must be at least 1");
+  }
+
+  const credentials: CredentialConfig[] = [];
+  const credentialLabels = new Map<string, string[]>();
+  for (const entry of asArray(parsed["credential"])) {
+    const row = asRecord(entry) ?? {};
+    const namespace = stringField(row, "namespace");
+    const provider = stringField(row, "provider");
+    const envName = typeof row["env"] === "string" ? row["env"] : "";
+    if (envName.trim().length === 0) {
+      throw configError(`credential for namespace \`${namespace}\` provider \`${provider}\` has an empty \`env\``);
+    }
+    const weight = numberField(row, "weight", 1);
+    const idField = row["id"];
+    const label = typeof idField === "string" ? idField : envName;
+    if (weight === 0) {
+      throw configError(`credential \`${label}\` has weight 0; remove it instead`);
+    }
+    if (!Number.isInteger(weight) || weight < 1) {
+      throw configError("credential weight must be at least 1");
+    }
+    const poolKey = `${namespace}\0${provider}`;
+    const seen = credentialLabels.get(poolKey) ?? [];
+    if (seen.includes(label)) {
+      throw configError(
+        `duplicate credential id \`${label}\` for namespace \`${namespace}\` provider \`${provider}\``,
+      );
+    }
+    seen.push(label);
+    credentialLabels.set(poolKey, seen);
+    if (!namespaces.some((item) => item.id === namespace)) {
+      throw configError(`credential references undefined namespace \`${namespace}\``);
+    }
+    if (!providers.some((item) => item.id === provider)) {
+      throw configError(`credential references undefined provider \`${provider}\``);
+    }
+    const explicitId = typeof idField === "string" && idField.length > 0;
+    credentials.push({
+      namespace,
+      provider,
+      secret: "",
+      env: envName,
+      id: label,
+      ...(explicitId ? {} : { explicitId: false as const }),
+      weight,
+    });
+  }
 
   const keys = asArray(parsed["gateway_key"]);
   if (keys.length === 0) {
@@ -301,34 +336,24 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
   }
   const key = asRecord(keys[0]) ?? {};
   const keyNamespace = typeof key["namespace"] === "string" ? key["namespace"] : "";
-  if (!namespaces.some((namespace) => namespace.id === keyNamespace)) {
-    throw configError(`gateway_key references undefined namespace \`${keyNamespace}\``);
+  const envRaw = typeof key["env"] === "string" ? key["env"] : "";
+  const fileRaw = typeof key["file"] === "string" ? key["file"] : "";
+  const envSet = envRaw.trim().length > 0;
+  const fileSet = fileRaw.trim().length > 0;
+  if (envSet && fileSet) {
+    throw configError(
+      `gateway_key for namespace \`${keyNamespace}\` declares both \`env\` and \`file\`; exactly one source is permitted`,
+    );
   }
-  const envName = typeof key["env"] === "string" && key["env"].trim().length > 0 ? key["env"] : null;
-  const fileName = typeof key["file"] === "string" && key["file"].trim().length > 0 ? key["file"] : null;
-  if ((envName === null) === (fileName === null)) {
+  if (!envSet && !fileSet) {
     throw configError(
       `gateway_key for namespace \`${keyNamespace}\` must declare exactly one non-empty source (\`env\` or \`file\`)`,
     );
   }
-  let gatewayKey: string;
-  const gatewayKeySubject = envName ?? fileName!;
-  if (envName !== null) {
-    const value = secrets.env(envName);
-    if (value === undefined || value.length === 0) {
-      throw configError(`gateway_key env \`${envName}\` is unset`);
-    }
-    gatewayKey = value;
-  } else {
-    try {
-      gatewayKey = await secrets.file(fileName!);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "unreadable";
-      throw configError(`gateway_key file could not be read (${message})`);
-    }
-    if (gatewayKey.length === 0) {
-      throw configError("gateway_key file is empty");
-    }
+  const gatewayKeySubject = envSet ? envRaw : fileRaw;
+  const gatewayKeySource = envSet ? "env" : "file";
+  if (!namespaces.some((namespace) => namespace.id === keyNamespace)) {
+    throw configError(`gateway_key \`${gatewayKeySubject}\` references undefined namespace \`${keyNamespace}\``);
   }
 
   const prices: PriceRule[] = asArray(parsed["price"]).map((entry) => {
@@ -445,14 +470,15 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     throw configError("`[catalog] source` must be `none`, `models-dev`, or `seed`");
   }
 
-  return {
+  const loaded: LoadedConfig = {
     bind,
     storage,
     namespaces,
     providers,
     credentials,
-    gatewayKey,
+    gatewayKey: "",
     gatewayKeySubject,
+    gatewayKeySource,
     gatewayKeyNamespace: keyNamespace,
     defaultNamespace,
     prices,
@@ -471,6 +497,132 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     credentialPool,
     usageSinks: loadUsageSinks(parsed["usage_sink"]),
   };
+  if (options?.resolveSecrets !== false) {
+    await resolveConfigSecrets(loaded, secrets);
+  }
+  return loaded;
+}
+
+/**
+ * Fill credential secrets and the gateway key. Structural graph errors stay in
+ * `loadConfig`. A missing value is the Rust snapshot error, wrapped the way
+ * `main` wraps it: `config resolution failed: …`.
+ */
+export async function resolveConfigSecrets(config: LoadedConfig, secrets: SecretReader): Promise<void> {
+  for (const credential of config.credentials) {
+    const envName = credential.env ?? "";
+    const value = secrets.env(envName);
+    if (value === undefined || value.length === 0) {
+      throw new Error(
+        "config resolution failed: credential `" +
+          credential.id +
+          "` for namespace `" +
+          credential.namespace +
+          "` provider `" +
+          credential.provider +
+          "` references env var `" +
+          envName +
+          "`, which is unset or empty",
+      );
+    }
+    credential.secret = value;
+  }
+  const namespace = config.gatewayKeyNamespace;
+  const subject = config.gatewayKeySubject;
+  if (config.gatewayKeySource === "env") {
+    const value = secrets.env(subject);
+    if (value === undefined || value.length === 0) {
+      throw new Error(
+        "config resolution failed: gateway_key for namespace `" +
+          namespace +
+          "` references env var `" +
+          subject +
+          "`, which is unset or empty",
+      );
+    }
+    config.gatewayKey = value;
+    return;
+  }
+  let text: string;
+  try {
+    text = await secrets.file(subject);
+  } catch (error) {
+    throw gatewayKeyReadError(namespace, subject, error);
+  }
+  if (text.length === 0) {
+    throw new Error(
+      "config resolution failed: gateway_key for namespace `" + namespace + "` file `" + subject + "` is empty",
+    );
+  }
+  config.gatewayKey = text;
+}
+
+function gatewayKeyReadError(namespace: string, path: string, error: unknown): Error {
+  const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : "";
+  if (code === "INVALID_UTF8") {
+    return new Error(
+      "config resolution failed: gateway_key for namespace `" + namespace + "` file `" + path + "` is not valid UTF-8",
+    );
+  }
+  const mapped = ioKind(code);
+  const kind = mapped?.kind ?? "other error";
+  const detail = mapped?.error ?? "unknown error";
+  return new Error(
+    "config resolution failed: gateway_key for namespace `" +
+      namespace +
+      "` file `" +
+      path +
+      "` failed (" +
+      kind +
+      "): " +
+      detail,
+  );
+}
+
+/** `std::io::ErrorKind` display plus the `fs::read` os-error string. */
+function ioKind(code: string): { kind: string; error: string } | null {
+  switch (code) {
+    case "ENOENT":
+      return { kind: "entity not found", error: "No such file or directory (os error 2)" };
+    case "EISDIR":
+      return { kind: "is a directory", error: "Is a directory (os error 21)" };
+    case "EACCES":
+      return { kind: "permission denied", error: "Permission denied (os error 13)" };
+    default:
+      return null;
+  }
+}
+
+function validatePriceBook(parsed: Record<string, unknown>, providers: { id: string }[]): void {
+  for (const entry of asArray(parsed["price"])) {
+    const row = asRecord(entry) ?? {};
+    const provider = typeof row["provider"] === "string" ? row["provider"] : "";
+    const model = typeof row["model"] === "string" ? row["model"] : "";
+    if (provider.trim().length === 0 || model.trim().length === 0) {
+      throw configError("`[[price]]` requires a non-empty `provider` and `model` glob");
+    }
+    if (!providers.some((item) => item.id === provider)) {
+      throw configError("`[[price]]` references undefined provider `" + provider + "`");
+    }
+    const stars = [...model].filter((char) => char === "*").length;
+    const star = model.indexOf("*");
+    const valid = stars === 0 || model === "*" || (stars === 1 && (star === 0 || star === model.length - 1));
+    if (!valid || model.length === 0) {
+      throw configError(
+        "`[[price]]` model glob `" + model + "` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
+      );
+    }
+  }
+}
+
+function validateBlocklist(parsed: Record<string, unknown>): void {
+  const blocklistRaw = asRecord(parsed["blocklist"]);
+  for (const pattern of asArray(blocklistRaw?.["models"])) {
+    if (typeof pattern !== "string") {
+      throw configError("blocklist models must be strings");
+    }
+    validateGlob(pattern);
+  }
 }
 
 function loadAdmission(row: Record<string, unknown>): AdmissionLimits {

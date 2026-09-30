@@ -2082,9 +2082,10 @@ namespace = "platform"
   await assert.rejects(
     () => loadConfig(toml, envSecretReader({}, async () => "")),
     (error: unknown) => {
-      const message = error instanceof Error ? error.message : "";
-      assert.match(message, /empty/);
-      assert.equal(message.includes("secret"), false);
+      assert.equal(
+        error instanceof Error ? error.message : "",
+        "config resolution failed: gateway_key for namespace `platform` file `/run/secrets/axond-gateway-key` is empty",
+      );
       return true;
     },
   );
@@ -2646,7 +2647,10 @@ max_attempts = 1
         envSecretReader({ GW_KEY: "k", OPENAI_KEY: "sk" }, async () => ""),
       ),
     (error: unknown) => {
-      assert.match(error instanceof Error ? error.message : "", /credential weight must be at least 1/);
+      assert.equal(
+        error instanceof Error ? error.message : "",
+        "credential `heavy` has weight 0; remove it instead",
+      );
       return true;
     },
   );

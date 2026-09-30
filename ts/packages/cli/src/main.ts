@@ -13,6 +13,7 @@ import {
   createMetrics,
   envSecretReader,
   loadConfig,
+  resolveConfigSecrets,
   resolveTelemetry,
 } from "../../gateway/src/index.ts";
 import { cliArguments, parseArgv } from "./argv.ts";
@@ -37,12 +38,15 @@ async function main(): Promise<void> {
   }
   const configPath = process.env["AXOND_CONFIG"] ?? "axond.toml";
   const config = await loadOperatorConfig(configPath);
-  const metrics = createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []);
+  const redactSecrets: string[] = [];
+  const metrics = createMetrics(redactSecrets);
   const store =
     config.storage.backend === "sqlite"
       ? openSqliteStore(config.storage.path!, metrics)
       : await openPostgres(requirePostgresDsn(config.storage), metrics);
   await seedConfigNamespaces(store, config.namespaces);
+  await resolveConfigSecrets(config, envSecretReader(process.env, readGatewayKeyFile));
+  redactSecrets.push(config.gatewayKey);
   const extensions = await loadExtensionDir(config.extensionsDir ?? process.env["AXOND_EXTENSIONS_DIR"] ?? null);
   for (const extension of extensions) {
     for (const [index, sql] of (extension.migrations ?? []).entries()) {
@@ -283,6 +287,10 @@ async function main(): Promise<void> {
 }
 
 async function readGatewayKeyFile(path: string): Promise<string> {
+  const bytes = await readFile(path);
+  if (bytes.length === 0) {
+    return "";
+  }
   try {
     const info = await stat(path);
     if ((info.mode & 0o077) !== 0) {
@@ -290,9 +298,15 @@ async function readGatewayKeyFile(path: string): Promise<string> {
       process.stdout.write(`${JSON.stringify(line)}\n`);
     }
   } catch {
-    // A missing file is reported by the read below.
+    // Metadata is advisory. The bytes are already in hand.
   }
-  return readFile(path, "utf8");
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    const invalid = new Error("gateway key file is not valid UTF-8");
+    (invalid as { code: string }).code = "INVALID_UTF8";
+    throw invalid;
+  }
 }
 
 function splitBind(bind: string): [string, string] {
@@ -381,7 +395,9 @@ async function loadOperatorConfig(configPath: string) {
     throw new Error(`failed to load config from \`${configPath}\`: config load: ${detail}`);
   }
   try {
-    return await loadConfig(toml, envSecretReader(process.env, readGatewayKeyFile));
+    return await loadConfig(toml, envSecretReader(process.env, readGatewayKeyFile), {
+      resolveSecrets: false,
+    });
   } catch (error) {
     const message = error instanceof Error ? error.message : "invalid config";
     if (message.startsWith("config: ")) {

@@ -207,6 +207,187 @@ namespace = "platform"
   assert.equal(whitespaceEnv.storage.backend, "sqlite");
 });
 
+const GRAPH = `
+[storage]
+backend = "sqlite"
+path = "/tmp/axond.sqlite"
+[[namespace]]
+id = "platform"
+default = true
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "http://127.0.0.1:9"
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "OPENAI_KEY"
+id = "primary"
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`;
+
+test("credential and gateway key graph matches the rust refusals", async () => {
+  const reader = (
+    env: Record<string, string | undefined>,
+    file: (path: string) => Promise<string> = async () => "file-secret",
+  ) => envSecretReader(env, file);
+  const ready = { GW_KEY: "k", OPENAI_KEY: "sk" };
+  const loaded = await loadConfig(GRAPH, reader(ready));
+  assert.equal(loaded.gatewayKey, "k");
+  assert.equal(loaded.gatewayKeySource, "env");
+  assert.equal(loaded.credentials[0]?.secret, "sk");
+  assert.equal(loaded.credentials[0]?.env, "OPENAI_KEY");
+  const held = await loadConfig(GRAPH, reader({}), { resolveSecrets: false });
+  assert.equal(held.gatewayKey, "");
+  assert.equal(held.credentials[0]?.secret, "");
+
+  const reject = async (
+    toml: string,
+    message: string,
+    env: Record<string, string | undefined> = ready,
+    file?: (path: string) => Promise<string>,
+  ) => {
+    await assert.rejects(
+      () => loadConfig(toml, reader(env, file)),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const coded =
+    (code: string) =>
+    async (): Promise<string> => {
+      const error = new Error("node");
+      (error as { code: string }).code = code;
+      throw error;
+    };
+
+  await reject(
+    GRAPH.replace(
+      'namespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+      'namespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+    ),
+    "credential references undefined namespace `ghost`",
+  );
+  await reject(
+    GRAPH.replace('provider = "openai"\nenv = "OPENAI_KEY"', 'provider = "missing"\nenv = "OPENAI_KEY"'),
+    "credential references undefined provider `missing`",
+  );
+  await reject(
+    `${GRAPH}[[credential]]\nnamespace = "platform"\nprovider = "openai"\nenv = "OTHER"\nid = "primary"\n`,
+    "duplicate credential id `primary` for namespace `platform` provider `openai`",
+  );
+  await reject(
+    GRAPH.replace('id = "primary"', 'id = "primary"\nweight = 0'),
+    "credential `primary` has weight 0; remove it instead",
+  );
+  await reject(
+    GRAPH.replace('env = "OPENAI_KEY"', 'env = "   "'),
+    "credential for namespace `platform` provider `openai` has an empty `env`",
+  );
+  await reject(
+    GRAPH.replace('id = "primary"', 'id = ""\nweight = 0'),
+    "credential `` has weight 0; remove it instead",
+  );
+  await reject(
+    `${GRAPH.replace(
+      'namespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+      'namespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+    )}[failover]\nfailure_threshold = 0\n`,
+    "failover.failure_threshold must be at least 1",
+  );
+  await reject(
+    `${GRAPH}[[price]]\nprovider = "nope"\nmodel = "a*b"\n`,
+    "`[[price]]` references undefined provider `nope`",
+  );
+  await reject(`${GRAPH}[[price]]\nmodel = "gpt"\n`, "`[[price]]` requires a non-empty `provider` and `model` glob");
+  await reject(
+    `${GRAPH}[[price]]\nprovider = "openai"\nmodel = "a*b"\n`,
+    "`[[price]]` model glob `a*b` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
+  );
+  await reject(
+    `${GRAPH.replace(
+      'namespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+      'namespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"',
+    )}[blocklist]\nmodels = ["a*b"]\n`,
+    "blocklist glob `a*b` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
+  );
+  await reject(
+    GRAPH.replace(
+      '[[gateway_key]]\nenv = "GW_KEY"\nnamespace = "platform"',
+      '[[gateway_key]]\nenv = "GW_KEY"\nfile = "/tmp/k"\nnamespace = "ghost"',
+    ),
+    "gateway_key for namespace `ghost` declares both `env` and `file`; exactly one source is permitted",
+  );
+  await reject(
+    GRAPH.replace("env = \"GW_KEY\"\n", ""),
+    "gateway_key for namespace `platform` must declare exactly one non-empty source (`env` or `file`)",
+  );
+  await reject(
+    GRAPH.replace(
+      '[[gateway_key]]\nenv = "GW_KEY"\nnamespace = "platform"',
+      '[[gateway_key]]\nenv = " GW_KEY "\nnamespace = "ghost"',
+    ),
+    "gateway_key ` GW_KEY ` references undefined namespace `ghost`",
+  );
+  await reject(
+    GRAPH,
+    "config resolution failed: credential `primary` for namespace `platform` provider `openai` references env var `OPENAI_KEY`, which is unset or empty",
+    { GW_KEY: "k", OPENAI_KEY: "" },
+  );
+  await reject(
+    GRAPH,
+    "config resolution failed: gateway_key for namespace `platform` references env var `GW_KEY`, which is unset or empty",
+    { OPENAI_KEY: "sk" },
+  );
+  const fileToml = GRAPH.replace(
+    '[[gateway_key]]\nenv = "GW_KEY"\nnamespace = "platform"',
+    '[[gateway_key]]\nfile = "/tmp/gateway-key"\nnamespace = "platform"',
+  );
+  const fromFile = await loadConfig(fileToml, reader({ OPENAI_KEY: "sk" }, async () => "secret\n"));
+  assert.equal(fromFile.gatewayKey, "secret\n");
+  assert.equal(fromFile.gatewayKeySource, "file");
+  await reject(
+    fileToml,
+    "config resolution failed: gateway_key for namespace `platform` file `/tmp/gateway-key` is empty",
+    { OPENAI_KEY: "sk" },
+    async () => "",
+  );
+  await reject(
+    fileToml,
+    "config resolution failed: gateway_key for namespace `platform` file `/tmp/gateway-key` failed (entity not found): No such file or directory (os error 2)",
+    { OPENAI_KEY: "sk" },
+    coded("ENOENT"),
+  );
+  await reject(
+    fileToml,
+    "config resolution failed: gateway_key for namespace `platform` file `/tmp/gateway-key` failed (is a directory): Is a directory (os error 21)",
+    { OPENAI_KEY: "sk" },
+    coded("EISDIR"),
+  );
+  await reject(
+    fileToml,
+    "config resolution failed: gateway_key for namespace `platform` file `/tmp/gateway-key` failed (permission denied): Permission denied (os error 13)",
+    { OPENAI_KEY: "sk" },
+    coded("EACCES"),
+  );
+  await reject(
+    fileToml,
+    "config resolution failed: gateway_key for namespace `platform` file `/tmp/gateway-key` is not valid UTF-8",
+    { OPENAI_KEY: "sk" },
+    coded("INVALID_UTF8"),
+  );
+  await reject(
+    fileToml,
+    "config resolution failed: gateway_key for namespace `platform` file `/tmp/gateway-key` failed (other error): unknown error",
+    { OPENAI_KEY: "sk" },
+    coded("EIO"),
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),
