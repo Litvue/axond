@@ -515,6 +515,50 @@ test("catalogue boot matches the rust refusals", async () => {
     '[discovery]\nrefresh_interval_seconds = 0\n[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\n',
     "discovery.refresh_interval_seconds must be at least 1",
   );
+  const dsn =
+    "catalog `postgres`: `dsn_env` must name the env var holding the connection string";
+  await reject(
+    '[catalog]\nsource = "models-dev"\nstore = "postgres"\n',
+    dsn,
+  );
+  await reject(
+    '[catalog]\nsource = "seed"\nstore = "postgres"\ndsn_env = "  "\n',
+    dsn,
+  );
+  await reject(
+    '[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\nstore = "postgres"\n',
+    https,
+  );
+  await reject(
+    '[catalog]\nsource = "models-dev"\nrefresh_interval_seconds = 0\nstore = "postgres"\n',
+    "catalog.refresh_interval_seconds must be at least 1",
+  );
+  await reject(
+    '[catalog]\nsource = "seed"\nsource_url = "https://models.dev/catalog.json"\nstore = "postgres"\n',
+    "catalog `seed`: `source_url` applies only to `models-dev`",
+  );
+  await reject(
+    '[catalog]\nsource = "seed"\nstore = "postgres"\ndsn_env = "CATALOG_DSN"\nschema = "Bad"\n',
+    "`catalog.schema`: `Bad` is not a valid table name: use lowercase letters, digits, and underscores",
+  );
+  await reject(
+    '[catalog]\nsource = "seed"\nstore = "postgres"\ndsn_env = "CATALOG_DSN"\nschema = "public.axond"\n',
+    "`catalog.schema` must be a single unqualified schema name: it names the search path, not a table",
+  );
+  await reject(
+    '[catalog]\nsource = "seed"\nstore = "postgres"\nschema = "Bad"\n',
+    dsn,
+  );
+  const retained = await loadConfig(
+    `${GRAPH}[catalog]\nsource = "models-dev"\nstore = "postgres"\ndsn_env = "CATALOG_DSN"\nschema = "public"\n`,
+    reader,
+  );
+  assert.equal(retained.catalog.source, "models-dev");
+  const disabledStore = await loadConfig(
+    `${GRAPH}[catalog]\nsource = "none"\nstore = "postgres"\n`,
+    reader,
+  );
+  assert.deepEqual(disabledStore.catalog, { source: "none" });
   const long = `https://mirror.example/${"snapshot/".repeat(20)}not-the-catalogue.json`;
   await assert.rejects(
     () => loadConfig(`${GRAPH}[catalog]\nsource = "models-dev"\nsource_url = "${long}"\n`, reader),

@@ -343,6 +343,22 @@ namespace = "platform"
     );
     await assert.rejects(() => stat(db));
 
+    const postgres = join(root, "postgres.toml");
+    await writeFile(
+      postgres,
+      `${base}[catalog]\nsource = "models-dev"\nstore = "postgres"\n`,
+    );
+    const postgresRun = await run(postgres, root, { GW_KEY: "k" });
+    assert.equal(postgresRun.code, 1);
+    assert.equal(postgresRun.stdout, "");
+    assert.equal(
+      postgresRun.stderr,
+      "Error: failed to load config from `" +
+        postgres +
+        "`: invalid config: catalog `postgres`: `dsn_env` must name the env var holding the connection string\n",
+    );
+    await assert.rejects(() => stat(db));
+
     const discovery = join(root, "discovery.toml");
     await writeFile(
       discovery,

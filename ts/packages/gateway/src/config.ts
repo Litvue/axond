@@ -850,11 +850,39 @@ function validateCatalog(toml: string, row: Record<string, unknown>): LoadedConf
     if (Object.hasOwn(row, "source_url")) {
       throw configError(`catalog \`${source}\`: \`source_url\` applies only to \`models-dev\``);
     }
+    rejectCatalogRetention(row);
     return { source: "seed", sourceUrl: null };
   }
   const url = sourceUrl ?? MODELS_DEV_CATALOG_URL;
   assertCatalogUrl(url);
+  rejectCatalogRetention(row);
   return { source: "models-dev", sourceUrl: url };
+}
+
+/** A Postgres catalogue store needs a DSN name, then an unqualified schema. */
+function rejectCatalogRetention(row: Record<string, unknown>): void {
+  if (row["store"] !== "postgres") {
+    return;
+  }
+  const dsnEnv = typeof row["dsn_env"] === "string" ? row["dsn_env"].trim() : "";
+  if (dsnEnv.length === 0) {
+    throw configError(
+      "catalog `postgres`: `dsn_env` must name the env var holding the connection string",
+    );
+  }
+  if (typeof row["schema"] !== "string") {
+    return;
+  }
+  const schema = row["schema"];
+  const tableError = usageTableError(schema);
+  if (tableError) {
+    throw configError("`catalog.schema`: " + tableError);
+  }
+  if (schema.includes(".")) {
+    throw configError(
+      "`catalog.schema` must be a single unqualified schema name: it names the search path, not a table",
+    );
+  }
 }
 
 function catalogInt(

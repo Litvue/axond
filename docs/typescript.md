@@ -55,7 +55,13 @@ with embedded credentials, a hostless URL, and any document other than
 echoed. `source = "seed"` rejects `source_url`. A zero refresh interval, a
 timeout above the interval, and a retry ceiling above the interval fail boot.
 `discovery.refresh_interval_seconds = 0` is reported before those catalogue
-errors. A disabled catalogue ignores `source_url`.
+errors. A disabled catalogue ignores `source_url`. An enabled catalogue with
+`store = "postgres"` and no `dsn_env` is
+`` catalog `postgres`: `dsn_env` must name the env var holding the connection string ``
+after the URL check, and the store file is not created. A plaintext URL is
+still the `https://` sentence. `schema = "public.axond"` is
+`` `catalog.schema` must be a single unqualified schema name: it names the search path, not a table ``.
+A disabled catalogue does not check that store.
 
 `[server] bind` is a socket address. `localhost:8080`, a bare port, or any
 other value that is not an IP and port fails boot with Figment's
