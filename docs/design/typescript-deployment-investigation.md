@@ -317,7 +317,7 @@ From Cloudflare's docs (research pass, 2026-09-28). Re-verify before committing.
 | Worker disconnect handling loses charges | Medium | Real-edge test before launch. Idempotent settlement (P12) makes retries safe. |
 | Hyperdrive caching serves stale budget or a deleted namespace | Certain if left at default | Caching-disabled config |
 | Hyperdrive pooling surprises not visible in local tests | Low to medium | Staging against PlanetScale before any commitment |
-| Binary size and startup regress against Rust | Certain for size, unmeasured for startup | Accept the size (99.3 MB measured). Measure startup during the spike. |
+| Binary size and startup regress against Rust | The `4ca3b20` binary is 82,154,976 bytes. The local Rust binary is a debug build of 412,428,264 bytes. | On this host the compiled binary reached `/healthz` in 80.5 ms and 78.2 ms. The debug Rust binary reached it in 167.3 ms and 41.9 ms. RSS was about 43 MB and 38 MB. |
 
 ## 13. Recommended plan
 
@@ -343,7 +343,8 @@ Recorded while landing the TypeScript gateway. [ADR 0066](../adr/0066-typescript
 | Extension seam | Promoted. Stages are `pre-auth`, `post-auth`, `pre-dispatch`, with response transforms after `await next()` and `onSettle` after the charge. Reference packages: `@axond/rate-limit`, `@axond/redact`, `@axond/tokens`. |
 | Shadow against the Rust binary | **Go for the fixture suite.** `ts/scripts/shadow-compare.ts` compared status, parsed bodies, and charged `(model, status, cost)` for health, models, chat, embeddings, responses, and messages, buffered and streamed, plus the unprefixed, unknown-namespace, and encoded-namespace errors. Seven usage rows matched. Rust re-encodes some JSON; TypeScript keeps the fixture bytes. Request ids are minted per process. This is not a production traffic sample. |
 | Rollback to the Rust binary | **Exercised locally.** The compiled TypeScript binary created namespace `rollback-tenant` (`201`). That process was stopped and `target/debug/axond` was started on the same TOML and SQLite file. Rust answered `/healthz` `ok`, listed `platform` and `rollback-tenant`, and `GET /ns/platform/v1/models` returned `200` with an empty list. That is a process switch on one machine, not a production cutover. |
-| SQLite restart on the compiled binary | **Go.** `ts/scripts/compiled-binary-smoke.sh` on the `89b0b5d` binary (the CLI sources are unchanged on `dc6142e`) created `restart-tenant` with attrs `org` `acme` (`201`), stopped, and started again on the same SQLite file. `GET /api/v1/namespaces/restart-tenant` was `200` and still named that id and `acme`. |
+| SQLite restart on the compiled binary | **Go.** `ts/scripts/compiled-binary-smoke.sh` on the `89b0b5d` binary (the CLI sources are unchanged on `dc6142e`) created `restart-tenant` with attrs `org` `acme` (`201`), stopped, and started again on the same SQLite file. `GET /api/v1/namespaces/restart-tenant` was `200` and still named that id and `acme`. The same script on the `4ca3b20` binary printed `sqlite_restart_ok`. |
+| Compiled binary at `4ca3b20` versus the debug Rust binary | **Measured on this host.** `/tmp/axond-ts-4ca3b20` is 82,154,976 bytes (`sha256 398d369708fea888c46af08addf556fa6db6fb431ee0d8027bea864a6b98d719`). Two boots reached `/healthz` `ok` in 80.5 ms at 43,168 kB RSS and 78.2 ms at 42,776 kB RSS. `target/debug/axond` is 412,428,264 bytes and reached `/healthz` `ok` in 167.3 ms at 38,220 kB RSS and 41.9 ms at 38,764 kB RSS. That Rust binary is a debug build, so this size is not a release-binary comparison. |
 
 ## Open questions
 
