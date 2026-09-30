@@ -265,11 +265,15 @@ function textChars(text: string): number {
   return [...text].length;
 }
 
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+
 /**
  * The stdout usage event. Absent optionals are omitted the way serde skips
  * `None`: `trace_id`, `attrs`, `period`, `signer_kid`, `price_book`,
- * `price_book_checksum`, and `price_catalog`. A null cost stays
- * `cost_microdollars: null`.
+ * `price_book_checksum`, and `price_catalog`. Token counts and a present cost
+ * are JSON numbers. A null cost stays `cost_microdollars: null`. Counts above
+ * `Number.MAX_SAFE_INTEGER` stay decimal text on `usageLine`; this object keeps
+ * that text so `JSON.stringify` would quote it.
  */
 export function usageEvent(record: UsageRecord): Record<string, unknown> {
   const line: Record<string, unknown> = {
@@ -287,11 +291,11 @@ export function usageEvent(record: UsageRecord): Record<string, unknown> {
     credential_source: record.credentialSource,
     credential_id: record.credentialId,
     status: record.status,
-    input_tokens: record.inputTokens.toString(),
-    cache_read_tokens: record.cacheReadTokens.toString(),
-    cache_write_tokens: record.cacheWriteTokens.toString(),
-    output_tokens: record.outputTokens.toString(),
-    cost_microdollars: record.costMicrodollars?.toString() ?? null,
+    input_tokens: uintJson(record.inputTokens),
+    cache_read_tokens: uintJson(record.cacheReadTokens),
+    cache_write_tokens: uintJson(record.cacheWriteTokens),
+    output_tokens: uintJson(record.outputTokens),
+    cost_microdollars: record.costMicrodollars === null ? null : uintJson(record.costMicrodollars),
     catalog_version: record.catalogVersion,
     ...(record.priceBook !== null ? { price_book: record.priceBook } : {}),
     ...(record.priceBookChecksum !== null ? { price_book_checksum: record.priceBookChecksum } : {}),
@@ -302,22 +306,46 @@ export function usageEvent(record: UsageRecord): Record<string, unknown> {
   return line;
 }
 
+/** A safe integer stays a number. A larger count stays its decimal text. */
+function uintJson(value: bigint): number | string {
+  if (value >= 0n && value <= MAX_SAFE) {
+    return Number(value);
+  }
+  return value.toString();
+}
+
 /**
  * One stdout usage line. `attrs` is spliced from the management encoding so a
  * float such as `1.0` stays the bytes a management read would write.
  */
 export function usageLine(record: UsageRecord): string {
+  let text = JSON.stringify(usageEvent({ ...record, attrs: undefined }));
+  text = bareUint(text, "input_tokens", record.inputTokens);
+  text = bareUint(text, "cache_read_tokens", record.cacheReadTokens);
+  text = bareUint(text, "cache_write_tokens", record.cacheWriteTokens);
+  text = bareUint(text, "output_tokens", record.outputTokens);
+  if (record.costMicrodollars !== null) {
+    text = bareUint(text, "cost_microdollars", record.costMicrodollars);
+  }
   if (record.attrs === undefined) {
-    return JSON.stringify(usageEvent(record));
+    return text;
   }
   const encoded = encodeAttrs(record.attrs);
-  const text = JSON.stringify(usageEvent({ ...record, attrs: undefined }));
   const marker = record.period !== null ? ',"period":' : ',"subject":';
   const at = text.indexOf(marker);
   if (at < 0) {
     return text;
   }
   return `${text.slice(0, at)},"attrs":${encoded}${text.slice(at)}`;
+}
+
+/** serde writes a `u64` as decimal digits, including values above 2^53. */
+function bareUint(text: string, key: string, value: bigint): string {
+  const quoted = `"${key}":"${value.toString()}"`;
+  if (!text.includes(quoted)) {
+    return text;
+  }
+  return text.replace(quoted, `"${key}":${value.toString()}`);
 }
 
 export function assignUsage(target: UsageTokens, next: UsageTokens): void {

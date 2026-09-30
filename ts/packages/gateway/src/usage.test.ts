@@ -145,8 +145,23 @@ test("usage event names the serving credential and omits an absent trace", () =>
   assert.equal(plain.attempts, 1);
   assert.equal(plain.latency_ms, 12);
   assert.equal(plain.period, "compat");
-  assert.equal(plain.cache_read_tokens, "2");
-  assert.equal(plain.cost_microdollars, "5");
+  assert.equal(plain.input_tokens, 4);
+  assert.equal(plain.cache_read_tokens, 2);
+  assert.equal(plain.output_tokens, 1);
+  assert.equal(plain.cost_microdollars, 5);
+  const counted = usageLine(base);
+  assert.equal(counted.includes('"input_tokens":4'), true);
+  assert.equal(counted.includes('"cache_read_tokens":2'), true);
+  assert.equal(counted.includes('"cost_microdollars":5'), true);
+  assert.equal(counted.includes('"input_tokens":"'), false);
+  const wide = usageLine({
+    ...base,
+    inputTokens: 9223372036854775807n,
+    costMicrodollars: 9223372036854775807n,
+  });
+  assert.equal(wide.includes('"input_tokens":9223372036854775807'), true);
+  assert.equal(wide.includes('"cost_microdollars":9223372036854775807'), true);
+  assert.equal(wide.includes('"input_tokens":"'), false);
   assert.equal(Object.hasOwn(plain, "signer_kid"), false);
   assert.equal(Object.hasOwn(plain, "price_book"), false);
   assert.equal(Object.hasOwn(plain, "price_book_checksum"), false);

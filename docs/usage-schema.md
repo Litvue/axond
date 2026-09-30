@@ -62,6 +62,7 @@ omitted when absent), and the OTLP sink emits it as an OTel log record with
 exported as zero; `Some(0)` is still emitted. Stdout omits a null `period`,
 `signer_kid`, `price_book`, `price_book_checksum`, and `price_catalog`, and
 still writes `cost_microdollars` as JSON null when the request was unpriced.
+Token counts and a present cost are JSON numbers. A value above 2^53 keeps every digit.
 Stdout also includes `attrs` when the request was admitted under a namespace:
 the opaque JSON copied at admission
 ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)), between

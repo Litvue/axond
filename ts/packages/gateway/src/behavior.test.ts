@@ -1466,7 +1466,7 @@ test("a provider failure records upstream_error and does not charge", async () =
     assert.equal(event.includes("sk-live-secret"), false);
     assert.equal(event.includes("PROMPT_SENTINEL"), false);
     assert.equal(event.includes('"status":"upstream_error"'), true);
-    assert.equal(event.includes('"cost_microdollars":"0"'), true);
+    assert.equal(event.includes('"cost_microdollars":0'), true);
     const after = (await store.getBudget("platform", "compat"))!;
     assert.equal(after.spent, before.spent);
     const summary = await store.summarizeUsage("platform", "compat");
