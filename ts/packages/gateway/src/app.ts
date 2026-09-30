@@ -1663,12 +1663,12 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
     if (c.req.method === "PUT") {
       const body = await readJson(c, BUDGET_PUT_FIELDS, "PutBudgetBody");
       const limit = requiredBig(body, "limit_microdollars");
-      const row = await opts.store.putBudget(namespace, period, limit);
+      const row = await opts.store.putBudget(namespace, period, limit, opts.clock?.() ?? Date.now());
       c.res = jsonBody(budgetRecordBody(row));
       return;
     }
     if (c.req.method === "GET") {
-      const row = await opts.store.getBudget(namespace, period);
+      const row = await opts.store.getBudget(namespace, period, opts.clock?.() ?? Date.now());
       if (!row) {
         const known = await opts.store.getNamespace(namespace);
         throw new GatewayFailure(known ? "unknown_budget" : "unknown_namespace", 404, known ? "unknown budget" : "unknown namespace");
@@ -1707,7 +1707,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
       return;
     }
     if (c.req.method === "GET") {
-      const row = await opts.store.getBudgetPolicy(namespace);
+      const row = await opts.store.getBudgetPolicy(namespace, opts.clock?.() ?? Date.now());
       if (!row) {
         const known = await opts.store.getNamespace(namespace);
         throw new GatewayFailure(known ? "unknown_budget" : "unknown_namespace", 404, known ? "unknown budget" : "unknown namespace");

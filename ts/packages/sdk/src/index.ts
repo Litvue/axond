@@ -330,10 +330,12 @@ export interface Store {
     cursor: string | null,
     limit: number,
   ): Promise<{ data: NamespaceWrite[]; nextCursor: string | null }>;
-  putBudget(namespace: string, period: string, limit: bigint): Promise<BudgetLedger>;
-  getBudget(namespace: string, period: string): Promise<BudgetLedger | null>;
+  putBudget(namespace: string, period: string, limit: bigint, nowMs?: number): Promise<BudgetLedger>;
+  /** `nowMs` is the gateway clock. A monthly ledger is active only in that month. */
+  getBudget(namespace: string, period: string, nowMs?: number): Promise<BudgetLedger | null>;
   putBudgetPolicy(input: BudgetPolicyWrite): Promise<BudgetPolicy>;
-  getBudgetPolicy(namespace: string): Promise<BudgetPolicy | null>;
+  /** `nowMs` is the gateway clock. A monthly policy reports that month. */
+  getBudgetPolicy(namespace: string, nowMs?: number): Promise<BudgetPolicy | null>;
   settle(input: SettleInput): Promise<{ charged: boolean }>;
   summarizeUsage(namespace: string, period: string): Promise<UsageSummaryRow[]>;
   listProviderModels(): Promise<ProviderModelCache[]>;

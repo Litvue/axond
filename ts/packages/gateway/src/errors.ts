@@ -41,3 +41,7 @@ export function gatewayError(error: GatewayFailure): Response {
 export function badRequest(message: string): GatewayFailure {
   return new GatewayFailure("bad_request", 400, message);
 }
+
+/** Rust `StoreError::Invalid` when `cadence: "fixed"` has no period and no active row. */
+export const FIXED_CADENCE_NEEDS_PERIOD =
+  "fixed cadence needs a period: the namespace has no active period";

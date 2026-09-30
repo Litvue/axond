@@ -1022,6 +1022,106 @@ test("budget_amounts_match_serde_numbers", async () => {
   }
 });
 
+test("budget_policy_follows_the_cadence_period", async () => {
+  let now = Date.parse("2026-09-30T12:00:00Z");
+  const store = createMemoryStore();
+  const app = createAxond({
+    store,
+    providers: [],
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    clock: () => now,
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const call = (path: string, method: string, body?: string) =>
+    app.request(`http://127.0.0.1${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+  assert.equal((await call("/api/v1/namespaces", "POST", '{"id":"wsp_roll"}')).status, 201);
+  assert.equal((await call("/api/v1/namespaces", "POST", '{"id":"wsp_resume"}')).status, 201);
+  assert.equal((await call("/api/v1/namespaces", "POST", '{"id":"wsp_need"}')).status, 201);
+  assert.equal((await call("/api/v1/namespaces", "POST", '{"id":"wsp_legacy"}')).status, 201);
+  const monthly = await call(
+    "/api/v1/namespaces/wsp_roll/budget",
+    "PUT",
+    '{"cadence":"monthly","limit_microdollars":1000,"timezone":"UTC"}',
+  );
+  assert.equal(monthly.status, 200);
+  assert.equal(
+    await monthly.text(),
+    '{"namespace":"wsp_roll","cadence":"monthly","limit_microdollars":1000,"timezone":"UTC","period":"2026-09","spent_microdollars":0,"reserved_microdollars":0,"remaining_microdollars":1000,"active":true}',
+  );
+  await store.settle({
+    requestId: "r1",
+    namespace: "wsp_roll",
+    period: "2026-09",
+    model: "m",
+    status: "ok",
+    cost: 40n,
+    incarnation: 1n,
+  });
+  const spent = await call("/api/v1/namespaces/wsp_roll/budget", "GET");
+  const spentBody =
+    '{"namespace":"wsp_roll","cadence":"monthly","limit_microdollars":1000,"timezone":"UTC","period":"2026-09","spent_microdollars":40,"reserved_microdollars":0,"remaining_microdollars":960,"active":true}';
+  assert.equal(await spent.text(), spentBody);
+  const other = await call("/api/v1/namespaces/wsp_roll/budgets/legacy", "PUT", '{"limit_microdollars":7}');
+  assert.equal(other.status, 200);
+  assert.equal(
+    await other.text(),
+    '{"namespace":"wsp_roll","period":"legacy","limit_microdollars":7,"spent_microdollars":0,"reserved_microdollars":0,"remaining_microdollars":7,"active":false}',
+  );
+  const still = await call("/api/v1/namespaces/wsp_roll/budget", "GET");
+  assert.equal(await still.text(), spentBody);
+  const current = await call("/api/v1/namespaces/wsp_roll/budgets/2026-09", "GET");
+  assert.equal((await current.json()).active, true);
+  const lowered = await call("/api/v1/namespaces/wsp_roll/budgets/2026-09", "PUT", '{"limit_microdollars":250}');
+  assert.equal(lowered.status, 200);
+  assert.equal((await lowered.json()).active, true);
+  const ledgerLimit = await (await call("/api/v1/namespaces/wsp_roll/budget", "GET")).json();
+  assert.equal(ledgerLimit.limit_microdollars, 250);
+  assert.equal(ledgerLimit.spent_microdollars, 40);
+  assert.equal(ledgerLimit.remaining_microdollars, 210);
+  now = Date.parse("2026-10-01T00:00:00Z");
+  const rolled = await call("/api/v1/namespaces/wsp_roll/budget", "GET");
+  assert.equal(
+    await rolled.text(),
+    '{"namespace":"wsp_roll","cadence":"monthly","limit_microdollars":1000,"timezone":"UTC","period":"2026-10","spent_microdollars":0,"reserved_microdollars":0,"remaining_microdollars":1000,"active":true}',
+  );
+  assert.equal((await call("/api/v1/namespaces/wsp_roll/budgets/2026-10", "GET")).status, 404);
+  assert.equal((await (await call("/api/v1/namespaces/wsp_roll/budgets/2026-09", "GET")).json()).active, false);
+  assert.equal(
+    (await call("/api/v1/namespaces/wsp_resume/budget", "PUT", '{"cadence":"monthly","limit_microdollars":1000,"timezone":"UTC"}')).status,
+    200,
+  );
+  assert.equal((await call("/api/v1/namespaces/wsp_resume/budgets/legacy", "PUT", '{"limit_microdollars":7}')).status, 200);
+  await store.resolveNamespace("wsp_resume", now);
+  const resumed = await call(
+    "/api/v1/namespaces/wsp_resume/budget",
+    "PUT",
+    '{"cadence":"fixed","limit_microdollars":9}',
+  );
+  assert.equal(resumed.status, 200);
+  assert.equal(
+    await resumed.text(),
+    '{"namespace":"wsp_resume","cadence":"fixed","limit_microdollars":9,"timezone":"UTC","period":"legacy","spent_microdollars":0,"reserved_microdollars":0,"remaining_microdollars":9,"active":true}',
+  );
+  const needsPeriod = await call(
+    "/api/v1/namespaces/wsp_need/budget",
+    "PUT",
+    '{"cadence":"monthly","limit_microdollars":1,"timezone":"UTC"}',
+  );
+  assert.equal(needsPeriod.status, 200);
+  const missing = await call("/api/v1/namespaces/wsp_need/budget", "PUT", '{"cadence":"fixed","limit_microdollars":1}');
+  assert.equal(missing.status, 400);
+  assert.deepEqual(await missing.json(), {
+    error: { type: "bad_request", message: "fixed cadence needs a period: the namespace has no active period" },
+  });
+  assert.equal((await call("/api/v1/namespaces/wsp_legacy/budgets/legacy", "PUT", '{"limit_microdollars":11}')).status, 200);
+  const synthesized = await call("/api/v1/namespaces/wsp_legacy/budget", "GET");
+  assert.equal(
+    await synthesized.text(),
+    '{"namespace":"wsp_legacy","cadence":"fixed","limit_microdollars":11,"timezone":"UTC","period":"legacy","spent_microdollars":0,"reserved_microdollars":0,"remaining_microdollars":11,"active":true}',
+  );
+});
+
 test("management_query_matches_the_rust_deserializer", async () => {
   const { app, upstream } = await gateway();
   try {
@@ -1389,10 +1489,11 @@ test("management_json_cadence_unit_enum_matches_serde", async () => {
       "PUT",
       '{"cadence":{"fixed":null},"limit_microdollars":1}',
     );
-    assert.equal(fixedOnly.status, 400);
-    assert.deepEqual(await fixedOnly.json(), {
-      error: { type: "bad_request", message: 'period is required for cadence "fixed"' },
-    });
+    assert.equal(fixedOnly.status, 200);
+    const resumed = await fixedOnly.json();
+    assert.equal(resumed.cadence, "fixed");
+    assert.equal(resumed.period, "2026-09");
+    assert.equal(resumed.limit_microdollars, 1);
     await bad(
       '{"cadence":{"a":"\\q"},"limit_microdollars":1}',
       `${data}: cadence: unknown variant \`a\`, expected \`monthly\` or \`fixed\` at line 1 column 15`,
@@ -1501,7 +1602,9 @@ test("management_json_cadence_unit_enum_matches_serde", async () => {
     await bad('[{"monthly":null,"fixed":null},1]', `${parse}: [0]: expected value at line 1 column 16`);
     const kept = await call("/api/v1/namespaces/wsp_cad/budget", "GET");
     assert.equal(kept.status, 200);
-    assert.equal((await kept.json()).cadence, "monthly");
+    const keptBody = await kept.json();
+    assert.equal(keptBody.cadence, "fixed");
+    assert.equal(keptBody.period, "2026-09");
   } finally {
     upstream.close();
   }

@@ -10,9 +10,9 @@ import type {
   Store,
 } from "@axond/sdk";
 
-import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
+import { FIXED_CADENCE_NEEDS_PERIOD, GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { encodeAttrs } from "../../gateway/src/strict-json.ts";
-import { foldUsageSummary, money, saturateMicrodollars } from "../../gateway/src/memory-store.ts";
+import { budgetPolicyFromLedger, foldUsageSummary, saturateMicrodollars } from "../../gateway/src/memory-store.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 import {
   recordConnectionDiscarded,
@@ -98,11 +98,6 @@ export function createPostgresStore(
              ON CONFLICT (namespace, period) DO NOTHING`,
             [id, period, policy.rows[0]["limit_microdollars"]],
           );
-          await client.query(
-            `INSERT INTO axond_store_budget_active (namespace, period) VALUES ($1, $2)
-             ON CONFLICT (namespace) DO UPDATE SET period = EXCLUDED.period`,
-            [id, period],
-          );
         } else {
           const active = await client.query("SELECT period FROM axond_store_budget_active WHERE namespace = $1", [id]);
           period = active.rows[0] ? String(active.rows[0]["period"]) : null;
@@ -184,7 +179,7 @@ export function createPostgresStore(
         return { data: page, nextCursor };
       });
     },
-    async putBudget(namespace, period, limit) {
+    async putBudget(namespace, period, limit, nowMs = Date.now()) {
       return withClient("budget_write", async (client) => {
         const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [namespace]);
         if (!known.rows[0]) {
@@ -201,16 +196,16 @@ export function createPostgresStore(
            ON CONFLICT (namespace) DO UPDATE SET period = EXCLUDED.period`,
           [namespace, period],
         );
-        return (await readBudget(client, namespace, period))!;
+        return (await readBudget(client, namespace, period, nowMs))!;
       });
     },
-    async getBudget(namespace, period) {
+    async getBudget(namespace, period, nowMs = Date.now()) {
       return withClient("budget_read", async (client) => {
         const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [namespace]);
         if (!known.rows[0]) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
-        return readBudget(client, namespace, period);
+        return readBudget(client, namespace, period, nowMs);
       });
     },
     async putBudgetPolicy(input: BudgetPolicyWrite) {
@@ -219,9 +214,17 @@ export function createPostgresStore(
         if (!known.rows[0]) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
-        const period = input.cadence === "monthly" ? monthlyPeriod(input.nowMs, input.timezone) : input.period;
-        if (!period) {
-          throw new GatewayFailure("bad_request", 400, 'period is required for cadence "fixed"');
+        let period = input.period;
+        if (input.cadence === "monthly") {
+          period = monthlyPeriod(input.nowMs, input.timezone);
+        } else if (!period) {
+          const active = await client.query("SELECT period FROM axond_store_budget_active WHERE namespace = $1", [
+            input.namespace,
+          ]);
+          period = active.rows[0] ? String(active.rows[0]["period"]) : null;
+          if (!period) {
+            throw new GatewayFailure("bad_request", 400, FIXED_CADENCE_NEEDS_PERIOD);
+          }
         }
         await client.query(
           `INSERT INTO axond_store_budget_cadence (namespace, cadence, limit_microdollars, timezone)
@@ -230,55 +233,28 @@ export function createPostgresStore(
           [input.namespace, input.cadence, input.limit.toString(), input.timezone],
         );
         await client.query(
-          `INSERT INTO axond_store_budget (namespace, period, limit_microdollars) VALUES ($1, $2, $3::bigint)
+          `INSERT INTO axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
+           VALUES ($1, $2, $3::bigint, 0)
            ON CONFLICT (namespace, period) DO UPDATE SET limit_microdollars = EXCLUDED.limit_microdollars`,
           [input.namespace, period, input.limit.toString()],
         );
-        await client.query(
-          `INSERT INTO axond_store_budget_active (namespace, period) VALUES ($1, $2)
-           ON CONFLICT (namespace) DO UPDATE SET period = EXCLUDED.period`,
-          [input.namespace, period],
-        );
-        const budget = (await readBudget(client, input.namespace, period))!;
-        return {
-          namespace: input.namespace,
-          cadence: input.cadence,
-          limit_microdollars: money(input.limit),
-          timezone: input.timezone,
-          period,
-          spent_microdollars: money(budget.spent),
-          reserved_microdollars: 0,
-          remaining_microdollars: money(budget.limit > budget.spent ? budget.limit - budget.spent : 0n),
-          active: true,
-        };
+        if (input.cadence === "fixed") {
+          await client.query(
+            `INSERT INTO axond_store_budget_active (namespace, period) VALUES ($1, $2)
+             ON CONFLICT (namespace) DO UPDATE SET period = EXCLUDED.period`,
+            [input.namespace, period],
+          );
+        }
+        return (await readPolicy(client, input.namespace, input.nowMs))!;
       });
     },
-    async getBudgetPolicy(namespace) {
+    async getBudgetPolicy(namespace, nowMs = Date.now()) {
       return withClient("budget_read", async (client) => {
-        const policy = await client.query("SELECT * FROM axond_store_budget_cadence WHERE namespace = $1", [namespace]);
-        if (!policy.rows[0]) {
-          const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [namespace]);
-          if (!known.rows[0]) {
-            throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
-          }
-          return null;
+        const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [namespace]);
+        if (!known.rows[0]) {
+          throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
-        const active = await client.query("SELECT period FROM axond_store_budget_active WHERE namespace = $1", [namespace]);
-        const period = String(active.rows[0]?.["period"] ?? "");
-        const budget = await readBudget(client, namespace, period);
-        const limit = budget?.limit ?? BigInt(String(policy.rows[0]["limit_microdollars"]));
-        const spent = budget?.spent ?? 0n;
-        return {
-          namespace,
-          cadence: policy.rows[0]["cadence"] === "monthly" ? "monthly" : "fixed",
-          limit_microdollars: money(limit),
-          timezone: String(policy.rows[0]["timezone"]),
-          period,
-          spent_microdollars: money(spent),
-          reserved_microdollars: 0,
-          remaining_microdollars: money(limit > spent ? limit - spent : 0n),
-          active: true,
-        };
+        return readPolicy(client, namespace, nowMs);
       });
     },
     settle(input) {
@@ -447,7 +423,54 @@ CREATE TABLE IF NOT EXISTS axond_schema_migrations (
 );
 `;
 
-async function readBudget(client: SqlExecutor, namespace: string, period: string): Promise<BudgetLedger | null> {
+async function readPolicy(client: SqlExecutor, namespace: string, nowMs: number) {
+  const policy = await client.query(
+    "SELECT cadence, limit_microdollars, timezone FROM axond_store_budget_cadence WHERE namespace = $1",
+    [namespace],
+  );
+  const row = policy.rows[0];
+  if (!row) {
+    const active = await client.query(
+      `SELECT a.period AS period, b.limit_microdollars AS limit_microdollars, b.spent_microdollars AS spent_microdollars
+       FROM axond_store_budget_active a
+       JOIN axond_store_budget b ON b.namespace = a.namespace AND b.period = a.period
+       WHERE a.namespace = $1`,
+      [namespace],
+    );
+    const legacy = active.rows[0];
+    if (!legacy) {
+      return null;
+    }
+    return budgetPolicyFromLedger({
+      namespace,
+      cadence: "fixed",
+      timezone: "UTC",
+      period: String(legacy["period"]),
+      limit: BigInt(String(legacy["limit_microdollars"])),
+      spent: BigInt(String(legacy["spent_microdollars"])),
+    });
+  }
+  const cadence = row["cadence"] === "monthly" ? "monthly" : "fixed";
+  const timezone = String(row["timezone"]);
+  let period = "";
+  if (cadence === "monthly") {
+    period = monthlyPeriod(nowMs, timezone);
+  } else {
+    const active = await client.query("SELECT period FROM axond_store_budget_active WHERE namespace = $1", [namespace]);
+    period = active.rows[0] ? String(active.rows[0]["period"]) : "";
+  }
+  const budget = period ? await readBudget(client, namespace, period, nowMs) : null;
+  return budgetPolicyFromLedger({
+    namespace,
+    cadence,
+    timezone,
+    period,
+    limit: budget?.limit ?? BigInt(String(row["limit_microdollars"])),
+    spent: budget?.spent ?? 0n,
+  });
+}
+
+async function readBudget(client: SqlExecutor, namespace: string, period: string, nowMs = Date.now()): Promise<BudgetLedger | null> {
   const result = await client.query(
     "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget WHERE namespace = $1 AND period = $2",
     [namespace, period],
@@ -456,13 +479,19 @@ async function readBudget(client: SqlExecutor, namespace: string, period: string
   if (!row) {
     return null;
   }
-  const active = await client.query("SELECT period FROM axond_store_budget_active WHERE namespace = $1", [namespace]);
+  const policy = await client.query("SELECT cadence, timezone FROM axond_store_budget_cadence WHERE namespace = $1", [namespace]);
+  const cadence = policy.rows[0];
+  const active =
+    cadence?.["cadence"] === "monthly"
+      ? monthlyPeriod(nowMs, String(cadence["timezone"])) === period
+      : (await client.query("SELECT period FROM axond_store_budget_active WHERE namespace = $1", [namespace])).rows[0]?.["period"] ===
+        period;
   return {
     namespace,
     period,
     limit: BigInt(String(row["limit_microdollars"])),
     spent: BigInt(String(row["spent_microdollars"])),
-    active: active.rows[0]?.["period"] === period,
+    active,
   };
 }
 

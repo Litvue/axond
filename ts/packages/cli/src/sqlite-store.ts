@@ -13,9 +13,9 @@ import type {
   Store,
 } from "@axond/sdk";
 
-import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
+import { FIXED_CADENCE_NEEDS_PERIOD, GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { encodeAttrs, serdeValue } from "../../gateway/src/strict-json.ts";
-import { budgetJson, foldUsageSummary, saturateMicrodollars } from "../../gateway/src/memory-store.ts";
+import { budgetPolicyFromLedger, foldUsageSummary, saturateMicrodollars } from "../../gateway/src/memory-store.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 import { recordStoreCall, type StoreMetrics, type StoreOperation } from "../../gateway/src/store-metrics.ts";
 
@@ -127,10 +127,6 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
              VALUES (?, ?, ?, 0)
              ON CONFLICT(namespace, period) DO NOTHING`,
           ).run(id, period, policy["limit_microdollars"]);
-          db.prepare(
-            `INSERT INTO axond_store_budget_active (namespace, period) VALUES (?, ?)
-             ON CONFLICT(namespace) DO UPDATE SET period = excluded.period`,
-          ).run(id, period);
         } else {
           const active = one(db, "SELECT period FROM axond_store_budget_active WHERE namespace = ?", [id]);
           period = active ? String(active["period"]) : null;
@@ -219,7 +215,7 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
         };
       });
     },
-    putBudget(namespace, period, limit) {
+    putBudget(namespace, period, limit, nowMs = Date.now()) {
       return lock("budget_write", () => {
         if (!readNamespace(db, namespace)) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -233,33 +229,26 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
           `INSERT INTO axond_store_budget_active (namespace, period) VALUES (?, ?)
            ON CONFLICT(namespace) DO UPDATE SET period = excluded.period`,
         ).run(namespace, period);
-        return readBudget(db, namespace, period)!;
+        return readBudget(db, namespace, period, nowMs)!;
       });
     },
-    getBudget(namespace, period) {
+    getBudget(namespace, period, nowMs = Date.now()) {
       return lock("budget_read", () => {
         if (!readNamespace(db, namespace)) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
-        return readBudget(db, namespace, period);
+        return readBudget(db, namespace, period, nowMs);
       });
     },
     putBudgetPolicy(input) {
       return lock("budget_write", () => writePolicy(db, input));
     },
-    getBudgetPolicy(namespace) {
+    getBudgetPolicy(namespace, nowMs = Date.now()) {
       return lock("budget_read", () => {
         if (!readNamespace(db, namespace)) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
-        const policy = one(db, "SELECT * FROM axond_store_budget_cadence WHERE namespace = ?", [namespace]);
-        if (!policy) {
-          return null;
-        }
-        const active = one(db, "SELECT period FROM axond_store_budget_active WHERE namespace = ?", [namespace]);
-        const period = String(active?.["period"] ?? "");
-        const budget = readBudget(db, namespace, period);
-        return policyJson(namespace, policy, budget);
+        return readPolicy(db, namespace, nowMs);
       });
     },
     settle(input) {
@@ -417,9 +406,15 @@ function writePolicy(db: DatabaseSync, input: BudgetPolicyWrite): BudgetPolicy {
   if (!readNamespace(db, input.namespace)) {
     throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
   }
-  const period = input.cadence === "monthly" ? monthlyPeriod(input.nowMs, input.timezone) : input.period;
-  if (!period) {
-    throw new GatewayFailure("bad_request", 400, 'period is required for cadence "fixed"');
+  let period = input.period;
+  if (input.cadence === "monthly") {
+    period = monthlyPeriod(input.nowMs, input.timezone);
+  } else if (!period) {
+    const active = one(db, "SELECT period FROM axond_store_budget_active WHERE namespace = ?", [input.namespace]);
+    period = active ? String(active["period"]) : null;
+    if (!period) {
+      throw new GatewayFailure("bad_request", 400, FIXED_CADENCE_NEEDS_PERIOD);
+    }
   }
   db.prepare(
     `INSERT INTO axond_store_budget_cadence (namespace, cadence, limit_microdollars, timezone, period)
@@ -431,42 +426,58 @@ function writePolicy(db: DatabaseSync, input: BudgetPolicyWrite): BudgetPolicy {
      VALUES (?, ?, ?, 0)
      ON CONFLICT(namespace, period) DO UPDATE SET limit_microdollars = excluded.limit_microdollars`,
   ).run(input.namespace, period, input.limit.toString());
-  db.prepare(
-    `INSERT INTO axond_store_budget_active (namespace, period) VALUES (?, ?)
-     ON CONFLICT(namespace) DO UPDATE SET period = excluded.period`,
-  ).run(input.namespace, period);
-  const policy = one(db, "SELECT * FROM axond_store_budget_cadence WHERE namespace = ?", [input.namespace])!;
-  return policyJson(input.namespace, policy, readBudget(db, input.namespace, period));
+  if (input.cadence === "fixed") {
+    db.prepare(
+      `INSERT INTO axond_store_budget_active (namespace, period) VALUES (?, ?)
+       ON CONFLICT(namespace) DO UPDATE SET period = excluded.period`,
+    ).run(input.namespace, period);
+  }
+  return readPolicy(db, input.namespace, input.nowMs)!;
 }
 
-function policyJson(
-  namespace: string,
-  policy: Record<string, unknown>,
-  budget: BudgetLedger | null,
-): BudgetPolicy {
-  const spent = budget?.spent ?? 0n;
-  const limit = budget?.limit ?? BigInt(String(policy["limit_microdollars"]));
-  const view = budgetJson({
+function readPolicy(db: DatabaseSync, namespace: string, nowMs: number): BudgetPolicy | null {
+  const policy = one(db, "SELECT cadence, limit_microdollars, timezone FROM axond_store_budget_cadence WHERE namespace = ?", [
     namespace,
-    period: budget?.period ?? "",
-    limit,
-    spent,
-    active: true,
+  ]);
+  if (!policy) {
+    const active = one(
+      db,
+      `SELECT a.period AS period, b.limit_microdollars AS limit_microdollars, b.spent_microdollars AS spent_microdollars
+       FROM axond_store_budget_active a
+       JOIN axond_store_budget b ON b.namespace = a.namespace AND b.period = a.period
+       WHERE a.namespace = ?`,
+      [namespace],
+    );
+    if (!active) {
+      return null;
+    }
+    return budgetPolicyFromLedger({
+      namespace,
+      cadence: "fixed",
+      timezone: "UTC",
+      period: String(active["period"]),
+      limit: BigInt(String(active["limit_microdollars"])),
+      spent: BigInt(String(active["spent_microdollars"])),
+    });
+  }
+  const cadence = policy["cadence"] === "monthly" ? "monthly" : "fixed";
+  const timezone = String(policy["timezone"]);
+  const period =
+    cadence === "monthly"
+      ? monthlyPeriod(nowMs, timezone)
+      : String(one(db, "SELECT period FROM axond_store_budget_active WHERE namespace = ?", [namespace])?.["period"] ?? "");
+  const budget = period ? readBudget(db, namespace, period, nowMs) : null;
+  return budgetPolicyFromLedger({
+    namespace,
+    cadence,
+    timezone,
+    period,
+    limit: budget?.limit ?? BigInt(String(policy["limit_microdollars"])),
+    spent: budget?.spent ?? 0n,
   });
-  return {
-    namespace,
-    cadence: policy["cadence"] === "monthly" ? "monthly" : "fixed",
-    limit_microdollars: view.limit_microdollars,
-    timezone: String(policy["timezone"]),
-    period: budget?.period ?? "",
-    spent_microdollars: view.spent_microdollars,
-    reserved_microdollars: 0,
-    remaining_microdollars: view.remaining_microdollars,
-    active: true,
-  };
 }
 
-function readBudget(db: DatabaseSync, namespace: string, period: string): BudgetLedger | null {
+function readBudget(db: DatabaseSync, namespace: string, period: string, nowMs = Date.now()): BudgetLedger | null {
   const row = one(
     db,
     "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget WHERE namespace = ? AND period = ?",
@@ -475,13 +486,17 @@ function readBudget(db: DatabaseSync, namespace: string, period: string): Budget
   if (!row) {
     return null;
   }
-  const active = one(db, "SELECT period FROM axond_store_budget_active WHERE namespace = ?", [namespace]);
+  const policy = one(db, "SELECT cadence, timezone FROM axond_store_budget_cadence WHERE namespace = ?", [namespace]);
+  const active =
+    policy?.["cadence"] === "monthly"
+      ? monthlyPeriod(nowMs, String(policy["timezone"])) === period
+      : one(db, "SELECT period FROM axond_store_budget_active WHERE namespace = ?", [namespace])?.["period"] === period;
   return {
     namespace,
     period,
     limit: BigInt(String(row["limit_microdollars"])),
     spent: BigInt(String(row["spent_microdollars"])),
-    active: active?.["period"] === period,
+    active,
   };
 }
 

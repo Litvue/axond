@@ -12,7 +12,7 @@ import type {
   UsageSummaryRow,
 } from "@axond/sdk";
 
-import { GatewayFailure } from "./errors.ts";
+import { FIXED_CADENCE_NEEDS_PERIOD, GatewayFailure } from "./errors.ts";
 import { monthlyPeriod } from "./namespace.ts";
 import { serdeCanonical, serdeValue } from "./strict-json.ts";
 
@@ -87,7 +87,15 @@ export function createMemoryStore(): Store {
     return record;
   }
 
-  function ledger(namespace: string, period: string): BudgetLedger {
+  function periodIsActive(namespace: string, period: string, nowMs: number): boolean {
+    const policy = policies.get(namespace);
+    if (policy?.cadence === "monthly") {
+      return monthlyPeriod(nowMs, policy.timezone) === period;
+    }
+    return active.get(namespace) === period;
+  }
+
+  function ledger(namespace: string, period: string, nowMs: number): BudgetLedger {
     const row = budgets.get(key(namespace, period));
     if (!row) {
       throw new GatewayFailure("unknown_budget", 404, "unknown budget");
@@ -97,7 +105,7 @@ export function createMemoryStore(): Store {
       period,
       limit: row.limit,
       spent: row.spent,
-      active: active.get(namespace) === period,
+      active: periodIsActive(namespace, period, nowMs),
     };
   }
 
@@ -111,7 +119,6 @@ export function createMemoryStore(): Store {
     if (!budgets.has(slot)) {
       budgets.set(slot, { limit: policy.limit, spent: 0n });
     }
-    active.set(namespace, period);
     return period;
   }
 
@@ -194,28 +201,33 @@ export function createMemoryStore(): Store {
         return { data: page.map((id) => namespaces.get(id)!), nextCursor };
       });
     },
-    putBudget(namespace, period, limit) {
+    putBudget(namespace, period, limit, nowMs = Date.now()) {
       return lock(() => {
         requireNamespace(namespace);
         const slot = key(namespace, period);
         const current = budgets.get(slot) ?? { limit: 0n, spent: 0n };
         budgets.set(slot, { limit, spent: current.spent });
         active.set(namespace, period);
-        return ledger(namespace, period);
+        return ledger(namespace, period, nowMs);
       });
     },
-    getBudget(namespace, period) {
+    getBudget(namespace, period, nowMs = Date.now()) {
       return lock(() => {
         requireNamespace(namespace);
-        return budgets.has(key(namespace, period)) ? ledger(namespace, period) : null;
+        return budgets.has(key(namespace, period)) ? ledger(namespace, period, nowMs) : null;
       });
     },
     putBudgetPolicy(input: BudgetPolicyWrite) {
       return lock(() => {
         requireNamespace(input.namespace);
-        const period = input.cadence === "monthly" ? monthlyPeriod(input.nowMs, input.timezone) : input.period;
-        if (!period) {
-          throw new GatewayFailure("bad_request", 400, "period is required for cadence \"fixed\"");
+        let period = input.period;
+        if (input.cadence === "monthly") {
+          period = monthlyPeriod(input.nowMs, input.timezone);
+        } else if (!period) {
+          period = active.get(input.namespace) ?? null;
+          if (!period) {
+            throw new GatewayFailure("bad_request", 400, FIXED_CADENCE_NEEDS_PERIOD);
+          }
         }
         policies.set(input.namespace, {
           cadence: input.cadence,
@@ -224,19 +236,18 @@ export function createMemoryStore(): Store {
           period: input.cadence === "fixed" ? period : null,
         });
         const slot = key(input.namespace, period);
-        if (!budgets.has(slot)) {
-          budgets.set(slot, { limit: input.limit, spent: 0n });
-        } else {
-          budgets.get(slot)!.limit = input.limit;
+        const current = budgets.get(slot);
+        budgets.set(slot, { limit: input.limit, spent: current?.spent ?? 0n });
+        if (input.cadence === "fixed") {
+          active.set(input.namespace, period);
         }
-        active.set(input.namespace, period);
-        return policyView(input.namespace);
+        return policyView(input.namespace, input.nowMs)!;
       });
     },
-    getBudgetPolicy(namespace) {
+    getBudgetPolicy(namespace, nowMs = Date.now()) {
       return lock(() => {
         requireNamespace(namespace);
-        return policies.has(namespace) ? policyView(namespace) : null;
+        return policyView(namespace, nowMs);
       });
     },
     settle(input: SettleInput) {
@@ -322,21 +333,33 @@ export function createMemoryStore(): Store {
     },
   };
 
-  function policyView(namespace: string): BudgetPolicy {
-    const policy = policies.get(namespace)!;
-    const period = active.get(namespace)!;
-    const row = ledger(namespace, period);
-    return {
+  function policyView(namespace: string, nowMs: number): BudgetPolicy | null {
+    const policy = policies.get(namespace);
+    if (!policy) {
+      const period = active.get(namespace);
+      const row = period ? budgets.get(key(namespace, period)) : undefined;
+      if (!period || !row) {
+        return null;
+      }
+      return budgetPolicyFromLedger({
+        namespace,
+        cadence: "fixed",
+        timezone: "UTC",
+        period,
+        limit: row.limit,
+        spent: row.spent,
+      });
+    }
+    const period = policy.cadence === "monthly" ? monthlyPeriod(nowMs, policy.timezone) : (active.get(namespace) ?? "");
+    const row = period ? budgets.get(key(namespace, period)) : undefined;
+    return budgetPolicyFromLedger({
       namespace,
       cadence: policy.cadence,
-      limit_microdollars: money(policy.limit),
       timezone: policy.timezone,
       period,
-      spent_microdollars: money(row.spent),
-      reserved_microdollars: 0,
-      remaining_microdollars: money(row.limit > row.spent ? row.limit - row.spent : 0n),
-      active: true,
-    };
+      limit: row?.limit ?? policy.limit,
+      spent: row?.spent ?? 0n,
+    });
   }
 
   return store;
@@ -428,6 +451,34 @@ function compareUtf8(left: string, right: string): number {
     }
   }
   return a.length - b.length;
+}
+
+export function budgetPolicyFromLedger(input: {
+  namespace: string;
+  cadence: "monthly" | "fixed";
+  timezone: string;
+  period: string;
+  limit: bigint;
+  spent: bigint;
+}): BudgetPolicy {
+  const view = budgetJson({
+    namespace: input.namespace,
+    period: input.period,
+    limit: input.limit,
+    spent: input.spent,
+    active: true,
+  });
+  return {
+    namespace: input.namespace,
+    cadence: input.cadence,
+    limit_microdollars: view.limit_microdollars,
+    timezone: input.timezone,
+    period: input.period,
+    spent_microdollars: view.spent_microdollars,
+    reserved_microdollars: 0,
+    remaining_microdollars: view.remaining_microdollars,
+    active: true,
+  };
 }
 
 export function budgetJson(row: BudgetLedger) {
