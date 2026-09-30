@@ -280,7 +280,7 @@ function readField(cur: Cursor, field: StrictField, key: string): unknown {
       const loc = skipValue(cur);
       fail(`Failed to parse the request body as JSON: ${key}: expected value ${at(loc)}`);
     }
-    const text = readString(cur);
+    const text = readString(cur, key);
     const loc = cur.loc();
     if (text !== "monthly" && text !== "fixed") {
       fail(
@@ -295,13 +295,13 @@ function readField(cur: Cursor, field: StrictField, key: string): unknown {
   if (field.kind === "strings") {
     return readStringList(cur, key);
   }
-  return jsonValue(cur);
+  return jsonValue(cur, key);
 }
 
 function readU64(cur: Cursor, key: string): bigint {
   const peek = cur.peek();
   if (peek === '"') {
-    const text = readString(cur);
+    const text = readString(cur, key);
     fail(`${DESERIALIZE}: ${key}: invalid type: string ${JSON.stringify(text)}, expected u64 ${at(cur.loc())}`);
   }
   if (peek === "t" || peek === "f") {
@@ -315,7 +315,6 @@ function readU64(cur: Cursor, key: string): bigint {
   }
   if (peek === "[" || peek === "{") {
     const where = cur.loc();
-    skipValue(cur);
     const kind = peek === "[" ? "sequence" : "map";
     fail(`${DESERIALIZE}: ${key}: invalid type: ${kind}, expected u64 ${at(where)}`);
   }
@@ -349,13 +348,12 @@ function readStringList(cur: Cursor, key: string): string[] | null {
   }
   if (cur.peek() !== "[") {
     if (cur.peek() === '"') {
-      const text = readString(cur);
+      const text = readString(cur, key);
       fail(`${DESERIALIZE}: ${key}: invalid type: string ${JSON.stringify(text)}, expected a sequence ${at(cur.loc())}`);
     }
     if (cur.peek() === "[" || cur.peek() === "{") {
       const where = cur.loc();
       const kind = cur.peek() === "[" ? "sequence" : "map";
-      skipValue(cur);
       fail(`${DESERIALIZE}: ${key}: invalid type: ${kind}, expected a sequence ${at(where)}`);
     }
     const kind = describeOther(cur);
@@ -374,13 +372,12 @@ function readStringList(cur: Cursor, key: string): string[] | null {
       if (cur.peek() === "[" || cur.peek() === "{") {
         const where = cur.loc();
         const kind = cur.peek() === "[" ? "sequence" : "map";
-        skipValue(cur);
         fail(`${DESERIALIZE}: ${key}[${index}]: invalid type: ${kind}, expected a string ${at(where)}`);
       }
       const described = describeOther(cur);
       fail(`${DESERIALIZE}: ${key}[${index}]: invalid type: ${described}, expected a string ${at(cur.loc())}`);
     }
-    items.push(readString(cur));
+    items.push(readString(cur, `${key}[${index}]`));
     index += 1;
     cur.skipWs();
     if (cur.peek() === ",") {
@@ -402,7 +399,6 @@ function expectString(cur: Cursor, key: string, expected: string): string {
     if (cur.peek() === "[" || cur.peek() === "{") {
       const where = cur.loc();
       const kind = cur.peek() === "[" ? "sequence" : "map";
-      skipValue(cur);
       fail(`${DESERIALIZE}: ${key}: invalid type: ${kind}, expected ${expected} ${at(where)}`);
     }
     const kind = describeOther(cur);
@@ -432,9 +428,9 @@ function describeOther(cur: Cursor): string {
   syntax(cur);
 }
 
-function jsonValue(cur: Cursor): unknown {
+function jsonValue(cur: Cursor, path: string): unknown {
   const start = cur.i;
-  skipValue(cur);
+  skipValue(cur, path);
   try {
     return JSON.parse(cur.raw.slice(start, cur.i)) as unknown;
   } catch {
@@ -442,51 +438,100 @@ function jsonValue(cur: Cursor): unknown {
   }
 }
 
+const CONTROL_IN_STRING = "control character (\\u0000-\\u001F) found while parsing a string";
+
+function stringError(cur: Cursor, path: string | undefined, message: string): never {
+  const prefix = path ? `${path}: ` : "";
+  parseFail(`${prefix}${message}`, cur.loc());
+}
+
+function readHex4(cur: Cursor, path: string | undefined): number {
+  let hex = "";
+  for (let i = 0; i < 4; i += 1) {
+    const digit = cur.bump();
+    if (digit === "") {
+      stringError(cur, path, "EOF while parsing a string");
+    }
+    hex += digit;
+  }
+  if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
+    stringError(cur, path, "invalid escape");
+  }
+  return Number.parseInt(hex, 16);
+}
+
+function appendUnicode(out: { text: string }, cur: Cursor, path: string | undefined, code: number): void {
+  if (code >= 0xdc00 && code <= 0xdfff) {
+    stringError(cur, path, "lone leading surrogate in hex escape");
+  }
+  if (code < 0xd800 || code > 0xdbff) {
+    out.text += String.fromCharCode(code);
+    return;
+  }
+  if (cur.peek() === "") {
+    stringError(cur, path, "EOF while parsing a string");
+  }
+  if (cur.peek() !== "\\") {
+    cur.bump();
+    stringError(cur, path, "unexpected end of hex escape");
+  }
+  cur.bump();
+  if (cur.peek() === "") {
+    stringError(cur, path, "EOF while parsing a string");
+  }
+  if (cur.peek() !== "u") {
+    cur.bump();
+    stringError(cur, path, "unexpected end of hex escape");
+  }
+  cur.bump();
+  const low = readHex4(cur, path);
+  if (low < 0xdc00 || low > 0xdfff) {
+    stringError(cur, path, "lone leading surrogate in hex escape");
+  }
+  const point = ((code - 0xd800) << 10) + (low - 0xdc00) + 0x10000;
+  out.text += String.fromCodePoint(point);
+}
+
 function readString(cur: Cursor, path?: string): string {
   if (cur.bump() !== '"') {
     syntax(cur);
   }
-  let out = "";
+  const out = { text: "" };
   while (cur.peek() !== "") {
     const ch = cur.bump();
     if (ch === '"') {
-      return out;
+      return out.text;
     }
     if (ch === "\\") {
       const esc = cur.bump();
+      if (esc === "") {
+        stringError(cur, path, "EOF while parsing a string");
+      }
       if (esc === '"' || esc === "\\" || esc === "/") {
-        out += esc;
+        out.text += esc;
       } else if (esc === "b") {
-        out += "\b";
+        out.text += "\b";
       } else if (esc === "f") {
-        out += "\f";
+        out.text += "\f";
       } else if (esc === "n") {
-        out += "\n";
+        out.text += "\n";
       } else if (esc === "r") {
-        out += "\r";
+        out.text += "\r";
       } else if (esc === "t") {
-        out += "\t";
+        out.text += "\t";
       } else if (esc === "u") {
-        let hex = "";
-        for (let i = 0; i < 4; i += 1) {
-          hex += cur.bump();
-        }
-        if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
-          syntax(cur);
-        }
-        out += String.fromCharCode(Number.parseInt(hex, 16));
+        appendUnicode(out, cur, path, readHex4(cur, path));
       } else {
-        syntax(cur);
+        stringError(cur, path, "invalid escape");
       }
       continue;
     }
     if (ch < " ") {
-      syntax(cur);
+      stringError(cur, path, CONTROL_IN_STRING);
     }
-    out += ch;
+    out.text += ch;
   }
-  const prefix = path ? `${path}: ` : "";
-  parseFail(`${prefix}EOF while parsing a string`, cur.loc());
+  stringError(cur, path, "EOF while parsing a string");
 }
 
 function readLiteral(cur: Cursor, word: string): Loc {
@@ -536,10 +581,10 @@ function readNumber(cur: Cursor): string {
   return cur.raw.slice(start, cur.i);
 }
 
-function skipValue(cur: Cursor): Loc {
+function skipValue(cur: Cursor, path = ""): Loc {
   const peek = cur.peek();
   if (peek === '"') {
-    readString(cur);
+    readString(cur, path.length === 0 ? undefined : path);
     return cur.loc();
   }
   if (peek === "t") {
@@ -566,13 +611,13 @@ function skipValue(cur: Cursor): Loc {
       if (cur.peek() !== '"') {
         syntax(cur);
       }
-      readString(cur);
+      const key = readString(cur, path.length === 0 ? undefined : `${path}.?`);
       cur.skipWs();
       if (cur.bump() !== ":") {
         syntax(cur);
       }
       cur.skipWs();
-      skipValue(cur);
+      skipValue(cur, path.length === 0 ? "" : `${path}.${key}`);
       cur.skipWs();
       if (cur.peek() === ",") {
         cur.bump();
@@ -594,8 +639,10 @@ function skipValue(cur: Cursor): Loc {
       cur.bump();
       return cur.loc();
     }
+    let index = 0;
     while (cur.peek() !== "") {
-      skipValue(cur);
+      skipValue(cur, path.length === 0 ? "" : `${path}[${index}]`);
+      index += 1;
       cur.skipWs();
       if (cur.peek() === ",") {
         cur.bump();

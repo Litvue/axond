@@ -1170,6 +1170,137 @@ test("management_json_rejects_duplicate_fields", async () => {
   }
 });
 
+test("management_json_string_escapes_match_serde", async () => {
+  const { app, upstream } = await gateway();
+  try {
+    const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+    const call = (path: string, method: string, body?: string) =>
+      app.request(`http://127.0.0.1${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+    const bad = async (path: string, method: string, body: string, message: string) => {
+      const response = await call(path, method, body);
+      assert.equal(response.status, 400, `${method} ${path} ${JSON.stringify(body)}`);
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+    };
+    const parse = "Failed to parse the request body as JSON";
+    const data = "Failed to deserialize the JSON body into the target type";
+    const control = "control character (\\u0000-\\u001F) found while parsing a string";
+    await bad("/api/v1/namespaces", "POST", '{"id":"\\q"}', `${parse}: id: invalid escape at line 1 column 9`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"\\', `${parse}: id: EOF while parsing a string at line 1 column 8`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"a\u0001b"}', `${parse}: id: ${control} at line 1 column 9`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"a\nb"}', `${parse}: id: ${control} at line 2 column 0`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"\\u12XY"}', `${parse}: id: invalid escape at line 1 column 13`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"\\u12"}', `${parse}: id: invalid escape at line 1 column 13`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"\\u12', `${parse}: id: EOF while parsing a string at line 1 column 11`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"\\uDFFF"}', `${parse}: id: lone leading surrogate in hex escape at line 1 column 13`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"\\uD800"}', `${parse}: id: unexpected end of hex escape at line 1 column 14`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"\\uD800x"}', `${parse}: id: unexpected end of hex escape at line 1 column 14`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"\\uD800\\uD800"}', `${parse}: id: lone leading surrogate in hex escape at line 1 column 19`);
+    await bad("/api/v1/namespaces", "POST", '{"\\q":1}', `${parse}: invalid escape at line 1 column 4`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"é\\q"}', `${parse}: id: invalid escape at line 1 column 11`);
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '{"id":"a","attrs":{"k":"\\q"}}',
+      `${parse}: attrs.k: invalid escape at line 1 column 26`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '{"id":"a","attrs":["\\q"]}',
+      `${parse}: attrs[0]: invalid escape at line 1 column 22`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '{"id":"a","attrs":{"a":[{"b":"\\q"}]}}',
+      `${parse}: attrs.a[0].b: invalid escape at line 1 column 32`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '{"id":"a","attrs":{"\\q":1}}',
+      `${parse}: attrs.?: invalid escape at line 1 column 22`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '{"id":"a","attrs":{"a.b":"\\q"}}',
+      `${parse}: attrs.a.b: invalid escape at line 1 column 28`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '{"id":"a","blocklist":["ok","\\q"]}',
+      `${parse}: blocklist[1]: invalid escape at line 1 column 31`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '{"id":"a","blocklist":"\\q"}',
+      `${parse}: blocklist: invalid escape at line 1 column 25`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '["\\q"]',
+      `${parse}: [0]: invalid escape at line 1 column 4`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '["ok", {}, ["\\q"]]',
+      `${parse}: [2][0]: invalid escape at line 1 column 15`,
+    );
+    await bad(
+      "/api/v1/namespaces/wsp_esc/budgets/2026-09",
+      "PUT",
+      '{"limit_microdollars":"\\q"}',
+      `${parse}: limit_microdollars: invalid escape at line 1 column 25`,
+    );
+    await bad(
+      "/api/v1/namespaces/wsp_esc/budgets/2026-09",
+      "PUT",
+      '{"limit_microdollars":{"a":"\\q"}}',
+      `${data}: limit_microdollars: invalid type: map, expected u64 at line 1 column 22`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '{"id":{"a":"\\q"}}',
+      `${data}: id: invalid type: map, expected a string at line 1 column 6`,
+    );
+    await bad(
+      "/api/v1/namespaces/wsp_esc/budget",
+      "PUT",
+      '{"cadence":"\\q","limit_microdollars":1}',
+      `${parse}: cadence: invalid escape at line 1 column 14`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      '{"id":"A\\nB"}',
+      "a namespace identifier contains a character outside ASCII letters, digits, `.`, `-`, and `_`",
+    );
+    const created = await call("/api/v1/namespaces", "POST", '{"id":"\\u0041"}');
+    assert.equal(created.status, 201);
+    assert.equal((await created.json()).id, "A");
+    const stored = await call(
+      "/api/v1/namespaces",
+      "POST",
+      '{"id":"wsp_esc","attrs":"\\uD800\\uDC00"}',
+    );
+    assert.equal(stored.status, 201);
+    assert.equal((await stored.json()).attrs, String.fromCodePoint(0x10000));
+    const newline = await call("/api/v1/namespaces/wsp_esc", "PUT", '{"attrs":"a\\nb"}');
+    assert.equal(newline.status, 200);
+    assert.equal((await newline.json()).attrs, "a\nb");
+    const missing = await call("/api/v1/namespaces/not-created", "GET");
+    assert.equal(missing.status, 404);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });
