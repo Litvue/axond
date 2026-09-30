@@ -582,7 +582,12 @@ function relayStream(
     observedChars += relayedTextChars(text);
   };
   const consider = (text: string): string | null => {
-    if (!onCredentialRateLimit || rateLimitNoted || stopRateLimitScan || text.length === 0) {
+    if (stopRateLimitScan || rateLimitNoted || text.length === 0) {
+      return null;
+    }
+    // Chat validates every complete data event. Other routes only scan so a
+    // rate-limit event can count against the credential.
+    if (route !== "chat" && !onCredentialRateLimit) {
       return null;
     }
     unscanned += text;
@@ -595,10 +600,19 @@ function relayStream(
         stopRateLimitScan = true;
         return null;
       }
-      const data = firstCompleteData(`${frame}\n\n`);
+      const payload = eventData(frame);
+      // OpenAiStreamDecoder parses chat data before it looks for a rate limit.
+      // A data-only [DONE] already returned above. A comment has no data line.
+      if (route === "chat" && payload !== undefined && payload.trim() !== "[DONE]") {
+        const invalid = chatJsonFailure(payload);
+        if (invalid !== null) {
+          return invalid;
+        }
+      }
+      const data = payload !== undefined && payload.length > 0 ? payload : firstCompleteData(`${frame}\n\n`);
       if (data && isRateLimitPayload(data)) {
         rateLimitNoted = true;
-        onCredentialRateLimit();
+        onCredentialRateLimit?.();
         // Rotation already consumed a pre-content chat rate limit when another
         // credential existed. A chat rate limit that reaches here is the only
         // credential, or it arrived after content. Either way the relay fails.
@@ -833,6 +847,33 @@ function relayStream(
       return reader.cancel(reason);
     },
   });
+}
+
+/**
+ * Joined `data:` lines of one complete SSE block, or undefined when the block
+ * has none. An empty string is a data line with an empty value. Carriage
+ * returns are removed the way `SseDecoder` strips them before parsing.
+ */
+function eventData(frame: string): string | undefined {
+  const lines = frame.replaceAll("\r", "").split("\n").filter((line) => line.startsWith("data:"));
+  if (lines.length === 0) {
+    return undefined;
+  }
+  return lines.map((line) => line.slice(5).replace(/^ /, "")).join("\n");
+}
+
+/**
+ * Chat wording when a complete SSE data event is not JSON and is not `[DONE]`.
+ * The detail is the runtime parser message, cut at 4096 bytes.
+ */
+function chatJsonFailure(data: string): string | null {
+  try {
+    JSON.parse(data);
+    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "invalid JSON";
+    return `provider stream was invalid: ${boundDiagnostic(message)}`;
+  }
 }
 
 /** The first complete SSE data payload, or undefined while the event is still open. */

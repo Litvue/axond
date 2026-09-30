@@ -2258,6 +2258,134 @@ test("chat_eof_names_an_incomplete_event_and_a_split_character", async () => {
   }
 });
 
+test("chat_invalid_json_fails_the_stream_and_keeps_the_credential", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const seen: string[] = [];
+  const broken = [
+    'data: {"choices":[{"delta":{"content":"partial answer"}}]}\n\n',
+    "data: {not json}\n\n",
+    'data: {"error":{"type":"rate_limit_exceeded","message":"slow down"}}\n\n',
+  ].join("");
+  const tail = `${CHAT_DONE}data: {not json}\n\n`;
+  const comment = 'data: {"choices":[{"delta":{"content":"a"}}]}\n\n: comment\n\n';
+  const empty = "data:\n\n";
+  let phase: "broken" | "tail" | "comment" | "empty" = "broken";
+  const upstream = await listen((req, res) => {
+    seen.push(req.headers.authorization ?? "");
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    if (phase === "broken") {
+      res.end(broken);
+      return;
+    }
+    if (phase === "tail") {
+      res.end(tail);
+      return;
+    }
+    if (phase === "comment") {
+      res.end(comment);
+      return;
+    }
+    res.end(empty);
+  });
+  const app = poolApp(store, upstream.url, {
+    credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  const chat = (body: string) => app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: CHAT_HEADERS,
+    body,
+  });
+  const payload = JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] });
+  const waitUsage = async () => {
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+  };
+  let invalid = "provider stream was invalid: invalid JSON";
+  try {
+    JSON.parse("{not json}");
+  } catch (error) {
+    invalid = `provider stream was invalid: ${error instanceof Error ? error.message : "invalid JSON"}`;
+  }
+  try {
+    const first = await chat(payload);
+    assert.equal(first.status, 200);
+    const firstBody = await first.text();
+    assert.equal(firstBody.startsWith(broken), true);
+    assert.equal(firstBody.includes(invalid), true);
+    assert.equal(firstBody.includes("data: [DONE]\n\n"), true);
+    assert.equal(firstBody.includes("provider stream was rate limited"), false);
+    assert.equal(firstBody.includes("bad-key"), false);
+    assert.equal(firstBody.includes("good-key"), false);
+    assert.equal(firstBody.includes(KEY), false);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+    assert.equal(records[0]!.outputTokens, 4n);
+
+    assert.deepEqual(seen, ["Bearer bad-key"]);
+    records.length = 0;
+    const second = await chat(payload);
+    assert.equal(second.status, 200);
+    assert.equal((await second.text()).includes(invalid), true);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+    records.length = 0;
+    const third = await chat(payload);
+    assert.equal(third.status, 200);
+    await third.text();
+    await waitUsage();
+    assert.deepEqual(seen, ["Bearer bad-key", "Bearer good-key", "Bearer bad-key"]);
+    const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
+    const rows = (await status.json()).data as { credential_id: string; state: string }[];
+    assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "healthy");
+    assert.equal(rows.find((row) => row.credential_id === "good")?.state, "healthy");
+
+    records.length = 0;
+    phase = "tail";
+    const afterDone = await chat(payload);
+    assert.equal(afterDone.status, 200);
+    const afterBody = await afterDone.text();
+    assert.equal(afterBody, tail);
+    assert.equal(afterBody.includes("upstream_stream_error"), false);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.outputTokens, 1n);
+
+    records.length = 0;
+    phase = "comment";
+    const commented = await chat(payload);
+    assert.equal(commented.status, 200);
+    assert.equal(await commented.text(), comment);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.outputTokens, 1n);
+
+    records.length = 0;
+    phase = "empty";
+    const blank = await chat(payload);
+    assert.equal(blank.status, 200);
+    const blankBody = await blank.text();
+    assert.equal(blankBody.startsWith(empty), true);
+    assert.equal(blankBody.includes("provider stream was invalid:"), true);
+    assert.equal(blankBody.includes("bad-key"), false);
+    await waitUsage();
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+    assert.equal(records[0]!.outputTokens, 0n);
+    assert.equal(records[0]!.inputTokens, 0n);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("sse_buffer_limit_fails_an_unterminated_event_and_keeps_a_finished_stream", async () => {
   const limit = 1024 * 1024;
   const over = "x".repeat(limit + 1);
