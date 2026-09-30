@@ -248,7 +248,8 @@ caller input; trace access is therefore diagnostic-data access. The regression
 `provider_refusals_keep_their_class_and_export_bounded_attempt_diagnostics`
 checks actual upstream status, error classification, OpenTelemetry error
 status, the UTF-8 byte bound, and credential omission across buffered and
-streamed OpenAI and Anthropic calls.
+streamed OpenAI and Anthropic calls. The TypeScript test of that name records
+attempt `axond.status` as `error` on the same matrix.
 
 **Regression tests.** The two copies of the shipped DDL are gated by
 `every_shipped_ddl_file_exists_in_both_locations` and

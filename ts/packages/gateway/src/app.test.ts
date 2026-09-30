@@ -615,7 +615,7 @@ test("credential_lease_spans_follow_the_pool_walk", async () => {
     assert.equal(served.parentSpanId, firstAttempts[1]!.spanId);
     assert.equal(firstAttempts[0]!.parentSpanId, firstServer.spanId);
     assert.equal(firstAttempts[1]!.parentSpanId, firstServer.spanId);
-    assert.equal(attr(firstAttempts[0]!, "axond.status"), "provider_dependency_failed");
+    assert.equal(attr(firstAttempts[0]!, "axond.status"), "error");
     assert.equal(attr(firstAttempts[1]!, "axond.status"), "ok");
 
     const skipped = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
@@ -757,6 +757,7 @@ test("attempt_span_records_a_header_timeout", async () => {
     const attr = (key: string) => attempt.attributes.find((item) => item.key === key)?.value.stringValue;
     assert.equal(attr("axond.timeout"), "response_headers");
     assert.equal(attr("axond.timeout.bound"), "phase");
+    assert.equal(attr("axond.status"), "error");
     assert.equal(attr("axond.upstream.status"), undefined);
     assert.equal(traces[0]!.includes("upstream-openai"), false);
     assert.equal(traces[0]!.includes(KEY), false);

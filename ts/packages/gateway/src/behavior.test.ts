@@ -3885,3 +3885,150 @@ test("provider_diagnostics_keep_context_limits_and_a_bounded_message", async () 
     collector.close();
   }
 });
+
+test("provider_refusals_keep_their_class_and_export_bounded_attempt_diagnostics", async () => {
+  const secret = "sk-refusal-sentinel";
+  const marker = "… [truncated]";
+  const cases = [
+    { status: 400, message: "input_schema does not support oneOf", http: 400, type: "invalid_request" },
+    { status: 422, message: "invalid field", http: 400, type: "invalid_request" },
+    { status: 401, message: "invalid provider credentials", http: 502, type: "invalid_request" },
+    { status: 403, message: "provider access denied", http: 502, type: "invalid_request" },
+    { status: 400, message: "context window exceeded", http: 400, type: "context_window_exceeded" },
+    { status: 404, message: "requested model not found", http: 502, type: "model_unavailable" },
+    { status: 429, message: "quota exhausted", http: 502, type: "provider_dependency_failed" },
+    { status: 503, message: "provider overloaded", http: 502, type: "provider_dependency_failed" },
+  ];
+  const routes = [
+    {
+      path: "/ns/platform/v1/chat/completions",
+      body: (stream: boolean) => ({ model: "fake-openai/gpt-test", stream, messages: [{ role: "user", content: "hello" }] }),
+    },
+    {
+      path: "/ns/platform/v1/responses",
+      body: (stream: boolean) => ({ model: "fake-openai/gpt-test", stream, input: "hello" }),
+    },
+    {
+      path: "/ns/platform/v1/messages",
+      body: (stream: boolean) => ({
+        model: "fake-anthropic/claude-test",
+        stream,
+        max_tokens: 16,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    },
+  ];
+  let current = cases[0]!;
+  let hits = 0;
+  const traces: string[] = [];
+  const collector = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    if ((req.url ?? "") === "/v1/traces") {
+      traces.push(Buffer.concat(chunks).toString("utf8"));
+    }
+    res.writeHead(200);
+    res.end();
+  });
+  const collectorAddress = await new Promise<import("node:net").AddressInfo>((resolve) => {
+    collector.listen(0, "127.0.0.1", () => {
+      const address = collector.address();
+      if (!address || typeof address === "string") {
+        throw new Error("no port");
+      }
+      resolve(address);
+    });
+  });
+  const upstream = await listen((_req, res) => {
+    hits += 1;
+    const diagnostic = `${current.message}; rejected key ${secret}; ${"界".repeat(1800)}`;
+    res.writeHead(current.status, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: diagnostic } }));
+  });
+  const store = await seeded();
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [
+      { id: "fake-openai", kind: "openai", baseUrl: upstream.url },
+      { id: "fake-anthropic", kind: "anthropic", baseUrl: upstream.url },
+    ],
+    credentials: [
+      { namespace: "platform", provider: "fake-openai", secret, id: "openai" },
+      { namespace: "platform", provider: "fake-anthropic", secret, id: "anthropic" },
+    ],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+      {
+        provider: "fake-anthropic",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    telemetry: { endpoint: `http://127.0.0.1:${collectorAddress.port}` },
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  try {
+    let expectedTraces = 0;
+    for (const route of routes) {
+      for (const stream of [false, true]) {
+        for (const item of cases) {
+          current = item;
+          hits = 0;
+          const response = await app.request(`http://127.0.0.1${route.path}`, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(route.body(stream)),
+          });
+          const text = await response.text();
+          const label = `${route.path} stream=${stream} upstream=${item.status}`;
+          assert.equal(response.status, item.http, label);
+          const body = JSON.parse(text) as { error: { type: string; message: string } };
+          assert.equal(body.error.type, item.type, label);
+          assert.equal(body.error.message.startsWith(item.message), true, label);
+          assert.equal(body.error.message.includes("[REDACTED]"), true, label);
+          assert.equal(body.error.message.endsWith(marker), true, label);
+          assert.equal(text.includes(secret), false, label);
+          assert.equal(hits, 1, label);
+          expectedTraces += 1;
+          const deadline = Date.now() + 2_000;
+          while (traces.length < expectedTraces && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          assert.equal(traces.length >= expectedTraces, true, label);
+          const spans = JSON.parse(traces[expectedTraces - 1]!).resourceSpans[0].scopeSpans[0].spans as {
+            name: string;
+            status?: { code?: number };
+            attributes: { key: string; value: { stringValue?: string } }[];
+          }[];
+          const attempts = spans.filter((span) => span.name === "axond.upstream.attempt");
+          assert.equal(attempts.length, 1, label);
+          const attempt = attempts[0]!;
+          assert.equal(attempt.status?.code, 2, label);
+          const attr = (key: string) => attempt.attributes.find((entry) => entry.key === key)?.value.stringValue;
+          assert.equal(attr("axond.status"), "error", label);
+          assert.equal(attr("axond.upstream.status"), String(item.status), label);
+          const recorded = attr("axond.upstream.message") ?? "";
+          assert.equal(recorded.startsWith(item.message), true, label);
+          assert.equal(recorded.includes("[REDACTED]"), true, label);
+          assert.equal(recorded.includes(marker), false, label);
+          assert.ok(new TextEncoder().encode(recorded).length <= 4096, label);
+          assert.equal(traces[expectedTraces - 1]!.includes(secret), false, label);
+        }
+      }
+    }
+  } finally {
+    upstream.close();
+    collector.closeAllConnections();
+    collector.close();
+  }
+});

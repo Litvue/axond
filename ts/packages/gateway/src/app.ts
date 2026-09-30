@@ -1005,7 +1005,7 @@ async function dispatch(
         credential,
         attempt,
         attemptStarted,
-        error instanceof GatewayFailure ? error.type : "error",
+        "error",
         true,
         walk.parked,
         rateLimited ? "rate_limited" : "error",

@@ -65,7 +65,9 @@ parked credential.
 An inbound `traceparent` is **joined**, not replaced, and the context is
 injected into the upstream request, so a caller's trace runs end to end.
 
-Failed attempt spans have OpenTelemetry error status. For a provider HTTP
+Failed attempt spans have OpenTelemetry error status. Their `axond.status`
+is `error` (a success is `ok`); the caller-visible type stays on the HTTP
+body. For a provider HTTP
 refusal, `axond.upstream.status` is the original upstream code, even when the
 gateway maps it to a different response status. `axond.upstream.message` holds
 the provider's extracted error message, capped at 4 KiB on a UTF-8 boundary.
