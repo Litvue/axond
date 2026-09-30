@@ -551,6 +551,7 @@ function relayStream(
       : null;
   let rateLimitNoted = false;
   let stopRateLimitScan = false;
+  let sawChatContent = false;
   let observedChars = 0;
   let sawDownstream = false;
   let sawUpstream = false;
@@ -576,9 +577,9 @@ function relayStream(
     noteSseChunk(route, usage, text);
     observedChars += relayedTextChars(text);
   };
-  const consider = (text: string) => {
+  const consider = (text: string): string | null => {
     if (!onCredentialRateLimit || rateLimitNoted || stopRateLimitScan || text.length === 0) {
-      return;
+      return null;
     }
     unscanned += text;
     const parts = unscanned.split(/\n\n|\r\n\r\n/);
@@ -588,15 +589,32 @@ function relayStream(
     for (const frame of complete) {
       if (sseTerminalSeen(route, `${frame}\n\n`)) {
         stopRateLimitScan = true;
-        return;
+        return null;
       }
       const data = firstCompleteData(`${frame}\n\n`);
       if (data && isRateLimitPayload(data)) {
         rateLimitNoted = true;
         onCredentialRateLimit();
-        return;
+        return route === "chat" && sawChatContent ? chatRateLimitFailure(data) : null;
+      }
+      if (route === "chat" && data && data !== "[DONE]") {
+        sawChatContent = true;
       }
     }
+    return null;
+  };
+  const closeRateLimit = async (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    message: string | null,
+  ): Promise<boolean> => {
+    if (!message) {
+      return false;
+    }
+    controller.enqueue(streamFailureFrame(route, message));
+    finish("fail");
+    controller.close();
+    await reader.cancel().catch(() => undefined);
+    return true;
   };
   const finish = (reason: "end" | "cancel" | "fail") => {
     if (done) {
@@ -740,12 +758,14 @@ function relayStream(
           controller.close();
           return;
         }
-        consider(releaseHeld(controller));
+        if (await closeRateLimit(controller, consider(releaseHeld(controller)))) {
+          return;
+        }
         return;
       }
       const piece = decoder.decode(value, { stream: true });
       const buffered = pending + piece;
-      consider(piece);
+      const limited = consider(piece);
       if (terminalAt === null && sseTerminalSeen(route, buffered)) {
         terminalAt = Date.now();
       }
@@ -754,6 +774,9 @@ function relayStream(
       pending = tail(buffered);
       markDownstream();
       controller.enqueue(value);
+      if (await closeRateLimit(controller, limited)) {
+        return;
+      }
       const sequenceError = sequence?.push(piece);
       if (sequenceError) {
         controller.enqueue(streamFailureFrame(route, sequenceError));
@@ -787,6 +810,25 @@ function firstCompleteData(text: string): string | undefined {
     }
   }
   return frames.length > 0 && ended ? "" : undefined;
+}
+
+/**
+ * Chat wording once content has already been released.
+ * The provider `/error/message` wins, including an empty one. A missing message
+ * uses the OpenAI default. The diagnostic is cut at 4096 bytes.
+ */
+export function chatRateLimitFailure(data: string): string {
+  let message = "OpenAI stream rate limited";
+  try {
+    const parsed = JSON.parse(data) as { error?: { message?: unknown } };
+    const nested = parsed.error?.message;
+    if (typeof nested === "string") {
+      message = nested;
+    }
+  } catch {
+    // The default names the OpenAI stream.
+  }
+  return `provider stream was rate limited: ${boundDiagnostic(message)}`;
 }
 
 /** Explicit provider rate-limit markers in one SSE JSON payload. */

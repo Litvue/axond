@@ -6,7 +6,7 @@ import { Agent } from "undici";
 
 import { createAdmission, defaultAdmission } from "./admission.ts";
 import { createAxond } from "./app.ts";
-import { classifyUpstream, isRateLimitPayload, targetAttemptCap, transportFailureReason } from "./dispatch.ts";
+import { chatRateLimitFailure, classifyUpstream, isRateLimitPayload, targetAttemptCap, transportFailureReason } from "./dispatch.ts";
 import { StoreFailure } from "./errors.ts";
 import { createMemoryStore } from "./memory-store.ts";
 import { createMetrics } from "./metrics.ts";
@@ -2380,6 +2380,32 @@ test("isRateLimitPayload matches explicit provider markers", () => {
   assert.equal(isRateLimitPayload("not json"), false);
 });
 
+test("chatRateLimitFailure uses the provider message and bounds it", () => {
+  assert.equal(
+    chatRateLimitFailure('{"error":{"type":"rate_limit_exceeded"}}'),
+    "provider stream was rate limited: OpenAI stream rate limited",
+  );
+  assert.equal(
+    chatRateLimitFailure('{"error":{"type":"rate_limit_exceeded","message":"slow down"}}'),
+    "provider stream was rate limited: slow down",
+  );
+  assert.equal(
+    chatRateLimitFailure('{"error":{"message":""}}'),
+    "provider stream was rate limited: ",
+  );
+  const bounded = chatRateLimitFailure(JSON.stringify({ error: { message: "€".repeat(4096) } }));
+  const prefix = "provider stream was rate limited: ";
+  const marker = "… [truncated]";
+  assert.equal(bounded.startsWith(prefix), true);
+  assert.equal(bounded.endsWith(marker), true);
+  const kept = bounded.slice(prefix.length, -marker.length);
+  assert.equal(kept.length > 0 && [...kept].every((character) => character === "€"), true);
+  assert.ok(
+    new TextEncoder().encode(bounded).length
+      <= new TextEncoder().encode(prefix).length + 4096 + new TextEncoder().encode(marker).length,
+  );
+});
+
 function poolApp(store: Store, url: string, extra: Partial<AxondOptions> = {}) {
   return createAxond({
     store,
@@ -2485,13 +2511,61 @@ test("a split rate-limit frame before content rotates without leaking the prefix
 test("a rate limit after chat content stays on that stream", async () => {
   const store = await seeded();
   const seen: string[] = [];
+  const records: UsageRecord[] = [];
+  const upstreamBytes = 'data: {"choices":[{"delta":{"content":"a"}}]}\n\ndata: {"error":{"type":"rate_limit_exceeded"}}\n\n';
   const upstream = await listen((req, res) => {
     seen.push(req.headers.authorization ?? "");
     res.writeHead(200, { "content-type": "text/event-stream" });
-    res.end('data: {"choices":[{"delta":{"content":"a"}}]}\n\ndata: {"error":{"type":"rate_limit_exceeded"}}\n\n');
+    res.end(upstreamBytes);
   });
   const app = poolApp(store, upstream.url, {
     credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: CHAT_HEADERS,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.equal(body.startsWith(upstreamBytes), true);
+  assert.match(body, /provider stream was rate limited: OpenAI stream rate limited/);
+  assert.match(body, /data: \[DONE\]/);
+  assert.equal(body.includes("bad-key"), false);
+  assert.equal(body.includes(KEY), false);
+  assert.deepEqual(seen, ["Bearer bad-key"]);
+  for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+    await new Promise((wake) => setTimeout(wake, 10));
+  }
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.status, "upstream_error");
+  const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
+  const rows = (await status.json()).data as { credential_id: string; state: string }[];
+  assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "parked");
+  assert.equal(rows.find((row) => row.credential_id === "good")?.state, "healthy");
+  upstream.close();
+});
+
+test("a chat rate limit after content uses the provider message", async () => {
+  const store = await seeded();
+  const seen: string[] = [];
+  const records: UsageRecord[] = [];
+  const upstream = await listen((req, res) => {
+    seen.push(req.headers.authorization ?? "");
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"choices":[{"delta":{"content":"a"}}]}\n\n');
+    setTimeout(() => {
+      res.end('data: {"error":{"type":"rate_limit_exceeded","message":"slow down"}}\n\n');
+    }, 40);
+  });
+  const app = poolApp(store, upstream.url, {
+    credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
+    onUsage: (record) => {
+      records.push(record);
+    },
   });
   const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
     method: "POST",
@@ -2501,8 +2575,15 @@ test("a rate limit after chat content stays on that stream", async () => {
   assert.equal(response.status, 200);
   const body = await response.text();
   assert.match(body, /"content":"a"/);
-  assert.match(body, /rate_limit_exceeded/);
+  assert.match(body, /slow down/);
+  assert.match(body, /provider stream was rate limited: slow down/);
+  assert.equal(body.includes("bad-key"), false);
   assert.deepEqual(seen, ["Bearer bad-key"]);
+  for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+    await new Promise((wake) => setTimeout(wake, 10));
+  }
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.status, "upstream_error");
   const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
   const rows = (await status.json()).data as { credential_id: string; state: string }[];
   assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "parked");
@@ -2530,6 +2611,8 @@ test("a rate limit after the chat terminal frame does not park the credential", 
   assert.match(body, /"content":"a"/);
   assert.match(body, /\[DONE\]/);
   assert.match(body, /rate_limit_exceeded/);
+  assert.equal(body.includes("provider stream was rate limited"), false);
+  assert.equal(body.includes("upstream_stream_error"), false);
   assert.deepEqual(seen, ["Bearer bad-key"]);
   const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
   const rows = (await status.json()).data as { credential_id: string; state: string }[];
