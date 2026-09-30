@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Boot a compiled axond binary, load one .ts extension from disk, and refuse apiVersion 2.
+# Boot a compiled axond binary, load one .ts extension from disk, refuse apiVersion 2,
+# and reopen the same SQLite file with an API-created namespace still present.
 set -euo pipefail
 
 bin="${1:?compiled axond binary}"
@@ -256,5 +257,51 @@ if [[ "$body" != "7" ]]; then
   exit 1
 fi
 echo "bundled_package_loaded"
+stop_child
+rm -rf "$dir"
+
+dir="$(mktemp -d)"
+port="$(free_port)"
+write_config "$dir" "$port"
+err="${dir}/stderr"
+AXOND_EXTENSIONS_DIR= AXOND_CONFIG="${dir}/axond.toml" \
+  GW_INBOUND_KEY=test-inbound-key GW_FAKE_OPENAI_KEY=upstream \
+  "$bin" >"${dir}/stdout" 2>"$err" &
+pid=$!
+wait_health "http://127.0.0.1:${port}/healthz" "$err"
+create_code="$(curl -sS -o "${dir}/create.json" -w '%{http_code}' \
+  -H "authorization: Bearer test-inbound-key" \
+  -H "content-type: application/json" \
+  -d '{"id":"restart-tenant","attrs":{"org":"acme"}}' \
+  "http://127.0.0.1:${port}/api/v1/namespaces")"
+if [[ "$create_code" != "201" ]]; then
+  echo "namespace create was ${create_code}" >&2
+  cat "${dir}/create.json" >&2 || true
+  cat "$err" >&2 || true
+  exit 1
+fi
+stop_child
+port="$(free_port)"
+write_config "$dir" "$port"
+AXOND_EXTENSIONS_DIR= AXOND_CONFIG="${dir}/axond.toml" \
+  GW_INBOUND_KEY=test-inbound-key GW_FAKE_OPENAI_KEY=upstream \
+  "$bin" >"${dir}/stdout" 2>"$err" &
+pid=$!
+wait_health "http://127.0.0.1:${port}/healthz" "$err"
+read_code="$(curl -sS -o "${dir}/read.json" -w '%{http_code}' \
+  -H "authorization: Bearer test-inbound-key" \
+  "http://127.0.0.1:${port}/api/v1/namespaces/restart-tenant")"
+if [[ "$read_code" != "200" ]]; then
+  echo "namespace after restart was ${read_code}" >&2
+  cat "${dir}/read.json" >&2 || true
+  cat "$err" >&2 || true
+  exit 1
+fi
+if ! grep -q '"id":"restart-tenant"' "${dir}/read.json" || ! grep -q '"org":"acme"' "${dir}/read.json"; then
+  echo "restart body lost the namespace" >&2
+  cat "${dir}/read.json" >&2 || true
+  exit 1
+fi
+echo "sqlite_restart_ok"
 stop_child
 rm -rf "$dir"
