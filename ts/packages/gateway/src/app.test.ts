@@ -1039,6 +1039,76 @@ test("management_query_matches_the_rust_deserializer", async () => {
   }
 });
 
+test("management_json_matches_serde_syntax_and_null_attrs", async () => {
+  const { app, upstream } = await gateway();
+  try {
+    const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+    const call = (path: string, method: string, body?: string) =>
+      app.request(`http://127.0.0.1${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+    const bad = async (path: string, method: string, body: string, message: string) => {
+      const response = await call(path, method, body);
+      assert.equal(response.status, 400, `${method} ${path} ${body}`);
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+    };
+    const parse = "Failed to parse the request body as JSON";
+    const data = "Failed to deserialize the JSON body into the target type";
+    await bad("/api/v1/namespaces", "POST", "", `${parse}: EOF while parsing a value at line 1 column 0`);
+    await bad("/api/v1/namespaces", "POST", " ", `${parse}: EOF while parsing a value at line 1 column 1`);
+    await bad("/api/v1/namespaces", "POST", "null", `${data}: invalid type: null, expected struct CreateBody at line 1 column 4`);
+    await bad("/api/v1/namespaces", "POST", "true", `${data}: invalid type: boolean \`true\`, expected struct CreateBody at line 1 column 4`);
+    await bad("/api/v1/namespaces", "POST", "0", `${data}: invalid type: integer \`0\`, expected struct CreateBody at line 1 column 1`);
+    await bad("/api/v1/namespaces", "POST", "1.5", `${data}: invalid type: floating point \`1.5\`, expected struct CreateBody at line 1 column 3`);
+    await bad("/api/v1/namespaces", "POST", '"x"', `${data}: invalid type: string "x", expected struct CreateBody at line 1 column 3`);
+    await bad("/api/v1/namespaces", "POST", "{", `${parse}: EOF while parsing an object at line 1 column 1`);
+    await bad("/api/v1/namespaces", "POST", "{]", `${parse}: key must be a string at line 1 column 2`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"a",}', `${parse}: trailing comma at line 1 column 11`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"a"', `${parse}: EOF while parsing an object at line 1 column 9`);
+    await bad("/api/v1/namespaces", "POST", '{"id":}', `${parse}: id: expected value at line 1 column 7`);
+    await bad("/api/v1/namespaces", "POST", '{"id":', `${parse}: id: EOF while parsing a value at line 1 column 6`);
+    await bad("/api/v1/namespaces", "POST", '"', `${parse}: EOF while parsing a string at line 1 column 1`);
+    await bad("/api/v1/namespaces", "POST", "[", `${parse}: EOF while parsing a list at line 1 column 1`);
+    await bad("/api/v1/namespaces", "POST", "[]", `${data}: invalid length 0, expected struct CreateBody with 3 elements at line 1 column 2`);
+    await bad("/api/v1/namespaces/wsp_x/budgets/2026-09", "PUT", "[]", `${data}: invalid length 0, expected struct PutBudgetBody with 1 element at line 1 column 2`);
+    await bad("/api/v1/namespaces/wsp_x/budget", "PUT", '["monthly"]', `${data}: invalid length 1, expected struct PutBudgetPolicyBody with 4 elements at line 1 column 11`);
+    await bad("/api/v1/namespaces/wsp_x", "PUT", "[{}, [], 1]", `${parse}: trailing characters at line 1 column 10`);
+    await bad("/api/v1/namespaces", "POST", '["wsp_x", {}, [], 1]', `${parse}: trailing characters at line 1 column 19`);
+
+    const created = await call("/api/v1/namespaces", "POST", '{"id":"wsp_null","attrs":null}');
+    assert.equal(created.status, 201);
+    assert.deepEqual((await created.json()).attrs, {});
+    const scalar = await call("/api/v1/namespaces/wsp_null", "PUT", '{"attrs":1}');
+    assert.equal(scalar.status, 200);
+    assert.equal((await scalar.json()).attrs, 1);
+    const text = await call("/api/v1/namespaces/wsp_null", "PUT", '{"attrs":"no"}');
+    assert.equal(text.status, 200);
+    assert.equal((await text.json()).attrs, "no");
+    const list = await call("/api/v1/namespaces/wsp_null", "PUT", '{"attrs":[true]}');
+    assert.equal(list.status, 200);
+    assert.deepEqual((await list.json()).attrs, [true]);
+    const reset = await call("/api/v1/namespaces/wsp_null", "PUT", "[]");
+    assert.equal(reset.status, 200);
+    assert.deepEqual((await reset.json()).attrs, {});
+    const kept = await call("/api/v1/namespaces/wsp_null", "GET");
+    assert.equal(kept.status, 200);
+    assert.deepEqual((await kept.json()).attrs, {});
+    const positional = await call("/api/v1/namespaces", "POST", '["wsp_pos"]');
+    assert.equal(positional.status, 201);
+    const positionalBody = await positional.json();
+    assert.equal(positionalBody.id, "wsp_pos");
+    assert.deepEqual(positionalBody.attrs, {});
+    const budget = await call("/api/v1/namespaces/wsp_null/budgets/2026-09", "PUT", "[3]");
+    assert.equal(budget.status, 200);
+    assert.equal((await budget.json()).limit_microdollars, 3);
+    const policy = await call("/api/v1/namespaces/wsp_null/budget", "PUT", '["monthly", 4]');
+    assert.equal(policy.status, 200);
+    const policyBody = await policy.json();
+    assert.equal(policyBody.cadence, "monthly");
+    assert.equal(policyBody.limit_microdollars, 4);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });

@@ -1660,7 +1660,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
     const period = decodeURIComponent(budget[2]!);
     validatePeriod(period);
     if (c.req.method === "PUT") {
-      const body = await readJson(c, BUDGET_PUT_FIELDS);
+      const body = await readJson(c, BUDGET_PUT_FIELDS, "PutBudgetBody");
       const limit = requiredBig(body, "limit_microdollars");
       const row = await opts.store.putBudget(namespace, period, limit);
       c.res = Response.json(budgetJson(row));
@@ -1680,7 +1680,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   if (policy) {
     const namespace = parseNamespaceId(decodeURIComponent(policy[1]!));
     if (c.req.method === "PUT") {
-      const body = await readJson(c, BUDGET_POLICY_FIELDS);
+      const body = await readJson(c, BUDGET_POLICY_FIELDS, "PutBudgetPolicyBody");
       const cadence = body["cadence"];
       if (cadence !== "monthly" && cadence !== "fixed") {
         throw badRequest('cadence must be "monthly" or "fixed"');
@@ -1741,7 +1741,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
     return;
   }
   if (c.req.method === "POST" && path === "/api/v1/namespaces") {
-    const body = await readJson(c, NAMESPACE_CREATE_FIELDS);
+    const body = await readJson(c, NAMESPACE_CREATE_FIELDS, "CreateBody");
     const id = typeof body["id"] === "string" ? body["id"] : "";
     parseNamespaceId(id);
     const attrs = asAttrs(body["attrs"]);
@@ -1773,7 +1773,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
       return;
     }
     if (c.req.method === "PUT") {
-      const body = await readJson(c, NAMESPACE_REPLACE_FIELDS);
+      const body = await readJson(c, NAMESPACE_REPLACE_FIELDS, "ReplaceBody");
       const row = await opts.store.updateNamespace(id, asAttrs(body["attrs"]), asBlocklist(body["blocklist"]));
       if (!row) {
         throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -1850,7 +1850,7 @@ const BUDGET_POLICY_FIELDS: readonly StrictField[] = [
   { name: "period", kind: "string", nullOk: true },
 ];
 
-async function readJson(c: Context<AxondEnv>, fields: readonly StrictField[]): Promise<Record<string, unknown>> {
+async function readJson(c: Context<AxondEnv>, fields: readonly StrictField[], structName: string): Promise<Record<string, unknown>> {
   const contentType = c.req.header("content-type") ?? "";
   if (!contentType.toLowerCase().includes("application/json")) {
     throw new GatewayFailure("unsupported_media_type", 415, "expected a `content-type: application/json` request");
@@ -1861,7 +1861,7 @@ async function readJson(c: Context<AxondEnv>, fields: readonly StrictField[]): P
   } catch {
     throw badRequest("malformed json");
   }
-  return readStrictObject(raw, fields);
+  return readStrictObject(raw, fields, structName);
 }
 
 function requiredBig(body: Record<string, unknown>, key: string): bigint {
@@ -1873,11 +1873,8 @@ function requiredBig(body: Record<string, unknown>, key: string): bigint {
 }
 
 function asAttrs(value: unknown): Record<string, unknown> {
-  if (value === undefined) {
+  if (value === undefined || value === null) {
     return {};
-  }
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw badRequest("attrs must be an object");
   }
   if (jsonUtf8Length(value) > 4 * 1024) {
     throw badRequest("attrs exceeds 4096 byte limit");

@@ -1,6 +1,7 @@
 import { badRequest } from "./errors.ts";
 
 const DESERIALIZE = "Failed to deserialize the JSON body into the target type";
+const PARSE = "Failed to parse the request body as JSON";
 const I64_MAX = 9223372036854775807n;
 const U64_MAX = 18446744073709551615n;
 
@@ -74,42 +75,87 @@ function fail(message: string): never {
   throw badRequest(message);
 }
 
-function syntax(): never {
-  throw badRequest("malformed json");
+function peekLoc(cur: Cursor): Loc {
+  const ch = cur.peek();
+  if (ch.length === 0) {
+    return cur.loc();
+  }
+  if (ch === "\n") {
+    return { line: cur.line + 1, column: 0 };
+  }
+  return { line: cur.line, column: cur.col + new TextEncoder().encode(ch).length };
+}
+
+function parseFail(message: string, loc: Loc): never {
+  fail(`${PARSE}: ${message} ${at(loc)}`);
+}
+
+function syntax(cur: Cursor): never {
+  if (cur.peek() === "") {
+    parseFail("EOF while parsing a value", cur.loc());
+  }
+  parseFail("expected value", peekLoc(cur));
 }
 
 /**
- * Read one management JSON object the way serde reads it with
- * `deny_unknown_fields`: the first unknown key, missing required key, or
- * mistyped field is refused, and the column is the last byte serde consumed.
+ * Read one management JSON body the way serde reads it with
+ * `deny_unknown_fields`. A JSON array is the positional struct form.
+ * The column is the last byte serde consumed, or the byte it refused.
  */
-export function readStrictObject(raw: string, fields: readonly StrictField[]): Record<string, unknown> {
+export function readStrictObject(
+  raw: string,
+  fields: readonly StrictField[],
+  structName: string,
+): Record<string, unknown> {
   const cur = new Cursor(raw);
   cur.skipWs();
-  if (cur.peek() !== "{") {
-    syntax();
+  if (cur.peek() === "") {
+    parseFail("EOF while parsing a value", cur.loc());
   }
+  if (cur.peek() === "{") {
+    return readObjectFields(cur, fields);
+  }
+  if (cur.peek() === "[") {
+    return readPositional(cur, fields, structName);
+  }
+  if (cur.peek() === '"') {
+    const text = readString(cur);
+    fail(`${DESERIALIZE}: invalid type: string ${JSON.stringify(text)}, expected struct ${structName} ${at(cur.loc())}`);
+  }
+  const described = describeOther(cur);
+  fail(`${DESERIALIZE}: invalid type: ${described}, expected struct ${structName} ${at(cur.loc())}`);
+}
+
+function readObjectFields(cur: Cursor, fields: readonly StrictField[]): Record<string, unknown> {
   cur.bump();
   const names = fields.map((field) => field.name);
   const byName = new Map(fields.map((field) => [field.name, field]));
   const out: Record<string, unknown> = {};
   const seen = new Set<string>();
-  cur.skipWs();
-  if (cur.peek() === "}") {
-    cur.bump();
-    finish(cur, fields, seen, out);
-    return out;
-  }
-  while (cur.peek() !== "") {
+  let afterComma = false;
+  while (true) {
+    cur.skipWs();
+    if (cur.peek() === "") {
+      parseFail("EOF while parsing an object", cur.loc());
+    }
+    if (cur.peek() === "}") {
+      if (afterComma) {
+        parseFail("trailing comma", peekLoc(cur));
+      }
+      cur.bump();
+      finish(cur, fields, seen, out);
+      return out;
+    }
     if (cur.peek() !== '"') {
-      syntax();
+      parseFail("key must be a string", peekLoc(cur));
     }
     const key = readString(cur);
     const keyEnd = cur.loc();
     cur.skipWs();
-    if (cur.bump() !== ":") {
-      syntax();
+    if (cur.peek() !== ":") {
+      parseFail("expected `:`", peekLoc(cur));
     }
+    cur.bump();
     cur.skipWs();
     const field = byName.get(key);
     if (!field) {
@@ -118,20 +164,62 @@ export function readStrictObject(raw: string, fields: readonly StrictField[]): R
     out[key] = readField(cur, field, key);
     seen.add(key);
     cur.skipWs();
-    const sep = cur.peek();
-    if (sep === ",") {
+    if (cur.peek() === "") {
+      parseFail("EOF while parsing an object", cur.loc());
+    }
+    if (cur.peek() === ",") {
+      cur.bump();
+      afterComma = true;
+      continue;
+    }
+    afterComma = false;
+    if (cur.peek() !== "}") {
+      syntax(cur);
+    }
+  }
+}
+
+function readPositional(cur: Cursor, fields: readonly StrictField[], structName: string): Record<string, unknown> {
+  cur.bump();
+  const values: unknown[] = [];
+  cur.skipWs();
+  while (cur.peek() !== "]") {
+    if (cur.peek() === "") {
+      parseFail("EOF while parsing a list", cur.loc());
+    }
+    if (values.length >= fields.length) {
+      parseFail("trailing characters", peekLoc(cur));
+    }
+    const field = fields[values.length]!;
+    values.push(readField(cur, field, `[${values.length}]`));
+    cur.skipWs();
+    if (cur.peek() === ",") {
       cur.bump();
       cur.skipWs();
       continue;
     }
-    if (sep === "}") {
-      cur.bump();
-      finish(cur, fields, seen, out);
-      return out;
+    if (cur.peek() !== "]" && cur.peek() !== "") {
+      syntax(cur);
     }
-    syntax();
   }
-  syntax();
+  const end = peekLoc(cur);
+  cur.bump();
+  const missing = fields.slice(values.length).some((field) => field.required);
+  if (missing) {
+    const noun = fields.length === 1 ? "element" : "elements";
+    fail(
+      `${DESERIALIZE}: invalid length ${values.length}, expected struct ${structName} with ${fields.length} ${noun} ${at(end)}`,
+    );
+  }
+  const out: Record<string, unknown> = {};
+  const seen = new Set<string>();
+  for (let index = 0; index < values.length; index += 1) {
+    const field = fields[index]!;
+    out[field.name] = values[index];
+    seen.add(field.name);
+  }
+  finish(cur, fields, seen, out);
+  return out;
 }
 
 function finish(cur: Cursor, fields: readonly StrictField[], seen: Set<string>, out: Record<string, unknown>): void {
@@ -157,6 +245,12 @@ function finish(cur: Cursor, fields: readonly StrictField[], seen: Set<string>, 
 }
 
 function readField(cur: Cursor, field: StrictField, key: string): unknown {
+  if (cur.peek() === "") {
+    parseFail(`${key}: EOF while parsing a value`, cur.loc());
+  }
+  if (cur.peek() === "}" || cur.peek() === "]" || cur.peek() === ",") {
+    parseFail(`${key}: expected value`, peekLoc(cur));
+  }
   const peek = cur.peek();
   if (field.nullOk && peek === "n") {
     const loc = readLiteral(cur, "null");
@@ -211,7 +305,7 @@ function readU64(cur: Cursor, key: string): bigint {
     fail(`${DESERIALIZE}: ${key}: invalid type: ${kind}, expected u64 ${at(where)}`);
   }
   if (peek !== "-" && (peek < "0" || peek > "9")) {
-    syntax();
+    syntax(cur);
   }
   const token = readNumber(cur);
   const loc = cur.loc();
@@ -225,7 +319,7 @@ function readU64(cur: Cursor, key: string): bigint {
   try {
     amount = BigInt(token);
   } catch {
-    syntax();
+    syntax(cur);
   }
   if (amount > U64_MAX) {
     fail(`${DESERIALIZE}: ${key}: invalid type: floating point \`${formatRustFloat(token)}\`, expected u64 ${at(loc)}`);
@@ -283,9 +377,9 @@ function readStringList(cur: Cursor, key: string): string[] | null {
       cur.bump();
       return items;
     }
-    syntax();
+    syntax(cur);
   }
-  syntax();
+  syntax(cur);
 }
 
 function expectString(cur: Cursor, key: string, expected: string): string {
@@ -299,7 +393,7 @@ function expectString(cur: Cursor, key: string, expected: string): string {
     const kind = describeOther(cur);
     fail(`${DESERIALIZE}: ${key}: invalid type: ${kind}, expected ${expected} ${at(cur.loc())}`);
   }
-  return readString(cur);
+  return readString(cur, key);
 }
 
 function describeOther(cur: Cursor): string {
@@ -320,7 +414,7 @@ function describeOther(cur: Cursor): string {
     }
     return `integer \`${token}\``;
   }
-  syntax();
+  syntax(cur);
 }
 
 function jsonValue(cur: Cursor): unknown {
@@ -329,13 +423,13 @@ function jsonValue(cur: Cursor): unknown {
   try {
     return JSON.parse(cur.raw.slice(start, cur.i)) as unknown;
   } catch {
-    syntax();
+    syntax(cur);
   }
 }
 
-function readString(cur: Cursor): string {
+function readString(cur: Cursor, path?: string): string {
   if (cur.bump() !== '"') {
-    syntax();
+    syntax(cur);
   }
   let out = "";
   while (cur.peek() !== "") {
@@ -363,26 +457,27 @@ function readString(cur: Cursor): string {
           hex += cur.bump();
         }
         if (!/^[0-9a-fA-F]{4}$/.test(hex)) {
-          syntax();
+          syntax(cur);
         }
         out += String.fromCharCode(Number.parseInt(hex, 16));
       } else {
-        syntax();
+        syntax(cur);
       }
       continue;
     }
     if (ch < " ") {
-      syntax();
+      syntax(cur);
     }
     out += ch;
   }
-  syntax();
+  const prefix = path ? `${path}: ` : "";
+  parseFail(`${prefix}EOF while parsing a string`, cur.loc());
 }
 
 function readLiteral(cur: Cursor, word: string): Loc {
   for (const ch of word) {
     if (cur.bump() !== ch) {
-      syntax();
+      syntax(cur);
     }
   }
   return cur.loc();
@@ -400,12 +495,12 @@ function readNumber(cur: Cursor): string {
       cur.bump();
     }
   } else {
-    syntax();
+    syntax(cur);
   }
   if (cur.peek() === ".") {
     cur.bump();
     if (cur.peek() < "0" || cur.peek() > "9") {
-      syntax();
+      syntax(cur);
     }
     while (cur.peek() >= "0" && cur.peek() <= "9") {
       cur.bump();
@@ -417,7 +512,7 @@ function readNumber(cur: Cursor): string {
       cur.bump();
     }
     if (cur.peek() < "0" || cur.peek() > "9") {
-      syntax();
+      syntax(cur);
     }
     while (cur.peek() >= "0" && cur.peek() <= "9") {
       cur.bump();
@@ -454,12 +549,12 @@ function skipValue(cur: Cursor): Loc {
     }
     while (cur.peek() !== "") {
       if (cur.peek() !== '"') {
-        syntax();
+        syntax(cur);
       }
       readString(cur);
       cur.skipWs();
       if (cur.bump() !== ":") {
-        syntax();
+        syntax(cur);
       }
       cur.skipWs();
       skipValue(cur);
@@ -473,9 +568,9 @@ function skipValue(cur: Cursor): Loc {
         cur.bump();
         return cur.loc();
       }
-      syntax();
+      syntax(cur);
     }
-    syntax();
+    syntax(cur);
   }
   if (peek === "[") {
     cur.bump();
@@ -496,11 +591,11 @@ function skipValue(cur: Cursor): Loc {
         cur.bump();
         return cur.loc();
       }
-      syntax();
+      syntax(cur);
     }
-    syntax();
+    syntax(cur);
   }
-  syntax();
+  syntax(cur);
 }
 
 function formatRustFloat(token: string): string {

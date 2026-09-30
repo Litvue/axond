@@ -29,6 +29,13 @@ interface PolicyRow {
   period: string | null;
 }
 
+function copyAttrs(attrs: NamespaceWrite["attrs"]): NamespaceWrite["attrs"] {
+  if (Array.isArray(attrs) || (attrs !== null && typeof attrs === "object")) {
+    return JSON.parse(JSON.stringify(attrs)) as NamespaceWrite["attrs"];
+  }
+  return attrs;
+}
+
 interface UsageRow {
   requestId: string;
   namespace: string;
@@ -138,7 +145,7 @@ export function createMemoryStore(): Store {
         if (namespaces.has(record.id)) {
           return "exists" as const;
         }
-        namespaces.set(record.id, { ...record, attrs: { ...record.attrs } });
+        namespaces.set(record.id, { ...record, attrs: copyAttrs(record.attrs) });
         return "created" as const;
       });
     },
@@ -151,7 +158,7 @@ export function createMemoryStore(): Store {
         if (!current) {
           return null;
         }
-        const next = { ...current, attrs: { ...attrs }, blocklist };
+        const next = { ...current, attrs: copyAttrs(attrs), blocklist };
         namespaces.set(id, next);
         return next;
       });
