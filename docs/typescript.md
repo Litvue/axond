@@ -110,7 +110,13 @@ A price `input_microdollars_per_million = 1.5` is `expected u64` at
 `default.price.0`. `[[provider]] base_url = 1` is reported before
 `server.bind = 1`. `unpriced_models = "nope"` names `deny` or `allow`.
 `[usage_journal] connect_timeout_ms = 1.5` is reported before
-`create_schema = 1.5` when `backend = "none"`. `[[usage_sink]]
+`create_schema = 1.5` when `backend = "none"`. `backend = "postgres"` is
+`` `[usage_journal] backend = "postgres"` is not built (ADR 0049) `` after
+storage, admission, credentials, and usage sinks pass. Sqlite `:memory:` with
+that backend is `` `[storage]` sqlite `:memory:` is not durable; use a file path ``.
+`admission.max_request_bytes = 0` with that backend is
+`admission.max_request_bytes must be at least 1`, and the store file is not
+created. `[[usage_sink]]
 buffer_capacity = 1.5` is reported before `create_table = 1.5` on a stdout
 sink. `[[gateway_key]]` without `namespace` is `missing field \`namespace\``
 before `server.bind = 1`. A credential that names `provider` and omits

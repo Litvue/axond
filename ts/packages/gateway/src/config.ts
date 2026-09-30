@@ -169,7 +169,6 @@ export async function loadConfig(
   projectPositional(toml, parsed, POSITIONAL_AFTER_SERVER);
   rejectWithdrawn(parsed);
   rejectCollisions(parsed);
-  rejectUsageJournal(parsed);
 
   const storageRaw = asRecord(parsed["storage"]);
   if (!storageRaw) {
@@ -509,6 +508,10 @@ export async function loadConfig(
     credentialPool,
     usageSinks: loadUsageSinks(parsed["usage_sink"]),
   };
+  // Rust reaches an enabled journal only after storage, admission, credentials,
+  // gateway keys, and usage sinks. The section is not built, so a file that
+  // passed those checks still fails here.
+  rejectUsageJournal(parsed);
   if (options?.resolveSecrets !== false) {
     await resolveConfigSecrets(loaded, secrets);
   }

@@ -1690,6 +1690,53 @@ test("a tenant ceiling that cannot isolate a tenant is refused before the semaph
   );
 });
 
+test("an enabled usage journal is refused after earlier boot bounds", async () => {
+  const notBuilt = '`[usage_journal] backend = "postgres"` is not built (ADR 0049)';
+  await assert.rejects(
+    () => loadConfig(`${BASE}\n[usage_journal]\nbackend = "postgres"\n`, secrets),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", notBuilt);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${BASE.replace('path = "/tmp/axond.sqlite"', 'path = ":memory:"')}\n[usage_journal]\nbackend = "postgres"\n`,
+        secrets,
+      ),
+    (error: unknown) => {
+      assert.equal(
+        error instanceof Error ? error.message : "",
+        "`[storage]` sqlite `:memory:` is not durable; use a file path",
+      );
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(`${BASE}\n[admission]\nmax_request_bytes = 0\n[usage_journal]\nbackend = "postgres"\n`, secrets),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", "admission.max_request_bytes must be at least 1");
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${BASE}\n[[usage_sink]]\nkind = "postgres"\n[usage_journal]\nbackend = "postgres"\n`,
+        secrets,
+      ),
+    (error: unknown) => {
+      assert.equal(
+        error instanceof Error ? error.message : "",
+        "usage_sink `postgres`: `dsn_env` must name the env var holding the connection string",
+      );
+      return true;
+    },
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),
