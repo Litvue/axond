@@ -29,6 +29,82 @@ export function parseCredentialQuery(rawQuery: string | null): string | null {
   return namespaces;
 }
 
+const QUERY_DESERIALIZE = "Failed to deserialize query string";
+const U32_MAX = 4294967295n;
+
+export type ManagementListQuery = { cursor: string | null; limit: number };
+
+/**
+ * `cursor` and `limit` from a namespace list query.
+ *
+ * Unknown keys are ignored. A repeated `cursor` or `limit` is refused before
+ * the second value is read. `limit` is a Rust `u32`: digits only, and a value
+ * above `4294967295` names the target type. The page size is then 1–1000.
+ */
+export function readListQuery(params: Iterable<[string, string]>): ManagementListQuery {
+  let cursor: string | null = null;
+  let sawCursor = false;
+  let sawLimit = false;
+  let limit: number | null = null;
+  for (const [key, value] of params) {
+    if (key === "cursor") {
+      if (sawCursor) {
+        throw badRequest(`${QUERY_DESERIALIZE}: duplicate field \`cursor\``);
+      }
+      sawCursor = true;
+      cursor = value;
+      continue;
+    }
+    if (key !== "limit") {
+      continue;
+    }
+    if (sawLimit) {
+      throw badRequest(`${QUERY_DESERIALIZE}: duplicate field \`limit\``);
+    }
+    sawLimit = true;
+    limit = parseQueryU32(value);
+  }
+  const page = limit ?? 100;
+  if (page < 1 || page > 1000) {
+    throw badRequest("`limit` must be between 1 and 1000");
+  }
+  return { cursor, limit: page };
+}
+
+/**
+ * The usage `period` query. A repeated key is a serde duplicate field.
+ * An absent or empty value is still missing, for the caller to validate.
+ */
+export function readUsagePeriod(params: Iterable<[string, string]>): string | null {
+  let period: string | null = null;
+  let saw = false;
+  for (const [key, value] of params) {
+    if (key !== "period") {
+      continue;
+    }
+    if (saw) {
+      throw badRequest(`${QUERY_DESERIALIZE}: duplicate field \`period\``);
+    }
+    saw = true;
+    period = value;
+  }
+  return period;
+}
+
+function parseQueryU32(text: string): number {
+  if (text.length === 0) {
+    throw badRequest(`${QUERY_DESERIALIZE}: limit: cannot parse integer from empty string`);
+  }
+  if (!/^[0-9]+$/.test(text)) {
+    throw badRequest(`${QUERY_DESERIALIZE}: limit: invalid digit found in string`);
+  }
+  const value = BigInt(text);
+  if (value > U32_MAX) {
+    throw badRequest(`${QUERY_DESERIALIZE}: limit: number too large to fit in target type`);
+  }
+  return Number(value);
+}
+
 /** The query string of `requestUrl`, without the leading `?`. */
 export function rawSearch(requestUrl: string): string | null {
   const search = new URL(requestUrl).search;

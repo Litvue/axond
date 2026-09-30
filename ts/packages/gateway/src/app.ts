@@ -42,7 +42,7 @@ import { beginTrace, childTrace, formatTraceparent, metricPayload, parseTracepar
 import { sanitizeAttributes } from "./metrics.ts";
 import { OPENAPI } from "./openapi.ts";
 import { costMicrodollars, lookupPrice } from "./pricing.ts";
-import { parseCredentialQuery, rawSearch } from "./query.ts";
+import { parseCredentialQuery, rawSearch, readListQuery, readUsagePeriod } from "./query.ts";
 import { scopeStore } from "./scoped-store.ts";
 import { emptyUsage } from "./usage.ts";
 
@@ -1718,7 +1718,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   const usage = path.match(/^\/api\/v1\/namespaces\/([^/]+)\/usage$/);
   if (usage && c.req.method === "GET") {
     const namespace = parseNamespaceId(decodeURIComponent(usage[1]!));
-    const period = url.searchParams.get("period");
+    const period = readUsagePeriod(url.searchParams);
     if (!period) {
       throw badRequest("`period` is required");
     }
@@ -1732,11 +1732,8 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
     return;
   }
   if (c.req.method === "GET" && path === "/api/v1/namespaces") {
-    const limit = Number(url.searchParams.get("limit") ?? "100");
-    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
-      throw badRequest("`limit` must be between 1 and 1000");
-    }
-    const page = await opts.store.listNamespaces(url.searchParams.get("cursor"), limit);
+    const listQuery = readListQuery(url.searchParams);
+    const page = await opts.store.listNamespaces(listQuery.cursor, listQuery.limit);
     c.res = Response.json({
       data: page.data.map(namespaceJson),
       ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),

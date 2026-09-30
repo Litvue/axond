@@ -978,6 +978,67 @@ test("management_json_rejects_unknown_fields_and_out_of_range_limits", async () 
   }
 });
 
+test("management_query_matches_the_rust_deserializer", async () => {
+  const { app, upstream } = await gateway();
+  try {
+    const get = (path: string) => app.request(`http://127.0.0.1${path}`, {
+      headers: { authorization: `Bearer ${KEY}` },
+    });
+    const bad = async (path: string, message: string) => {
+      const response = await get(path);
+      assert.equal(response.status, 400, path);
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+    };
+    const digit = "Failed to deserialize query string: limit: invalid digit found in string";
+    await bad("/api/v1/namespaces?limit=abc", digit);
+    await bad("/api/v1/namespaces?limit=", "Failed to deserialize query string: limit: cannot parse integer from empty string");
+    await bad("/api/v1/namespaces?limit", "Failed to deserialize query string: limit: cannot parse integer from empty string");
+    await bad("/api/v1/namespaces?limit=1.5", digit);
+    await bad("/api/v1/namespaces?limit=-1", digit);
+    await bad("/api/v1/namespaces?limit=+10", digit);
+    await bad("/api/v1/namespaces?limit=1e2", digit);
+    await bad("/api/v1/namespaces?limit=%201", digit);
+    await bad("/api/v1/namespaces?limit=1%20", digit);
+    await bad("/api/v1/namespaces?limit=abc&limit=1", digit);
+    await bad("/api/v1/namespaces?limit=4294967296", "Failed to deserialize query string: limit: number too large to fit in target type");
+    await bad("/api/v1/namespaces?limit=0", "`limit` must be between 1 and 1000");
+    await bad("/api/v1/namespaces?limit=1001", "`limit` must be between 1 and 1000");
+    await bad("/api/v1/namespaces?limit=4294967295", "`limit` must be between 1 and 1000");
+    await bad("/api/v1/namespaces?limit=1&limit=abc", "Failed to deserialize query string: duplicate field `limit`");
+    await bad("/api/v1/namespaces?cursor=a&cursor=b", "Failed to deserialize query string: duplicate field `cursor`");
+    await bad("/api/v1/namespaces/platform/usage?period=a&period=b", "Failed to deserialize query string: duplicate field `period`");
+    await bad("/api/v1/namespaces/platform/usage?period=bad/period", "period must be 1–128 characters of [A-Za-z0-9._-]");
+    await bad("/api/v1/namespaces/platform/usage", "`period` is required");
+    await bad("/api/v1/namespaces/platform/usage?period=", "`period` is required");
+
+    const padded = await get("/api/v1/namespaces?limit=010&foo=1");
+    assert.equal(padded.status, 200);
+    const paddedBody = await padded.json();
+    assert.deepEqual(paddedBody.data.map((row: { id: string }) => row.id), ["platform", "tenant"]);
+    assert.equal(paddedBody.next_cursor, undefined);
+
+    const page = await get("/api/v1/namespaces?limit=1");
+    assert.equal(page.status, 200);
+    const pageBody = await page.json();
+    assert.deepEqual(pageBody.data.map((row: { id: string }) => row.id), ["platform"]);
+    assert.equal(pageBody.next_cursor, "platform");
+
+    const rest = await get("/api/v1/namespaces?cursor=platform");
+    assert.equal(rest.status, 200);
+    assert.deepEqual((await rest.json()).data.map((row: { id: string }) => row.id), ["tenant"]);
+
+    const spaced = await get("/api/v1/namespaces?cursor=a+b&limit=10");
+    assert.equal(spaced.status, 200);
+    assert.deepEqual((await spaced.json()).data.map((row: { id: string }) => row.id), ["platform", "tenant"]);
+
+    const usage = await get("/api/v1/namespaces/platform/usage?period=compat&extra=1");
+    assert.equal(usage.status, 200);
+    assert.equal((await usage.json()).period, "compat");
+  } finally {
+    upstream.close();
+  }
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });
