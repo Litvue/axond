@@ -137,6 +137,62 @@ if (!point || point.value !== 1 || point.attributes.route !== "list") {
 }
 ```
 
+`transformSseEvents` from `@axond/sdk` buffers until an event delimiter
+(`\n\n` or `\r\n\r\n`). The callback sees one complete event. Returning the
+same object writes the original bytes, including comments and a CRLF
+delimiter. Returning a new object re-encodes that frame. Returning `null`
+drops it. An incomplete tail at the end of the stream is forwarded as it
+arrived. `npm run check:docs` runs the sample below.
+
+```ts
+import { transformSseEvents } from "@axond/sdk";
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const parts = ["data: hel", "lo\n\ndata: next\n: keep\n\n"];
+let index = 0;
+const source = new ReadableStream<Uint8Array>({
+  pull(controller) {
+    if (index >= parts.length) {
+      controller.close();
+      return;
+    }
+    controller.enqueue(encoder.encode(parts[index]));
+    index += 1;
+  },
+});
+const seen: string[] = [];
+const transformed = transformSseEvents(source, (event) => {
+  seen.push(event.data);
+  if (event.data === "hello") {
+    return { ...event, data: "HELLO" };
+  }
+  return event;
+});
+const reader = transformed.getReader();
+const received: Uint8Array[] = [];
+for (;;) {
+  const next = await reader.read();
+  if (next.done) {
+    break;
+  }
+  received.push(next.value);
+}
+const bytes = new Uint8Array(received.reduce((total, item) => total + item.length, 0));
+let offset = 0;
+for (const item of received) {
+  bytes.set(item, offset);
+  offset += item.length;
+}
+const text = decoder.decode(bytes);
+if (text !== "data: HELLO\n\ndata: next\n: keep\n\n") {
+  throw new Error(text);
+}
+if (seen.join(",") !== "hello,next") {
+  throw new Error(seen.join(","));
+}
+```
+
 ## Container
 
 `ts/Dockerfile` is the TypeScript image. The repository-root `Dockerfile` stays
