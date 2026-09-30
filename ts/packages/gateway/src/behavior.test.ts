@@ -4404,16 +4404,23 @@ test("an admitted request holds a reserved settlement until the charge is spawne
   });
   const metrics = createMetrics(["sk-live-secret"]);
   const store = await seeded();
-  let releaseUpstream: () => void = () => undefined;
+  let released = false;
+  let finishUpstream: (() => void) | null = null;
+  const releaseUpstream = () => {
+    released = true;
+    finishUpstream?.();
+    finishUpstream = null;
+  };
   const upstream = await listen((_req, res) => {
-    void new Promise<void>((resolve) => {
-      releaseUpstream = () => {
-        releaseUpstream = () => undefined;
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}');
-        resolve();
-      };
-    });
+    const finish = () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}');
+    };
+    if (released) {
+      finish();
+      return;
+    }
+    finishUpstream = finish;
   });
   const app = createAxond({
     store,
