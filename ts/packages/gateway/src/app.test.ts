@@ -1493,6 +1493,50 @@ test("namespace_create_uses_the_rust_identifier_messages", async () => {
   assert.deepEqual(ids.filter((id: string) => id === "" || id === "-bad" || id.includes("é")), []);
 });
 
+test("json_content_type_matches_axum", async () => {
+  const { app, upstream } = await gateway();
+  try {
+    const post = (contentType: string | null, path: string, body: string) =>
+      app.request(`http://127.0.0.1${path}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${KEY}`,
+          ...(contentType === null ? {} : { "content-type": contentType }),
+        },
+        body,
+      });
+    const media = {
+      error: {
+        type: "unsupported_media_type",
+        message: "expected a `content-type: application/json` request",
+      },
+    };
+    const suffix = await post("application/cloudevents+json", "/ns/platform/v1/chat/completions", "{}");
+    assert.equal(suffix.status, 400);
+    assert.deepEqual(await suffix.json(), { error: { type: "bad_request", message: "missing `model`" } });
+    const charset = await post("Application/Json; Charset=UTF-8", "/ns/platform/v1/chat/completions", "{}");
+    assert.equal(charset.status, 400);
+    assert.deepEqual(await charset.json(), { error: { type: "bad_request", message: "missing `model`" } });
+    const textJson = await post("text/json", "/ns/platform/v1/chat/completions", "{}");
+    assert.equal(textJson.status, 415);
+    assert.deepEqual(await textJson.json(), media);
+    const embedded = await post("fooapplication/json", "/ns/platform/v1/chat/completions", "{}");
+    assert.equal(embedded.status, 415);
+    assert.deepEqual(await embedded.json(), media);
+    const jsonFoo = await post("application/jsonfoo", "/api/v1/namespaces", '{"id":"wsp_ct"}');
+    assert.equal(jsonFoo.status, 415);
+    assert.deepEqual(await jsonFoo.json(), media);
+    const created = await post("application/vnd.api+json", "/api/v1/namespaces", '{"id":"wsp_ct"}');
+    assert.equal(created.status, 201);
+    const absent = await post(null, "/api/v1/namespaces", '{"id":"wsp_missing"}');
+    assert.equal(absent.status, 415);
+    assert.deepEqual(await absent.json(), media);
+    assert.equal(upstream.requests.length, 0);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("shutdown bounds default to the rust values and reject an unbounded wait", async () => {
   const toml = `
 [storage]

@@ -35,6 +35,7 @@ import {
 } from "./dispatch.ts";
 import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors.ts";
 import { globMatch, validateGlob } from "./glob.ts";
+import { isJsonContentType } from "./content-type.ts";
 import { readStrictObject, type StrictField } from "./strict-json.ts";
 import { budgetJson, money, namespaceJson } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, namespaceIdMessage, validatePeriod, validateTimezone } from "./namespace.ts";
@@ -541,7 +542,7 @@ async function prepareInference(
     throw new GatewayFailure("not_found", 404, "not found");
   }
   const contentType = c.req.header("content-type") ?? "";
-  if (!contentType.toLowerCase().includes("application/json")) {
+  if (!isJsonContentType(contentType)) {
     throw new GatewayFailure("unsupported_media_type", 415, "expected a `content-type: application/json` request");
   }
   const limit = opts.maxRequestBytes ?? DEFAULT_MAX_REQUEST;
@@ -1855,7 +1856,7 @@ const BUDGET_POLICY_FIELDS: readonly StrictField[] = [
 
 async function readJson(c: Context<AxondEnv>, fields: readonly StrictField[], structName: string): Promise<Record<string, unknown>> {
   const contentType = c.req.header("content-type") ?? "";
-  if (!contentType.toLowerCase().includes("application/json")) {
+  if (!isJsonContentType(contentType)) {
     throw new GatewayFailure("unsupported_media_type", 415, "expected a `content-type: application/json` request");
   }
   let raw: string;
