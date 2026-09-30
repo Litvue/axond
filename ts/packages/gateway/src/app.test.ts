@@ -873,6 +873,34 @@ test("empty_model_segments_match_the_rust_split", async () => {
   upstream.close();
 });
 
+test("json_null_is_missing_model_and_invalid_json_names_the_body", async () => {
+  const { app, upstream } = await gateway();
+  const post = (body: BodyInit) => app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body,
+  });
+  for (const body of ["null", "[]", "true", "0", "{}"]) {
+    const response = await post(body);
+    assert.equal(response.status, 400, body);
+    assert.deepEqual(await response.json(), {
+      error: { type: "bad_request", message: "missing `model`" },
+    });
+  }
+  const invalid = await post("{");
+  assert.equal(invalid.status, 400);
+  assert.deepEqual(await invalid.json(), {
+    error: { type: "bad_request", message: "request body is not valid JSON" },
+  });
+  const utf8 = await post(new Uint8Array([0xff, 0xfe]));
+  assert.equal(utf8.status, 400);
+  assert.deepEqual(await utf8.json(), {
+    error: { type: "bad_request", message: "request body is not valid JSON" },
+  });
+  assert.equal(upstream.requests.length, 0);
+  upstream.close();
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });

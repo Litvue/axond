@@ -553,6 +553,9 @@ async function prepareInference(
     throw new GatewayFailure("request_too_large", 413, "request body exceeds the configured inbound limit");
   }
   const parsed = await axond.body.json<Record<string, unknown>>();
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw badRequest("missing `model`");
+  }
   if (parsed["stream"] !== undefined && typeof parsed["stream"] !== "boolean") {
     throw badRequest("`stream` must be a boolean when present");
   }

@@ -38,14 +38,14 @@ export class ByteRequestBody implements RequestBody {
       try {
         return JSON.parse(decoder.decode(this.outgoing())) as T;
       } catch {
-        throw badRequest("malformed json");
+        throw badRequest("request body is not valid JSON");
       }
     }
     const bytes = await this.bytes();
     try {
       return JSON.parse(decoder.decode(bytes)) as T;
     } catch {
-      throw badRequest("malformed json");
+      throw badRequest("request body is not valid JSON");
     }
   }
 
