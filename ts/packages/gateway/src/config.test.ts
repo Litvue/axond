@@ -1359,6 +1359,69 @@ test("axond env overrides are figment values and cite the environment", async ()
   assert.equal(sink.usageSinks[0]?.kind, "stdout");
 });
 
+test("an earlier figment key finishes before a later sequence fill", async () => {
+  const tail = `
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "/tmp/axond.sqlite"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`;
+  const reject = async (toml: string, message: string, extra: Record<string, string> = {}) => {
+    await assert.rejects(
+      () => loadConfig(toml, envSecretReader({ GW_KEY: "k", ...extra }, async () => "")),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const typed = (found: string, expected: string, key: string) =>
+    `config: invalid type: found ${found}, expected ${expected} for key "${key}"`;
+  await reject(
+    `failover = [1.5]\n[admission]\nmax_request_bytes = 1.5\n${tail}`,
+    typed("float `1.5`", "usize", "default.admission.max_request_bytes"),
+  );
+  await reject(
+    `namespace = "x"\n[admission]\nmax_request_bytes = 1.5\n[server]\nbind = "127.0.0.1:9"\n[storage]\nbackend = "sqlite"\npath = "/tmp/axond.sqlite"\n[[gateway_key]]\nenv = "GW_KEY"\nnamespace = "platform"\n`,
+    typed("float `1.5`", "usize", "default.admission.max_request_bytes"),
+  );
+  await reject(
+    `failover = [1.5]\n[blocklist]\nmodels = [1]\n${tail}`,
+    typed("signed int `1`", "a string", "default.blocklist.models.0"),
+  );
+  await reject(
+    `failover = [1.5]\n${tail}[[credential]]\nnamespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"\nweight = 1.5\n`,
+    typed("float `1.5`", "u32", "default.credential.0.weight"),
+  );
+  await reject(
+    `failover = [1.5]\n${tail}`,
+    typed("float `1.5`", "usize", "ADMISSION.0") + " in `AXOND_` environment variable(s)",
+    { AXOND_ADMISSION: "[1.5]" },
+  );
+  await reject(
+    `failover = [1.5]\n${tail}`,
+    typed("float `1.5`", "u32", "CREDENTIAL.0.WEIGHT") + " in `AXOND_` environment variable(s)",
+    { AXOND_CREDENTIAL: '[{weight=1.5}]' },
+  );
+  await reject(
+    `failover = [1.5]\n${tail}`,
+    typed("unsigned int `1`", "a string", "BLOCKLIST.0.0") + " in `AXOND_` environment variable(s)",
+    { AXOND_BLOCKLIST: "[[1]]" },
+  );
+  await reject(
+    `failover = [1.5]\n${tail}`,
+    typed("float `1.5`", "u32", "default.failover.0"),
+    { AXOND_NAMESPACE: "[1]" },
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),

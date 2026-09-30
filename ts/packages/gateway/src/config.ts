@@ -1348,11 +1348,26 @@ const SECTIONS_AFTER_SERVER: ReadonlyArray<readonly [string, SectionShape]> = [
   ["usage_sink", { form: "seq", element: "UsageSinkConfigWire" }],
 ];
 
+/**
+ * Figment finishes one top-level key before the next. A `failover = [1.5]`
+ * fill must not hide an earlier admission float, blocklist string, or
+ * credential weight.
+ */
+function visitBeforeServer(toml: string, parsed: Record<string, unknown>, key: string): void {
+  const shape = SECTIONS_BEFORE_SERVER.find((entry) => entry[0] === key);
+  if (shape) {
+    rejectSectionShapes(toml, parsed, [shape]);
+  }
+  const positional = POSITIONAL_BEFORE_SERVER.find((entry) => entry[0] === key);
+  if (positional) {
+    projectPositional(toml, parsed, [positional]);
+  }
+}
+
 function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void {
-  rejectSectionShapes(toml, parsed, SECTIONS_BEFORE_SERVER);
-  projectPositional(toml, parsed, POSITIONAL_BEFORE_SERVER);
-  // Figment visits top-level keys in sorted order. `admission` is before
-  // `catalog`, `credential`, `discovery`, `failover`, and `namespace`.
+  // Figment visits top-level keys in sorted order and finishes each one,
+  // including a sequence-to-struct fill, before the next key.
+  visitBeforeServer(toml, parsed, "admission");
   const admission = asRecord(parsed["admission"]) ?? {};
   realizePositionalEnv(admission, positionalFields("admission") ?? []);
   for (const [key, expected, fallback] of [
@@ -1374,14 +1389,17 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
   ] as const) {
     readTypedInt(toml, "admission", admission, key, expected, fallback);
   }
+  visitBeforeServer(toml, parsed, "blocklist");
   const blocklist = asRecord(parsed["blocklist"]);
   if (blocklist) {
     rejectBlocklistExtract(toml, blocklist);
   }
+  visitBeforeServer(toml, parsed, "catalog");
   const catalog = asRecord(parsed["catalog"]);
   if (catalog) {
     rejectCatalogExtract(toml, catalog);
   }
+  visitBeforeServer(toml, parsed, "credential");
   asArray(parsed["credential"]).forEach((entry, index) => {
     rejectEnvElement(parsed["credential"], index, "Credential");
     const row = asRecord(entry);
@@ -1408,20 +1426,24 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
       }
     }
   });
+  visitBeforeServer(toml, parsed, "credential_pool");
   const pool = asRecord(parsed["credential_pool"]) ?? {};
   realizePositionalEnv(pool, positionalFields("credential_pool") ?? []);
   readTypedInt(toml, "credential_pool", pool, "cooldown_seconds", "u64", 30);
   readTypedInt(toml, "credential_pool", pool, "failure_threshold", "u32", 2);
   readVariant(toml, "credential_pool", pool, "strategy", ["round-robin", "weighted"], "SelectionStrategy");
+  visitBeforeServer(toml, parsed, "discovery");
   const discovery = asRecord(parsed["discovery"]) ?? {};
   realizePositionalEnv(discovery, positionalFields("discovery") ?? []);
   readTypedInt(toml, "discovery", discovery, "refresh_interval_seconds", "u64", 300);
+  visitBeforeServer(toml, parsed, "failover");
   const failover = asRecord(parsed["failover"]) ?? {};
   realizePositionalEnv(failover, positionalFields("failover") ?? []);
   readTypedInt(toml, "failover", failover, "cooldown_seconds", "u64", 30);
   readTypedInt(toml, "failover", failover, "failure_threshold", "u32", 3);
   readTypedInt(toml, "failover", failover, "max_attempts", "u32", 3);
   readTypedInt(toml, "failover", failover, "overall_timeout_ms", "u64", 30_000);
+  visitBeforeServer(toml, parsed, "gateway_key");
   asArray(parsed["gateway_key"]).forEach((entry, index) => {
     rejectEnvElement(parsed["gateway_key"], index, "GatewayKey");
     const row = asRecord(entry);
@@ -1435,6 +1457,7 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
       missingField(row, "namespace", `default.gateway_key.${index}`);
     }
   });
+  visitBeforeServer(toml, parsed, "namespace");
   asArray(parsed["namespace"]).forEach((entry, index) => {
     rejectEnvElement(parsed["namespace"], index, "Namespace");
     const row = asRecord(entry);
@@ -1448,6 +1471,7 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
       missingField(row, "id", `default.namespace.${index}`);
     }
   });
+  visitBeforeServer(toml, parsed, "price");
   asArray(parsed["price"]).forEach((entry, index) => {
     rejectEnvElement(parsed["price"], index, "PriceRule");
     const row = asRecord(entry);
@@ -1456,6 +1480,7 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
     }
     rejectPriceExtract(toml, index, row);
   });
+  visitBeforeServer(toml, parsed, "provider");
   asArray(parsed["provider"]).forEach((entry, index) => {
     rejectEnvElement(parsed["provider"], index, "Provider");
     const row = asRecord(entry);

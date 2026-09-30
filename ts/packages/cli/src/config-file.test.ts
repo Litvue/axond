@@ -939,6 +939,47 @@ output_microdollars_per_million = 1
   }
 });
 
+test("admission_float_beats_a_later_failover_array", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-order-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "order.toml");
+  await writeFile(
+    config,
+    `
+failover = [1.5]
+[admission]
+max_request_bytes = 1.5
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        '`: config load: invalid type: found float `1.5`, expected usize for key "default.admission.max_request_bytes" in ' +
+        figmentFileSource(config, root) +
+        " TOML file\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function run(
   config: string,
   cwd: string,
