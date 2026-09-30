@@ -388,6 +388,99 @@ test("credential and gateway key graph matches the rust refusals", async () => {
   );
 });
 
+test("catalogue boot matches the rust refusals", async () => {
+  const reader = envSecretReader({ GW_KEY: "k", OPENAI_KEY: "sk" }, async () => "");
+  const https =
+    "catalog.source_url `http://models.dev/catalog.json` must be `https://`: imported metadata is read for pricing and enablement decisions, so a source that can be substituted in transit is refused rather than trusted";
+  const reject = async (extra: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(`${GRAPH}${extra}`, reader),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const loaded = await loadConfig(`${GRAPH}[catalog]\nsource = "models-dev"\n`, reader);
+  assert.deepEqual(loaded.catalog, { source: "models-dev", sourceUrl: "https://models.dev/catalog.json" });
+  const mirror = await loadConfig(
+    `${GRAPH}[catalog]\nsource = "models-dev"\nsource_url = "https://mirror.example/models.dev/catalog.json"\n`,
+    reader,
+  );
+  assert.equal(mirror.catalog.sourceUrl, "https://mirror.example/models.dev/catalog.json");
+  const queried = await loadConfig(
+    `${GRAPH}[catalog]\nsource = "models-dev"\nsource_url = "https://models.dev/catalog.json?x=1"\n`,
+    reader,
+  );
+  assert.equal(queried.catalog.sourceUrl, "https://models.dev/catalog.json?x=1");
+  const seeded = await loadConfig(`${GRAPH}[catalog]\nsource = "seed"\n`, reader);
+  assert.deepEqual(seeded.catalog, { source: "seed", sourceUrl: null });
+  const ignored = await loadConfig(
+    `${GRAPH}[catalog]\nsource = "none"\nsource_url = "http://models.dev/catalog.json"\n`,
+    reader,
+  );
+  assert.deepEqual(ignored.catalog, { source: "none" });
+
+  await reject('[catalog]\nsource = "models-dev"\nrefresh_interval_seconds = 0\n', "catalog.refresh_interval_seconds must be at least 1");
+  await reject('[catalog]\nsource = "models-dev"\nmax_payload_bytes = 0\n', "catalog.max_payload_bytes must be at least 1");
+  await reject(
+    '[catalog]\nsource = "models-dev"\nrefresh_interval_seconds = 30\n',
+    "catalog: catalogue refresh timeout (60s) must not exceed the interval (30s)",
+  );
+  await reject(
+    '[catalog]\nsource = "models-dev"\nretry_initial_seconds = 600\nretry_max_seconds = 60\n',
+    "catalog: backoff.max (60s) must be at least backoff.initial (600s)",
+  );
+  await reject(
+    '[catalog]\nsource = "models-dev"\nrefresh_interval_seconds = 120\n',
+    "catalog: catalogue retry ceiling (3600s) must not exceed the refresh interval (120s): a refusing deployment would refresh less often than a healthy one",
+  );
+  await reject('[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\n', https);
+  await reject(
+    '[catalog]\nsource = "models-dev"\nsource_url = "https://"\n',
+    "catalog.source_url is not a valid URL: empty host",
+  );
+  await reject(
+    '[catalog]\nsource = "models-dev"\nsource_url = "not a url"\n',
+    "catalog.source_url is not a valid URL: relative URL without a base",
+  );
+  await reject(
+    '[catalog]\nsource = "models-dev"\nsource_url = "https:///catalog.json"\n',
+    "catalog.source_url must name an HTTPS host",
+  );
+  await reject(
+    '[catalog]\nsource = "models-dev"\nsource_url = "https://user:secret@mirror.example/catalog.json"\n',
+    "catalog.source_url must not contain embedded credentials",
+  );
+  await reject(
+    '[catalog]\nsource = "models-dev"\nsource_url = "https://models.dev/nope"\n',
+    "catalog.source_url: `https://models.dev/nope` is not a supported models.dev document; only `/catalog.json` is (`api.json` and `models.json` have different shapes)",
+  );
+  await reject(
+    '[catalog]\nsource = "seed"\nsource_url = "https://models.dev/catalog.json"\n',
+    "catalog `seed`: `source_url` applies only to `models-dev`",
+  );
+  await reject(
+    '[catalog]\nsource = "models-dev"\nsource_url = "https://models.dev/nope"\n[[credential]]\nnamespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"\n',
+    "catalog.source_url: `https://models.dev/nope` is not a supported models.dev document; only `/catalog.json` is (`api.json` and `models.json` have different shapes)",
+  );
+  await reject(
+    '[discovery]\nrefresh_interval_seconds = 0\n[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\n',
+    "discovery.refresh_interval_seconds must be at least 1",
+  );
+  const long = `https://mirror.example/${"snapshot/".repeat(20)}not-the-catalogue.json`;
+  await assert.rejects(
+    () => loadConfig(`${GRAPH}[catalog]\nsource = "models-dev"\nsource_url = "${long}"\n`, reader),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : "";
+      assert.equal(message.includes("not-the-catalogue.json"), true);
+      assert.equal(message.includes("secret"), false);
+      assert.equal(message.startsWith("catalog.source_url: `"), true);
+      return true;
+    },
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),

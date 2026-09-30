@@ -212,6 +212,11 @@ export async function loadConfig(
       onUnavailable,
     };
   }
+  const discoveryEarly = asRecord(parsed["discovery"]) ?? {};
+  const discoveryIntervalSeconds = numberField(discoveryEarly, "refresh_interval_seconds", 300);
+  if (discoveryIntervalSeconds < 1) {
+    throw configError("discovery.refresh_interval_seconds must be at least 1");
+  }
 
   const namespaces = asArray(parsed["namespace"]).map((entry) => {
     const row = asRecord(entry) ?? {};
@@ -276,6 +281,7 @@ export async function loadConfig(
   if (!Number.isInteger(targetCooldown) || targetCooldown < 1) {
     throw configError("failover.cooldown_seconds must be at least 1");
   }
+  const catalog = validateCatalog(asRecord(parsed["catalog"]) ?? {});
 
   const credentials: CredentialConfig[] = [];
   const credentialLabels = new Map<string, string[]>();
@@ -444,31 +450,11 @@ export async function loadConfig(
   } catch (error) {
     throw configError(error instanceof Error ? error.message : "invalid admission");
   }
-  const discovery = asRecord(parsed["discovery"]) ?? {};
-  const discoveryIntervalSeconds = numberField(discovery, "refresh_interval_seconds", 300);
-  if (discoveryIntervalSeconds < 1) {
-    throw configError("discovery.refresh_interval_seconds must be at least 1");
-  }
 
   const shutdown = loadShutdown(asRecord(parsed["shutdown"]) ?? {});
 
   const extensions = asRecord(parsed["extensions"]);
   const extensionsDir = typeof extensions?.["dir"] === "string" ? extensions["dir"] : null;
-
-  const catalogRaw = asRecord(parsed["catalog"]) ?? {};
-  const catalogSource = catalogRaw["source"];
-  let catalog: LoadedConfig["catalog"] = { source: "none" };
-  if (catalogSource === "models-dev" || catalogSource === "models_dev") {
-    const sourceUrl = typeof catalogRaw["source_url"] === "string" ? catalogRaw["source_url"] : null;
-    if (sourceUrl !== null) {
-      assertHttpsCatalog(sourceUrl);
-    }
-    catalog = { source: "models-dev", sourceUrl };
-  } else if (catalogSource === "seed") {
-    catalog = { source: "seed", sourceUrl: null };
-  } else if (catalogSource !== undefined && catalogSource !== "none") {
-    throw configError("`[catalog] source` must be `none`, `models-dev`, or `seed`");
-  }
 
   const loaded: LoadedConfig = {
     bind,
@@ -692,19 +678,153 @@ function loadShutdown(row: Record<string, unknown>): LoadedConfig["shutdown"] {
   return { drainGraceMs, deadlineMs, flushTimeoutMs };
 }
 
-function assertHttpsCatalog(sourceUrl: string): void {
-  let url: URL;
-  try {
-    url = new URL(sourceUrl);
-  } catch {
-    throw configError("catalog source_url is not a URL");
+const MODELS_DEV_CATALOG_URL = "https://models.dev/catalog.json";
+const CATALOG_REFRESH_INTERVAL_SECONDS = 21_600;
+const CATALOG_REFRESH_TIMEOUT_SECONDS = 60;
+const CATALOG_RETRY_INITIAL_SECONDS = 60;
+const CATALOG_RETRY_MAX_SECONDS = 3_600;
+const CATALOG_CONNECT_TIMEOUT_MS = 10_000;
+const CATALOG_OPERATION_TIMEOUT_MS = 30_000;
+const CATALOG_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Enabled catalogue imports are refused with the Rust sentences. A disabled
+ * section is not checked: fields left at their defaults describe an import
+ * that will never run.
+ */
+function validateCatalog(row: Record<string, unknown>): LoadedConfig["catalog"] {
+  const sourceRaw = row["source"];
+  const source =
+    sourceRaw === "models-dev" || sourceRaw === "models_dev"
+      ? "models-dev"
+      : sourceRaw === "seed"
+        ? "seed"
+        : sourceRaw === undefined || sourceRaw === "none"
+          ? "none"
+          : null;
+  if (source === null) {
+    throw configError("`[catalog] source` must be `none`, `models-dev`, or `seed`");
   }
-  if (url.protocol !== "https:") {
-    throw configError("a catalogue source url must be https");
+  if (source === "none") {
+    return { source: "none" };
   }
-  if (url.username.length > 0 || url.password.length > 0) {
-    throw configError("a catalogue source url must have a host without credentials");
+  for (const [field, fallback] of [
+    ["refresh_interval_seconds", CATALOG_REFRESH_INTERVAL_SECONDS],
+    ["refresh_timeout_seconds", CATALOG_REFRESH_TIMEOUT_SECONDS],
+    ["retry_initial_seconds", CATALOG_RETRY_INITIAL_SECONDS],
+    ["retry_max_seconds", CATALOG_RETRY_MAX_SECONDS],
+    ["connect_timeout_ms", CATALOG_CONNECT_TIMEOUT_MS],
+    ["operation_timeout_ms", CATALOG_OPERATION_TIMEOUT_MS],
+  ] as const) {
+    catalogInt(row, field, fallback);
   }
+  catalogInt(row, "max_payload_bytes", CATALOG_MAX_PAYLOAD_BYTES);
+  const interval = catalogInt(row, "refresh_interval_seconds", CATALOG_REFRESH_INTERVAL_SECONDS);
+  const timeout = catalogInt(row, "refresh_timeout_seconds", CATALOG_REFRESH_TIMEOUT_SECONDS);
+  const initial = catalogInt(row, "retry_initial_seconds", CATALOG_RETRY_INITIAL_SECONDS);
+  const max = catalogInt(row, "retry_max_seconds", CATALOG_RETRY_MAX_SECONDS);
+  if (timeout > interval) {
+    throw configError(
+      `catalog: catalogue refresh timeout (${timeout}s) must not exceed the interval (${interval}s)`,
+    );
+  }
+  if (max < initial) {
+    throw configError(`catalog: backoff.max (${max}s) must be at least backoff.initial (${initial}s)`);
+  }
+  if (max > interval) {
+    throw configError(
+      `catalog: catalogue retry ceiling (${max}s) must not exceed the refresh interval (${interval}s): a refusing deployment would refresh less often than a healthy one`,
+    );
+  }
+  const sourceUrl = Object.hasOwn(row, "source_url") && typeof row["source_url"] === "string" ? row["source_url"] : null;
+  if (source !== "models-dev") {
+    if (Object.hasOwn(row, "source_url")) {
+      throw configError(`catalog \`${source}\`: \`source_url\` applies only to \`models-dev\``);
+    }
+    return { source: "seed", sourceUrl: null };
+  }
+  const url = sourceUrl ?? MODELS_DEV_CATALOG_URL;
+  assertCatalogUrl(url);
+  return { source: "models-dev", sourceUrl: url };
+}
+
+function catalogInt(row: Record<string, unknown>, key: string, fallback: number): number {
+  const value = numberField(row, key, fallback);
+  if (Number.isInteger(value) && value < 1) {
+    throw configError(`catalog.${key} must be at least 1`);
+  }
+  return Number.isInteger(value) ? value : fallback;
+}
+
+function assertCatalogUrl(sourceUrl: string): void {
+  const parsed = rustUrl(sourceUrl);
+  if (parsed.error !== null) {
+    throw configError(`catalog.source_url is not a valid URL: ${parsed.error}`);
+  }
+  if (parsed.scheme !== "https") {
+    throw configError(
+      `catalog.source_url \`${sourceUrl}\` must be \`https://\`: imported metadata is read for pricing and enablement decisions, so a source that can be substituted in transit is refused rather than trusted`,
+    );
+  }
+  if (!parsed.hasAuthority) {
+    throw configError("catalog.source_url must name an HTTPS host");
+  }
+  if (parsed.username.length > 0 || parsed.password) {
+    throw configError("catalog.source_url must not contain embedded credentials");
+  }
+  const afterScheme = sourceUrl.split("://")[1] ?? sourceUrl;
+  const path = afterScheme.split(/[?#]/, 1)[0] ?? afterScheme;
+  if (!path.endsWith("/catalog.json")) {
+    throw configError(
+      "catalog.source_url: `" +
+        excerptLocated(sourceUrl) +
+        "` is not a supported models.dev document; only `/catalog.json` is (`api.json` and `models.json` have different shapes)",
+    );
+  }
+}
+
+function rustUrl(value: string): { error: string | null; scheme: string; hasAuthority: boolean; username: string; password: boolean } {
+  const schemeMatch = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.*)$/s.exec(value);
+  if (!schemeMatch) {
+    return { error: "relative URL without a base", scheme: "", hasAuthority: false, username: "", password: false };
+  }
+  const scheme = schemeMatch[1]!.toLowerCase();
+  const rest = schemeMatch[2] ?? "";
+  if (rest.length === 0) {
+    return { error: "empty host", scheme, hasAuthority: false, username: "", password: false };
+  }
+  const authority = rest.split(/[/?#]/, 1)[0] ?? "";
+  const hasAuthority = authority.length > 0;
+  let username = "";
+  let password = false;
+  const at = authority.lastIndexOf("@");
+  if (at !== -1) {
+    const userinfo = authority.slice(0, at);
+    const colon = userinfo.indexOf(":");
+    if (colon === -1) {
+      username = userinfo;
+    } else {
+      username = userinfo.slice(0, colon);
+      password = true;
+    }
+  }
+  return { error: null, scheme, hasAuthority, username, password };
+}
+
+function excerptLocated(value: string): string {
+  const bytes = Buffer.from(value);
+  if (bytes.length <= 128) {
+    return value;
+  }
+  let head = 96;
+  while (head > 0 && (bytes[head]! & 0xc0) === 0x80) {
+    head -= 1;
+  }
+  let tail = bytes.length - 32;
+  while (tail < bytes.length && (bytes[tail]! & 0xc0) === 0x80) {
+    tail += 1;
+  }
+  return `${bytes.subarray(0, head).toString("utf8")}… (${bytes.length} bytes) …${bytes.subarray(tail).toString("utf8")}`;
 }
 
 function rejectUsageJournal(parsed: Record<string, unknown>): void {

@@ -48,6 +48,15 @@ uses Rust's `entity not found`, `is a directory`, and `not valid UTF-8`
 wording. A price row that names an unknown provider, and
 `failover.failure_threshold = 0`, are reported before a bad credential.
 
+An enabled `[catalog]` uses the Rust bounds. `source = "models-dev"` with no
+`source_url` fetches `https://models.dev/catalog.json`. A plaintext URL, a URL
+with embedded credentials, a hostless URL, and any document other than
+`/catalog.json` fails boot with the Rust sentence, and the credential is not
+echoed. `source = "seed"` rejects `source_url`. A zero refresh interval, a
+timeout above the interval, and a retry ceiling above the interval fail boot.
+`discovery.refresh_interval_seconds = 0` is reported before those catalogue
+errors. A disabled catalogue ignores `source_url`.
+
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
 directory of `.ts`, `.js`, or `.mjs` files. Each file's default export is an

@@ -311,6 +311,56 @@ namespace = "platform"
   }
 });
 
+test("catalogue_boot_matches_the_rust_refusals", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-catalog-"));
+  const db = join(root, "fresh.sqlite");
+  const base = `
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`;
+  try {
+    const http = join(root, "http.toml");
+    await writeFile(
+      http,
+      `${base}[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\n`,
+    );
+    const httpRun = await run(http, root, { GW_KEY: "k" });
+    assert.equal(httpRun.code, 1);
+    assert.equal(httpRun.stdout, "");
+    assert.equal(
+      httpRun.stderr,
+      "Error: failed to load config from `" +
+        http +
+        "`: invalid config: catalog.source_url `http://models.dev/catalog.json` must be `https://`: imported metadata is read for pricing and enablement decisions, so a source that can be substituted in transit is refused rather than trusted\n",
+    );
+    await assert.rejects(() => stat(db));
+
+    const discovery = join(root, "discovery.toml");
+    await writeFile(
+      discovery,
+      `${base}[discovery]\nrefresh_interval_seconds = 0\n[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\n`,
+    );
+    const discoveryRun = await run(discovery, root, { GW_KEY: "k" });
+    assert.equal(discoveryRun.code, 1);
+    assert.equal(discoveryRun.stdout, "");
+    assert.equal(
+      discoveryRun.stderr,
+      "Error: failed to load config from `" +
+        discovery +
+        "`: invalid config: discovery.refresh_interval_seconds must be at least 1\n",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function run(
   config: string,
   cwd: string,
