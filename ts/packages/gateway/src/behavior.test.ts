@@ -2593,6 +2593,107 @@ test("a split rate-limit frame before content rotates without leaking the prefix
   upstream.close();
 });
 
+test("a chat rate limit before content on one credential fails the stream", async () => {
+  const store = await seeded();
+  const seen: string[] = [];
+  const records: UsageRecord[] = [];
+  const upstreamBytes = 'data: {"error":{"type":"rate_limit_exceeded","message":"slow down"}}\n\n';
+  const upstream = await listen((req, res) => {
+    seen.push(req.headers.authorization ?? "");
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(upstreamBytes);
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "only-key", id: "only" }],
+    credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: CHAT_HEADERS,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.equal(body.startsWith(upstreamBytes), true);
+  assert.match(body, /provider stream was rate limited: slow down/);
+  assert.match(body, /data: \[DONE\]/);
+  assert.equal(body.includes("only-key"), false);
+  assert.equal(body.includes(KEY), false);
+  assert.deepEqual(seen, ["Bearer only-key"]);
+  for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+    await new Promise((wake) => setTimeout(wake, 10));
+  }
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.status, "upstream_error");
+  const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
+  const rows = (await status.json()).data as { credential_id: string; state: string }[];
+  assert.equal(rows.find((row) => row.credential_id === "only")?.state, "parked");
+  upstream.close();
+});
+
+test("a chat rate limit with no credential left fails the stream", async () => {
+  const store = await seeded();
+  const seen: string[] = [];
+  const records: UsageRecord[] = [];
+  const lastBytes = 'data: {"error":{"type":"rate_limit_exceeded","message":"last key"}}\n\n';
+  const upstream = await listen((req, res) => {
+    const authorization = req.headers.authorization ?? "";
+    seen.push(authorization);
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    if (authorization.includes("bad-key")) {
+      res.end('data: {"error":{"type":"rate_limit_exceeded","message":"first key"}}\n\n');
+      return;
+    }
+    res.end(lastBytes);
+  });
+  const app = poolApp(store, upstream.url, {
+    credentialPool: { failureThreshold: 1, cooldownMs: 30_000 },
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: CHAT_HEADERS,
+    body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.text();
+  assert.equal(body.startsWith(lastBytes), true);
+  assert.equal(body.includes("first key"), false);
+  assert.match(body, /provider stream was rate limited: last key/);
+  assert.match(body, /data: \[DONE\]/);
+  assert.equal(body.includes("bad-key"), false);
+  assert.equal(body.includes("good-key"), false);
+  assert.equal(body.includes(KEY), false);
+  assert.deepEqual(seen, ["Bearer bad-key", "Bearer good-key"]);
+  for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+    await new Promise((wake) => setTimeout(wake, 10));
+  }
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.status, "upstream_error");
+  const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
+  const rows = (await status.json()).data as { credential_id: string; state: string }[];
+  assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "parked");
+  assert.equal(rows.find((row) => row.credential_id === "good")?.state, "parked");
+  upstream.close();
+});
+
 test("a rate limit after chat content stays on that stream", async () => {
   const store = await seeded();
   const seen: string[] = [];

@@ -551,7 +551,6 @@ function relayStream(
       : null;
   let rateLimitNoted = false;
   let stopRateLimitScan = false;
-  let sawChatContent = false;
   let observedChars = 0;
   let sawDownstream = false;
   let sawUpstream = false;
@@ -595,10 +594,10 @@ function relayStream(
       if (data && isRateLimitPayload(data)) {
         rateLimitNoted = true;
         onCredentialRateLimit();
-        return route === "chat" && sawChatContent ? chatRateLimitFailure(data) : null;
-      }
-      if (route === "chat" && data && data !== "[DONE]") {
-        sawChatContent = true;
+        // Rotation already consumed a pre-content chat rate limit when another
+        // credential existed. A chat rate limit that reaches here is the only
+        // credential, or it arrived after content. Either way the relay fails.
+        return route === "chat" ? chatRateLimitFailure(data) : null;
       }
     }
     return null;
@@ -767,9 +766,11 @@ function relayStream(
             controller.enqueue(chunk.value);
             return;
           }
+          // No later credential accepted the stream. Keep the provider bytes,
+          // then fail with the same rate-limit wording. rotateStream already
+          // counted this credential's failure.
           releaseHeld(controller);
-          finish("end");
-          controller.close();
+          failBound(controller, chatRateLimitFailure(first));
           return;
         }
         if (await closeRateLimit(controller, consider(releaseHeld(controller)))) {
@@ -827,7 +828,7 @@ function firstCompleteData(text: string): string | undefined {
 }
 
 /**
- * Chat wording once content has already been released.
+ * Chat wording for a rate-limit SSE event that the relay cannot rotate away.
  * The provider `/error/message` wins, including an empty one. A missing message
  * uses the OpenAI default. The diagnostic is cut at 4096 bytes.
  */
