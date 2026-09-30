@@ -279,17 +279,36 @@ export interface AxondOptions {
     instanceId?: string;
     fetch?: typeof fetch;
   };
-  /** One JSON object per request. The gateway never puts a body or credential in it. */
+  /**
+   * One JSON object per request, written when the handler returns. It carries
+   * the server-span fields known at that moment. A buffered charge includes
+   * status, tokens, and cost. A stream has been routed but has not settled, so
+   * those fields are absent. The gateway never puts a body or credential in it.
+   */
   onLog?: (record: {
     msg: "request";
     request_id: string;
+    trace_id: string;
+    span_id: string;
     http_method: string;
     http_route: string;
     status_code: number;
     duration_ms: number;
     namespace: string;
+    subject: string;
     model: string;
-    trace_id: string;
+    target_provider?: string;
+    target_model?: string;
+    credential_source?: string;
+    status?: string;
+    retry_count?: number;
+    input_tokens?: string;
+    cache_read_tokens?: string;
+    cache_write_tokens?: string;
+    output_tokens?: string;
+    cost_microdollars?: string | null;
+    latency_ms?: number;
+    ttft_ms?: number;
   }) => void;
   maxRequestBytes?: number;
   /**

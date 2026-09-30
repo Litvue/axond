@@ -20,6 +20,12 @@ async function gateway(
   metrics?: ReturnType<typeof createMetrics>,
   telemetry?: { endpoint: string; instanceId?: string },
   responseBody?: string,
+  onLog?: (record: {
+    msg: "request";
+    status?: string;
+    input_tokens?: string;
+    [key: string]: unknown;
+  }) => void,
 ) {
   const store = createMemoryStore();
   await store.putNamespace({
@@ -69,6 +75,7 @@ async function gateway(
     rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
     metrics,
     telemetry,
+    onLog,
   });
   return { app, store, upstream };
 }
@@ -319,6 +326,170 @@ test("otlp json joins traceparent and omits the prompt", async () => {
     upstream.close();
     collector.closeAllConnections();
     collector.close();
+  }
+});
+
+test("request_log_carries_server_span_fields_and_omits_content", async () => {
+  const logs: {
+    msg: string;
+    request_id: string;
+    trace_id: string;
+    span_id: string;
+    http_method: string;
+    http_route: string;
+    status_code: number;
+    duration_ms: number;
+    namespace: string;
+    subject: string;
+    model: string;
+    target_provider?: string;
+    target_model?: string;
+    credential_source?: string;
+    status?: string;
+    retry_count?: number;
+    input_tokens?: string;
+    cache_read_tokens?: string;
+    cache_write_tokens?: string;
+    output_tokens?: string;
+    cost_microdollars?: string | null;
+    latency_ms?: number;
+    ttft_ms?: number;
+  }[] = [];
+  const completion = JSON.stringify({
+    id: "chatcmpl-test",
+    choices: [{ message: { role: "assistant", content: "COMPLETION_SENTINEL" } }],
+    usage: { prompt_tokens: 12, completion_tokens: 7 },
+  });
+  const { app, upstream } = await gateway(undefined, undefined, completion, (record) => {
+    logs.push(record as (typeof logs)[number]);
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${KEY}`,
+        "content-type": "application/json",
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      },
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), completion);
+    assert.equal(logs.length, 1);
+    const line = logs[0]!;
+    assert.equal(line.msg, "request");
+    assert.equal(line.http_method, "POST");
+    assert.equal(line.http_route, "/ns/{namespace}/v1/chat/completions");
+    assert.equal(line.status_code, 200);
+    assert.equal(line.namespace, "platform");
+    assert.equal(line.subject, "gateway-key");
+    assert.equal(line.model, "fake-openai/gpt-test");
+    assert.equal(line.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+    assert.match(line.span_id, /^[0-9a-f]{16}$/);
+    assert.equal(line.target_provider, "fake-openai");
+    assert.equal(line.target_model, "gpt-test");
+    assert.equal(line.credential_source, "platform");
+    assert.equal(line.status, "ok");
+    assert.equal(line.retry_count, 0);
+    assert.equal(line.input_tokens, "12");
+    assert.equal(line.output_tokens, "7");
+    assert.equal(line.cache_read_tokens, "0");
+    assert.equal(line.cache_write_tokens, "0");
+    assert.equal(line.cost_microdollars, "100");
+    assert.equal(typeof line.latency_ms, "number");
+    assert.equal(typeof line.ttft_ms, "number");
+    assert.ok(line.request_id.length > 0);
+    const encoded = JSON.stringify(line);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+    assert.equal(encoded.includes("COMPLETION_SENTINEL"), false);
+    assert.equal(encoded.includes(KEY), false);
+    assert.equal(encoded.includes("upstream-openai"), false);
+  } finally {
+    upstream.close();
+  }
+
+  const streamLogs: typeof logs = [];
+  const sse = 'data: {"choices":[{"delta":{"content":"COMPLETION_SENTINEL"}}]}\n\ndata: [DONE]\n\n';
+  const streamUpstream = await new Promise<{ url: string; close: () => void }>((resolve) => {
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(sse);
+      });
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("no port");
+      }
+      resolve({
+        url: `http://127.0.0.1:${address.port}`,
+        close: () => {
+          server.closeAllConnections();
+          server.close();
+        },
+      });
+    });
+  });
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000_000_000n);
+  const streamApp = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: streamUpstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream-openai", id: "openai" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 2_500_000n,
+        outputMicrodollarsPerMillion: 10_000_000n,
+      },
+    ],
+    onLog: (record) => {
+      streamLogs.push(record);
+    },
+  });
+  try {
+    const response = await streamApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        stream: true,
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(streamLogs.length, 1);
+    const opened = streamLogs[0]!;
+    assert.equal(opened.target_provider, "fake-openai");
+    assert.equal(opened.target_model, "gpt-test");
+    assert.equal(opened.credential_source, "platform");
+    assert.equal(opened.status, undefined);
+    assert.equal(opened.input_tokens, undefined);
+    assert.equal(opened.cost_microdollars, undefined);
+    const body = await response.text();
+    assert.equal(body.includes("COMPLETION_SENTINEL"), true);
+    const encoded = JSON.stringify(opened);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+    assert.equal(encoded.includes("COMPLETION_SENTINEL"), false);
+    assert.equal(encoded.includes(KEY), false);
+    assert.equal(encoded.includes("upstream-openai"), false);
+  } finally {
+    streamUpstream.close();
   }
 });
 

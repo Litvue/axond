@@ -121,17 +121,20 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
         admission.observeAge(opts.metrics);
         const axond = readAxond(c);
         const ended = Date.now();
-        opts.onLog?.({
-          msg: "request",
-          request_id: axond?.requestId ?? "",
-          http_method: httpAttributes["http.request.method"] ?? "",
-          http_route: httpAttributes["http.route"] ?? "",
-          status_code: status,
-          duration_ms: ended - started,
-          namespace: axond?.namespace?.id ?? "",
-          model: axond?.alias ?? "",
-          trace_id: trace?.traceId ?? "",
-        });
+        opts.onLog?.(
+          requestLog(
+            axond,
+            trace,
+            {
+              method: httpAttributes["http.request.method"] ?? "",
+              route: httpAttributes["http.route"] ?? "",
+              status,
+              durationMs: ended - started,
+            },
+            ended,
+            secretValues(opts),
+          ),
+        );
         if (opts.telemetry && trace) {
           const attributes = sanitizeAttributes(
             {
@@ -1197,6 +1200,65 @@ function settlementCost(opts: AxondOptions, axond: MutableContext, usage: UsageT
     || usage.cacheReadTokens > 0n
     || usage.cacheWriteTokens > 0n;
   return status === "upstream_error" && !measured ? 0n : priced;
+}
+
+type RequestLog = Parameters<NonNullable<AxondOptions["onLog"]>>[0];
+
+function requestLog(
+  axond: MutableContext | undefined,
+  trace: TraceContext | undefined,
+  http: { method: string; route: string; status: number; durationMs: number },
+  endedMs: number,
+  secrets: readonly string[],
+): RequestLog {
+  const text = (value: string) =>
+    secrets.some((secret) => secret.length > 0 && value.includes(secret)) ? "" : value;
+  const record: RequestLog = {
+    msg: "request",
+    request_id: text(axond?.requestId ?? ""),
+    trace_id: trace?.traceId ?? "",
+    span_id: trace?.spanId ?? "",
+    http_method: http.method,
+    http_route: http.route,
+    status_code: http.status,
+    duration_ms: http.durationMs,
+    namespace: text(axond?.namespace?.id ?? ""),
+    subject: text(axond?.subject ?? ""),
+    model: text(axond?.alias ?? ""),
+  };
+  if (!axond?.target) {
+    return record;
+  }
+  const provider = text(axond.target.provider);
+  const targetModel = text(axond.target.model);
+  if (provider.length > 0) {
+    record.target_provider = provider;
+  }
+  if (targetModel.length > 0) {
+    record.target_model = targetModel;
+  }
+  if (axond.servedCredentialId.length > 0) {
+    const source = text(axond.servedCredentialSource);
+    if (source.length > 0) {
+      record.credential_source = source;
+    }
+  }
+  const settlement = axond.settlement;
+  if (!settlement) {
+    return record;
+  }
+  record.status = settlement.status;
+  record.retry_count = Math.max(0, axond.upstreamAttempts - 1);
+  record.input_tokens = settlement.usage.inputTokens.toString();
+  record.cache_read_tokens = settlement.usage.cacheReadTokens.toString();
+  record.cache_write_tokens = settlement.usage.cacheWriteTokens.toString();
+  record.output_tokens = settlement.usage.outputTokens.toString();
+  record.cost_microdollars = settlement.cost === null ? null : settlement.cost.toString();
+  record.latency_ms = Math.max(0, endedMs - axond.startedMs);
+  if (axond.ttftMs !== null) {
+    record.ttft_ms = axond.ttftMs;
+  }
+  return record;
 }
 
 function serverSpanAttributes(axond: MutableContext | undefined, endedMs: number): Record<string, string> {
