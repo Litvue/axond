@@ -5,7 +5,7 @@ export type { LoadedConfig, SecretReader } from "./config.ts";
 export { createMemoryStore, budgetJson, money, namespaceJson } from "./memory-store.ts";
 export { GatewayFailure, gatewayError } from "./errors.ts";
 export { constantTimeEqual } from "./auth.ts";
-export { rewriteTopLevelModel } from "./body.ts";
+export { forceChatIncludeUsage, rewriteTopLevelModel } from "./body.ts";
 export { createMetrics, METRIC_NAMES, sanitizeAttributes } from "./metrics.ts";
 export { resolveTelemetry } from "./otel.ts";
 export { OPENAPI } from "./openapi.ts";
