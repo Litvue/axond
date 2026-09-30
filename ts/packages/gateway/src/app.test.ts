@@ -962,7 +962,10 @@ test("management_json_rejects_unknown_fields_and_out_of_range_limits", async () 
   });
   const exact = await call("/api/v1/namespaces/wsp_x/budgets/2026-09", "PUT", '{"limit_microdollars":9223372036854775807}');
   assert.equal(exact.status, 200);
-  assert.equal((await exact.json()).limit_microdollars, "9223372036854775807");
+  assert.equal(
+    await exact.text(),
+    '{"namespace":"wsp_x","period":"2026-09","limit_microdollars":9223372036854775807,"spent_microdollars":0,"reserved_microdollars":0,"remaining_microdollars":9223372036854775807,"active":true}',
+  );
   const weekly = await call("/api/v1/namespaces/wsp_x/budget", "PUT", '{"cadence":"weekly","limit_microdollars":1}');
   assert.equal(weekly.status, 400);
   assert.deepEqual(await weekly.json(), {
@@ -973,6 +976,47 @@ test("management_json_rejects_unknown_fields_and_out_of_range_limits", async () 
   });
   const absent = await call("/api/v1/namespaces/not-created", "GET");
   assert.equal(absent.status, 404);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("budget_amounts_match_serde_numbers", async () => {
+  const { app, upstream } = await gateway();
+  try {
+    const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+    const call = (path: string, method: string, body?: string) =>
+      app.request(`http://127.0.0.1${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+    assert.equal((await call("/api/v1/namespaces", "POST", '{"id":"wsp_amt"}')).status, 201);
+    const cap = "9223372036854775807";
+    const ledger =
+      `{"namespace":"wsp_amt","period":"2026-09","limit_microdollars":${cap},` +
+      `"spent_microdollars":0,"reserved_microdollars":0,"remaining_microdollars":${cap},"active":true}`;
+    const put = await call("/api/v1/namespaces/wsp_amt/budgets/2026-09", "PUT", `{"limit_microdollars":${cap}}`);
+    assert.equal(put.status, 200);
+    assert.equal(await put.text(), ledger);
+    const got = await call("/api/v1/namespaces/wsp_amt/budgets/2026-09", "GET");
+    assert.equal(got.status, 200);
+    assert.equal(await got.text(), ledger);
+    const policyBody =
+      `{"namespace":"wsp_amt","cadence":"fixed","limit_microdollars":${cap},"timezone":"UTC",` +
+      `"period":"2026-09","spent_microdollars":0,"reserved_microdollars":0,"remaining_microdollars":${cap},"active":true}`;
+    const policy = await call(
+      "/api/v1/namespaces/wsp_amt/budget",
+      "PUT",
+      `{"cadence":"fixed","limit_microdollars":${cap},"period":"2026-09","timezone":"UTC"}`,
+    );
+    assert.equal(policy.status, 200);
+    assert.equal(await policy.text(), policyBody);
+    const policyGet = await call("/api/v1/namespaces/wsp_amt/budget", "GET");
+    assert.equal(policyGet.status, 200);
+    assert.equal(await policyGet.text(), policyBody);
+    const small = await call("/api/v1/namespaces/wsp_amt/budgets/2026-08", "PUT", '{"limit_microdollars":3}');
+    assert.equal(small.status, 200);
+    assert.equal(
+      await small.text(),
+      '{"namespace":"wsp_amt","period":"2026-08","limit_microdollars":3,"spent_microdollars":0,"reserved_microdollars":0,"remaining_microdollars":3,"active":true}',
+    );
   } finally {
     upstream.close();
   }

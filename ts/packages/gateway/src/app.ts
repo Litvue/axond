@@ -37,7 +37,7 @@ import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors
 import { globMatch, validateGlob } from "./glob.ts";
 import { isJsonContentType } from "./content-type.ts";
 import { encodeAttrs, readStrictObject, type StrictField } from "./strict-json.ts";
-import { budgetJson, usageSummaryBody } from "./memory-store.ts";
+import { budgetPolicyBody, budgetRecordBody, usageSummaryBody } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, namespaceIdMessage, validatePeriod, validateTimezone } from "./namespace.ts";
 import { beginTrace, childTrace, formatTraceparent, metricPayload, parseTraceparent, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
 import { sanitizeAttributes } from "./metrics.ts";
@@ -1664,7 +1664,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
       const body = await readJson(c, BUDGET_PUT_FIELDS, "PutBudgetBody");
       const limit = requiredBig(body, "limit_microdollars");
       const row = await opts.store.putBudget(namespace, period, limit);
-      c.res = Response.json(budgetJson(row));
+      c.res = jsonBody(budgetRecordBody(row));
       return;
     }
     if (c.req.method === "GET") {
@@ -1673,7 +1673,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
         const known = await opts.store.getNamespace(namespace);
         throw new GatewayFailure(known ? "unknown_budget" : "unknown_namespace", 404, known ? "unknown budget" : "unknown namespace");
       }
-      c.res = Response.json(budgetJson(row));
+      c.res = jsonBody(budgetRecordBody(row));
       return;
     }
   }
@@ -1703,7 +1703,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
         period,
         nowMs: opts.clock?.() ?? Date.now(),
       });
-      c.res = Response.json(row);
+      c.res = jsonBody(budgetPolicyBody(row));
       return;
     }
     if (c.req.method === "GET") {
@@ -1712,7 +1712,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
         const known = await opts.store.getNamespace(namespace);
         throw new GatewayFailure(known ? "unknown_budget" : "unknown_namespace", 404, known ? "unknown budget" : "unknown namespace");
       }
-      c.res = Response.json(row);
+      c.res = jsonBody(budgetPolicyBody(row));
       return;
     }
   }

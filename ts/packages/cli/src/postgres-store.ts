@@ -12,7 +12,7 @@ import type {
 
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { encodeAttrs } from "../../gateway/src/strict-json.ts";
-import { foldUsageSummary, saturateMicrodollars } from "../../gateway/src/memory-store.ts";
+import { foldUsageSummary, money, saturateMicrodollars } from "../../gateway/src/memory-store.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 import {
   recordConnectionDiscarded,
@@ -243,12 +243,12 @@ export function createPostgresStore(
         return {
           namespace: input.namespace,
           cadence: input.cadence,
-          limit_microdollars: Number(input.limit),
+          limit_microdollars: money(input.limit),
           timezone: input.timezone,
           period,
-          spent_microdollars: Number(budget.spent),
+          spent_microdollars: money(budget.spent),
           reserved_microdollars: 0,
-          remaining_microdollars: Number(budget.limit - budget.spent),
+          remaining_microdollars: money(budget.limit > budget.spent ? budget.limit - budget.spent : 0n),
           active: true,
         };
       });
@@ -266,15 +266,17 @@ export function createPostgresStore(
         const active = await client.query("SELECT period FROM axond_store_budget_active WHERE namespace = $1", [namespace]);
         const period = String(active.rows[0]?.["period"] ?? "");
         const budget = await readBudget(client, namespace, period);
+        const limit = budget?.limit ?? BigInt(String(policy.rows[0]["limit_microdollars"]));
+        const spent = budget?.spent ?? 0n;
         return {
           namespace,
           cadence: policy.rows[0]["cadence"] === "monthly" ? "monthly" : "fixed",
-          limit_microdollars: Number(policy.rows[0]["limit_microdollars"]),
+          limit_microdollars: money(limit),
           timezone: String(policy.rows[0]["timezone"]),
           period,
-          spent_microdollars: Number(budget?.spent ?? 0n),
+          spent_microdollars: money(spent),
           reserved_microdollars: 0,
-          remaining_microdollars: Number((budget?.limit ?? 0n) - (budget?.spent ?? 0n)),
+          remaining_microdollars: money(limit > spent ? limit - spent : 0n),
           active: true,
         };
       });

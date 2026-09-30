@@ -410,8 +410,11 @@ export function usageSummaryBody(namespace: string, period: string, data: readon
   return `{"namespace":${JSON.stringify(namespace)},"period":${JSON.stringify(period)},"data":[${rows.join(",")}]}`;
 }
 
-function jsonUint(value: number | string): string {
-  return typeof value === "number" ? JSON.stringify(value) : value;
+function jsonUint(value: number | string | bigint): string {
+  if (typeof value === "number") {
+    return JSON.stringify(value);
+  }
+  return typeof value === "bigint" ? value.toString() : value;
 }
 
 function compareUtf8(left: string, right: string): number {
@@ -438,6 +441,35 @@ export function budgetJson(row: BudgetLedger) {
     remaining_microdollars: money(remaining),
     active: row.active,
   };
+}
+
+/** `PUT`/`GET` budget ledger. Amounts stay decimal digits, as serde emits `u64`. */
+export function budgetRecordBody(row: BudgetLedger): string {
+  const remaining = row.limit > row.spent ? row.limit - row.spent : 0n;
+  return (
+    `{"namespace":${JSON.stringify(row.namespace)},` +
+    `"period":${JSON.stringify(row.period)},` +
+    `"limit_microdollars":${row.limit.toString()},` +
+    `"spent_microdollars":${row.spent.toString()},` +
+    `"reserved_microdollars":0,` +
+    `"remaining_microdollars":${remaining.toString()},` +
+    `"active":${row.active ? "true" : "false"}}`
+  );
+}
+
+/** `PUT`/`GET` budget policy. Field order matches the Rust `BudgetPolicy` struct. */
+export function budgetPolicyBody(row: BudgetPolicy): string {
+  return (
+    `{"namespace":${JSON.stringify(row.namespace)},` +
+    `"cadence":${JSON.stringify(row.cadence)},` +
+    `"limit_microdollars":${jsonUint(row.limit_microdollars)},` +
+    `"timezone":${JSON.stringify(row.timezone)},` +
+    `"period":${JSON.stringify(row.period)},` +
+    `"spent_microdollars":${jsonUint(row.spent_microdollars)},` +
+    `"reserved_microdollars":${jsonUint(row.reserved_microdollars)},` +
+    `"remaining_microdollars":${jsonUint(row.remaining_microdollars)},` +
+    `"active":${row.active ? "true" : "false"}}`
+  );
 }
 
 export function namespaceJson(record: NamespaceWrite) {
