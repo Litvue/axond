@@ -472,6 +472,11 @@ export interface AxondOptions {
    * `waitUntil`.
    */
   waitUntil?: (promise: Promise<unknown>, request: Request) => void;
+  /**
+   * Exporter work with no request to bind it to. The CLI drains it inside the
+   * shutdown flush budget. The endpoint stays off the timeout line.
+   */
+  onBackground?: (task: Promise<void>) => void;
   prices?: PriceRule[];
   blocklist?: string[];
   credentials?: CredentialConfig[];

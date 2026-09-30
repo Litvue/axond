@@ -300,6 +300,40 @@ test("a second signal closes admission before the drain grace ends", async () =>
   }
 });
 
+test("telemetry_flush_times_out_without_the_endpoint", async () => {
+  const hung = createHttpServer(() => undefined);
+  await new Promise<void>((resolve) => {
+    hung.listen(0, "127.0.0.1", () => resolve());
+  });
+  const collectorPort = (hung.address() as AddressInfo).port;
+  const endpoint = `http://127.0.0.1:${collectorPort}`;
+  const child = await bootShutdown({ drainGraceMs: 0, deadlineMs: 50, flushTimeoutMs: 300 }, "test-inbound-key", {
+    OTEL_EXPORTER_OTLP_ENDPOINT: endpoint,
+    OTEL_EXPORTER_OTLP_PROTOCOL: "http/json",
+  });
+  try {
+    await waitFor(`${child.base}/healthz`);
+    child.proc.kill("SIGTERM");
+    const code = await Promise.race([
+      child.exited,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000)),
+    ]);
+    assert.equal(code, 0, child.log.stderr);
+    await child.stdoutEnded;
+    const lines = child.log.stdout.split("\n").filter((line) => line.includes('"msg":"telemetry_flush"'));
+    assert.equal(lines.length, 1, child.log.stdout);
+    assert.equal(lines[0], '{"msg":"telemetry_flush","outcome":"timeout"}');
+    const stopped = shutdownRecords(child.log.stdout).find((record) => record.phase === "stopped");
+    assert.equal(stopped?.usage_flushed, true);
+    assert.equal(stopped?.telemetry_flushed, false);
+    assert.equal(child.log.stdout.includes(endpoint), false);
+    assert.equal(child.log.stdout.includes(String(collectorPort)), false);
+  } finally {
+    hung.close();
+    await child.stop();
+  }
+});
+
 test("drain_grace_ms of 0 closes admission on the first signal", async () => {
   const child = await bootShutdown({ drainGraceMs: 0, deadlineMs: 400, flushTimeoutMs: 400 });
   try {
@@ -323,6 +357,7 @@ test("drain_grace_ms of 0 closes admission on the first signal", async () => {
     assert.equal(records.some((record) => record.phase === "spend_unsettled"), false);
     const stopped = records.find((record) => record.phase === "stopped");
     assert.equal(stopped?.usage_flushed, true);
+    assert.equal(stopped?.telemetry_flushed, true);
     assert.equal(JSON.stringify(records).includes("test-inbound-key"), false);
   } finally {
     await child.stop();
@@ -569,6 +604,7 @@ output_microdollars_per_million = 1
 async function bootShutdown(
   shutdown: { drainGraceMs: number; deadlineMs: number; flushTimeoutMs: number },
   gatewayKey = "test-inbound-key",
+  extraEnv: Record<string, string> = {},
 ) {
   const dir = await mkdtemp(join(tmpdir(), "axond-shutdown-"));
   const port = await freePort();
@@ -601,6 +637,7 @@ namespace = "platform"
       ...process.env,
       AXOND_CONFIG: join(dir, "axond.toml"),
       GW_INBOUND_KEY: gatewayKey,
+      ...extraEnv,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -744,6 +781,7 @@ function shutdownRecords(text: string): Array<{
   oldest_settlement_ms?: number;
   settle_share_ms?: number;
   usage_flushed?: boolean;
+  telemetry_flushed?: boolean;
 }> {
   const records = [];
   for (const line of text.split("\n")) {
@@ -764,6 +802,7 @@ function shutdownRecords(text: string): Array<{
       oldest_settlement_ms?: number;
       settle_share_ms?: number;
       usage_flushed?: boolean;
+      telemetry_flushed?: boolean;
     };
     if (parsed.msg === "shutdown") {
       records.push(parsed);

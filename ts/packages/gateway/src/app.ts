@@ -170,7 +170,7 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
           if (opts.waitUntil) {
             opts.waitUntil(task, c.req.raw);
           } else {
-            void task;
+            opts.onBackground?.(task);
           }
         }
       }

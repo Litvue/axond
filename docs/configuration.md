@@ -196,9 +196,14 @@ process mid-flush, discarding the usage records the sequence exists to write.
 The TypeScript process writes each of those as JSON `msg` `shutdown` with
 `phase` `requested`, `second_signal`, `admission_closed`, `signal_ignored`, or
 `deadline_expired`. The line names the signal and the admitted-request count.
-After the usage flush it writes `phase` `stopped` with `usage_flushed`, and one
-JSON `msg` `usage_flush` per sink. A timeout names `abandoned`. A finished flush
-names `records`. The driver text stays off those lines.
+Settlement, the usage flush, and the telemetry drain share that one
+`flush_timeout_ms` deadline. Settlement may use at most half. The usage flush
+and any in-flight OTLP post get what remains, not a second full timeout. After
+the usage flush it writes `phase` `stopped` with `usage_flushed` and
+`telemetry_flushed`, and one JSON `msg` `usage_flush` per sink. A usage-flush
+timeout names `abandoned`. A finished flush names `records`. An exporter that
+misses the bound writes `msg` `telemetry_flush` with `outcome` `timeout` and
+leaves the endpoint off the line. The driver text stays off those lines.
 When the settle share ends with a spawned charge or an admitted request still
 open, it also writes `phase` `spend_unsettled` with `settlements_queued`,
 `settlements_executing`, `settlements_reserved`, and `oldest_settlement_ms`.

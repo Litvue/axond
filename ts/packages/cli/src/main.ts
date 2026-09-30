@@ -15,6 +15,7 @@ import {
   loadConfig,
   resolveTelemetry,
 } from "../../gateway/src/index.ts";
+import { createBackgroundDrain, remainingMs, settleShareMs as flushSettleShare } from "./shutdown-budget.ts";
 import { openUsageDelivery } from "./usage-delivery.ts";
 import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
 
@@ -56,11 +57,13 @@ async function main(): Promise<void> {
     protocol: process.env["OTEL_EXPORTER_OTLP_PROTOCOL"],
     instanceId: process.env["AXOND_INSTANCE_ID"],
   });
+  const background = createBackgroundDrain();
   const usageDelivery = await openUsageDelivery({
     sinks: config.usageSinks,
     env: process.env,
     telemetry,
     metrics,
+    onBackground: background.track,
     onLog: (record) => {
       process.stdout.write(`${JSON.stringify(record)}\n`);
     },
@@ -109,6 +112,7 @@ async function main(): Promise<void> {
     admitting: () => admitting,
     metrics,
     telemetry: telemetry ?? undefined,
+    onBackground: background.track,
     onLog: (record) => {
       process.stdout.write(`${JSON.stringify(record)}\n`);
     },
@@ -160,8 +164,10 @@ async function main(): Promise<void> {
     if (deadlineTimer) {
       clearTimeout(deadlineTimer);
     }
-    const settleShareMs = Math.floor(config.shutdown.flushTimeoutMs / 2);
-    const leftovers = await admission.awaitIdle(settleShareMs);
+    const started = Date.now();
+    const deadline = started + config.shutdown.flushTimeoutMs;
+    const settleShareMs = flushSettleShare(config.shutdown.flushTimeoutMs);
+    const leftovers = await admission.awaitIdle(Math.min(settleShareMs, remainingMs(deadline, Date.now())));
     const inFlight = admission.inFlightRequests();
     if (leftovers.spawned > 0) {
       metrics.record("axond.shutdown.abandoned_settlements", leftovers.spawned);
@@ -180,8 +186,17 @@ async function main(): Promise<void> {
       };
       writeLog(unsettled);
     }
-    const usageFlushed = await usageDelivery.flush(config.shutdown.flushTimeoutMs);
-    writeLog({ msg: "shutdown", phase: "stopped", usage_flushed: usageFlushed });
+    const usageFlushed = await usageDelivery.flush(remainingMs(deadline, Date.now()));
+    const telemetryFlushed = await background.drain(remainingMs(deadline, Date.now()));
+    if (!telemetryFlushed) {
+      writeLog({ msg: "telemetry_flush", outcome: "timeout" });
+    }
+    writeLog({
+      msg: "shutdown",
+      phase: "stopped",
+      usage_flushed: usageFlushed,
+      telemetry_flushed: telemetryFlushed,
+    });
     process.exit(0);
   };
   const closeAdmission = () => {

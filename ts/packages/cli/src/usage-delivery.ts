@@ -72,6 +72,7 @@ export async function openUsageDelivery(input: {
   telemetry: TelemetryTarget | null;
   metrics: Metrics;
   onLog: (record: unknown) => void;
+  onBackground?: (task: Promise<void>) => void;
   fetchImpl?: typeof fetch;
   writeStdout?: (line: string) => void;
 }): Promise<UsageDelivery> {
@@ -97,7 +98,11 @@ export async function openUsageDelivery(input: {
       const fetchImpl = input.fetchImpl ?? fetch;
       writers.push(immediateWriter("otlp", input.metrics, input.onLog, (record, observedAt) => {
         const body = usageLogPayload(record, resourceAttributes(telemetry.instanceId), observedAt.getTime());
-        void postOtlp(telemetry.endpoint, "logs", body, fetchImpl).catch(() => undefined);
+        const task = postOtlp(telemetry.endpoint, "logs", body, fetchImpl).then(
+          () => undefined,
+          () => undefined,
+        );
+        input.onBackground?.(task);
       }));
       continue;
     }
