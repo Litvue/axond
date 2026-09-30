@@ -167,7 +167,7 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
             ...attempts,
           ]);
           if (opts.waitUntil) {
-            opts.waitUntil(task);
+            opts.waitUntil(task, c.req.raw);
           } else {
             void task;
           }
@@ -844,6 +844,7 @@ async function dispatch(
             await settle(opts, axond, usage, streamStatus);
           }
         }),
+        c.req.raw,
       );
     }
     const transport = opts.transport ?? {
@@ -868,7 +869,7 @@ async function dispatch(
         releaseStream();
         return;
       }
-      scheduleSettle(opts, axond, usage, streamStatus);
+      scheduleSettle(opts, axond, usage, streamStatus, c.req.raw);
     };
     const noteTimeout = (kind: string, bound: string) => {
       opts.metrics?.record("axond.upstream.timeouts", 1, {
@@ -1009,7 +1010,7 @@ async function dispatch(
       if (!stream) {
         noteServed(axond, opts, credential);
         axond.ttftMs = Math.max(0, Date.now() - walkStarted);
-        scheduleSettle(opts, axond, upstream.usage, "ok");
+        scheduleSettle(opts, axond, upstream.usage, "ok", c.req.raw);
       } else {
         noteServed(axond, opts, credential);
       }
@@ -1048,7 +1049,7 @@ async function dispatch(
       }
       if (!(rateLimited && !pinned && attempt + 1 < planned.length)) {
         noteServed(axond, opts, credential);
-        scheduleSettle(opts, axond, emptyUsage(), "upstream_error");
+        scheduleSettle(opts, axond, emptyUsage(), "upstream_error", c.req.raw);
         throw error;
       }
     }
@@ -1416,7 +1417,13 @@ function serverSpanAttributes(axond: MutableContext | undefined, endedMs: number
   return attributes;
 }
 
-function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): void {
+function scheduleSettle(
+  opts: AxondOptions,
+  axond: MutableContext,
+  usage: UsageTokens,
+  status: string,
+  request: Request,
+): void {
   axond.settlement = {
     status,
     usage: {
@@ -1430,7 +1437,7 @@ function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageT
   };
   const task = settle(opts, axond, usage, status);
   if (opts.waitUntil) {
-    opts.waitUntil(task);
+    opts.waitUntil(task, request);
   } else {
     void task;
   }

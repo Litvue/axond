@@ -28,9 +28,12 @@ interface WaitContext {
  * them. The process binary loads the same contract from `AXOND_EXTENSIONS_DIR`
  * at startup instead. Hyperdrive supplies the Postgres connection string;
  * each call opens one client and closes it, with no session-level SET.
+ * One gateway lives for the isolate, so a parked credential stays parked.
+ * Settlement is bound to the request that owns it.
  */
 let metrics: ReturnType<typeof createMetrics> | undefined;
 let admission = createAdmission(defaultAdmission());
+const handlers = new Map<string, ReturnType<typeof createHandler>>();
 
 export function createHandler(env: WorkerEnv, storeOverride?: Store) {
   metrics ??= createMetrics([env.GATEWAY_KEY]);
@@ -61,6 +64,24 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
     protocol: env.OTEL_EXPORTER_OTLP_PROTOCOL,
     instanceId: env.AXOND_INSTANCE_ID,
   });
+  const waits = new WeakMap<Request, WaitContext>();
+  const app = createAxond({
+    store,
+    gatewayKey: env.GATEWAY_KEY,
+    defaultNamespace: "platform",
+    providers,
+    credentials,
+    extensions,
+    waitUntil: (promise, request) => {
+      waits.get(request)?.waitUntil(promise);
+    },
+    admissionControl: admission,
+    metrics,
+    telemetry: telemetry ?? undefined,
+    onLog: (record) => {
+      console.log(JSON.stringify(record));
+    },
+  });
   return {
     scheduled(ctx: WaitContext, fetchImpl?: typeof fetch): void {
       ctx.waitUntil(discoverOnce({
@@ -76,32 +97,40 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
       }));
     },
     fetch(request: Request, ctx: WaitContext): Response | Promise<Response> {
-      const app = createAxond({
-        store,
-        gatewayKey: env.GATEWAY_KEY,
-        defaultNamespace: "platform",
-        providers,
-        credentials,
-        extensions,
-        waitUntil: (promise) => ctx.waitUntil(promise),
-        admissionControl: admission,
-        metrics,
-        telemetry: telemetry ?? undefined,
-        onLog: (record) => {
-          console.log(JSON.stringify(record));
-        },
-      });
+      waits.set(request, ctx);
       return app.fetch(request);
     },
   };
 }
 
+/** One gateway per env on this isolate. A new credential list builds another. */
+export function handlerFor(env: WorkerEnv) {
+  const key = [
+    env.HYPERDRIVE.connectionString,
+    env.GATEWAY_KEY,
+    env.PROVIDERS_JSON,
+    env.CREDENTIALS_JSON ?? "",
+    env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "",
+    env.OTEL_EXPORTER_OTLP_PROTOCOL ?? "",
+    env.AXOND_INSTANCE_ID ?? "",
+    env.CATALOG_SOURCE ?? "",
+    env.CATALOG_SOURCE_URL ?? "",
+  ].join("\0");
+  const existing = handlers.get(key);
+  if (existing) {
+    return existing;
+  }
+  const created = createHandler(env);
+  handlers.set(key, created);
+  return created;
+}
+
 export default {
   fetch(request: Request, env: WorkerEnv, ctx: WaitContext): Promise<Response> {
-    return Promise.resolve(createHandler(env).fetch(request, ctx));
+    return Promise.resolve(handlerFor(env).fetch(request, ctx));
   },
   scheduled(_event: unknown, env: WorkerEnv, ctx: WaitContext): void {
-    createHandler(env).scheduled(ctx);
+    handlerFor(env).scheduled(ctx);
   },
 };
 

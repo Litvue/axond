@@ -47,7 +47,7 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 | --- | --- |
 | Node process | `ts/bin/axond` |
 | Container | `ts/Dockerfile`. The repository-root `Dockerfile` remains the Rust release image. |
-| Worker | `ts/packages/worker`. Hyperdrive caching disabled. Not executed against PlanetScale here. `CREDENTIALS_JSON` is the request-path credential list and the cron list. `worker_request_path_uses_credentials_json` covers that. |
+| Worker | `ts/packages/worker`. Hyperdrive caching disabled. Not executed against PlanetScale here. `CREDENTIALS_JSON` is the request-path credential list and the cron list. `worker_request_path_uses_credentials_json` covers that. One gateway stays for the isolate, so a parked credential stays parked, and each settlement uses the `waitUntil` of the request that owns it. |
 | Compiled binary | `bun build --compile` of `ts/packages/cli/src/main.ts`, when Bun is installed. CI runs the unit suite on Bun and the compat lanes through the Node wrapper. |
 
 ## Shadow

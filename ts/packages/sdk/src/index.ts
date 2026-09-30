@@ -465,7 +465,12 @@ export interface AxondOptions {
    */
   gatewayKeySubject?: string;
   extensions?: AxondExtension[];
-  waitUntil?: (promise: Promise<unknown>) => void;
+  /**
+   * Park work that outlives the response. The request argument is the call
+   * that owns the work, so one shared app can bind it to that call's
+   * `waitUntil`.
+   */
+  waitUntil?: (promise: Promise<unknown>, request: Request) => void;
   prices?: PriceRule[];
   blocklist?: string[];
   credentials?: CredentialConfig[];

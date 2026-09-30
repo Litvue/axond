@@ -5,7 +5,7 @@ import test from "node:test";
 
 import { createMemoryStore } from "../../gateway/src/memory-store.ts";
 
-import { createHandler, discoverOnSchedule } from "./index.ts";
+import { createHandler, discoverOnSchedule, handlerFor } from "./index.ts";
 
 test("the worker handler is a static bundle of the gateway and an extension", async () => {
   const source = await readFile(new URL("./index.ts", import.meta.url), "utf8");
@@ -137,3 +137,174 @@ test("worker_request_path_uses_credentials_json", async () => {
     upstream.close();
   }
 });
+
+test("worker_credential_pool_survives_the_next_request", async () => {
+  let hits = 0;
+  const upstream = await listen((req, res) => {
+    hits += 1;
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end('{"error":{"message":"slow down"}}');
+    });
+  });
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000n);
+  const env = {
+    HYPERDRIVE: { connectionString: "postgres://example" },
+    GATEWAY_KEY: "k",
+    PROVIDERS_JSON: JSON.stringify([
+      { id: "fake-openai", kind: "openai", baseUrl: upstream.url, unpricedModels: "allow" },
+    ]),
+    CREDENTIALS_JSON: JSON.stringify([
+      { namespace: "platform", provider: "fake-openai", secret: "sk-worker-secret", id: "plat" },
+    ]),
+  };
+  const handler = createHandler(env, store);
+  const wait = { waitUntil() {} };
+  const chat = () =>
+    handler.fetch(
+      new Request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer k", "content-type": "application/json" },
+        body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "hi" }] }),
+      }),
+      wait,
+    );
+  try {
+    const first = await chat();
+    assert.equal(first.status, 502, await first.text());
+    const second = await chat();
+    assert.equal(second.status, 502, await second.text());
+    const listed = await handler.fetch(
+      new Request("http://127.0.0.1/ns/platform/v1/credentials", { headers: { authorization: "Bearer k" } }),
+      wait,
+    );
+    const listedBody = await listed.text();
+    assert.equal(listed.status, 200, listedBody);
+    assert.equal(listedBody.includes("sk-worker-secret"), false);
+    const rows = JSON.parse(listedBody) as { data: { credential_id?: string; state: string }[] };
+    assert.equal(rows.data[0]?.credential_id, "plat");
+    assert.equal(rows.data[0]?.state, "parked");
+    assert.equal(hits, 2);
+    const fresh = createHandler(env, store);
+    const again = await fresh.fetch(
+      new Request("http://127.0.0.1/ns/platform/v1/credentials", { headers: { authorization: "Bearer k" } }),
+      wait,
+    );
+    const againBody = await again.text();
+    const freshRows = JSON.parse(againBody) as { data: { state: string }[] };
+    assert.equal(freshRows.data[0]?.state, "healthy");
+  } finally {
+    upstream.close();
+  }
+});
+
+test("worker_wait_until_stays_on_the_request", async () => {
+  let started = 0;
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let both = () => {};
+  const opened = new Promise<void>((resolve) => {
+    both = resolve;
+  });
+  const upstream = await listen((req, res) => {
+    started += 1;
+    if (started === 2) {
+      both();
+    }
+    req.resume();
+    void gate.then(() => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"id":"chatcmpl-worker","choices":[{"message":{"role":"assistant","content":"ok"}}]}');
+    });
+  });
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000n);
+  const handler = createHandler(
+    {
+      HYPERDRIVE: { connectionString: "postgres://example" },
+      GATEWAY_KEY: "k",
+      PROVIDERS_JSON: JSON.stringify([
+        { id: "fake-openai", kind: "openai", baseUrl: upstream.url, unpricedModels: "allow" },
+      ]),
+      CREDENTIALS_JSON: JSON.stringify([
+        { namespace: "platform", provider: "fake-openai", secret: "sk-worker-secret", id: "plat" },
+      ]),
+    },
+    store,
+  );
+  const buckets: Promise<unknown>[][] = [[], []];
+  const ctx = (index: number) => ({
+    waitUntil(promise: Promise<unknown>) {
+      buckets[index]!.push(promise);
+    },
+  });
+  const request = () =>
+    new Request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer k", "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "hi" }] }),
+    });
+  try {
+    const first = handler.fetch(request(), ctx(0));
+    const second = handler.fetch(request(), ctx(1));
+    await opened;
+    release();
+    const [one, two] = await Promise.all([first, second]);
+    assert.equal(one.status, 200, await one.text());
+    assert.equal(two.status, 200, await two.text());
+    assert.equal(buckets[0]!.length, 1);
+    assert.equal(buckets[1]!.length, 1);
+    await Promise.all([...buckets[0]!, ...buckets[1]!]);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("worker_handler_for_reuses_one_gateway", () => {
+  const env = {
+    HYPERDRIVE: { connectionString: "postgres://example" },
+    GATEWAY_KEY: "k",
+    PROVIDERS_JSON: "[]",
+  };
+  assert.equal(handlerFor(env), handlerFor({ ...env }));
+  assert.notEqual(handlerFor(env), handlerFor({ ...env, CREDENTIALS_JSON: "[]" }));
+});
+
+function listen(
+  onRequest: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void,
+): Promise<{ url: string; close: () => void }> {
+  return new Promise((resolve) => {
+    const server = createServer(onRequest);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("no port");
+      }
+      resolve({
+        url: `http://127.0.0.1:${address.port}`,
+        close: () => {
+          server.closeAllConnections();
+          server.close();
+        },
+      });
+    });
+  });
+}
