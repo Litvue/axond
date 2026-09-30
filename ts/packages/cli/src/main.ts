@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { Agent } from "undici";
 
@@ -16,7 +16,7 @@ import {
   resolveTelemetry,
   usageEvent,
 } from "../../gateway/src/index.ts";
-import type { AxondExtension, ShutdownLog } from "@axond/sdk";
+import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
 import { createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
@@ -29,7 +29,7 @@ async function main(): Promise<void> {
   const toml = await readFile(configPath, "utf8");
   const config = await loadConfig(
     toml,
-    envSecretReader(process.env, async (path) => readFile(path, "utf8")),
+    envSecretReader(process.env, readGatewayKeyFile),
   );
   const metrics = createMetrics(typeof config.gatewayKey === "string" ? [config.gatewayKey] : []);
   const store =
@@ -77,6 +77,7 @@ async function main(): Promise<void> {
     store,
     providers: config.providers,
     gatewayKey: config.gatewayKey,
+    gatewayKeySubject: config.gatewayKeySubject,
     credentials: config.credentials,
     prices: config.prices,
     blocklist: config.blocklist,
@@ -250,6 +251,19 @@ async function main(): Promise<void> {
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+}
+
+async function readGatewayKeyFile(path: string): Promise<string> {
+  try {
+    const info = await stat(path);
+    if ((info.mode & 0o077) !== 0) {
+      const line: KeyMaterialLog = { msg: "key_material", path };
+      process.stdout.write(`${JSON.stringify(line)}\n`);
+    }
+  } catch {
+    // A missing file is reported by the read below.
+  }
+  return readFile(path, "utf8");
 }
 
 function splitBind(bind: string): [string, string] {

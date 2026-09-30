@@ -878,6 +878,72 @@ backend = "redis"
   );
 });
 
+test("file_gateway_key_keeps_exact_bytes", async () => {
+  const path = "/run/secrets/axond-gateway-key";
+  const toml = `
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "/tmp/axond.sqlite"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+file = "${path}"
+namespace = "platform"
+`;
+  const loaded = await loadConfig(toml, envSecretReader({}, async () => "secret\n"));
+  assert.equal(loaded.gatewayKey, "secret\n");
+  assert.equal(loaded.gatewayKeySubject, path);
+  const fromEnv = await loadConfig(
+    toml.replace(`file = "${path}"`, 'env = "GW_KEY"'),
+    envSecretReader({ GW_KEY: "env-secret" }, async () => ""),
+  );
+  assert.equal(fromEnv.gatewayKey, "env-secret");
+  assert.equal(fromEnv.gatewayKeySubject, "GW_KEY");
+  await assert.rejects(
+    () => loadConfig(toml, envSecretReader({}, async () => "")),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : "";
+      assert.match(message, /empty/);
+      assert.equal(message.includes("secret"), false);
+      return true;
+    },
+  );
+});
+
+test("gateway_key_subject_is_the_source_label", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  const logs: { msg: string; subject?: string }[] = [];
+  const app = createAxond({
+    store,
+    gatewayKey: "sk-subject-sentinel",
+    gatewayKeySubject: "GW_INBOUND_KEY",
+    defaultNamespace: "platform",
+    providers: [],
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  const response = await app.request("http://127.0.0.1/api/v1/namespaces", {
+    headers: { authorization: "Bearer sk-subject-sentinel" },
+  });
+  assert.equal(response.status, 200);
+  await response.text();
+  const line = logs.find((entry) => entry.msg === "request");
+  assert.ok(line);
+  assert.equal(line.subject, "GW_INBOUND_KEY");
+  assert.equal(JSON.stringify(logs).includes("sk-subject-sentinel"), false);
+});
+
 test("shutdown bounds default to the rust values and reject an unbounded wait", async () => {
   const toml = `
 [storage]

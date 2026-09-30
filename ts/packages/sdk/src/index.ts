@@ -240,6 +240,15 @@ export type ShutdownLog =
       settle_share_ms: number;
     };
 
+/**
+ * A file-backed gateway key is readable by group or others.
+ * The line names the path. The file bytes stay off it.
+ */
+export interface KeyMaterialLog {
+  msg: "key_material";
+  path: string;
+}
+
 export type AxondLog =
   | RequestLog
   | CredentialRateLimitLog
@@ -250,7 +259,8 @@ export type AxondLog =
   | SettlementFailureLog
   | BudgetUnavailableLog
   | CatalogueImportLog
-  | ShutdownLog;
+  | ShutdownLog
+  | KeyMaterialLog;
 
 export interface AxondContext {
   requestId: string;
@@ -426,6 +436,11 @@ export interface AxondOptions {
   store: Store;
   providers: ProviderConfig[] | (() => Promise<ProviderConfig[]>);
   gatewayKey: string | ((c: Context<AxondEnv>) => string | Promise<string>);
+  /**
+   * Usage subject for the static gateway key: the env var name or the file path.
+   * Absent keeps the label `gateway-key`.
+   */
+  gatewayKeySubject?: string;
   extensions?: AxondExtension[];
   waitUntil?: (promise: Promise<unknown>) => void;
   prices?: PriceRule[];
@@ -478,8 +493,10 @@ export interface AxondOptions {
    * byte cap, a settlement bound, a failed Store write, a budget-store outage,
    * a catalogue import, and a byte-faithful body that stays open until the
    * post-terminal grace or the stream duration bound are separate lines. The
-   * CLI also writes a shutdown line for each phase. None of them carry a body,
-   * a credential, a driver message, a bind address, or a source URL.
+   * CLI also writes a shutdown line for each phase, and a `key_material` line
+   * when a gateway-key file is readable by group or others. That line names
+   * the path. None of them carry a body, a credential, a driver message, a
+   * bind address, or a source URL.
    */
   onLog?: (record: AxondLog) => void;
   maxRequestBytes?: number;

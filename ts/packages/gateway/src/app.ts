@@ -235,7 +235,7 @@ async function pipeline(
     const key = await resolveKey(opts, c);
     assertGatewayKey(presentedCredential(c.req.raw.headers), key, axond.authenticated);
     if (!axond.subject) {
-      axond.subject = "gateway-key";
+      axond.subject = opts.gatewayKeySubject ?? "gateway-key";
     }
     if (kind === "inference") {
       const path = opts.rawPath?.(c) ?? new URL(c.req.url).pathname;

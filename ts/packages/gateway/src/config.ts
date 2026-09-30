@@ -60,6 +60,8 @@ export interface LoadedConfig {
   providers: ProviderConfig[];
   credentials: CredentialConfig[];
   gatewayKey: string;
+  /** Env var name or file path. Usage records use this as the subject. */
+  gatewayKeySubject: string;
   gatewayKeyNamespace: string;
   defaultNamespace: string;
   prices: PriceRule[];
@@ -260,6 +262,7 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     );
   }
   let gatewayKey: string;
+  const gatewayKeySubject = envName ?? fileName!;
   if (envName !== null) {
     const value = secrets.env(envName);
     if (value === undefined || value.length === 0) {
@@ -268,7 +271,7 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     gatewayKey = value;
   } else {
     try {
-      gatewayKey = (await secrets.file(fileName!)).replace(/\r?\n$/, "");
+      gatewayKey = await secrets.file(fileName!);
     } catch (error) {
       const message = error instanceof Error ? error.message : "unreadable";
       throw configError(`gateway_key file could not be read (${message})`);
@@ -399,6 +402,7 @@ export async function loadConfig(toml: string, secrets: SecretReader): Promise<L
     providers,
     credentials,
     gatewayKey,
+    gatewayKeySubject,
     gatewayKeyNamespace: keyNamespace,
     defaultNamespace,
     prices,

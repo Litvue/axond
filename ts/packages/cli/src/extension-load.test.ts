@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer } from "node:http";
 import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -376,6 +376,47 @@ test("shutdown_log_names_the_phase_and_omits_the_secret", async () => {
   }
 });
 
+test("key_material_log_names_the_path_and_omits_the_secret", async () => {
+  const secret = "sk-file-sentinel";
+  const dir = await mkdtemp(join(tmpdir(), "axond-key-"));
+  const keyPath = join(dir, "gateway-key");
+  await writeFile(keyPath, secret);
+  await chmod(keyPath, 0o644);
+  const child = await bootFileKey(dir, keyPath);
+  try {
+    await waitFor(`${child.base}/healthz`);
+    const warned = await waitForKeyMaterial(() => child.log.stdout);
+    assert.equal(warned.length, 1, child.log.stderr + child.log.stdout);
+    assert.equal(warned[0]?.path, keyPath);
+    const listed = await fetch(`${child.base}/api/v1/namespaces`, {
+      headers: { authorization: `Bearer ${secret}` },
+    });
+    assert.equal(listed.status, 200);
+    await listed.text();
+    const request = await waitForRequestSubject(() => child.log.stdout, keyPath);
+    assert.ok(request, child.log.stdout);
+    assert.equal(child.log.stdout.includes(secret), false);
+    assert.equal(child.log.stderr.includes(secret), false);
+  } finally {
+    await child.stop();
+  }
+  await chmod(keyPath, 0o600);
+  const quiet = await bootFileKey(dir, keyPath);
+  try {
+    await waitFor(`${quiet.base}/healthz`);
+    assert.equal(keyMaterialRecords(quiet.log.stdout).length, 0);
+    const listed = await fetch(`${quiet.base}/api/v1/namespaces`, {
+      headers: { authorization: `Bearer ${secret}` },
+    });
+    assert.equal(listed.status, 200);
+    await listed.text();
+    assert.equal(quiet.log.stdout.includes(secret), false);
+  } finally {
+    await quiet.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("shutdown_spend_log_names_the_stages_and_omits_the_secret", async () => {
   const key = "sk-spend-sentinel";
   const prompt = "PROMPT_SENTINEL_spend";
@@ -592,6 +633,99 @@ namespace = "platform"
       await rm(dir, { recursive: true, force: true });
     },
   };
+}
+
+async function bootFileKey(dir: string, keyPath: string) {
+  const port = await freePort();
+  await writeFile(
+    join(dir, "axond.toml"),
+    `
+[server]
+bind = "127.0.0.1:${port}"
+
+[storage]
+backend = "sqlite"
+path = "${join(dir, "axond.sqlite")}"
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[gateway_key]]
+file = "${keyPath}"
+namespace = "platform"
+`,
+  );
+  const proc = spawn(BIN.pathname, {
+    env: {
+      ...process.env,
+      AXOND_CONFIG: join(dir, "axond.toml"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const log = { stderr: "", stdout: "" };
+  proc.stderr?.on("data", (chunk: Buffer) => {
+    log.stderr += chunk.toString();
+  });
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    log.stdout += chunk.toString();
+  });
+  return {
+    proc,
+    log,
+    base: `http://127.0.0.1:${port}`,
+    stop: async () => {
+      if (proc.exitCode === null) {
+        proc.kill("SIGKILL");
+        await new Promise((done) => proc.once("exit", done));
+      }
+    },
+  };
+}
+
+async function waitForKeyMaterial(read: () => string): Promise<Array<{ msg: string; path?: string }>> {
+  const until = Date.now() + 2_000;
+  while (Date.now() < until) {
+    const found = keyMaterialRecords(read());
+    if (found.length > 0) {
+      return found;
+    }
+    await new Promise((wake) => setTimeout(wake, 20));
+  }
+  return keyMaterialRecords(read());
+}
+
+async function waitForRequestSubject(read: () => string, subject: string): Promise<boolean> {
+  const until = Date.now() + 2_000;
+  while (Date.now() < until) {
+    const found = read().split("\n").some((line) => {
+      try {
+        const parsed = JSON.parse(line) as { msg?: string; subject?: string };
+        return parsed.msg === "request" && parsed.subject === subject;
+      } catch {
+        return false;
+      }
+    });
+    if (found) {
+      return true;
+    }
+    await new Promise((wake) => setTimeout(wake, 20));
+  }
+  return false;
+}
+
+function keyMaterialRecords(text: string): Array<{ msg: string; path?: string }> {
+  const records = [];
+  for (const line of text.split("\n")) {
+    if (!line.includes('"msg":"key_material"')) {
+      continue;
+    }
+    const parsed = JSON.parse(line) as { msg: string; path?: string };
+    if (parsed.msg === "key_material") {
+      records.push(parsed);
+    }
+  }
+  return records;
 }
 
 function shutdownRecords(text: string): Array<{

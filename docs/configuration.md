@@ -582,7 +582,9 @@ Exactly one source (`env` or `file`) is permitted; both declared or
 neither declared is a config error. File contents are read without trimming:
 static gateway-key secrets are exact bytes, so do not leave a trailing newline
 (`printf %s 'secret' > /run/secrets/axond-gateway-key`). On Unix, a
-group/other-readable file produces a warning. A trailing newline makes a
+group/other-readable file produces a warning. The TypeScript CLI writes that
+warning as JSON `msg` `key_material` naming the path and omitting the file
+bytes. A trailing newline makes a
 file-backed static key unusable because HTTP headers cannot carry it. The resolved material is never
 logged; usage subjects use the env name or file path. Switching an existing
 key from `env` to `file` changes that subject, so in-flight or accumulated
@@ -592,7 +594,7 @@ usage sinks.
 
 Callers present the token as `Authorization: Bearer <token>` or
 `x-api-key: <token>`. Minted `axt1.` tokens are `401` and are not issued.
-The usage record's `subject` is the env var's *name*
+The usage record's `subject` is the env var's *name*, or the file path when the key is read from a file.
 ([ADR 0013](./adr/0013-inbound-auth-fails-closed.md)).
 
 A key whose `namespace` is the file default namespace may use
