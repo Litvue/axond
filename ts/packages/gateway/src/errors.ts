@@ -15,6 +15,8 @@ export class GatewayFailure extends Error {
   timeoutKind: "connect" | "response_headers" | "buffered_body" | "stream_idle" | "overall" | null = null;
   /** Whose budget ended that wait. */
   timeoutBound: "phase" | "walk_budget" | null = null;
+  /** Provider HTTP status, before the gateway maps it onto its own response. */
+  upstreamStatus: number | null = null;
   /** Seconds for `Retry-After`, when this refusal advertises a retry. */
   retryAfter: string | null = null;
 

@@ -909,7 +909,7 @@ async function dispatch(
       if (!stream) {
         noteCredentialSuccess(pools, record.id, provider.id, credential.id);
       }
-      noteAttempt(c, opts, axond, credential, attempt, attemptStarted, "ok", false, walk.parked, "served");
+      noteAttempt(c, opts, axond, credential, attempt, attemptStarted, "ok", false, walk.parked, "served", null, !stream);
       break;
     } catch (error) {
       lastError = error;
@@ -930,6 +930,8 @@ async function dispatch(
         true,
         walk.parked,
         rateLimited ? "rate_limited" : "error",
+        error,
+        false,
       );
       if (rateLimited) {
         noteCredentialFailure(pools, record.id, provider.id, credential.id, now, policy.failureThreshold);
@@ -974,6 +976,26 @@ function secretValues(opts: AxondOptions): string[] {
   return secrets;
 }
 
+const MAX_DIAGNOSTIC_BYTES = 4096;
+
+function redactDiagnostic(message: string, secrets: readonly string[]): string {
+  let text = message;
+  for (const secret of secrets) {
+    if (secret.length > 0 && text.includes(secret)) {
+      text = text.split(secret).join("");
+    }
+  }
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length <= MAX_DIAGNOSTIC_BYTES) {
+    return text;
+  }
+  let end = MAX_DIAGNOSTIC_BYTES;
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) {
+    end -= 1;
+  }
+  return new TextDecoder().decode(bytes.subarray(0, end));
+}
+
 function noteAttempt(
   c: Context<AxondEnv>,
   opts: AxondOptions,
@@ -985,6 +1007,8 @@ function noteAttempt(
   error: boolean,
   parked: readonly CredentialConfig[],
   lease: "served" | "rate_limited" | "error",
+  failure: unknown,
+  buffered: boolean,
 ): void {
   const parent = requestTrace.get(c.req.raw);
   if (!parent || !opts.telemetry) {
@@ -993,6 +1017,36 @@ function noteAttempt(
   const spans = requestAttempts.get(c.req.raw) ?? [];
   const attemptTrace = childTrace(parent);
   const source = credential.namespace === opts.defaultNamespace ? "platform" : "byok";
+  const secrets = secretValues(opts);
+  const latencyMs = String(Date.now() - startedMs);
+  const attributes = sanitizeAttributes(
+    {
+      "axond.attempt": String(attempt),
+      "axond.target.provider": axond.target?.provider ?? "",
+      "axond.target.model": axond.target?.model ?? "",
+      "axond.status": status,
+      "axond.credential.id": credential.id,
+      "axond.credential_source": source,
+      "axond.latency_ms": latencyMs,
+      ...(buffered && !error ? { "axond.ttft_ms": latencyMs } : {}),
+      ...(failure instanceof GatewayFailure && failure.upstreamStatus !== null
+        ? { "axond.upstream.status": String(failure.upstreamStatus) }
+        : {}),
+      ...(failure instanceof GatewayFailure && failure.timeoutKind
+        ? {
+            "axond.timeout": failure.timeoutKind,
+            "axond.timeout.bound": failure.timeoutBound ?? "phase",
+          }
+        : {}),
+    },
+    secrets,
+  );
+  if (failure instanceof GatewayFailure) {
+    const diagnostic = redactDiagnostic(failure.message, secrets);
+    if (diagnostic.length > 0) {
+      attributes["axond.upstream.message"] = diagnostic;
+    }
+  }
   spans.push({
     name: "axond.upstream.attempt",
     trace: attemptTrace,
@@ -1000,18 +1054,7 @@ function noteAttempt(
     endMs: Date.now(),
     kind: 1,
     error,
-    attributes: sanitizeAttributes(
-      {
-        "axond.attempt": String(attempt),
-        "axond.target.provider": axond.target?.provider ?? "",
-        "axond.target.model": axond.target?.model ?? "",
-        "axond.status": status,
-        "axond.credential.id": credential.id,
-        "axond.credential_source": source,
-        "axond.latency_ms": String(Date.now() - startedMs),
-      },
-      secretValues(opts),
-    ),
+    attributes,
   });
   if (attempt === 0) {
     for (let index = 0; index < parked.length; index += 1) {

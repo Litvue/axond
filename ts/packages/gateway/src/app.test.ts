@@ -283,6 +283,10 @@ test("otlp json joins traceparent and omits the prompt", async () => {
     assert.equal(attempt.parentSpanId, span.spanId);
     assert.equal(attempt.attributes.find((item) => item.key === "axond.target.provider")?.value.stringValue, "fake-openai");
     assert.equal(attempt.attributes.find((item) => item.key === "axond.status")?.value.stringValue, "ok");
+    assert.equal(
+      attempt.attributes.find((item) => item.key === "axond.ttft_ms")?.value.stringValue,
+      attempt.attributes.find((item) => item.key === "axond.latency_ms")?.value.stringValue,
+    );
     const lease = spans.find((item) => item.name === "axond.credential.lease");
     assert.ok(lease);
     assert.equal(lease.traceId, span.traceId);
@@ -338,8 +342,9 @@ test("credential_lease_spans_follow_the_pool_walk", async () => {
     seen.push(authorization);
     if (authorization.includes("bad-key") || mode === "down") {
       const status = mode === "down" ? 500 : 429;
+      const message = mode === "down" ? "slow down good-key" : "slow down";
       res.writeHead(status, { "content-type": "application/json" });
-      res.end('{"error":{"message":"slow down"}}');
+      res.end(JSON.stringify({ error: { message } }));
       return;
     }
     res.writeHead(200, { "content-type": "application/json" });
@@ -420,6 +425,8 @@ test("credential_lease_spans_follow_the_pool_walk", async () => {
     assert.equal(attr(limited, "axond.status"), "rate_limited");
     assert.equal(attr(limited, "axond.credential.index"), "0");
     assert.equal(attr(limited, "axond.credential_source"), "platform");
+    assert.equal(attr(firstAttempts[0]!, "axond.upstream.status"), "429");
+    assert.equal(attr(firstAttempts[0]!, "axond.upstream.message"), "slow down");
     assert.equal(attr(served, "axond.status"), "served");
     assert.equal(attr(served, "axond.credential.index"), "1");
     assert.equal(limited.parentSpanId, firstAttempts[0]!.spanId);
@@ -470,11 +477,107 @@ test("credential_lease_spans_follow_the_pool_walk", async () => {
     assert.ok(failed);
     assert.equal(attr(failed, "axond.status"), "error");
     assert.equal(attr(failed, "axond.credential.index"), "1");
+    const failedAttempt = third.find((span) => span.name === "axond.upstream.attempt");
+    assert.ok(failedAttempt);
+    assert.equal(attr(failedAttempt, "axond.upstream.status"), "500");
+    assert.equal(attr(failedAttempt, "axond.upstream.message"), "slow down ");
+    assert.equal(attr(failedAttempt, "axond.timeout"), undefined);
     const exported = traces.join("\n");
     assert.equal(exported.includes(KEY), false);
     assert.equal(exported.includes("bad-key"), false);
     assert.equal(exported.includes("good-key"), false);
     assert.equal(exported.includes("PROMPT_SENTINEL"), false);
+  } finally {
+    upstream.close();
+    collector.closeAllConnections();
+    collector.close();
+  }
+});
+
+test("attempt_span_records_a_header_timeout", async () => {
+  const traces: string[] = [];
+  const collector = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    if ((req.url ?? "") === "/v1/traces") {
+      traces.push(Buffer.concat(chunks).toString("utf8"));
+    }
+    res.writeHead(200);
+    res.end();
+  });
+  collector.listen(0, "127.0.0.1");
+  await once(collector, "listening");
+  const collectorAddress = collector.address();
+  if (!collectorAddress || typeof collectorAddress === "string") {
+    throw new Error("no collector port");
+  }
+  const upstream = createServer(() => {
+    // Never writes a response.
+  });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  const upstreamAddress = upstream.address();
+  if (!upstreamAddress || typeof upstreamAddress === "string") {
+    throw new Error("no upstream port");
+  }
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000_000_000n);
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: `http://127.0.0.1:${upstreamAddress.port}` }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream-openai", id: "openai" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 80,
+      bufferedBodyTimeoutMs: 5_000,
+      streamIdleTimeoutMs: 5_000,
+      maxResponseBytes: 1024,
+    },
+    telemetry: { endpoint: `http://127.0.0.1:${collectorAddress.port}` },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(response.status, 504);
+    await response.text();
+    const deadline = Date.now() + 2_000;
+    while (traces.length < 1 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(traces.length >= 1, true);
+    const spans = JSON.parse(traces[0]!).resourceSpans[0].scopeSpans[0].spans as {
+      name: string;
+      attributes: { key: string; value: { stringValue: string } }[];
+    }[];
+    const attempt = spans.find((span) => span.name === "axond.upstream.attempt");
+    assert.ok(attempt);
+    const attr = (key: string) => attempt.attributes.find((item) => item.key === key)?.value.stringValue;
+    assert.equal(attr("axond.timeout"), "response_headers");
+    assert.equal(attr("axond.timeout.bound"), "phase");
+    assert.equal(attr("axond.upstream.status"), undefined);
+    assert.equal(traces[0]!.includes("upstream-openai"), false);
+    assert.equal(traces[0]!.includes(KEY), false);
   } finally {
     upstream.close();
     collector.closeAllConnections();

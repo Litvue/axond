@@ -218,21 +218,33 @@ export function classifyUpstream(status: number, body: string): GatewayFailure {
     }
   }
   if (status === 401 || status === 403) {
-    return new GatewayFailure("invalid_request", 502, message);
+    return upstreamFailure("invalid_request", 502, message, false, status);
   }
   if (status === 404) {
-    return new GatewayFailure("model_unavailable", 502, message);
+    return upstreamFailure("model_unavailable", 502, message, false, status);
   }
   if (status === 429) {
-    return new GatewayFailure("provider_dependency_failed", 502, message, true);
+    return upstreamFailure("provider_dependency_failed", 502, message, true, status);
   }
   if (status >= 500) {
-    return new GatewayFailure("provider_dependency_failed", 502, message);
+    return upstreamFailure("provider_dependency_failed", 502, message, false, status);
   }
   if (message.toLowerCase().includes("context window")) {
-    return new GatewayFailure("context_window_exceeded", 400, message);
+    return upstreamFailure("context_window_exceeded", 400, message, false, status);
   }
-  return new GatewayFailure("invalid_request", 400, message);
+  return upstreamFailure("invalid_request", 400, message, false, status);
+}
+
+function upstreamFailure(
+  type: string,
+  status: number,
+  message: string,
+  rateLimited: boolean,
+  upstreamStatus: number,
+): GatewayFailure {
+  const error = new GatewayFailure(type, status, message, rateLimited);
+  error.upstreamStatus = upstreamStatus;
+  return error;
 }
 
 export async function callUpstream(input: {
