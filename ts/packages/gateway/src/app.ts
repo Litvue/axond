@@ -1504,7 +1504,15 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
     });
   } catch (error) {
     if (!(error instanceof StoreFailure)) {
-      throw error;
+      // A StoreFailure is a rejected write. Anything else is the panic path:
+      // the charge did not finish, and the thrown text stays off the log.
+      opts.metrics?.record("axond.settlement.failures", 1, { "axond.settlement.reason": "panicked" });
+      emitLog(opts, {
+        msg: "settlement_failure",
+        request_id: axond.requestId,
+        reason: "panicked",
+      });
+      return;
     }
     opts.metrics?.record("axond.settlement.failures", 1, { "axond.settlement.reason": "charge_failed" });
     emitLog(opts, {

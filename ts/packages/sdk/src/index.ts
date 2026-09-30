@@ -157,7 +157,8 @@ export type TerminalRemainLog =
  * `queue_timeout` means the charge never started and spend was not written.
  * `execution_timeout` means Store work outlived its deadline and still finishes.
  * `charge_failed` means the Store write threw and spend was not written.
- * The driver text stays off this line.
+ * `panicked` means settlement threw something other than that Store failure.
+ * The driver text and the thrown text stay off this line.
  */
 export type SettlementFailureLog =
   | {
@@ -169,7 +170,7 @@ export type SettlementFailureLog =
   | {
       msg: "settlement_failure";
       request_id: string;
-      reason: "charge_failed";
+      reason: "charge_failed" | "panicked";
     };
 
 /**

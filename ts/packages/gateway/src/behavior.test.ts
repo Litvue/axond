@@ -4057,6 +4057,88 @@ test("charge_failure_log_names_the_reason_and_omits_the_driver_text", async () =
   }
 });
 
+test("settlement_panic_log_names_the_reason_and_omits_the_thrown_text", async () => {
+  const thrown = "password=secret host=db.internal:5432/axond settlement blew up";
+  const logs: { msg: string; reason?: string; waited_ms?: number; request_id?: string }[] = [];
+  const usage: UsageRecord[] = [];
+  const store = await seeded();
+  const before = (await store.getBudget("platform", "compat"))!;
+  store.settle = async () => {
+    throw new Error(thrown);
+  };
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":4,"completion_tokens":4}}');
+  });
+  const metrics = createMetrics(["sk-live-secret", KEY]);
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1_000_000n,
+        outputMicrodollarsPerMillion: 1_000_000n,
+      },
+    ],
+    metrics,
+    onLog: (record) => {
+      logs.push(record);
+    },
+    onUsage: (record) => {
+      usage.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: CHAT_HEADERS,
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    let failed: (typeof logs)[number] | undefined;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      failed = logs.find((line) => line.msg === "settlement_failure" && line.reason === "panicked");
+      if (failed) {
+        break;
+      }
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.ok(failed);
+    assert.equal(failed.waited_ms, undefined);
+    assert.ok((failed.request_id ?? "").length > 0);
+    const after = (await store.getBudget("platform", "compat"))!;
+    assert.equal(after.spent, before.spent);
+    assert.equal(usage.length, 0);
+    const point = metrics.points.find(
+      (item) => item.name === "axond.settlement.failures" && item.attributes["axond.settlement.reason"] === "panicked",
+    );
+    assert.equal(point?.value, 1);
+    const chargeFailed = metrics.points.find(
+      (item) => item.name === "axond.settlement.failures" && item.attributes["axond.settlement.reason"] === "charge_failed",
+    );
+    assert.equal(chargeFailed, undefined);
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes(thrown), false);
+    assert.equal(encoded.includes("db.internal"), false);
+    assert.equal(encoded.includes("password=secret"), false);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+    assert.equal(encoded.includes("sk-live-secret"), false);
+    assert.equal(encoded.includes(KEY), false);
+    assert.equal(encoded.includes(upstream.url), false);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("an admitted request holds a reserved settlement until the charge is spawned", async () => {
   const admission = createAdmission({
     ...defaultAdmission(),
