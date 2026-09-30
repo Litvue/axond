@@ -126,7 +126,7 @@ test("chat stream usage splice keeps unrelated bytes", () => {
         ),
       ),
     ),
-    '{"z":1,"model":"gpt-test","n":9007199254740993,"a":1,"a":2,"stream":true,"messages":[{"stream_options":{"include_usage":false}}]},"stream_options":{"include_usage":true}}',
+    '{"z":1,"model":"gpt-test","n":9007199254740993,"a":1,"a":2,"stream":true,"messages":[{"stream_options":{"include_usage":false}}],"stream_options":{"include_usage":true}}',
   );
   assert.equal(
     decode(
