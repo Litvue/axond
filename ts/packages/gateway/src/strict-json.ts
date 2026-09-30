@@ -276,18 +276,7 @@ function readField(cur: Cursor, field: StrictField, key: string): unknown {
     return expectString(cur, key, "a string");
   }
   if (field.kind === "cadence") {
-    if (peek !== '"') {
-      const loc = skipValue(cur);
-      fail(`Failed to parse the request body as JSON: ${key}: expected value ${at(loc)}`);
-    }
-    const text = readString(cur, key);
-    const loc = cur.loc();
-    if (text !== "monthly" && text !== "fixed") {
-      fail(
-        `${DESERIALIZE}: ${key}: unknown variant \`${text}\`, expected \`monthly\` or \`fixed\` ${at(loc)}`,
-      );
-    }
-    return text;
+    return readCadence(cur, key);
   }
   if (field.kind === "u64") {
     return readU64(cur, key);
@@ -296,6 +285,152 @@ function readField(cur: Cursor, field: StrictField, key: string): unknown {
     return readStringList(cur, key);
   }
   return jsonValue(cur, key);
+}
+
+function readCadence(cur: Cursor, key: string): "monthly" | "fixed" {
+  const peek = cur.peek();
+  if (peek === '"') {
+    return knownCadence(readString(cur, key), key, cur.loc());
+  }
+  if (peek !== "{") {
+    parseFail(`${key}: expected value`, peekLoc(cur));
+  }
+  cur.bump();
+  cur.skipWs();
+  if (cur.peek() === "") {
+    parseFail(`${key}: EOF while parsing an object`, cur.loc());
+  }
+  if (cur.peek() === "}") {
+    parseFail(`${key}: expected value`, peekLoc(cur));
+  }
+  if (cur.peek() !== '"') {
+    parseFail(`${key}: key must be a string`, peekLoc(cur));
+  }
+  const variant = readString(cur, key);
+  const name = knownCadence(variant, key, cur.loc());
+  cur.skipWs();
+  if (cur.peek() === "") {
+    parseFail(`${key}: EOF while parsing an object`, cur.loc());
+  }
+  if (cur.peek() !== ":") {
+    parseFail(`${key}: expected \`:\``, peekLoc(cur));
+  }
+  cur.bump();
+  cur.skipWs();
+  readUnit(cur, `${key}.${name}`);
+  cur.skipWs();
+  if (cur.peek() === "") {
+    parseFail(`${key}: EOF while parsing an object`, cur.loc());
+  }
+  if (cur.peek() !== "}") {
+    parseFail(`${key}: expected value`, cur.loc());
+  }
+  cur.bump();
+  return name;
+}
+
+function knownCadence(text: string, key: string, loc: Loc): "monthly" | "fixed" {
+  if (text === "monthly" || text === "fixed") {
+    return text;
+  }
+  fail(`${DESERIALIZE}: ${key}: unknown variant \`${text}\`, expected \`monthly\` or \`fixed\` ${at(loc)}`);
+}
+
+function readUnit(cur: Cursor, path: string): void {
+  if (cur.peek() === "") {
+    parseFail(`${path}: EOF while parsing a value`, cur.loc());
+  }
+  const peek = cur.peek();
+  if (peek === "n") {
+    cur.bump();
+    readIdent(cur, path, "ull");
+    return;
+  }
+  if (peek === "t" || peek === "f") {
+    const word = peek === "t" ? "true" : "false";
+    cur.bump();
+    readIdent(cur, path, word.slice(1));
+    fail(`${DESERIALIZE}: ${path}: invalid type: boolean \`${word}\`, expected unit ${at(cur.loc())}`);
+  }
+  if (peek === '"') {
+    const text = readString(cur, path);
+    fail(`${DESERIALIZE}: ${path}: invalid type: string ${JSON.stringify(text)}, expected unit ${at(cur.loc())}`);
+  }
+  if (peek === "[" || peek === "{") {
+    const kind = peek === "[" ? "sequence" : "map";
+    fail(`${DESERIALIZE}: ${path}: invalid type: ${kind}, expected unit ${at(cur.loc())}`);
+  }
+  if (peek === "-" || (peek >= "0" && peek <= "9")) {
+    const token = readUnitNumber(cur, path);
+    const kind = token.includes(".") || token.includes("e") || token.includes("E")
+      ? `floating point \`${formatRustFloat(token)}\``
+      : `integer \`${token}\``;
+    fail(`${DESERIALIZE}: ${path}: invalid type: ${kind}, expected unit ${at(cur.loc())}`);
+  }
+  parseFail(`${path}: expected value`, peekLoc(cur));
+}
+
+function readIdent(cur: Cursor, path: string, word: string): void {
+  for (const ch of word) {
+    const got = cur.bump();
+    if (got === "") {
+      parseFail(`${path}: EOF while parsing a value`, cur.loc());
+    }
+    if (got !== ch) {
+      parseFail(`${path}: expected ident`, cur.loc());
+    }
+  }
+}
+
+function readUnitNumber(cur: Cursor, path: string): string {
+  const start = cur.i;
+  if (cur.peek() === "-") {
+    cur.bump();
+  }
+  const first = cur.bump();
+  if (first === "") {
+    parseFail(`${path}: EOF while parsing a value`, cur.loc());
+  }
+  if (first === "0") {
+    if (cur.peek() >= "0" && cur.peek() <= "9") {
+      parseFail(`${path}: invalid number`, peekLoc(cur));
+    }
+  } else if (first >= "1" && first <= "9") {
+    while (cur.peek() >= "0" && cur.peek() <= "9") {
+      cur.bump();
+    }
+  } else {
+    parseFail(`${path}: invalid number`, cur.loc());
+  }
+  if (cur.peek() === ".") {
+    cur.bump();
+    if (cur.peek() < "0" || cur.peek() > "9") {
+      if (cur.peek() === "") {
+        parseFail(`${path}: EOF while parsing a value`, cur.loc());
+      }
+      parseFail(`${path}: invalid number`, peekLoc(cur));
+    }
+    while (cur.peek() >= "0" && cur.peek() <= "9") {
+      cur.bump();
+    }
+  }
+  if (cur.peek() === "e" || cur.peek() === "E") {
+    cur.bump();
+    if (cur.peek() === "+" || cur.peek() === "-") {
+      cur.bump();
+    }
+    const exp = cur.bump();
+    if (exp === "") {
+      parseFail(`${path}: EOF while parsing a value`, cur.loc());
+    }
+    if (exp < "0" || exp > "9") {
+      parseFail(`${path}: invalid number`, cur.loc());
+    }
+    while (cur.peek() >= "0" && cur.peek() <= "9") {
+      cur.bump();
+    }
+  }
+  return cur.raw.slice(start, cur.i);
 }
 
 function readU64(cur: Cursor, key: string): bigint {

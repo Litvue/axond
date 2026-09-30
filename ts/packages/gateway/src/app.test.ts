@@ -1301,6 +1301,168 @@ test("management_json_string_escapes_match_serde", async () => {
   }
 });
 
+test("management_json_cadence_unit_enum_matches_serde", async () => {
+  const { app, upstream } = await gateway();
+  try {
+    const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+    const call = (path: string, method: string, body?: string) =>
+      app.request(`http://127.0.0.1${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+    const data = "Failed to deserialize the JSON body into the target type";
+    const parse = "Failed to parse the request body as JSON";
+    const created = await call("/api/v1/namespaces", "POST", '{"id":"wsp_cad"}');
+    assert.equal(created.status, 201);
+    const bad = async (body: string, message: string) => {
+      const response = await call("/api/v1/namespaces/wsp_cad/budget", "PUT", body);
+      assert.equal(response.status, 400);
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+    };
+    const monthly = await call(
+      "/api/v1/namespaces/wsp_cad/budget",
+      "PUT",
+      '{"cadence":{"monthly":null},"limit_microdollars":1}',
+    );
+    assert.equal(monthly.status, 200);
+    assert.equal((await monthly.json()).cadence, "monthly");
+    const spaced = await call(
+      "/api/v1/namespaces/wsp_cad/budget",
+      "PUT",
+      '{"cadence": { "fixed" : null },"limit_microdollars":1,"period":"2026-09"}',
+    );
+    assert.equal(spaced.status, 200);
+    assert.equal((await spaced.json()).cadence, "fixed");
+    const decoded = await call(
+      "/api/v1/namespaces/wsp_cad/budget",
+      "PUT",
+      '{"cadence":{"mon\\u0074hly":null},"limit_microdollars":1}',
+    );
+    assert.equal(decoded.status, 200);
+    assert.equal((await decoded.json()).cadence, "monthly");
+    const positional = await call("/api/v1/namespaces/wsp_cad/budget", "PUT", '[{"monthly":null},1]');
+    assert.equal(positional.status, 200);
+    assert.equal((await positional.json()).cadence, "monthly");
+    const fixedOnly = await call(
+      "/api/v1/namespaces/wsp_cad/budget",
+      "PUT",
+      '{"cadence":{"fixed":null},"limit_microdollars":1}',
+    );
+    assert.equal(fixedOnly.status, 400);
+    assert.deepEqual(await fixedOnly.json(), {
+      error: { type: "bad_request", message: 'period is required for cadence "fixed"' },
+    });
+    await bad(
+      '{"cadence":{"a":"\\q"},"limit_microdollars":1}',
+      `${data}: cadence: unknown variant \`a\`, expected \`monthly\` or \`fixed\` at line 1 column 15`,
+    );
+    await bad(
+      '{"cadence":{"weekly":null},"limit_microdollars":1}',
+      `${data}: cadence: unknown variant \`weekly\`, expected \`monthly\` or \`fixed\` at line 1 column 20`,
+    );
+    await bad(
+      '{"cadence":{"weekly"}}',
+      `${data}: cadence: unknown variant \`weekly\`, expected \`monthly\` or \`fixed\` at line 1 column 20`,
+    );
+    await bad(
+      '{"cadence":{"":null},"limit_microdollars":1}',
+      `${data}: cadence: unknown variant \`\`, expected \`monthly\` or \`fixed\` at line 1 column 14`,
+    );
+    await bad(
+      '{"cadence":{"\\u0061":null},"limit_microdollars":1}',
+      `${data}: cadence: unknown variant \`a\`, expected \`monthly\` or \`fixed\` at line 1 column 20`,
+    );
+    await bad(
+      '{"cadence":{"monthly":"\\q"},"limit_microdollars":1}',
+      `${parse}: cadence.monthly: invalid escape at line 1 column 25`,
+    );
+    await bad(
+      '{"cadence":{"monthly":"\\uD800"},"limit_microdollars":1}',
+      `${parse}: cadence.monthly: unexpected end of hex escape at line 1 column 30`,
+    );
+    await bad(
+      '{"cadence":{"fixed":[]},"limit_microdollars":1}',
+      `${data}: cadence.fixed: invalid type: sequence, expected unit at line 1 column 20`,
+    );
+    await bad(
+      '{"cadence":{"monthly":{}},"limit_microdollars":1}',
+      `${data}: cadence.monthly: invalid type: map, expected unit at line 1 column 22`,
+    );
+    await bad(
+      '{"cadence":{"monthly":"no"},"limit_microdollars":1}',
+      `${data}: cadence.monthly: invalid type: string "no", expected unit at line 1 column 26`,
+    );
+    await bad(
+      '{"cadence":{"monthly":"a\\"b"},"limit_microdollars":1}',
+      `${data}: cadence.monthly: invalid type: string "a\\"b", expected unit at line 1 column 28`,
+    );
+    await bad(
+      '{"cadence":{"monthly":true},"limit_microdollars":1}',
+      `${data}: cadence.monthly: invalid type: boolean \`true\`, expected unit at line 1 column 26`,
+    );
+    await bad(
+      '{"cadence":{"monthly":1},"limit_microdollars":1}',
+      `${data}: cadence.monthly: invalid type: integer \`1\`, expected unit at line 1 column 23`,
+    );
+    await bad(
+      '{"cadence":{"monthly":-1},"limit_microdollars":1}',
+      `${data}: cadence.monthly: invalid type: integer \`-1\`, expected unit at line 1 column 24`,
+    );
+    await bad(
+      '{"cadence":{"monthly":1.5},"limit_microdollars":1}',
+      `${data}: cadence.monthly: invalid type: floating point \`1.5\`, expected unit at line 1 column 25`,
+    );
+    await bad(
+      '{"cadence":{"monthly":1e2},"limit_microdollars":1}',
+      `${data}: cadence.monthly: invalid type: floating point \`100.0\`, expected unit at line 1 column 25`,
+    );
+    await bad(
+      '{"cadence":{"monthly":null,"fixed":null},"limit_microdollars":1}',
+      `${parse}: cadence: expected value at line 1 column 26`,
+    );
+    await bad(
+      '{"cadence":{"monthly":null ,"fixed":null},"limit_microdollars":1}',
+      `${parse}: cadence: expected value at line 1 column 27`,
+    );
+    await bad(
+      '{"cadence":{"monthly":null,},"limit_microdollars":1}',
+      `${parse}: cadence: expected value at line 1 column 26`,
+    );
+    await bad('{"cadence":1,"limit_microdollars":1}', `${parse}: cadence: expected value at line 1 column 12`);
+    await bad('{"cadence":null,"limit_microdollars":1}', `${parse}: cadence: expected value at line 1 column 12`);
+    await bad('{"cadence":[],"limit_microdollars":1}', `${parse}: cadence: expected value at line 1 column 12`);
+    await bad('{"cadence":{},"limit_microdollars":1}', `${parse}: cadence: expected value at line 1 column 13`);
+    await bad('{"cadence":{1:null},"limit_microdollars":1}', `${parse}: cadence: key must be a string at line 1 column 13`);
+    await bad('{"cadence":{"monthly"},"limit_microdollars":1}', `${parse}: cadence: expected \`:\` at line 1 column 22`);
+    await bad('{"cadence":{"\\q":null},"limit_microdollars":1}', `${parse}: cadence: invalid escape at line 1 column 15`);
+    await bad('{"cadence":{"monthly":', `${parse}: cadence.monthly: EOF while parsing a value at line 1 column 22`);
+    await bad('{"cadence":{', `${parse}: cadence: EOF while parsing an object at line 1 column 12`);
+    await bad(
+      '{"cadence":{"monthly":1e},"limit_microdollars":1}',
+      `${parse}: cadence.monthly: invalid number at line 1 column 25`,
+    );
+    await bad(
+      '{"cadence":{"monthly":nul},"limit_microdollars":1}',
+      `${parse}: cadence.monthly: expected ident at line 1 column 26`,
+    );
+    await bad(
+      '{"cadence":{"monthly":},"limit_microdollars":1}',
+      `${parse}: cadence.monthly: expected value at line 1 column 23`,
+    );
+    await bad(
+      '[{"a":"\\q"},1]',
+      `${data}: [0]: unknown variant \`a\`, expected \`monthly\` or \`fixed\` at line 1 column 5`,
+    );
+    await bad(
+      '[{"fixed":[]},1]',
+      `${data}: [0].fixed: invalid type: sequence, expected unit at line 1 column 10`,
+    );
+    await bad('[{"monthly":null,"fixed":null},1]', `${parse}: [0]: expected value at line 1 column 16`);
+    const kept = await call("/api/v1/namespaces/wsp_cad/budget", "GET");
+    assert.equal(kept.status, 200);
+    assert.equal((await kept.json()).cadence, "monthly");
+  } finally {
+    upstream.close();
+  }
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });
