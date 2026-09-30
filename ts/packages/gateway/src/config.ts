@@ -160,6 +160,7 @@ export async function loadConfig(
   rejectExtractTypes(toml, parsed);
   const bind = readServerBind(toml, parsed, secrets);
   rejectSectionShapes(toml, parsed, SECTIONS_AFTER_SERVER);
+  projectPositional(toml, parsed, POSITIONAL_AFTER_SERVER);
   rejectWithdrawn(parsed);
   rejectCollisions(parsed);
   rejectUsageJournal(parsed);
@@ -1102,6 +1103,7 @@ const SECTIONS_AFTER_SERVER: ReadonlyArray<readonly [string, SectionShape]> = [
 
 function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void {
   rejectSectionShapes(toml, parsed, SECTIONS_BEFORE_SERVER);
+  projectPositional(toml, parsed, POSITIONAL_BEFORE_SERVER);
   const admission = asRecord(parsed["admission"]) ?? {};
   for (const [key, expected, fallback] of [
     ["max_in_flight", "usize", 1024],
@@ -1202,27 +1204,322 @@ function rejectSectionShapes(
 }
 
 function nthArrayToken(rhs: string, index: number): string | null {
-  const text = rhs.trim();
-  if (!text.startsWith("[")) {
-    return null;
+  return arrayElements(rhs)[index] ?? null;
+}
+
+/**
+ * Serde fills a struct from a sequence in declaration order and ignores extra
+ * elements. A bad element is reported at `default.{section}.{index}` during
+ * extract, before a later zero bound.
+ */
+type PositionalField =
+  | { name: string; kind: "int"; expected: "u32" | "u64" | "usize" }
+  | { name: string; kind: "string" }
+  | { name: string; kind: "bool" }
+  | { name: string; kind: "enum"; enumName: string; variants: readonly string[] }
+  | { name: string; kind: "strings" }
+  | { name: string; kind: "struct"; structName: string; fields: readonly PositionalField[] };
+
+const USAGE_INDEX_FIELDS: readonly PositionalField[] = [
+  { name: "buffer_capacity", kind: "int", expected: "usize" },
+  { name: "max_batch", kind: "int", expected: "usize" },
+  { name: "flush_interval_ms", kind: "int", expected: "u64" },
+];
+
+const POSITIONAL_BEFORE_SERVER: ReadonlyArray<readonly [string, readonly PositionalField[]]> = [
+  [
+    "admission",
+    [
+      { name: "max_request_bytes", kind: "int", expected: "usize" },
+      { name: "max_in_flight", kind: "int", expected: "usize" },
+      { name: "max_in_flight_streams", kind: "int", expected: "usize" },
+      { name: "max_in_flight_per_tenant", kind: "int", expected: "usize" },
+      { name: "max_tenants", kind: "int", expected: "usize" },
+      { name: "queue_capacity", kind: "int", expected: "usize" },
+      { name: "queue_wait_ms", kind: "int", expected: "u64" },
+      { name: "max_stream_duration_ms", kind: "int", expected: "u64" },
+      { name: "max_prompt_tokens", kind: "int", expected: "u64" },
+      { name: "max_output_tokens", kind: "int", expected: "u64" },
+      { name: "max_stream_bytes", kind: "int", expected: "u64" },
+      { name: "max_pending_settlements", kind: "int", expected: "usize" },
+      { name: "max_in_flight_settlements", kind: "int", expected: "usize" },
+      { name: "settlement_queue_wait_ms", kind: "int", expected: "u64" },
+      { name: "settlement_timeout_ms", kind: "int", expected: "u64" },
+    ],
+  ],
+  ["blocklist", [{ name: "models", kind: "strings" }]],
+  [
+    "catalog",
+    [
+      { name: "source", kind: "enum", enumName: "CatalogSourceBackend", variants: ["none", "models-dev", "seed"] },
+      { name: "store", kind: "enum", enumName: "CatalogStoreBackend", variants: ["in-memory", "postgres"] },
+      { name: "source_url", kind: "string" },
+      { name: "dsn_env", kind: "string" },
+      { name: "schema", kind: "string" },
+      { name: "create_table", kind: "bool" },
+      { name: "refresh_interval_seconds", kind: "int", expected: "u64" },
+      { name: "refresh_timeout_seconds", kind: "int", expected: "u64" },
+      { name: "retry_initial_seconds", kind: "int", expected: "u64" },
+      { name: "retry_max_seconds", kind: "int", expected: "u64" },
+      { name: "bootstrap", kind: "enum", enumName: "CatalogBootstrap", variants: ["empty", "seed"] },
+      { name: "max_payload_bytes", kind: "int", expected: "usize" },
+      { name: "connect_timeout_ms", kind: "int", expected: "u64" },
+      { name: "operation_timeout_ms", kind: "int", expected: "u64" },
+    ],
+  ],
+  [
+    "credential_pool",
+    [
+      { name: "strategy", kind: "enum", enumName: "SelectionStrategy", variants: ["round-robin", "weighted"] },
+      { name: "failure_threshold", kind: "int", expected: "u32" },
+      { name: "cooldown_seconds", kind: "int", expected: "u64" },
+    ],
+  ],
+  ["discovery", [{ name: "refresh_interval_seconds", kind: "int", expected: "u64" }]],
+  [
+    "failover",
+    [
+      { name: "max_attempts", kind: "int", expected: "u32" },
+      { name: "overall_timeout_ms", kind: "int", expected: "u64" },
+      { name: "failure_threshold", kind: "int", expected: "u32" },
+      { name: "cooldown_seconds", kind: "int", expected: "u64" },
+    ],
+  ],
+];
+
+const POSITIONAL_AFTER_SERVER: ReadonlyArray<readonly [string, readonly PositionalField[]]> = [
+  [
+    "shutdown",
+    [
+      { name: "drain_grace_ms", kind: "int", expected: "u64" },
+      { name: "deadline_ms", kind: "int", expected: "u64" },
+      { name: "flush_timeout_ms", kind: "int", expected: "u64" },
+    ],
+  ],
+  [
+    "storage",
+    [
+      { name: "backend", kind: "enum", enumName: "StorageBackend", variants: ["sqlite", "postgres"] },
+      { name: "path", kind: "string" },
+      { name: "dsn_env", kind: "string" },
+      { name: "on_unavailable", kind: "enum", enumName: "StoreUnavailable", variants: ["deny", "allow"] },
+      { name: "create_table", kind: "bool" },
+      { name: "usage_index", kind: "struct", structName: "UsageIndexConfig", fields: USAGE_INDEX_FIELDS },
+    ],
+  ],
+  [
+    "transport",
+    [
+      { name: "connect_timeout_ms", kind: "int", expected: "u64" },
+      { name: "response_header_timeout_ms", kind: "int", expected: "u64" },
+      { name: "buffered_body_timeout_ms", kind: "int", expected: "u64" },
+      { name: "stream_idle_timeout_ms", kind: "int", expected: "u64" },
+      { name: "stream_terminal_grace_ms", kind: "int", expected: "u64" },
+      { name: "max_response_bytes", kind: "int", expected: "u64" },
+      { name: "max_error_bytes", kind: "int", expected: "u64" },
+    ],
+  ],
+  [
+    "usage_journal",
+    [
+      { name: "backend", kind: "enum", enumName: "UsageJournalBackend", variants: ["none", "postgres"] },
+      { name: "dsn_env", kind: "string" },
+      { name: "schema", kind: "string" },
+      { name: "create_schema", kind: "bool" },
+      { name: "consumer", kind: "string" },
+      { name: "max_events", kind: "int", expected: "u64" },
+      { name: "max_delivery_attempts", kind: "int", expected: "u32" },
+      { name: "retain_acknowledged_seconds", kind: "int", expected: "u64" },
+      { name: "capacity_policy", kind: "enum", enumName: "UsageCapacityPolicy", variants: ["refuse", "drop-oldest"] },
+      { name: "on_undurable", kind: "enum", enumName: "UndurablePolicy", variants: ["refuse", "serve"] },
+      { name: "operation_timeout_ms", kind: "int", expected: "u64" },
+      { name: "connect_timeout_ms", kind: "int", expected: "u64" },
+      { name: "connections", kind: "int", expected: "usize" },
+      { name: "claim_batch", kind: "int", expected: "usize" },
+      { name: "lease_seconds", kind: "int", expected: "u64" },
+      { name: "poll_interval_ms", kind: "int", expected: "u64" },
+    ],
+  ],
+];
+
+function projectPositional(
+  toml: string,
+  parsed: Record<string, unknown>,
+  sections: ReadonlyArray<readonly [string, readonly PositionalField[]]>,
+): void {
+  for (const [key, fields] of sections) {
+    if (!Object.hasOwn(parsed, key) || parsed[key] === undefined) {
+      continue;
+    }
+    const value = parsed[key];
+    if (Array.isArray(value)) {
+      parsed[key] = structFromSequence(value, fields, topLevelAssignment(toml, key), `default.${key}`);
+      continue;
+    }
+    const record = asRecord(value);
+    if (record) {
+      projectNestedStructs(toml, key, record, fields);
+    }
   }
-  let inner = text.slice(1).trim();
-  for (let cursor = 0; cursor <= index; cursor += 1) {
-    if (inner.length === 0 || inner.startsWith("]")) {
-      return null;
+}
+
+function projectNestedStructs(
+  toml: string,
+  section: string,
+  record: Record<string, unknown>,
+  fields: readonly PositionalField[],
+): void {
+  for (const field of fields) {
+    if (field.kind !== "struct" || !Array.isArray(record[field.name])) {
+      continue;
     }
-    const token = scalarToken(inner);
-    const bracket = token.indexOf("]");
-    const clean = (bracket === -1 ? token : token.slice(0, bracket)).trim();
-    if (cursor === index) {
-      return clean;
-    }
-    inner = inner.slice(token.length).trim();
-    if (inner.startsWith(",")) {
-      inner = inner.slice(1).trim();
-    }
+    record[field.name] = structFromSequence(
+      record[field.name] as unknown[],
+      field.fields,
+      sectionFieldLiteral(toml, section, field.name),
+      `default.${section}.${field.name}`,
+    );
   }
-  return null;
+}
+
+function structFromSequence(
+  values: unknown[],
+  fields: readonly PositionalField[],
+  literal: string | null,
+  keyPrefix: string,
+): Record<string, unknown> {
+  const tokens = literal === null ? [] : arrayElements(literal);
+  const record: Record<string, unknown> = {};
+  const count = Math.min(values.length, fields.length);
+  for (let index = 0; index < count; index += 1) {
+    const field = fields[index];
+    if (!field) {
+      break;
+    }
+    record[field.name] = positionalValue(values[index], field, tokens[index] ?? null, `${keyPrefix}.${index}`);
+  }
+  return record;
+}
+
+function positionalValue(
+  value: unknown,
+  field: PositionalField,
+  token: string | null,
+  figmentKey: string,
+): unknown {
+  if (field.kind === "int") {
+    return positionalInt(value, token, field.expected, figmentKey);
+  }
+  if (field.kind === "string") {
+    if (typeof value === "string" && (token === null || !isFloatToken(token))) {
+      return value;
+    }
+    throw configLoad(`invalid type: found ${foundPhrase(value, token)}, expected a string for key "${figmentKey}"`);
+  }
+  if (field.kind === "bool") {
+    if (typeof value === "boolean" && (token === null || !isFloatToken(token))) {
+      return value;
+    }
+    throw configLoad(`invalid type: found ${foundPhrase(value, token)}, expected a boolean for key "${figmentKey}"`);
+  }
+  if (field.kind === "strings") {
+    if (!Array.isArray(value)) {
+      throw configLoad(`invalid type: found ${foundPhrase(value, token)}, expected a sequence for key "${figmentKey}"`);
+    }
+    const nested = token === null ? [] : arrayElements(token);
+    value.forEach((entry, index) => {
+      const entryToken = nested[index] ?? null;
+      if (typeof entry === "string" && (entryToken === null || !isFloatToken(entryToken))) {
+        return;
+      }
+      throw configLoad(
+        `invalid type: found ${foundPhrase(entry, entryToken)}, expected a string for key "${figmentKey}.${index}"`,
+      );
+    });
+    return value;
+  }
+  if (field.kind === "enum") {
+    if (token !== null && isFloatToken(token)) {
+      throw configLoad(
+        `invalid type: found float \`${rustFloatText(token)}\`, expected enum ${field.enumName} for key "${figmentKey}"`,
+      );
+    }
+    if (typeof value === "string") {
+      if (field.variants.includes(value)) {
+        return value;
+      }
+      const list =
+        field.variants.length === 2
+          ? `\`${field.variants[0]}\` or \`${field.variants[1]}\``
+          : `one of ${field.variants.map((item) => `\`${item}\``).join(", ")}`;
+      throw configLoad(`unknown variant: found \`${value}\`, expected \`${list}\` for key "${figmentKey}"`);
+    }
+    throw configLoad(
+      `invalid type: found ${foundPhrase(value, token)}, expected enum ${field.enumName} for key "${figmentKey}"`,
+    );
+  }
+  if (Array.isArray(value)) {
+    return structFromSequence(value, field.fields, token, figmentKey);
+  }
+  const record = asRecord(value);
+  if (record) {
+    for (const nested of field.fields) {
+      if (nested.kind !== "int" || !(nested.name in record)) {
+        continue;
+      }
+      positionalInt(record[nested.name], null, nested.expected, `${figmentKey}.${nested.name}`);
+    }
+    return record;
+  }
+  throw configLoad(
+    `invalid type: found ${foundPhrase(value, token)}, expected struct ${field.structName} for key "${figmentKey}"`,
+  );
+}
+
+function positionalInt(
+  value: unknown,
+  token: string | null,
+  expected: "u32" | "u64" | "usize",
+  figmentKey: string,
+): number | bigint {
+  if (token !== null && isFloatToken(token)) {
+    throw configLoad(
+      `invalid type: found float \`${rustFloatText(token)}\`, expected ${expected} for key "${figmentKey}"`,
+    );
+  }
+  const typeError = (found: string): never => {
+    throw configLoad(`invalid type: found ${found}, expected ${expected} for key "${figmentKey}"`);
+  };
+  if (typeof value === "string") {
+    typeError(`string ${JSON.stringify(value)}`);
+  }
+  if (typeof value === "boolean") {
+    typeError(`bool ${value}`);
+  }
+  if (Array.isArray(value)) {
+    typeError("sequence");
+  }
+  if (value !== null && typeof value === "object") {
+    typeError("map");
+  }
+  let integer: bigint;
+  if (typeof value === "bigint") {
+    integer = value;
+  } else if (typeof value === "number" && Number.isInteger(value)) {
+    integer = BigInt(value);
+  } else if (typeof value === "number") {
+    typeError(`float \`${value}\``);
+  } else {
+    typeError("sequence");
+  }
+  const max = expected === "u32" ? U32_MAX : TARGET_UINT_MAX;
+  if (integer < 0n || (expected === "u32" && integer > U32_MAX)) {
+    throw configLoad(`invalid value signed int \`${integer}\`, expected ${expected} for key "${figmentKey}"`);
+  }
+  if (integer > max) {
+    throw configLoad("number too large to fit in target type");
+  }
+  return typeof value === "bigint" ? value : Number(integer);
 }
 
 function readVariant(
@@ -1582,17 +1879,73 @@ function topLevelAssignment(toml: string, key: string): string | null {
 }
 
 function firstArrayToken(rhs: string): string | null {
+  return arrayElements(rhs)[0] ?? null;
+}
+
+function arrayElements(rhs: string): string[] {
   const text = rhs.trim();
   if (!text.startsWith("[")) {
-    return null;
+    return [];
   }
-  const inner = text.slice(1).trim();
-  if (inner.startsWith("]")) {
-    return null;
+  const elements: string[] = [];
+  let index = 1;
+  while (index < text.length) {
+    while (index < text.length && " \t,\n\r".includes(text[index] ?? "")) {
+      index += 1;
+    }
+    if (index >= text.length || text[index] === "]") {
+      break;
+    }
+    const start = index;
+    index = skipTomlValue(text, index);
+    elements.push(text.slice(start, index).trim());
   }
-  const token = scalarToken(inner);
-  const bracket = token.indexOf("]");
-  return (bracket === -1 ? token : token.slice(0, bracket)).trim();
+  return elements;
+}
+
+function skipTomlValue(text: string, index: number): number {
+  const opener = text[index];
+  if (opener === '"' || opener === "'") {
+    const quote = opener;
+    index += 1;
+    while (index < text.length) {
+      if (text[index] === "\\") {
+        index += 2;
+        continue;
+      }
+      if (text[index] === quote) {
+        return index + 1;
+      }
+      index += 1;
+    }
+    return index;
+  }
+  if (opener === "[" || opener === "{") {
+    let depth = 0;
+    while (index < text.length) {
+      const char = text[index];
+      if (char === '"' || char === "'") {
+        index = skipTomlValue(text, index);
+        continue;
+      }
+      if (char === "[" || char === "{") {
+        depth += 1;
+      } else if (char === "]" || char === "}") {
+        depth -= 1;
+        index += 1;
+        if (depth === 0) {
+          return index;
+        }
+        continue;
+      }
+      index += 1;
+    }
+    return index;
+  }
+  while (index < text.length && text[index] !== "," && text[index] !== "]" && text[index] !== "}") {
+    index += 1;
+  }
+  return index;
 }
 
 function scalarFromToken(value: unknown, token: string | null): FigmentScalar {

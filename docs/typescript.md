@@ -77,7 +77,11 @@ extract error is reported before a zero failover bound. `server = "x"` is
 `default.server.0`. An empty `server = []` keeps `0.0.0.0:8080`. A scalar in
 place of a table is the same extract error: `admission = "x"` is
 `expected struct AdmissionConfigWire` and is reported before a zero failover
-bound. `[namespace]` (one pair of brackets) is `expected a sequence`.
+bound. `[namespace]` (one pair of brackets) is `expected a sequence`. A table
+written as an array fills fields in declaration order and drops extra
+elements. `failover = [0]` is `failover.max_attempts must be at least 1`
+before a ghost credential. `failover = [1.5]` is `expected u32` at
+`default.failover.0`. `storage = []` still requires a SQLite path.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

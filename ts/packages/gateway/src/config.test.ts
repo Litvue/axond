@@ -743,6 +743,91 @@ test("a non-table section is refused while figment extracts", async () => {
   );
 });
 
+test("a struct written as a sequence fills its fields", async () => {
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const typed = (found: string, expected: string, key: string) =>
+    `config: invalid type: found ${found}, expected ${expected} for key "${key}"`;
+  const withoutStorage = BASE.replace('[storage]\nbackend = "sqlite"\npath = "/tmp/axond.sqlite"\n', "");
+  await reject(
+    `failover = [0]\n${BASE}[[credential]]\nnamespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"\n[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\n`,
+    "failover.max_attempts must be at least 1",
+  );
+  await reject(`failover = [1.5]\n${BASE}`, typed("float `1.5`", "u32", "default.failover.0"));
+  await reject(`failover = [3, 1.0]\n${BASE}`, typed("float `1`", "u64", "default.failover.1"));
+  await reject(`admission = [0]\n${BASE}`, "admission.max_request_bytes must be at least 1");
+  await reject(
+    `discovery = [0]\nfailover = [0]\n${BASE}`,
+    "discovery.refresh_interval_seconds must be at least 1",
+  );
+  await reject(
+    `catalog = ["nope"]\ndiscovery = [0]\n${BASE}`,
+    "config: unknown variant: found `nope`, expected `one of `none`, `models-dev`, `seed`` for key \"default.catalog.0\"",
+  );
+  await reject(
+    `storage = ["nope"]\n${withoutStorage}`,
+    "config: unknown variant: found `nope`, expected ``sqlite` or `postgres`` for key \"default.storage.0\"",
+  );
+  await reject(
+    `storage = ["postgres"]\n${withoutStorage}`,
+    "`[storage]` postgres requires a non-empty `dsn_env`",
+  );
+  await reject(`storage = []\n${withoutStorage}`, "`[storage]` sqlite requires a non-empty `path`");
+  await reject(
+    `storage = ["sqlite", 1]\n${withoutStorage}`,
+    typed("signed int `1`", "a string", "default.storage.1"),
+  );
+  await reject(
+    BASE.replace('path = "/tmp/axond.sqlite"\n', 'path = "/tmp/axond.sqlite"\nusage_index = [0]\n'),
+    "`[storage.usage_index]` buffer_capacity must be at least 1",
+  );
+  await reject(
+    BASE.replace('path = "/tmp/axond.sqlite"\n', 'path = "/tmp/axond.sqlite"\nusage_index = [1.5]\n'),
+    typed("float `1.5`", "usize", "default.storage.usage_index.0"),
+  );
+  await reject(
+    `shutdown = [0, 0]\n${BASE}`,
+    "shutdown.deadline_ms must be at least 1: shutdown waits are bounded",
+  );
+  await reject(`transport = [0]\n${BASE}`, "transport.connect_timeout_ms must be at least 1");
+  await reject(
+    `usage_journal = ["postgres"]\n${BASE}`,
+    '`[usage_journal] backend = "postgres"` is not built (ADR 0049)',
+  );
+  await reject(`blocklist = ["gpt"]\n${BASE}`, typed('string "gpt"', "a sequence", "default.blocklist.0"));
+  await reject(
+    `credential_pool = ["weighted", 0]\n${BASE}`,
+    "credential_pool.failure_threshold must be at least 1",
+  );
+
+  const attempts = await loadConfig(`failover = [1]\n${BASE}`, secrets);
+  assert.equal(attempts.transport.maxAttempts, 1);
+  const bytes = await loadConfig(`admission = [1]\n${BASE}`, secrets);
+  assert.equal(bytes.maxRequestBytes, 1);
+  const drain = await loadConfig(`shutdown = [0]\n${BASE}`, secrets);
+  assert.equal(drain.shutdown.drainGraceMs, 0);
+  assert.equal(drain.shutdown.deadlineMs, 15_000);
+  const catalog = await loadConfig(`catalog = ["models-dev"]\n${BASE}`, secrets);
+  assert.deepEqual(catalog.catalog, {
+    source: "models-dev",
+    sourceUrl: "https://models.dev/catalog.json",
+  });
+  const bind = await loadConfig(
+    BASE.replace('[server]\nbind = "127.0.0.1:9"\n', 'server = ["127.0.0.1:9", 1]\n'),
+    secrets,
+  );
+  assert.equal(bind.bind, "127.0.0.1:9");
+  const empty = await loadConfig(`failover = []\n${BASE}`, secrets);
+  assert.equal(empty.transport.maxAttempts, 3);
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),
