@@ -62,7 +62,17 @@ export function createHandler(env: WorkerEnv) {
   });
   return {
     scheduled(ctx: WaitContext, fetchImpl?: typeof fetch): void {
-      ctx.waitUntil(discoverOnce({ store, providers, credentials, catalog, fetchImpl, metrics }));
+      ctx.waitUntil(discoverOnce({
+        store,
+        providers,
+        credentials,
+        catalog,
+        fetchImpl,
+        metrics,
+        onLog: (record) => {
+          console.log(JSON.stringify(record));
+        },
+      }));
     },
     fetch(request: Request, ctx: WaitContext): Response | Promise<Response> {
       const app = createAxond({
@@ -116,6 +126,9 @@ export function discoverOnSchedule(
       catalog: workerCatalog(env),
       fetchImpl,
       metrics,
+      onLog: (record) => {
+        console.log(JSON.stringify(record));
+      },
     }),
   );
 }

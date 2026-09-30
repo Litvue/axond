@@ -262,6 +262,8 @@ export async function callUpstream(input: {
   /** Node client that enforces the connect bound. Absent means the runtime owns connect. */
   dispatcher?: object;
   onTimeout?: (kind: string, bound: string) => void;
+  /** An open stream outlived its duration cap before a terminal event. */
+  onStreamLimit?: () => void;
   /**
    * OpenAI chat only. A rate-limit event before any byte is released asks for
    * another upstream. Null keeps the held event and ends the stream.
@@ -360,6 +362,7 @@ export async function callUpstream(input: {
       input.onStreamDone?.(reason);
     },
     input.onTimeout,
+    input.onStreamLimit,
     input.onBeforeContentRateLimit,
     input.onCredentialRateLimit,
     input.estimatedInputTokens ?? 0,
@@ -412,6 +415,7 @@ function relayStream(
   usage: UsageTokens,
   onDone: (reason: "end" | "cancel" | "fail") => void,
   onTimeout?: (kind: string, bound: string) => void,
+  onStreamLimit?: () => void,
   onBeforeContentRateLimit?: () => Promise<Response | null>,
   onCredentialRateLimit?: () => void,
   estimatedInputTokens = 0,
@@ -568,6 +572,7 @@ function relayStream(
         return;
       }
       if (value === "duration") {
+        onStreamLimit?.();
         failBound(controller, "stream exceeded the gateway's maximum stream duration");
         return;
       }

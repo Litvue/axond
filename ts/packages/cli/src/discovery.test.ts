@@ -173,6 +173,46 @@ test("a catalogue refusal names a bounded reason and omits the source url", asyn
   assert.equal(JSON.stringify(metrics.points).includes(secret), false);
 });
 
+test("catalogue_import_log_names_the_reason_and_omits_the_url", async () => {
+  const store = createMemoryStore();
+  const logs: { msg: string; outcome: string; reason: string; consecutive_refusals: number }[] = [];
+  const secret = "sk-live-secret";
+  const sourceUrl = `https://example.test/${secret}.json`;
+  await discoverOnce({
+    store,
+    providers: [],
+    credentials: [],
+    catalog: { source: "models-dev", sourceUrl },
+    onLog: (record) => {
+      logs.push(record);
+    },
+    fetchImpl: async () => {
+      throw new Error(secret);
+    },
+  });
+  await discoverOnce({
+    store,
+    providers: [],
+    credentials: [],
+    catalog: { source: "models-dev", sourceUrl },
+    onLog: (record) => {
+      logs.push(record);
+    },
+    fetchImpl: async () => new Response(JSON.stringify({ "openai/gpt-test": { id: "gpt-test" } }), { status: 200 }),
+  });
+  assert.equal(logs[0]!.msg, "catalogue_import");
+  assert.equal(logs[0]!.outcome, "refused");
+  assert.equal(logs[0]!.reason, "unreachable");
+  assert.equal(logs[0]!.consecutive_refusals, 1);
+  assert.equal(logs[1]!.outcome, "admitted");
+  assert.equal(logs[1]!.reason, "");
+  assert.equal(logs[1]!.consecutive_refusals, 0);
+  const encoded = JSON.stringify(logs);
+  assert.equal(encoded.includes(secret), false);
+  assert.equal(encoded.includes(sourceUrl), false);
+  assert.equal(encoded.includes("example.test"), false);
+});
+
 test("catalogue refusals survive a new store object on the same database", async () => {
   const dir = await mkdtemp(join(tmpdir(), "axond-streak-"));
   const path = join(dir, "axond.sqlite");

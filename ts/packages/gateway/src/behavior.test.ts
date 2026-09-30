@@ -539,6 +539,181 @@ test("a provider 500 stays on that credential and a 429 rotates", async () => {
   upstream.close();
 });
 
+test("credential_rate_limit_log_names_the_id_and_omits_the_secret", async () => {
+  const store = await seeded();
+  const logs: { msg: string; provider?: string; credential_id?: string; request_id?: string }[] = [];
+  const upstream = await listen((req, res) => {
+    const authorization = req.headers.authorization ?? "";
+    if (authorization.includes("bad-key")) {
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end('{"error":{"message":"slow down"}}');
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [
+      { namespace: "platform", provider: "fake-openai", secret: "bad-key", id: "bad" },
+      { namespace: "platform", provider: "fake-openai", secret: "good-key", id: "good" },
+    ],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+    const rotated = logs.filter((line) => line.msg === "credential_rate_limited");
+    assert.equal(rotated.length, 1);
+    assert.equal(rotated[0]!.provider, "fake-openai");
+    assert.equal(rotated[0]!.credential_id, "bad");
+    assert.ok((rotated[0]!.request_id ?? "").length > 0);
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes("bad-key"), false);
+    assert.equal(encoded.includes("good-key"), false);
+    assert.equal(encoded.includes(KEY), false);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("upstream_timeout_log_names_the_phase_and_omits_the_address", async () => {
+  const store = await seeded();
+  const logs: { msg: string; timeout?: string; bound?: string; provider?: string; model?: string }[] = [];
+  const upstream = await listen(() => {
+    // Holds the socket open so the header budget expires.
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream-openai", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    transport: {
+      responseHeaderTimeoutMs: 80,
+      bufferedBodyTimeoutMs: 5_000,
+      streamIdleTimeoutMs: 5_000,
+      maxResponseBytes: 1024,
+    },
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "PROMPT_SENTINEL" }] }),
+    });
+    assert.equal(response.status, 504);
+    const timeout = logs.find((line) => line.msg === "upstream_timeout");
+    assert.ok(timeout);
+    assert.equal(timeout.provider, "fake-openai");
+    assert.equal(timeout.model, "gpt-test");
+    assert.equal(timeout.timeout, "response_headers");
+    assert.equal(timeout.bound, "phase");
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes("upstream-openai"), false);
+    assert.equal(encoded.includes(KEY), false);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+    assert.equal(encoded.includes(upstream.url), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("stream_limit_log_names_the_duration_cap", async () => {
+  const store = await seeded();
+  const logs: { msg: string; limit?: string; provider?: string; model?: string }[] = [];
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"choices":[{"delta":{"content":"COMPLETION_SENTINEL"}}]}\n\n');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxStreamDurationMs: 80,
+    transport: {
+      responseHeaderTimeoutMs: 30_000,
+      bufferedBodyTimeoutMs: 30_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 5_000,
+      maxResponseBytes: 1024 * 1024,
+    },
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        stream: true,
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text.includes("COMPLETION_SENTINEL"), true);
+    const limit = logs.find((line) => line.msg === "stream_limit");
+    assert.ok(limit);
+    assert.equal(limit.limit, "duration");
+    assert.equal(limit.provider, "fake-openai");
+    assert.equal(limit.model, "gpt-test");
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes("sk-live-secret"), false);
+    assert.equal(encoded.includes(KEY), false);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+    assert.equal(encoded.includes("COMPLETION_SENTINEL"), false);
+    assert.equal(encoded.includes(upstream.url), false);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("a target attempt cap of one still walks every credential", async () => {
   assert.equal(targetAttemptCap(false, undefined), 3);
   assert.equal(targetAttemptCap(false, 1), 1);

@@ -1,4 +1,4 @@
-import type { CredentialConfig, ProviderConfig, Store } from "@axond/sdk";
+import type { CatalogueImportLog, CredentialConfig, ProviderConfig, Store } from "@axond/sdk";
 
 export interface CatalogConfig {
   source: "none" | "models-dev" | "seed";
@@ -27,6 +27,7 @@ export async function discoverOnce(input: {
   catalog: CatalogConfig;
   fetchImpl?: typeof fetch;
   metrics?: CatalogMetrics;
+  onLog?: (record: CatalogueImportLog) => void;
 }): Promise<void> {
   const fetchImpl = input.fetchImpl ?? fetch;
   for (const provider of input.providers) {
@@ -66,7 +67,7 @@ export async function discoverOnce(input: {
 }
 
 async function refreshCatalog(
-  input: { store: Store; metrics?: CatalogMetrics },
+  input: { store: Store; metrics?: CatalogMetrics; onLog?: (record: CatalogueImportLog) => void },
   fetchImpl: typeof fetch,
   sourceUrl: string,
 ): Promise<void> {
@@ -113,6 +114,7 @@ async function refreshCatalog(
   );
   catalogStreaks.set(input.store, reset);
   input.metrics?.set("axond.catalog.consecutive_refusals", reset);
+  input.onLog?.({ msg: "catalogue_import", outcome: "admitted", reason: "", consecutive_refusals: reset });
   const age = Date.now() - Date.parse(fetchedAt);
   if (Number.isFinite(age)) {
     input.metrics?.set("axond.catalog.active_age", Math.max(0, age));
@@ -130,7 +132,7 @@ function catalogStatusReason(status: number): CatalogRefusalReason {
 }
 
 async function noteCatalogRefusal(
-  input: { store: Store; metrics?: CatalogMetrics },
+  input: { store: Store; metrics?: CatalogMetrics; onLog?: (record: CatalogueImportLog) => void },
   reason: CatalogRefusalReason,
 ): Promise<void> {
   let next: number;
@@ -141,6 +143,7 @@ async function noteCatalogRefusal(
   }
   catalogStreaks.set(input.store, next);
   input.metrics?.record("axond.catalog.refusals", 1, { "axond.catalog.reason": reason });
+  input.onLog?.({ msg: "catalogue_import", outcome: "refused", reason, consecutive_refusals: next });
   input.metrics?.set("axond.catalog.consecutive_refusals", next);
   try {
     const row = await input.store.getProviderModels("catalog");
@@ -177,6 +180,7 @@ export function startDiscovery(input: {
   catalog: CatalogConfig;
   intervalSeconds: number;
   metrics?: CatalogMetrics;
+  onLog?: (record: CatalogueImportLog) => void;
 }): () => void {
   const run = () => {
     void discoverOnce(input);

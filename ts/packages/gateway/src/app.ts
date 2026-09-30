@@ -4,12 +4,14 @@ import type {
   AxondContext,
   AxondEnv,
   AxondExtension,
+  AxondLog,
   AxondOptions,
   CredentialConfig,
   ExtensionStore,
   InferenceRoute,
   NamespaceWrite,
   ProviderConfig,
+  RequestLog,
   Settlement,
   Store,
   UsageRecord,
@@ -829,9 +831,35 @@ async function dispatch(
       }
       scheduleSettle(opts, axond, usage, streamStatus);
     };
+    const noteTimeout = (kind: string, bound: string) => {
+      opts.metrics?.record("axond.upstream.timeouts", 1, {
+        "axond.target.provider": provider.id,
+        "axond.target.model": axond.target?.model ?? "",
+        "axond.timeout": kind,
+        "axond.timeout.bound": bound,
+      });
+      emitLog(opts, {
+        msg: "upstream_timeout",
+        request_id: axond.requestId,
+        provider: provider.id,
+        model: axond.target?.model ?? "",
+        timeout: kind,
+        bound,
+      });
+    };
+    const noteStreamLimit = () => {
+      emitLog(opts, {
+        msg: "stream_limit",
+        request_id: axond.requestId,
+        provider: provider.id,
+        model: axond.target?.model ?? "",
+        limit: "duration",
+      });
+    };
     const rotateStream = async (failedIndex: number): Promise<Response | null> => {
       const failed = planned[failedIndex]!;
       noteCredentialFailure(pools, record.id, provider.id, failed.id, now, policy.failureThreshold);
+      noteRateLimit(opts, axond, provider.id, failed.id);
       for (let index = failedIndex + 1; index < planned.length; index += 1) {
         const nextCredential = planned[index]!;
         try {
@@ -845,14 +873,8 @@ async function dispatch(
             deadlineAt,
             now: clock,
             dispatcher: opts.upstreamDispatcher,
-            onTimeout: (kind, bound) => {
-              opts.metrics?.record("axond.upstream.timeouts", 1, {
-                "axond.target.provider": provider.id,
-                "axond.target.model": axond.target?.model ?? "",
-                "axond.timeout": kind,
-                "axond.timeout.bound": bound,
-              });
-            },
+            onTimeout: noteTimeout,
+            onStreamLimit: noteStreamLimit,
             onUsage: (next) => copyUsage(usage, next),
             onStreamDone: (reason) => finishStream(nextCredential, reason),
             onDownstreamFirstToken: noteDownstreamFirstToken,
@@ -868,6 +890,9 @@ async function dispatch(
         } catch (error) {
           if (error instanceof GatewayFailure && error.rateLimited) {
             noteCredentialFailure(pools, record.id, provider.id, nextCredential.id, now, policy.failureThreshold);
+            if (index + 1 < planned.length) {
+              noteRateLimit(opts, axond, provider.id, nextCredential.id);
+            }
             continue;
           }
           throw error;
@@ -887,14 +912,8 @@ async function dispatch(
         deadlineAt,
         now: clock,
         dispatcher: opts.upstreamDispatcher,
-        onTimeout: (kind, bound) => {
-          opts.metrics?.record("axond.upstream.timeouts", 1, {
-            "axond.target.provider": provider.id,
-            "axond.target.model": axond.target?.model ?? "",
-            "axond.timeout": kind,
-            "axond.timeout.bound": bound,
-          });
-        },
+        onTimeout: noteTimeout,
+        onStreamLimit: noteStreamLimit,
         onUsage: (next) => copyUsage(usage, next),
         onStreamDone: (reason) => finishStream(credential, reason),
         onDownstreamFirstToken: stream ? noteDownstreamFirstToken : undefined,
@@ -945,6 +964,9 @@ async function dispatch(
       );
       if (rateLimited) {
         noteCredentialFailure(pools, record.id, provider.id, credential.id, now, policy.failureThreshold);
+        if (!pinned && attempt + 1 < planned.length) {
+          noteRateLimit(opts, axond, provider.id, credential.id);
+        }
       }
       if (!(rateLimited && !pinned && attempt + 1 < planned.length)) {
         noteServed(axond, opts, credential);
@@ -1202,7 +1224,31 @@ function settlementCost(opts: AxondOptions, axond: MutableContext, usage: UsageT
   return status === "upstream_error" && !measured ? 0n : priced;
 }
 
-type RequestLog = Parameters<NonNullable<AxondOptions["onLog"]>>[0];
+function emitLog(opts: AxondOptions, record: Exclude<AxondLog, RequestLog>): void {
+  if (!opts.onLog) {
+    return;
+  }
+  const secrets = secretValues(opts);
+  const safe: Record<string, string | number> = { ...record };
+  for (const [key, value] of Object.entries(safe)) {
+    if (key === "msg") {
+      continue;
+    }
+    if (typeof value === "string" && secrets.some((secret) => secret.length > 0 && value.includes(secret))) {
+      safe[key] = "";
+    }
+  }
+  opts.onLog(safe as Exclude<AxondLog, RequestLog>);
+}
+
+function noteRateLimit(opts: AxondOptions, axond: MutableContext, provider: string, credentialId: string): void {
+  emitLog(opts, {
+    msg: "credential_rate_limited",
+    request_id: axond.requestId,
+    provider,
+    credential_id: credentialId,
+  });
+}
 
 function requestLog(
   axond: MutableContext | undefined,

@@ -61,6 +61,75 @@ export interface RequestBody {
   setJson(value: unknown): void;
 }
 
+/** One request, written when the handler returns. */
+export interface RequestLog {
+  msg: "request";
+  request_id: string;
+  trace_id: string;
+  span_id: string;
+  http_method: string;
+  http_route: string;
+  status_code: number;
+  duration_ms: number;
+  namespace: string;
+  subject: string;
+  model: string;
+  target_provider?: string;
+  target_model?: string;
+  credential_source?: string;
+  status?: string;
+  retry_count?: number;
+  input_tokens?: string;
+  cache_read_tokens?: string;
+  cache_write_tokens?: string;
+  output_tokens?: string;
+  cost_microdollars?: string | null;
+  latency_ms?: number;
+  ttft_ms?: number;
+}
+
+/** A credential was refused and the pool is opening the next one. */
+export interface CredentialRateLimitLog {
+  msg: "credential_rate_limited";
+  request_id: string;
+  provider: string;
+  credential_id: string;
+}
+
+/** A transport phase exceeded its own bound or the remaining failover budget. */
+export interface UpstreamTimeoutLog {
+  msg: "upstream_timeout";
+  request_id: string;
+  provider: string;
+  model: string;
+  timeout: string;
+  bound: string;
+}
+
+/** An open stream outlived `admission.max_stream_duration_ms` before a terminal event. */
+export interface StreamLimitLog {
+  msg: "stream_limit";
+  request_id: string;
+  provider: string;
+  model: string;
+  limit: "duration";
+}
+
+/** A catalogue fetch was stored, or refused without replacing the active document. */
+export interface CatalogueImportLog {
+  msg: "catalogue_import";
+  outcome: "admitted" | "refused";
+  reason: string;
+  consecutive_refusals: number;
+}
+
+export type AxondLog =
+  | RequestLog
+  | CredentialRateLimitLog
+  | UpstreamTimeoutLog
+  | StreamLimitLog
+  | CatalogueImportLog;
+
 export interface AxondContext {
   requestId: string;
   route: InferenceRoute | "management" | "other";
@@ -280,36 +349,14 @@ export interface AxondOptions {
     fetch?: typeof fetch;
   };
   /**
-   * One JSON object per request, written when the handler returns. It carries
-   * the server-span fields known at that moment. A buffered charge includes
-   * status, tokens, and cost. A stream has been routed but has not settled, so
-   * those fields are absent. The gateway never puts a body or credential in it.
+   * JSON logs on stdout. A request line is written when the handler returns.
+   * A buffered charge includes status, tokens, and cost. A stream has been
+   * routed but has not settled, so those fields are absent. A rate-limit
+   * rotation, an upstream timeout, a stream duration cap, and a catalogue
+   * import are separate lines. None of them carry a body, a credential, or a
+   * source URL.
    */
-  onLog?: (record: {
-    msg: "request";
-    request_id: string;
-    trace_id: string;
-    span_id: string;
-    http_method: string;
-    http_route: string;
-    status_code: number;
-    duration_ms: number;
-    namespace: string;
-    subject: string;
-    model: string;
-    target_provider?: string;
-    target_model?: string;
-    credential_source?: string;
-    status?: string;
-    retry_count?: number;
-    input_tokens?: string;
-    cache_read_tokens?: string;
-    cache_write_tokens?: string;
-    output_tokens?: string;
-    cost_microdollars?: string | null;
-    latency_ms?: number;
-    ttft_ms?: number;
-  }) => void;
+  onLog?: (record: AxondLog) => void;
   maxRequestBytes?: number;
   /**
    * Largest estimated input, in tokens, a request may carry. `0` disables.

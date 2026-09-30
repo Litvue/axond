@@ -120,12 +120,16 @@ async function main(): Promise<void> {
   await new Promise<void>((resolve) => {
     server.listen(Number(portText), host, () => resolve());
   });
+  const writeLog = (record: unknown) => {
+    process.stdout.write(`${JSON.stringify(record)}\n`);
+  };
   void discoverOnce({
     store,
     providers: config.providers,
     credentials: config.credentials,
     catalog: config.catalog,
     metrics,
+    onLog: writeLog,
   });
   const stopDiscovery = startDiscovery({
     store,
@@ -134,6 +138,7 @@ async function main(): Promise<void> {
     catalog: config.catalog,
     intervalSeconds: config.discoveryIntervalSeconds,
     metrics,
+    onLog: writeLog,
   });
   let phase: "serving" | "draining" | "closing" = "serving";
   let exited = false;
