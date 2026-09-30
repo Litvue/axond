@@ -1,7 +1,8 @@
 import { GatewayFailure } from "./errors.ts";
 
-/** Tokio's semaphore ceiling (`usize::MAX >> 3` on 64-bit), as decimal text. */
-const MAX_PERMITS = "2305843009213693951";
+/** Tokio's semaphore ceiling (`usize::MAX >> 3` on 64-bit). */
+export const ADMISSION_MAX_PERMITS = 2305843009213693951n;
+const MAX_PERMITS = ADMISSION_MAX_PERMITS.toString();
 
 const DEFAULT_MAX_IN_FLIGHT = 1024;
 const DEFAULT_MAX_IN_FLIGHT_STREAMS = 512;

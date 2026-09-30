@@ -1500,6 +1500,51 @@ test("a u64 overall timeout above 2^53 loads", async () => {
   );
 });
 
+test("an admission ceiling above the semaphore limit names every digit", async () => {
+  const permits = "2305843009213693951";
+  const absurd = "2305843009213693952";
+  const ceiling = (field: string, value: string) =>
+    `admission.${field} (${value}) must not exceed ${permits}: a larger ceiling is not a bound this process can hold`;
+  await assert.rejects(
+    () =>
+      loadConfig(
+        BASE,
+        envSecretReader({ GW_KEY: "k", AXOND_ADMISSION__MAX_IN_FLIGHT: absurd }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", ceiling("max_in_flight", absurd));
+      return true;
+    },
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        BASE,
+        envSecretReader({ GW_KEY: "k", AXOND_ADMISSION__MAX_IN_FLIGHT_STREAMS: absurd }, async () => ""),
+      ),
+    (error: unknown) => {
+      assert.equal(
+        error instanceof Error ? error.message : "",
+        `admission.max_in_flight_streams (${absurd}) must not exceed admission.max_in_flight (1024): a stream is an in-flight request`,
+      );
+      return true;
+    },
+  );
+  const held = await loadConfig(
+    BASE,
+    envSecretReader({ GW_KEY: "k", AXOND_ADMISSION__MAX_IN_FLIGHT: permits }, async () => ""),
+  );
+  assert.equal(held.admission.maxInFlight, Number.MAX_SAFE_INTEGER);
+  const wideBytes = await loadConfig(
+    BASE,
+    envSecretReader(
+      { GW_KEY: "k", AXOND_ADMISSION__MAX_REQUEST_BYTES: "18446744073709551615" },
+      async () => "",
+    ),
+  );
+  assert.equal(wideBytes.maxRequestBytes, Number.MAX_SAFE_INTEGER);
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),

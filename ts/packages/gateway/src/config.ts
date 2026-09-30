@@ -2,7 +2,12 @@ import { parse } from "smol-toml";
 
 import type { CredentialConfig, PriceRule, ProviderConfig, TransportLimits } from "@axond/sdk";
 
-import { clampStreams, defaultPending, validateAdmission, type AdmissionLimits } from "./admission.ts";
+import {
+  ADMISSION_MAX_PERMITS,
+  clampStreams,
+  validateAdmission,
+  type AdmissionLimits,
+} from "./admission.ts";
 
 import { GatewayFailure } from "./errors.ts";
 import { validateGlob } from "./glob.ts";
@@ -283,26 +288,15 @@ export async function loadConfig(
   const targetFailures = atLeastOne(toml, "failover", failoverRaw, "failure_threshold", "u32", 3);
   const targetCooldown = atLeastOne(toml, "failover", failoverRaw, "cooldown_seconds", "u64", 30);
   const admissionRaw = asRecord(parsed["admission"]) ?? {};
-  const maxRequestBytes = numberField(admissionRaw, "max_request_bytes", 2 * 1024 * 1024);
-  if (!Number.isInteger(maxRequestBytes) || maxRequestBytes < 1) {
+  const maxRequestBytesRaw = admissionInteger(admissionRaw, "max_request_bytes", 2 * 1024 * 1024);
+  if (asUint(maxRequestBytesRaw) < 1n) {
     throw configError("admission.max_request_bytes must be at least 1");
   }
-  const maxPromptTokens = numberField(admissionRaw, "max_prompt_tokens", 1_000_000);
-  if (!Number.isInteger(maxPromptTokens) || maxPromptTokens < 0) {
-    throw configError("admission.max_prompt_tokens must be an integer of at least 0");
-  }
-  const maxOutputTokens = numberField(admissionRaw, "max_output_tokens", 200_000);
-  if (!Number.isInteger(maxOutputTokens) || maxOutputTokens < 0) {
-    throw configError("admission.max_output_tokens must be an integer of at least 0");
-  }
-  const maxStreamDurationMs = numberField(admissionRaw, "max_stream_duration_ms", 3_600_000);
-  if (!Number.isInteger(maxStreamDurationMs) || maxStreamDurationMs < 0) {
-    throw configError("admission.max_stream_duration_ms must be an integer of at least 0");
-  }
-  const maxStreamBytes = numberField(admissionRaw, "max_stream_bytes", 64 * 1024 * 1024);
-  if (!Number.isInteger(maxStreamBytes) || maxStreamBytes < 0) {
-    throw configError("admission.max_stream_bytes must be an integer of at least 0");
-  }
+  const maxRequestBytes = runtimeCount(maxRequestBytesRaw);
+  const maxPromptTokens = runtimeCount(admissionAtLeastZero(admissionRaw, "max_prompt_tokens", 1_000_000));
+  const maxOutputTokens = runtimeCount(admissionAtLeastZero(admissionRaw, "max_output_tokens", 200_000));
+  const maxStreamDurationMs = timerCount(admissionAtLeastZero(admissionRaw, "max_stream_duration_ms", 3_600_000));
+  const maxStreamBytes = runtimeCount(admissionAtLeastZero(admissionRaw, "max_stream_bytes", 64 * 1024 * 1024));
   const admission = loadAdmission(admissionRaw);
   try {
     validateAdmission(admission);
@@ -644,52 +638,115 @@ function validateBlocklist(parsed: Record<string, unknown>): void {
 }
 
 function loadAdmission(row: Record<string, unknown>): AdmissionLimits {
-  const maxInFlight = nonNegative(row, "max_in_flight", 1024, "admission.max_in_flight");
-  const streams = clampStreams(
-    maxInFlight,
-    Object.hasOwn(row, "max_in_flight_streams")
-      ? nonNegative(row, "max_in_flight_streams", 512, "admission.max_in_flight_streams")
-      : undefined,
-  );
-  const queueCapacity = nonNegative(row, "queue_capacity", 0, "admission.queue_capacity");
-  const queueWaitMs = nonNegative(row, "queue_wait_ms", 0, "admission.queue_wait_ms");
+  const maxInFlight = admissionAtLeastZero(row, "max_in_flight", 1024);
+  const streamsExplicit = Object.hasOwn(row, "max_in_flight_streams");
+  const maxInFlightStreams = streamsExplicit
+    ? admissionAtLeastZero(row, "max_in_flight_streams", 512)
+    : clampStreams(runtimeCount(maxInFlight)).value;
+  const queueCapacity = admissionAtLeastZero(row, "queue_capacity", 0);
+  const queueWaitMs = admissionAtLeastZero(row, "queue_wait_ms", 0);
   const pendingExplicit = Object.hasOwn(row, "max_pending_settlements");
   const maxPendingSettlements = pendingExplicit
-    ? nonNegative(row, "max_pending_settlements", 0, "admission.max_pending_settlements")
-    : defaultPending(maxInFlight);
-  const maxInFlightSettlements = nonNegative(
-    row,
-    "max_in_flight_settlements",
-    64,
-    "admission.max_in_flight_settlements",
+    ? admissionAtLeastZero(row, "max_pending_settlements", 0)
+    : defaultPendingExact(maxInFlight);
+  const maxInFlightSettlements = admissionAtLeastZero(row, "max_in_flight_settlements", 64);
+  const settlementQueueWaitMs = admissionAtLeastZero(row, "settlement_queue_wait_ms", 10_000);
+  const settlementTimeoutMs = admissionAtLeastZero(row, "settlement_timeout_ms", 10_000);
+  if (
+    asUint(maxInFlight) > 0n &&
+    streamsExplicit &&
+    asUint(maxInFlightStreams) > 0n &&
+    asUint(maxInFlightStreams) > asUint(maxInFlight)
+  ) {
+    throw configError(
+      `admission.max_in_flight_streams (${asUint(maxInFlightStreams)}) must not exceed admission.max_in_flight (${asUint(maxInFlight)}): a stream is an in-flight request`,
+    );
+  }
+  for (const [field, value] of [
+    ["admission.max_in_flight", maxInFlight],
+    ["admission.max_in_flight_streams", maxInFlightStreams],
+    ["admission.queue_capacity", queueCapacity],
+    ["admission.max_pending_settlements", maxPendingSettlements],
+    ["admission.max_in_flight_settlements", maxInFlightSettlements],
+  ] as const) {
+    if (asUint(value) > ADMISSION_MAX_PERMITS) {
+      throw configError(
+        `${field} (${asUint(value)}) must not exceed ${ADMISSION_MAX_PERMITS}: a larger ceiling is not a bound this process can hold`,
+      );
+    }
+  }
+  if ((asUint(queueCapacity) === 0n) !== (asUint(queueWaitMs) === 0n)) {
+    throw configError(
+      "admission.queue_capacity and admission.queue_wait_ms must be set together: a queue without a wait bound is unbounded latency, and a wait without a queue is never used",
+    );
+  }
+  if (asUint(queueCapacity) > 0n && asUint(maxInFlight) === 0n) {
+    throw configError(
+      "admission.queue_capacity requires admission.max_in_flight: nothing queues when the global ceiling is off",
+    );
+  }
+  if (
+    asUint(maxInFlight) > 0n &&
+    pendingExplicit &&
+    asUint(maxPendingSettlements) > 0n &&
+    asUint(maxPendingSettlements) < asUint(maxInFlight)
+  ) {
+    throw configError(
+      `admission.max_pending_settlements (${asUint(maxPendingSettlements)}) must be at least admission.max_in_flight (${asUint(maxInFlight)}): every admitted request reserves one settlement`,
+    );
+  }
+  const narrowedInFlight = runtimeCount(maxInFlight);
+  const streams = clampStreams(
+    narrowedInFlight,
+    streamsExplicit ? runtimeCount(maxInFlightStreams) : undefined,
   );
-  const settlementQueueWaitMs = nonNegative(
-    row,
-    "settlement_queue_wait_ms",
-    10_000,
-    "admission.settlement_queue_wait_ms",
-  );
-  const settlementTimeoutMs = nonNegative(row, "settlement_timeout_ms", 10_000, "admission.settlement_timeout_ms");
   return {
-    maxInFlight,
+    maxInFlight: narrowedInFlight,
     maxInFlightStreams: streams.value,
     streamsExplicit: streams.explicit,
-    queueCapacity,
-    queueWaitMs,
-    maxPendingSettlements,
+    queueCapacity: runtimeCount(queueCapacity),
+    queueWaitMs: timerCount(queueWaitMs),
+    maxPendingSettlements: runtimeCount(maxPendingSettlements),
     pendingExplicit,
-    maxInFlightSettlements,
-    settlementQueueWaitMs,
-    settlementTimeoutMs,
+    maxInFlightSettlements: runtimeCount(maxInFlightSettlements),
+    settlementQueueWaitMs: timerCount(settlementQueueWaitMs),
+    settlementTimeoutMs: timerCount(settlementTimeoutMs),
   };
 }
 
-function nonNegative(row: Record<string, unknown>, key: string, fallback: number, label: string): number {
-  const value = numberField(row, key, fallback);
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw configError(`${label} must be an integer of at least 0`);
+/** Four settlements per admitted request, capped at the semaphore ceiling. */
+function defaultPendingExact(maxInFlight: number | bigint): number | bigint {
+  const base = asUint(maxInFlight) > 0n ? asUint(maxInFlight) : 1024n;
+  const scaled = base > ADMISSION_MAX_PERMITS / 4n ? ADMISSION_MAX_PERMITS : base * 4n;
+  return scaled <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(scaled) : scaled;
+}
+
+/**
+ * An admission integer Figment already extracted. A u64 or usize above 2^53
+ * stays exact so the semaphore ceiling can name every digit.
+ */
+function admissionInteger(row: Record<string, unknown>, key: string, fallback: number): number | bigint {
+  const value = row[key];
+  if (value === undefined) {
+    return fallback;
   }
-  return value;
+  if (typeof value === "bigint") {
+    if (value < 0n) {
+      throw configError(`admission.${key} must be an integer of at least 0`);
+    }
+    return value;
+  }
+  if (typeof value === "number" && Number.isInteger(value)) {
+    if (value < 0) {
+      throw configError(`admission.${key} must be an integer of at least 0`);
+    }
+    return value;
+  }
+  throw configError(`admission.${key} must be an integer of at least 0`);
+}
+
+function admissionAtLeastZero(row: Record<string, unknown>, key: string, fallback: number): number | bigint {
+  return admissionInteger(row, key, fallback);
 }
 
 function loadShutdown(toml: string, row: Record<string, unknown>): LoadedConfig["shutdown"] {

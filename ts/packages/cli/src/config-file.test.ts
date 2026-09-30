@@ -1025,6 +1025,45 @@ namespace = "platform"
   assert.equal(stderr, "", stderr);
 });
 
+test("admission_ceiling_above_the_semaphore_is_refused_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-admit-ceiling-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "admission.toml");
+  await writeFile(
+    config,
+    `
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`,
+  );
+  try {
+    const result = await run(config, root, {
+      GW_KEY: "k",
+      AXOND_ADMISSION__MAX_IN_FLIGHT: "2305843009213693952",
+    });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        "`: invalid config: admission.max_in_flight (2305843009213693952) must not exceed 2305843009213693951: a larger ceiling is not a bound this process can hold\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("admission_float_beats_a_later_failover_array", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-order-"));
   const db = join(root, "fresh.sqlite");
