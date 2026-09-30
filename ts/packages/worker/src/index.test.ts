@@ -286,6 +286,83 @@ test("worker_handler_for_reuses_one_gateway", () => {
   };
   assert.equal(handlerFor(env), handlerFor({ ...env }));
   assert.notEqual(handlerFor(env), handlerFor({ ...env, CREDENTIALS_JSON: "[]" }));
+  assert.notEqual(handlerFor(env), handlerFor({ ...env, PRICES_JSON: "[]" }));
+});
+
+test("worker_price_charges_one_request_id_once", async () => {
+  const upstream = await listen((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        '{"id":"chatcmpl-worker","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}',
+      );
+    });
+  });
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000n);
+  const handler = createHandler(
+    {
+      HYPERDRIVE: { connectionString: "postgres://example" },
+      GATEWAY_KEY: "k",
+      PROVIDERS_JSON: JSON.stringify([
+        { id: "fake-openai", kind: "openai", baseUrl: upstream.url, unpricedModels: "allow" },
+      ]),
+      CREDENTIALS_JSON: JSON.stringify([
+        { namespace: "platform", provider: "fake-openai", secret: "sk-worker-secret", id: "plat" },
+      ]),
+      PRICES_JSON: JSON.stringify([
+        {
+          provider: "fake-openai",
+          model: "*",
+          inputMicrodollarsPerMillion: 1_000_000,
+          outputMicrodollarsPerMillion: 1_000_000,
+        },
+      ]),
+    },
+    store,
+  );
+  const pending: Promise<unknown>[] = [];
+  const wait = {
+    waitUntil(promise: Promise<unknown>) {
+      pending.push(promise);
+    },
+  };
+  const chat = () =>
+    handler.fetch(
+      new Request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer k",
+          "content-type": "application/json",
+          "x-request-id": "worker-price-once",
+        },
+        body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "hi" }] }),
+      }),
+      wait,
+    );
+  try {
+    const first = await chat();
+    assert.equal(first.status, 200, await first.text());
+    const second = await chat();
+    assert.equal(second.status, 200, await second.text());
+    await Promise.all(pending);
+    const budget = await store.getBudget("platform", "compat");
+    assert.equal(budget?.spent, 2n);
+    const summary = await store.summarizeUsage("platform", "compat");
+    assert.equal(summary.length, 1);
+    assert.equal(summary[0]?.count, 1);
+    assert.equal(summary[0]?.cost_microdollars, 2);
+  } finally {
+    upstream.close();
+  }
 });
 
 function listen(

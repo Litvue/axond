@@ -2,7 +2,7 @@ import { Client } from "pg";
 
 import { createAdmission, createAxond, createMetrics, defaultAdmission, resolveTelemetry } from "@axond/gateway";
 import { rateLimitExtension } from "@axond/rate-limit";
-import type { AxondExtension, CredentialConfig, ProviderConfig, Store } from "@axond/sdk";
+import type { AxondExtension, CredentialConfig, PriceRule, ProviderConfig, Store } from "@axond/sdk";
 
 import { discoverOnce, type CatalogMetrics } from "../../cli/src/discovery.ts";
 import { applyPostgresMigrationOn, createPostgresStore, POSTGRES_SCHEMA } from "../../cli/src/postgres-store.ts";
@@ -11,6 +11,8 @@ export interface WorkerEnv {
   HYPERDRIVE: { connectionString: string };
   GATEWAY_KEY: string;
   PROVIDERS_JSON: string;
+  /** Price rules. Absent means models stay unpriced and a successful chat does not move spent. */
+  PRICES_JSON?: string;
   OTEL_EXPORTER_OTLP_ENDPOINT?: string;
   OTEL_EXPORTER_OTLP_PROTOCOL?: string;
   AXOND_INSTANCE_ID?: string;
@@ -28,6 +30,7 @@ interface WaitContext {
  * them. The process binary loads the same contract from `AXOND_EXTENSIONS_DIR`
  * at startup instead. Hyperdrive supplies the Postgres connection string;
  * each call opens one client and closes it, with no session-level SET.
+ * `PRICES_JSON` is the price list a chat uses when it settles.
  * One gateway lives for the isolate, so a parked credential stays parked.
  * Settlement is bound to the request that owns it.
  */
@@ -71,6 +74,7 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
     defaultNamespace: "platform",
     providers,
     credentials,
+    prices: workerPrices(env.PRICES_JSON),
     extensions,
     waitUntil: (promise, request) => {
       waits.get(request)?.waitUntil(promise);
@@ -103,12 +107,13 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
   };
 }
 
-/** One gateway per env on this isolate. A new credential list builds another. */
+/** One gateway per env on this isolate. A new credential list or price list builds another. */
 export function handlerFor(env: WorkerEnv) {
   const key = [
     env.HYPERDRIVE.connectionString,
     env.GATEWAY_KEY,
     env.PROVIDERS_JSON,
+    env.PRICES_JSON ?? "",
     env.CREDENTIALS_JSON ?? "",
     env.OTEL_EXPORTER_OTLP_ENDPOINT ?? "",
     env.OTEL_EXPORTER_OTLP_PROTOCOL ?? "",
@@ -148,6 +153,21 @@ async function prepareWorkerSchema(client: Client, extensions: readonly AxondExt
       await applyPostgresMigrationOn(executor, `${extension.name}:${index}`, sql);
     }
   }
+}
+
+function workerPrices(raw: string | undefined): PriceRule[] {
+  const rows = JSON.parse(raw && raw.length > 0 ? raw : "[]") as {
+    provider: string;
+    model: string;
+    inputMicrodollarsPerMillion: number | string;
+    outputMicrodollarsPerMillion: number | string;
+  }[];
+  return rows.map((row) => ({
+    provider: row.provider,
+    model: row.model,
+    inputMicrodollarsPerMillion: BigInt(row.inputMicrodollarsPerMillion),
+    outputMicrodollarsPerMillion: BigInt(row.outputMicrodollarsPerMillion),
+  }));
 }
 
 function workerCatalog(env: WorkerEnv): { source: "none" | "models-dev" | "seed"; sourceUrl: string | null } {

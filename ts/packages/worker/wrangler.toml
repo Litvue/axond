@@ -16,6 +16,8 @@ id = "00000000000000000000000000000000"
 [vars]
 GATEWAY_KEY = "replace-me"
 PROVIDERS_JSON = "[]"
+# Optional. Price rules charged on settlement. Absent leaves models unpriced.
+# PRICES_JSON = "[{\"provider\":\"openai\",\"model\":\"*\",\"inputMicrodollarsPerMillion\":1,\"outputMicrodollarsPerMillion\":1}]"
 # Optional. The request path and the cron both read this list.
 # CREDENTIALS_JSON = "[]"
 # CATALOG_SOURCE = "models-dev"
