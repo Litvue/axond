@@ -615,6 +615,22 @@ namespace = "platform"
     "[transport]\nconnect_timeout_ms = 0\n[[credential]]\nnamespace = \"ghost\"\nprovider = \"openai\"\nenv = \"OPENAI_KEY\"\n",
     "transport.connect_timeout_ms must be at least 1",
   );
+  await reject(
+    "[admission]\nmax_request_bytes = 0\n[transport]\nconnect_timeout_ms = 0\nmax_response_bytes = 0\n",
+    "admission.max_request_bytes must be at least 1",
+  );
+  await reject(
+    "[transport]\nconnect_timeout_ms = 0\nmax_response_bytes = 0\n",
+    "transport.connect_timeout_ms must be at least 1",
+  );
+  await reject(
+    "[transport]\nconnect_timeout_ms = 0\nmax_response_bytes = 100\nmax_error_bytes = 200\n",
+    "transport.connect_timeout_ms must be at least 1",
+  );
+  await reject(
+    "[transport]\nconnect_timeout_ms = 0\n[shutdown]\ndeadline_ms = 0\n",
+    "transport.connect_timeout_ms must be at least 1",
+  );
 });
 
 test("extract type errors are figment sentences before later bounds", async () => {

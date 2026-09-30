@@ -278,67 +278,6 @@ export async function loadConfig(
   const overallTimeoutMs = atLeastOne(toml, "failover", failoverRaw, "overall_timeout_ms", "u64", 30_000);
   const targetFailures = atLeastOne(toml, "failover", failoverRaw, "failure_threshold", "u32", 3);
   const targetCooldown = atLeastOne(toml, "failover", failoverRaw, "cooldown_seconds", "u64", 30);
-  const transportRaw = asRecord(parsed["transport"]) ?? {};
-  const maxResponseBytes = atLeastOne(toml, "transport", transportRaw, "max_response_bytes", "u64", DEFAULT_TRANSPORT.maxResponseBytes);
-  const maxErrorBytes = atLeastOne(
-    toml,
-    "transport",
-    transportRaw,
-    "max_error_bytes",
-    "u64",
-    DEFAULT_TRANSPORT.maxErrorBytes ?? 64 * 1024,
-  );
-  if (maxErrorBytes > maxResponseBytes) {
-    throw configError(
-      "transport.max_error_bytes must not exceed transport.max_response_bytes: an error body is a response body",
-    );
-  }
-  const transport: TransportLimits = {
-    responseHeaderTimeoutMs: atLeastOne(
-      toml,
-      "transport",
-      transportRaw,
-      "response_header_timeout_ms",
-      "u64",
-      DEFAULT_TRANSPORT.responseHeaderTimeoutMs,
-    ),
-    bufferedBodyTimeoutMs: atLeastOne(
-      toml,
-      "transport",
-      transportRaw,
-      "buffered_body_timeout_ms",
-      "u64",
-      DEFAULT_TRANSPORT.bufferedBodyTimeoutMs,
-    ),
-    streamIdleTimeoutMs: atLeastOne(
-      toml,
-      "transport",
-      transportRaw,
-      "stream_idle_timeout_ms",
-      "u64",
-      DEFAULT_TRANSPORT.streamIdleTimeoutMs,
-    ),
-    connectTimeoutMs: atLeastOne(
-      toml,
-      "transport",
-      transportRaw,
-      "connect_timeout_ms",
-      "u64",
-      DEFAULT_TRANSPORT.connectTimeoutMs ?? 5_000,
-    ),
-    streamTerminalGraceMs: atLeastOne(
-      toml,
-      "transport",
-      transportRaw,
-      "stream_terminal_grace_ms",
-      "u64",
-      DEFAULT_TRANSPORT.streamTerminalGraceMs ?? 1_000,
-    ),
-    maxResponseBytes,
-    maxErrorBytes,
-    overallTimeoutMs,
-    maxAttempts,
-  };
   const admissionRaw = asRecord(parsed["admission"]) ?? {};
   const maxRequestBytes = numberField(admissionRaw, "max_request_bytes", 2 * 1024 * 1024);
   if (!Number.isInteger(maxRequestBytes) || maxRequestBytes < 1) {
@@ -366,6 +305,79 @@ export async function loadConfig(
   } catch (error) {
     throw configError(error instanceof Error ? error.message : "invalid admission");
   }
+  const transportRaw = asRecord(parsed["transport"]) ?? {};
+  const connectTimeoutMs = atLeastOne(
+    toml,
+    "transport",
+    transportRaw,
+    "connect_timeout_ms",
+    "u64",
+    DEFAULT_TRANSPORT.connectTimeoutMs ?? 5_000,
+  );
+  const responseHeaderTimeoutMs = atLeastOne(
+    toml,
+    "transport",
+    transportRaw,
+    "response_header_timeout_ms",
+    "u64",
+    DEFAULT_TRANSPORT.responseHeaderTimeoutMs,
+  );
+  const bufferedBodyTimeoutMs = atLeastOne(
+    toml,
+    "transport",
+    transportRaw,
+    "buffered_body_timeout_ms",
+    "u64",
+    DEFAULT_TRANSPORT.bufferedBodyTimeoutMs,
+  );
+  const streamIdleTimeoutMs = atLeastOne(
+    toml,
+    "transport",
+    transportRaw,
+    "stream_idle_timeout_ms",
+    "u64",
+    DEFAULT_TRANSPORT.streamIdleTimeoutMs,
+  );
+  const streamTerminalGraceMs = atLeastOne(
+    toml,
+    "transport",
+    transportRaw,
+    "stream_terminal_grace_ms",
+    "u64",
+    DEFAULT_TRANSPORT.streamTerminalGraceMs ?? 1_000,
+  );
+  const maxResponseBytes = atLeastOne(
+    toml,
+    "transport",
+    transportRaw,
+    "max_response_bytes",
+    "u64",
+    DEFAULT_TRANSPORT.maxResponseBytes,
+  );
+  const maxErrorBytes = atLeastOne(
+    toml,
+    "transport",
+    transportRaw,
+    "max_error_bytes",
+    "u64",
+    DEFAULT_TRANSPORT.maxErrorBytes ?? 64 * 1024,
+  );
+  if (maxErrorBytes > maxResponseBytes) {
+    throw configError(
+      "transport.max_error_bytes must not exceed transport.max_response_bytes: an error body is a response body",
+    );
+  }
+  const transport: TransportLimits = {
+    responseHeaderTimeoutMs,
+    bufferedBodyTimeoutMs,
+    streamIdleTimeoutMs,
+    connectTimeoutMs,
+    streamTerminalGraceMs,
+    maxResponseBytes,
+    maxErrorBytes,
+    overallTimeoutMs,
+    maxAttempts,
+  };
   const shutdown = loadShutdown(toml, asRecord(parsed["shutdown"]) ?? {});
   const catalog = validateCatalog(toml, asRecord(parsed["catalog"]) ?? {});
 

@@ -515,6 +515,49 @@ source_url = "http://models.dev/catalog.json"
   }
 });
 
+test("admission_zero_beats_a_transport_zero", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-admit-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "admission.toml");
+  await writeFile(
+    config,
+    `
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[credential]]
+namespace = "ghost"
+provider = "openai"
+env = "OPENAI_KEY"
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[admission]
+max_request_bytes = 0
+[transport]
+connect_timeout_ms = 0
+max_response_bytes = 0
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        "`: invalid config: admission.max_request_bytes must be at least 1\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("sequence_struct_is_refused_before_the_store_opens", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-seq-"));
   const db = join(root, "fresh.sqlite");

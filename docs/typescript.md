@@ -68,8 +68,12 @@ valid bind.
 `failover.max_attempts = 0` and `failover.overall_timeout_ms = 0` fail boot
 with `must be at least 1` before a bad credential and before a catalogue URL.
 A float is Figment's type sentence (`expected u32` or `expected u64`).
-Admission, transport, and shutdown bounds are checked in that same pass, so a
-zero `admission.max_request_bytes` is reported before the catalogue. A float,
+Admission, transport, and shutdown bounds are checked in that same pass.
+`admission.max_request_bytes = 0` is reported before a zero
+`transport.connect_timeout_ms` and before the catalogue. Transport zeros run
+from `connect_timeout_ms` through `max_error_bytes`, so a zero connect timeout
+is reported before a zero `max_response_bytes` and before an error body that
+is larger than the response. A float,
 string, or negative on an admission, catalogue, or discovery integer is
 Figment's extract error, including a float on a disabled catalogue. That
 extract error is reported before a zero failover bound. `server = "x"` is
