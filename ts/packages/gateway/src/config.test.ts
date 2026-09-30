@@ -303,7 +303,10 @@ test("credential and gateway key graph matches the rust refusals", async () => {
     `${GRAPH}[[price]]\nprovider = "nope"\nmodel = "a*b"\n`,
     "`[[price]]` references undefined provider `nope`",
   );
-  await reject(`${GRAPH}[[price]]\nmodel = "gpt"\n`, "`[[price]]` requires a non-empty `provider` and `model` glob");
+  await reject(
+    `${GRAPH}[[price]]\nmodel = "gpt"\n`,
+    'config: missing field `provider` for key "default.price.0"',
+  );
   await reject(
     `${GRAPH}[[price]]\nprovider = "openai"\nmodel = "a*b"\n`,
     "`[[price]]` model glob `a*b` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
@@ -1022,10 +1025,104 @@ test("catalog credential and namespace keys follow figment order", async () => {
   );
 });
 
+test("blocklist price provider and usage keys follow figment order", async () => {
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const typed = (found: string, expected: string, key: string) =>
+    `config: invalid type: found ${found}, expected ${expected} for key "${key}"`;
+  const variant = (found: string, expected: string, key: string) =>
+    `config: unknown variant: found \`${found}\`, expected \`${expected}\` for key "${key}"`;
+  await reject(
+    `${BASE}[blocklist]\nmodels = [1]\n[catalog]\ncreate_table = 1.5\n`,
+    typed("signed int `1`", "a string", "default.blocklist.models.0"),
+  );
+  await reject(
+    `${BASE}[admission]\nmax_request_bytes = 1.5\n[blocklist]\nmodels = [1]\n`,
+    typed("float `1.5`", "usize", "default.admission.max_request_bytes"),
+  );
+  await reject(`${BASE}[blocklist]\nmodels = 1\n`, typed("signed int `1`", "a sequence", "default.blocklist.models"));
+  const listed = await loadConfig(`${BASE}[blocklist]\nmodels = ["gpt-4"]\n`, secrets);
+  assert.deepEqual(listed.blocklist, ["gpt-4"]);
+  await reject(
+    `${BASE}[[price]]\nmodel = 1\nprovider = "openai"\ninput_microdollars_per_million = 1.5\noutput_microdollars_per_million = 1\n`,
+    typed("signed int `1`", "a string", "default.price.0.model"),
+  );
+  await reject(
+    `${BASE}[[provider]]\nid = "openai"\nkind = "openai"\nbase_url = "http://127.0.0.1:9"\n[[price]]\nprovider = "openai"\nmodel = "*"\ninput_microdollars_per_million = 1.5\noutput_microdollars_per_million = 1\n`,
+    typed("float `1.5`", "u64", "default.price.0"),
+  );
+  await reject(
+    `${BASE}[[price]]\nprovider = "openai"\ninput_microdollars_per_million = 1.5\noutput_microdollars_per_million = 1\n`,
+    'config: missing field `model` for key "default.price.0"',
+  );
+  const priced = await loadConfig(
+    `${BASE}[[provider]]\nid = "openai"\nkind = "openai"\nbase_url = "http://127.0.0.1:9"\n[[price]]\nprovider = "openai"\nmodel = "*"\ninput_microdollars_per_million = 1\noutput_microdollars_per_million = 2\n`,
+    secrets,
+  );
+  assert.equal(priced.prices[0]?.inputMicrodollarsPerMillion, 1n);
+  await reject(
+    BASE.replace('bind = "127.0.0.1:9"', "bind = 1") +
+      '[[provider]]\nbase_url = 1\nid = "openai"\nkind = "openai"\n',
+    typed("signed int `1`", "a string", "default.provider.0.base_url"),
+  );
+  await reject(
+    `${BASE}[[provider]]\nid = "openai"\nkind = "nope"\nbase_url = "http://127.0.0.1:9"\n`,
+    variant("nope", "one of `openai`, `anthropic`, `openai-compatible`", "default.provider.0.kind"),
+  );
+  await reject(
+    `${BASE}[[provider]]\nid = "openai"\nkind = "openai"\nbase_url = "http://127.0.0.1:9"\nunpriced_models = "nope"\n`,
+    variant("nope", "`deny` or `allow`", "default.provider.0.unpriced_models"),
+  );
+  const allowed = await loadConfig(
+    `${BASE}[[provider]]\nid = "openai"\nkind = "openai"\nbase_url = "http://127.0.0.1:9"\nunpriced_models = "allow"\n`,
+    secrets,
+  );
+  assert.equal(allowed.providers[0]?.unpricedModels, "allow");
+  await reject(
+    `${BASE}[usage_journal]\nbackend = "none"\ncreate_schema = 1.5\nconnect_timeout_ms = 1.5\n`,
+    typed("float `1.5`", "u64", "default.usage_journal.connect_timeout_ms"),
+  );
+  await reject(
+    `${BASE}[usage_journal]\nbackend = "none"\ncreate_schema = 1.5\n`,
+    typed("float `1.5`", "a boolean", "default.usage_journal.create_schema"),
+  );
+  await reject(
+    `${BASE}[usage_journal]\ncapacity_policy = "nope"\nconnect_timeout_ms = 1.5\nbackend = "none"\n`,
+    variant("nope", "`refuse` or `drop-oldest`", "default.usage_journal.capacity_policy"),
+  );
+  const inert = await loadConfig(`${BASE}[usage_journal]\nbackend = "none"\nmax_events = 0\n`, secrets);
+  assert.deepEqual(inert.usageSinks, []);
+  await reject(
+    `${BASE}[[usage_sink]]\nkind = "stdout"\ncreate_table = 1.5\nbuffer_capacity = 1.5\n`,
+    typed("float `1.5`", "usize", "default.usage_sink.0.buffer_capacity"),
+  );
+  await reject(
+    `${BASE}[[usage_sink]]\nkind = "stdout"\nbuffer_capacity = 8\ncreate_table = 1.5\n`,
+    typed("float `1.5`", "a boolean", "default.usage_sink.0.create_table"),
+  );
+  await reject(
+    `${BASE}[[usage_sink]]\nbuffer_capacity = 8\n`,
+    'config: missing field `kind` for key "default.usage_sink.0"',
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),
-    /unknown variant `redis`, expected `stdout`, `postgres`, or `otlp`/,
+    (error: unknown) => {
+      assert.equal(
+        error instanceof Error ? error.message : "",
+        'config: unknown variant: found `redis`, expected `one of `stdout`, `postgres`, `otlp`` for key "default.usage_sink.0.kind"',
+      );
+      return true;
+    },
   );
   await assert.rejects(
     () => loadConfig(`${BASE}\n[usage_journal]\nbackend = "postgres"\ndsn_env = "JOURNAL_DSN"\n`, secrets),

@@ -1139,6 +1139,10 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
   ] as const) {
     readTypedInt(toml, "admission", admission, key, expected, fallback);
   }
+  const blocklist = asRecord(parsed["blocklist"]);
+  if (blocklist) {
+    rejectBlocklistExtract(toml, blocklist);
+  }
   const catalog = asRecord(parsed["catalog"]);
   if (catalog) {
     rejectCatalogExtract(toml, catalog);
@@ -1190,6 +1194,20 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
     readEntryBool(toml, "namespace", index, row, "allow_platform_fallback");
     readEntryBool(toml, "namespace", index, row, "default");
     readEntryString(toml, "namespace", index, row, "id");
+  });
+  asArray(parsed["price"]).forEach((entry, index) => {
+    const row = asRecord(entry);
+    if (!row) {
+      return;
+    }
+    rejectPriceExtract(toml, index, row);
+  });
+  asArray(parsed["provider"]).forEach((entry, index) => {
+    const row = asRecord(entry);
+    if (!row) {
+      return;
+    }
+    rejectProviderExtract(toml, index, row);
   });
 }
 
@@ -1260,6 +1278,171 @@ function rejectAfterServerExtract(toml: string, parsed: Record<string, unknown>)
   extractStruct(toml, parsed, "shutdown", "Shutdown", (row) => rejectShutdownExtract(toml, row));
   extractStruct(toml, parsed, "storage", "StorageConfig", (row) => rejectStorageExtract(toml, row));
   extractStruct(toml, parsed, "transport", "Transport", (row) => rejectTransportExtract(toml, row));
+  extractStruct(toml, parsed, "usage_journal", "UsageJournalConfig", (row) => rejectUsageJournalExtract(toml, row));
+  if (Array.isArray(parsed["usage_sink"])) {
+    const literal = topLevelAssignment(toml, "usage_sink");
+    parsed["usage_sink"].forEach((entry, index) => {
+      const row = asRecord(entry);
+      if (!row) {
+        const token = literal === null ? null : nthArrayToken(literal, index);
+        throw configLoad(
+          `invalid type: found ${foundPhrase(entry, token)}, expected struct UsageSinkConfigWire for key "default.usage_sink.${index}"`,
+        );
+      }
+      rejectUsageSinkExtract(toml, index, row);
+    });
+  }
+}
+
+/** Journal keys are visited even when `backend = "none"` leaves the section inert. */
+function rejectUsageJournalExtract(toml: string, row: Record<string, unknown>): void {
+  readVariant(toml, "usage_journal", row, "backend", ["none", "postgres"], "UsageJournalBackend");
+  readVariant(toml, "usage_journal", row, "capacity_policy", ["refuse", "drop-oldest"], "UsageCapacityPolicy");
+  readTypedInt(toml, "usage_journal", row, "claim_batch", "usize", 1);
+  readTypedInt(toml, "usage_journal", row, "connect_timeout_ms", "u64", 5_000);
+  readTypedInt(toml, "usage_journal", row, "connections", "usize", 8);
+  readString(toml, "usage_journal", row, "consumer");
+  readBool(toml, "usage_journal", row, "create_schema");
+  readString(toml, "usage_journal", row, "dsn_env");
+  readTypedInt(toml, "usage_journal", row, "lease_seconds", "u64", 30);
+  readTypedInt(toml, "usage_journal", row, "max_delivery_attempts", "u32", 1);
+  readTypedInt(toml, "usage_journal", row, "max_events", "u64", 1);
+  readVariant(toml, "usage_journal", row, "on_undurable", ["refuse", "serve"], "UndurablePolicy");
+  readTypedInt(toml, "usage_journal", row, "operation_timeout_ms", "u64", 5_000);
+  readTypedInt(toml, "usage_journal", row, "poll_interval_ms", "u64", 1_000);
+  readTypedInt(toml, "usage_journal", row, "retain_acknowledged_seconds", "u64", 1);
+  readString(toml, "usage_journal", row, "schema");
+}
+
+/** Sink keys sort `buffer_capacity` before `create_table` before `kind`. */
+function rejectUsageSinkExtract(toml: string, index: number, row: Record<string, unknown>): void {
+  if ("buffer_capacity" in row) {
+    positionalInt(
+      row["buffer_capacity"],
+      arrayEntryLiteral(toml, "usage_sink", index, "buffer_capacity"),
+      "usize",
+      `default.usage_sink.${index}.buffer_capacity`,
+    );
+  }
+  readEntryBool(toml, "usage_sink", index, row, "create_table");
+  readEntryString(toml, "usage_sink", index, row, "dsn_env");
+  if ("flush_interval_ms" in row) {
+    positionalInt(
+      row["flush_interval_ms"],
+      arrayEntryLiteral(toml, "usage_sink", index, "flush_interval_ms"),
+      "u64",
+      `default.usage_sink.${index}.flush_interval_ms`,
+    );
+  }
+  readEntryVariant(toml, "usage_sink", index, row, "kind", ["stdout", "postgres", "otlp"], "UsageSinkKind");
+  if ("max_batch" in row) {
+    positionalInt(
+      row["max_batch"],
+      arrayEntryLiteral(toml, "usage_sink", index, "max_batch"),
+      "usize",
+      `default.usage_sink.${index}.max_batch`,
+    );
+  }
+  readEntryString(toml, "usage_sink", index, row, "table");
+  if (!("kind" in row)) {
+    throw configLoad(`missing field \`kind\` for key "default.usage_sink.${index}"`);
+  }
+}
+
+/** `[blocklist] models` is a sequence of strings, visited before `catalog`. */
+function rejectBlocklistExtract(toml: string, row: Record<string, unknown>): void {
+  if (!("models" in row)) {
+    return;
+  }
+  positionalValue(
+    row["models"],
+    { name: "models", kind: "strings" },
+    sectionAssignment(toml, "blocklist", "models"),
+    "default.blocklist.models",
+  );
+}
+
+/**
+ * Named price keys are visited before the flattened `ModelPrice` integers.
+ * A flattened integer that fails reports `default.price.N`, not the field.
+ */
+function rejectPriceExtract(toml: string, index: number, row: Record<string, unknown>): void {
+  readEntryString(toml, "price", index, row, "model");
+  readEntryString(toml, "price", index, row, "provider");
+  if (!("provider" in row)) {
+    throw configLoad(`missing field \`provider\` for key "default.price.${index}"`);
+  }
+  if (!("model" in row)) {
+    throw configLoad(`missing field \`model\` for key "default.price.${index}"`);
+  }
+  for (const key of [
+    "cache_read_microdollars_per_million",
+    "cache_write_microdollars_per_million",
+    "input_microdollars_per_million",
+    "output_microdollars_per_million",
+    "reasoning_microdollars_per_million",
+  ]) {
+    if (!(key in row)) {
+      continue;
+    }
+    positionalInt(
+      row[key],
+      arrayEntryLiteral(toml, "price", index, key),
+      "u64",
+      `default.price.${index}`,
+    );
+  }
+}
+
+/** Provider keys sort `base_url`, `id`, `kind`, then `unpriced_models`. */
+function rejectProviderExtract(toml: string, index: number, row: Record<string, unknown>): void {
+  readEntryString(toml, "provider", index, row, "base_url");
+  readEntryString(toml, "provider", index, row, "id");
+  readEntryVariant(
+    toml,
+    "provider",
+    index,
+    row,
+    "kind",
+    ["openai", "anthropic", "openai-compatible"],
+    "ProviderKind",
+  );
+  readEntryVariant(toml, "provider", index, row, "unpriced_models", ["deny", "allow"], "UnpricedModels");
+  for (const key of ["id", "kind", "base_url"] as const) {
+    if (!(key in row)) {
+      throw configLoad(`missing field \`${key}\` for key "default.provider.${index}"`);
+    }
+  }
+}
+
+function readEntryVariant(
+  toml: string,
+  section: string,
+  index: number,
+  row: Record<string, unknown>,
+  key: string,
+  variants: readonly string[],
+  enumName: string,
+): void {
+  if (!(key in row)) {
+    return;
+  }
+  const literal = arrayEntryLiteral(toml, section, index, key);
+  const value = row[key];
+  const figmentKey = `default.${section}.${index}.${key}`;
+  if (typeof value === "string" && (literal === null || !isFloatToken(literal))) {
+    if (variants.includes(value)) {
+      return;
+    }
+    const list =
+      variants.length === 2
+        ? `\`${variants[0]}\` or \`${variants[1]}\``
+        : `one of ${variants.map((item) => `\`${item}\``).join(", ")}`;
+    throw configLoad(`unknown variant: found \`${value}\`, expected \`${list}\` for key "${figmentKey}"`);
+  }
+  throw configLoad(
+    `invalid type: found ${foundPhrase(value, literal)}, expected enum ${enumName} for key "${figmentKey}"`,
+  );
 }
 
 function extractStruct(
@@ -1878,6 +2061,30 @@ function readTypedInt(
     throw configError(`\`${key}\` must be an integer`);
   }
   return Number(integer);
+}
+
+function sectionAssignment(toml: string, section: string, key: string): string | null {
+  let inSection = false;
+  let found: string | null = null;
+  const header = new RegExp(`^\\[${section}\\]\\s*(?:#.*)?$`);
+  for (const line of toml.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (header.test(trimmed)) {
+      inSection = true;
+      continue;
+    }
+    if (inSection && /^\s*\[/.test(line)) {
+      inSection = false;
+    }
+    if (!inSection) {
+      continue;
+    }
+    const assigned = assignmentValue(line, key);
+    if (assigned !== null) {
+      found = assigned;
+    }
+  }
+  return found;
 }
 
 function sectionFieldLiteral(toml: string, section: string, key: string): string | null {

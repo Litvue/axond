@@ -52,6 +52,7 @@ export function wantsFigmentLocation(detail: string): boolean {
   return (
     detail.startsWith("invalid type:") ||
     detail.startsWith("invalid value ") ||
+    detail.startsWith("missing field ") ||
     detail.startsWith("unknown variant:") ||
     detail.startsWith("unknown field:") ||
     detail.startsWith("number too large to fit in target type") ||

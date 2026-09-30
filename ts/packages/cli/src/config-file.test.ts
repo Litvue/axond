@@ -515,6 +515,47 @@ source_url = "http://models.dev/catalog.json"
   }
 });
 
+test("blocklist_string_beats_a_catalog_boolean", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-blocklist-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "blocklist.toml");
+  await writeFile(
+    config,
+    `
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[blocklist]
+models = [1]
+[catalog]
+create_table = 1.5
+refresh_interval_seconds = 1.5
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        '`: config load: invalid type: found signed int `1`, expected a string for key "default.blocklist.models.0" in ' +
+        figmentFileSource(config, root) +
+        " TOML file\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("catalog_create_table_float_beats_a_later_refresh", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-catalog-order-"));
   const db = join(root, "fresh.sqlite");

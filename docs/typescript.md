@@ -103,6 +103,14 @@ names `in-memory` or `postgres`. `source_url = 1` is `expected a string` when
 `source = "none"`. A credential `namespace = 1` is reported before
 `weight = 1.5`. A namespace `allow_platform_fallback = 1.5` is reported before
 `id = 1`. An admission float is reported before that credential weight.
+`[blocklist] models = [1]` is reported before `[catalog] create_table = 1.5`.
+A price `input_microdollars_per_million = 1.5` is `expected u64` at
+`default.price.0`. `[[provider]] base_url = 1` is reported before
+`server.bind = 1`. `unpriced_models = "nope"` names `deny` or `allow`.
+`[usage_journal] connect_timeout_ms = 1.5` is reported before
+`create_schema = 1.5` when `backend = "none"`. `[[usage_sink]]
+buffer_capacity = 1.5` is reported before `create_table = 1.5` on a stdout
+sink.
 `failover = [0]` is `failover.max_attempts must be at least 1`
 before a ghost credential. `failover = [1.5]` is `expected u32` at
 `default.failover.0`. `storage = []` still requires a SQLite path.
