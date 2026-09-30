@@ -35,6 +35,7 @@ import {
 } from "./dispatch.ts";
 import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors.ts";
 import { globMatch, validateGlob } from "./glob.ts";
+import { readStrictObject, type StrictField } from "./strict-json.ts";
 import { budgetJson, money, namespaceJson } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, parseNamespaceId, validatePeriod, validateTimezone } from "./namespace.ts";
 import { beginTrace, childTrace, formatTraceparent, metricPayload, parseTraceparent, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
@@ -1659,7 +1660,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
     const period = decodeURIComponent(budget[2]!);
     validatePeriod(period);
     if (c.req.method === "PUT") {
-      const body = await readJson(c);
+      const body = await readJson(c, BUDGET_PUT_FIELDS);
       const limit = requiredBig(body, "limit_microdollars");
       const row = await opts.store.putBudget(namespace, period, limit);
       c.res = Response.json(budgetJson(row));
@@ -1679,7 +1680,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   if (policy) {
     const namespace = parseNamespaceId(decodeURIComponent(policy[1]!));
     if (c.req.method === "PUT") {
-      const body = await readJson(c);
+      const body = await readJson(c, BUDGET_POLICY_FIELDS);
       const cadence = body["cadence"];
       if (cadence !== "monthly" && cadence !== "fixed") {
         throw badRequest('cadence must be "monthly" or "fixed"');
@@ -1743,7 +1744,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
     return;
   }
   if (c.req.method === "POST" && path === "/api/v1/namespaces") {
-    const body = await readJson(c);
+    const body = await readJson(c, NAMESPACE_CREATE_FIELDS);
     const id = typeof body["id"] === "string" ? body["id"] : "";
     parseNamespaceId(id);
     const attrs = asAttrs(body["attrs"]);
@@ -1775,7 +1776,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
       return;
     }
     if (c.req.method === "PUT") {
-      const body = await readJson(c);
+      const body = await readJson(c, NAMESPACE_REPLACE_FIELDS);
       const row = await opts.store.updateNamespace(id, asAttrs(body["attrs"]), asBlocklist(body["blocklist"]));
       if (!row) {
         throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -1830,34 +1831,48 @@ async function loadProviders(opts: AxondOptions): Promise<ProviderConfig[]> {
   return typeof opts.providers === "function" ? opts.providers() : opts.providers;
 }
 
-async function readJson(c: Context<AxondEnv>): Promise<Record<string, unknown>> {
+const NAMESPACE_CREATE_FIELDS: readonly StrictField[] = [
+  { name: "id", kind: "string", required: true },
+  { name: "attrs", kind: "any" },
+  { name: "blocklist", kind: "strings", nullOk: true },
+];
+
+const NAMESPACE_REPLACE_FIELDS: readonly StrictField[] = [
+  { name: "attrs", kind: "any" },
+  { name: "blocklist", kind: "strings", nullOk: true },
+];
+
+const BUDGET_PUT_FIELDS: readonly StrictField[] = [
+  { name: "limit_microdollars", kind: "u64", required: true },
+];
+
+const BUDGET_POLICY_FIELDS: readonly StrictField[] = [
+  { name: "cadence", kind: "cadence", required: true },
+  { name: "limit_microdollars", kind: "u64", required: true },
+  { name: "timezone", kind: "string", nullOk: true },
+  { name: "period", kind: "string", nullOk: true },
+];
+
+async function readJson(c: Context<AxondEnv>, fields: readonly StrictField[]): Promise<Record<string, unknown>> {
   const contentType = c.req.header("content-type") ?? "";
   if (!contentType.toLowerCase().includes("application/json")) {
     throw new GatewayFailure("unsupported_media_type", 415, "expected a `content-type: application/json` request");
   }
+  let raw: string;
   try {
-    const value = await c.req.json();
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw badRequest("malformed json");
-    }
-    return value as Record<string, unknown>;
-  } catch (error) {
-    if (error instanceof GatewayFailure) {
-      throw error;
-    }
+    raw = await c.req.text();
+  } catch {
     throw badRequest("malformed json");
   }
+  return readStrictObject(raw, fields);
 }
 
 function requiredBig(body: Record<string, unknown>, key: string): bigint {
   const value = body[key];
-  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) {
-    return BigInt(value);
+  if (typeof value === "bigint" && value >= 0n && value <= 9223372036854775807n) {
+    return value;
   }
-  if (typeof value === "string" && /^[0-9]+$/.test(value)) {
-    return BigInt(value);
-  }
-  throw badRequest(`\`${key}\` must be an integer`);
+  throw badRequest("microdollar amount exceeds the store integer range");
 }
 
 function asAttrs(value: unknown): Record<string, unknown> {

@@ -901,6 +901,83 @@ test("json_null_is_missing_model_and_invalid_json_names_the_body", async () => {
   upstream.close();
 });
 
+test("management_json_rejects_unknown_fields_and_out_of_range_limits", async () => {
+  const { app, upstream } = await gateway();
+  try {
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const call = (path: string, method: string, body?: string) =>
+    app.request(`http://127.0.0.1${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+  const created = await call("/api/v1/namespaces", "POST", JSON.stringify({ id: "wsp_x", attrs: { org: "acme" } }));
+  assert.equal(created.status, 201);
+  const typo = await call("/api/v1/namespaces/wsp_x", "PUT", JSON.stringify({ attr: { org: "typo" } }));
+  assert.equal(typo.status, 400);
+  assert.deepEqual(await typo.json(), {
+    error: {
+      type: "bad_request",
+      message: "Failed to deserialize the JSON body into the target type: attr: unknown field `attr`, expected `attrs` or `blocklist` at line 1 column 7",
+    },
+  });
+  const kept = await call("/api/v1/namespaces/wsp_x", "GET");
+  assert.equal(kept.status, 200);
+  assert.equal((await kept.json()).attrs.org, "acme");
+  const extra = await call("/api/v1/namespaces", "POST", '{"id":"wsp_x","extra":1}');
+  assert.equal(extra.status, 400);
+  assert.deepEqual(await extra.json(), {
+    error: {
+      type: "bad_request",
+      message: "Failed to deserialize the JSON body into the target type: extra: unknown field `extra`, expected one of `id`, `attrs`, `blocklist` at line 1 column 21",
+    },
+  });
+  const missing = await call("/api/v1/namespaces", "POST", "{}");
+  assert.equal(missing.status, 400);
+  assert.deepEqual(await missing.json(), {
+    error: {
+      type: "bad_request",
+      message: "Failed to deserialize the JSON body into the target type: missing field `id` at line 1 column 2",
+    },
+  });
+  const spaced = await call("/api/v1/namespaces/wsp_x", "PUT", "{\n  \"attr\": 1\n}");
+  assert.equal(spaced.status, 400);
+  assert.match((await spaced.json()).error.message, /at line 2 column 8$/);
+  const stringLimit = await call("/api/v1/namespaces/wsp_x/budgets/2026-09", "PUT", '{"limit_microdollars":"10"}');
+  assert.equal(stringLimit.status, 400);
+  assert.deepEqual(await stringLimit.json(), {
+    error: {
+      type: "bad_request",
+      message: 'Failed to deserialize the JSON body into the target type: limit_microdollars: invalid type: string "10", expected u64 at line 1 column 26',
+    },
+  });
+  const floatLimit = await call("/api/v1/namespaces/wsp_x/budgets/2026-09", "PUT", '{"limit_microdollars":1.5}');
+  assert.equal(floatLimit.status, 400);
+  assert.deepEqual(await floatLimit.json(), {
+    error: {
+      type: "bad_request",
+      message: "Failed to deserialize the JSON body into the target type: limit_microdollars: invalid type: floating point `1.5`, expected u64 at line 1 column 25",
+    },
+  });
+  const over = await call("/api/v1/namespaces/wsp_x/budgets/2026-09", "PUT", '{"limit_microdollars":9223372036854775808}');
+  assert.equal(over.status, 400);
+  assert.deepEqual(await over.json(), {
+    error: { type: "bad_request", message: "microdollar amount exceeds the store integer range" },
+  });
+  const exact = await call("/api/v1/namespaces/wsp_x/budgets/2026-09", "PUT", '{"limit_microdollars":9223372036854775807}');
+  assert.equal(exact.status, 200);
+  assert.equal((await exact.json()).limit_microdollars, "9223372036854775807");
+  const weekly = await call("/api/v1/namespaces/wsp_x/budget", "PUT", '{"cadence":"weekly","limit_microdollars":1}');
+  assert.equal(weekly.status, 400);
+  assert.deepEqual(await weekly.json(), {
+    error: {
+      type: "bad_request",
+      message: "Failed to deserialize the JSON body into the target type: cadence: unknown variant `weekly`, expected `monthly` or `fixed` at line 1 column 19",
+    },
+  });
+  const absent = await call("/api/v1/namespaces/not-created", "GET");
+  assert.equal(absent.status, 404);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });
