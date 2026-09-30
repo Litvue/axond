@@ -136,6 +136,23 @@ export function createPostgresStore(
         return (result.rowCount ?? 0) > 0 ? "created" : "exists";
       });
     },
+    async adoptConfigNamespace(id, allowPlatformFallback) {
+      await withClient("namespace_write", async (client) => {
+        await client.query(
+          `INSERT INTO axond_namespace (id, attrs, blocklist, allow_platform_fallback, from_config)
+           VALUES ($1, $2::jsonb, NULL, $3, true)
+           ON CONFLICT (id) DO UPDATE SET
+             allow_platform_fallback = EXCLUDED.allow_platform_fallback,
+             from_config = true`,
+          [id, encodeAttrs({}), allowPlatformFallback],
+        );
+      });
+    },
+    async releaseConfigNamespace(id) {
+      await withClient("namespace_write", async (client) => {
+        await client.query("UPDATE axond_namespace SET from_config = false WHERE id = $1", [id]);
+      });
+    },
     async getNamespace(id) {
       return withClient("namespace_read", async (client) => {
         const result = await client.query("SELECT * FROM axond_namespace WHERE id = $1", [id]);

@@ -167,6 +167,26 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
         return "created" as const;
       });
     },
+    adoptConfigNamespace(id, allowPlatformFallback) {
+      return lock("namespace_write", () => {
+        const exists = one(db, "SELECT id FROM axond_namespace WHERE id = ?", [id]);
+        if (!exists) {
+          db.prepare(
+            "INSERT INTO axond_namespace (id, attrs, blocklist, allow_platform_fallback, from_config) VALUES (?, ?, NULL, ?, 1)",
+          ).run(id, encodeAttrs({}), allowPlatformFallback ? 1 : 0);
+          return;
+        }
+        db.prepare("UPDATE axond_namespace SET allow_platform_fallback = ?, from_config = 1 WHERE id = ?").run(
+          allowPlatformFallback ? 1 : 0,
+          id,
+        );
+      });
+    },
+    releaseConfigNamespace(id) {
+      return lock("namespace_write", () => {
+        db.prepare("UPDATE axond_namespace SET from_config = 0 WHERE id = ?").run(id);
+      });
+    },
     getNamespace(id) {
       return lock("namespace_read", () => readNamespace(db, id));
     },

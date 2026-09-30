@@ -319,6 +319,14 @@ export interface Store {
   query(sql: string, params?: readonly SqlValue[]): Promise<QueryResult>;
   resolveNamespace(id: string, nowMs: number): Promise<ResolvedNamespace | null>;
   putNamespace(record: NamespaceWrite): Promise<"created" | "exists">;
+  /**
+   * Record a deployment-file namespace. Inserts when absent. When the row
+   * exists, updates only the fallback flag and `fromConfig`, leaving attrs
+   * and the blocklist in place.
+   */
+  adoptConfigNamespace(id: string, allowPlatformFallback: boolean): Promise<void>;
+  /** A namespace that left the deployment file inherits platform credentials. */
+  releaseConfigNamespace(id: string): Promise<void>;
   getNamespace(id: string): Promise<NamespaceWrite | null>;
   updateNamespace(
     id: string,

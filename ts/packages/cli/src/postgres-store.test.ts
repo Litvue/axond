@@ -6,6 +6,7 @@ import pg from "pg";
 import { StoreFailure } from "../../gateway/src/errors.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
 import { applyPostgresMigration, createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
+import { seedConfigNamespaces } from "./seed-namespaces.ts";
 import type { Store } from "@axond/sdk";
 
 const dsn = process.env["AXOND_TEST_POSTGRES"];
@@ -285,6 +286,34 @@ test("postgres provider models keep the last payload and reject a different fres
   const replaced = await db.getProviderModels("openai");
   assert.equal(replaced?.stale, false);
   assert.deepEqual(replaced?.data, [{ id: "other" }]);
+});
+
+test("config_seed_tracks_file_fallback_on_postgres", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  await db.putNamespace({
+    id: "wsp_ok",
+    attrs: { org: "acme" },
+    blocklist: ["gpt*"],
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await db.putNamespace({
+    id: "left_file",
+    attrs: { keep: true },
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await seedConfigNamespaces(db, [{ id: "wsp_ok", allowPlatformFallback: true }]);
+  const kept = await db.getNamespace("wsp_ok");
+  assert.equal(kept?.allowPlatformFallback, true);
+  assert.equal(kept?.fromConfig, true);
+  assert.deepEqual(kept?.attrs, { org: "acme" });
+  assert.deepEqual(kept?.blocklist, ["gpt*"]);
+  const released = await db.getNamespace("left_file");
+  assert.equal(released?.fromConfig, false);
+  assert.deepEqual(released?.attrs, { keep: true });
 });
 
 test("a catalogue refusal streak survives a new postgres store", { skip: !dsn }, async () => {

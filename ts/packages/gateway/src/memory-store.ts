@@ -162,6 +162,25 @@ export function createMemoryStore(): Store {
         return "created" as const;
       });
     },
+    adoptConfigNamespace(id, allowPlatformFallback) {
+      return lock(() => {
+        const current = namespaces.get(id);
+        if (!current) {
+          namespaces.set(id, { id, attrs: {}, blocklist: null, allowPlatformFallback, fromConfig: true });
+          return;
+        }
+        namespaces.set(id, { ...current, allowPlatformFallback, fromConfig: true });
+      });
+    },
+    releaseConfigNamespace(id) {
+      return lock(() => {
+        const current = namespaces.get(id);
+        if (!current) {
+          return;
+        }
+        namespaces.set(id, { ...current, fromConfig: false });
+      });
+    },
     getNamespace(id) {
       return lock(() => namespaces.get(id) ?? null);
     },

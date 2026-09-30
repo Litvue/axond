@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
+import { createAxond } from "../../gateway/src/app.ts";
 import { envSecretReader, loadConfig } from "../../gateway/src/config.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
@@ -277,6 +278,74 @@ namespace = "wsp_ok"
     assert.equal((await store.getNamespace("wsp_ok"))?.fromConfig, true);
     assert.equal(await store.getNamespace("acme/core"), null);
     assert.equal(await store.getNamespace(""), null);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("config_seed_tracks_file_fallback", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-seed-flag-"));
+  try {
+    const store = openSqliteStore(join(directory, "axond.sqlite"));
+    await store.putNamespace({
+      id: "wsp_ok",
+      attrs: { org: "acme" },
+      blocklist: ["gpt*"],
+      allowPlatformFallback: false,
+      fromConfig: true,
+    });
+    await store.putNamespace({
+      id: "left_file",
+      attrs: { keep: true },
+      blocklist: null,
+      allowPlatformFallback: false,
+      fromConfig: true,
+    });
+    await store.putNamespace({
+      id: "api_made",
+      attrs: {},
+      blocklist: null,
+      allowPlatformFallback: false,
+      fromConfig: false,
+    });
+    await seedConfigNamespaces(store, [
+      { id: "wsp_ok", allowPlatformFallback: true },
+      { id: "closed", allowPlatformFallback: false },
+      { id: "acme/core", allowPlatformFallback: true },
+    ]);
+    const kept = await store.getNamespace("wsp_ok");
+    assert.equal(kept?.allowPlatformFallback, true);
+    assert.equal(kept?.fromConfig, true);
+    assert.deepEqual(kept?.attrs, { org: "acme" });
+    assert.deepEqual(kept?.blocklist, ["gpt*"]);
+    const released = await store.getNamespace("left_file");
+    assert.equal(released?.fromConfig, false);
+    assert.equal(released?.allowPlatformFallback, false);
+    assert.deepEqual(released?.attrs, { keep: true });
+    const created = await store.getNamespace("api_made");
+    assert.equal(created?.fromConfig, false);
+    assert.equal(created?.allowPlatformFallback, false);
+    assert.equal(await store.getNamespace("acme/core"), null);
+    const app = createAxond({
+      store,
+      gatewayKey: "k",
+      defaultNamespace: "platform",
+      credentials: [{ namespace: "platform", provider: "openai", secret: "sk-secret", id: "plat" }],
+    });
+    const headers = { authorization: "Bearer k" };
+    const inherited = await app.request("http://127.0.0.1/ns/left_file/v1/credentials", { headers });
+    assert.equal(inherited.status, 200);
+    const inheritedBody = await inherited.json();
+    assert.deepEqual(
+      inheritedBody.data.map((row: { credential_id?: string; source: string }) => ({
+        credential_id: row.credential_id,
+        source: row.source,
+      })),
+      [{ credential_id: "plat", source: "platform" }],
+    );
+    assert.equal(JSON.stringify(inheritedBody).includes("sk-secret"), false);
+    const closed = await app.request("http://127.0.0.1/ns/closed/v1/credentials", { headers });
+    assert.deepEqual((await closed.json()).data, []);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
