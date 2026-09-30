@@ -2563,9 +2563,9 @@ max_in_flight = 16
         envSecretReader({ GW_KEY: "k" }, async () => ""),
       ),
     (error: unknown) => {
-      assert.match(
+      assert.equal(
         error instanceof Error ? error.message : "",
-        /admission\.max_in_flight_settlements must be an integer of at least 0/,
+        'config: invalid type: found float `1.5`, expected usize for key "default.admission.max_in_flight_settlements"',
       );
       return true;
     },
@@ -2740,7 +2740,10 @@ max_request_bytes = 64
         envSecretReader({ GW_KEY: "k" }, async () => ""),
       ),
     (error: unknown) => {
-      assert.match(error instanceof Error ? error.message : "", /admission\.max_prompt_tokens must be an integer of at least 0/);
+      assert.equal(
+        error instanceof Error ? error.message : "",
+        'config: invalid value signed int `-1`, expected u64 for key "default.admission.max_prompt_tokens"',
+      );
       return true;
     },
   );
@@ -2751,7 +2754,10 @@ max_request_bytes = 64
         envSecretReader({ GW_KEY: "k" }, async () => ""),
       ),
     (error: unknown) => {
-      assert.match(error instanceof Error ? error.message : "", /admission\.max_output_tokens must be an integer of at least 0/);
+      assert.equal(
+        error instanceof Error ? error.message : "",
+        'config: invalid type: found float `1.5`, expected u64 for key "default.admission.max_output_tokens"',
+      );
       return true;
     },
   );
@@ -2771,9 +2777,9 @@ max_request_bytes = 64
         envSecretReader({ GW_KEY: "k" }, async () => ""),
       ),
     (error: unknown) => {
-      assert.match(
+      assert.equal(
         error instanceof Error ? error.message : "",
-        /admission\.max_stream_duration_ms must be an integer of at least 0/,
+        'config: invalid value signed int `-1`, expected u64 for key "default.admission.max_stream_duration_ms"',
       );
       return true;
     },
@@ -2785,9 +2791,9 @@ max_request_bytes = 64
         envSecretReader({ GW_KEY: "k" }, async () => ""),
       ),
     (error: unknown) => {
-      assert.match(
+      assert.equal(
         error instanceof Error ? error.message : "",
-        /admission\.max_stream_bytes must be an integer of at least 0/,
+        'config: invalid type: found float `1.5`, expected u64 for key "default.admission.max_stream_bytes"',
       );
       return true;
     },

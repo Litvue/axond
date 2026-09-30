@@ -157,6 +157,7 @@ export async function loadConfig(
     throw new GatewayFailure("bad_request", 400, `config: ${error instanceof Error ? error.message : "unreadable toml"}`);
   }
   applyEnvOverrides(parsed, secrets);
+  rejectExtractTypes(toml, parsed);
   const bind = readServerBind(toml, parsed, secrets);
   rejectWithdrawn(parsed);
   rejectCollisions(parsed);
@@ -212,7 +213,14 @@ export async function loadConfig(
     };
   }
   const discoveryEarly = asRecord(parsed["discovery"]) ?? {};
-  const discoveryIntervalSeconds = numberField(discoveryEarly, "refresh_interval_seconds", 300);
+  const discoveryIntervalSeconds = readTypedInt(
+    toml,
+    "discovery",
+    discoveryEarly,
+    "refresh_interval_seconds",
+    "u64",
+    300,
+  );
   if (discoveryIntervalSeconds < 1) {
     throw configError("discovery.refresh_interval_seconds must be at least 1");
   }
@@ -254,10 +262,8 @@ export async function loadConfig(
   validatePriceBook(parsed, providers);
   validateBlocklist(parsed);
   const poolRaw = asRecord(parsed["credential_pool"]) ?? {};
+  readVariant(toml, "credential_pool", poolRaw, "strategy", ["round-robin", "weighted"], "SelectionStrategy");
   const strategyRaw = poolRaw["strategy"];
-  if (strategyRaw !== undefined && strategyRaw !== "round-robin" && strategyRaw !== "weighted") {
-    throw configError("`[credential_pool] strategy` must be `round-robin` or `weighted`");
-  }
   const failureThreshold = atLeastOne(toml, "credential_pool", poolRaw, "failure_threshold", "u32", 2);
   const cooldownSeconds = atLeastOne(toml, "credential_pool", poolRaw, "cooldown_seconds", "u64", 30);
   const credentialPool: LoadedConfig["credentialPool"] = {
@@ -359,7 +365,7 @@ export async function loadConfig(
     throw configError(error instanceof Error ? error.message : "invalid admission");
   }
   const shutdown = loadShutdown(toml, asRecord(parsed["shutdown"]) ?? {});
-  const catalog = validateCatalog(asRecord(parsed["catalog"]) ?? {});
+  const catalog = validateCatalog(toml, asRecord(parsed["catalog"]) ?? {});
 
   const credentials: CredentialConfig[] = [];
   const credentialLabels = new Map<string, string[]>();
@@ -697,19 +703,10 @@ const CATALOG_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
  * section is not checked: fields left at their defaults describe an import
  * that will never run.
  */
-function validateCatalog(row: Record<string, unknown>): LoadedConfig["catalog"] {
+function validateCatalog(toml: string, row: Record<string, unknown>): LoadedConfig["catalog"] {
+  readVariant(toml, "catalog", row, "source", ["none", "models-dev", "seed"], "CatalogSourceBackend");
   const sourceRaw = row["source"];
-  const source =
-    sourceRaw === "models-dev" || sourceRaw === "models_dev"
-      ? "models-dev"
-      : sourceRaw === "seed"
-        ? "seed"
-        : sourceRaw === undefined || sourceRaw === "none"
-          ? "none"
-          : null;
-  if (source === null) {
-    throw configError("`[catalog] source` must be `none`, `models-dev`, or `seed`");
-  }
+  const source = sourceRaw === "models-dev" ? "models-dev" : sourceRaw === "seed" ? "seed" : "none";
   if (source === "none") {
     return { source: "none" };
   }
@@ -721,13 +718,13 @@ function validateCatalog(row: Record<string, unknown>): LoadedConfig["catalog"] 
     ["connect_timeout_ms", CATALOG_CONNECT_TIMEOUT_MS],
     ["operation_timeout_ms", CATALOG_OPERATION_TIMEOUT_MS],
   ] as const) {
-    catalogInt(row, field, fallback);
+    catalogInt(toml, row, field, fallback, "u64");
   }
-  catalogInt(row, "max_payload_bytes", CATALOG_MAX_PAYLOAD_BYTES);
-  const interval = catalogInt(row, "refresh_interval_seconds", CATALOG_REFRESH_INTERVAL_SECONDS);
-  const timeout = catalogInt(row, "refresh_timeout_seconds", CATALOG_REFRESH_TIMEOUT_SECONDS);
-  const initial = catalogInt(row, "retry_initial_seconds", CATALOG_RETRY_INITIAL_SECONDS);
-  const max = catalogInt(row, "retry_max_seconds", CATALOG_RETRY_MAX_SECONDS);
+  catalogInt(toml, row, "max_payload_bytes", CATALOG_MAX_PAYLOAD_BYTES, "usize");
+  const interval = catalogInt(toml, row, "refresh_interval_seconds", CATALOG_REFRESH_INTERVAL_SECONDS, "u64");
+  const timeout = catalogInt(toml, row, "refresh_timeout_seconds", CATALOG_REFRESH_TIMEOUT_SECONDS, "u64");
+  const initial = catalogInt(toml, row, "retry_initial_seconds", CATALOG_RETRY_INITIAL_SECONDS, "u64");
+  const max = catalogInt(toml, row, "retry_max_seconds", CATALOG_RETRY_MAX_SECONDS, "u64");
   if (timeout > interval) {
     throw configError(
       `catalog: catalogue refresh timeout (${timeout}s) must not exceed the interval (${interval}s)`,
@@ -753,12 +750,18 @@ function validateCatalog(row: Record<string, unknown>): LoadedConfig["catalog"] 
   return { source: "models-dev", sourceUrl: url };
 }
 
-function catalogInt(row: Record<string, unknown>, key: string, fallback: number): number {
-  const value = numberField(row, key, fallback);
-  if (Number.isInteger(value) && value < 1) {
+function catalogInt(
+  toml: string,
+  row: Record<string, unknown>,
+  key: string,
+  fallback: number,
+  expected: "u64" | "usize",
+): number {
+  const value = readTypedInt(toml, "catalog", row, key, expected, fallback);
+  if (value < 1) {
     throw configError(`catalog.${key} must be at least 1`);
   }
-  return Number.isInteger(value) ? value : fallback;
+  return value;
 }
 
 function assertCatalogUrl(sourceUrl: string): void {
@@ -1066,6 +1069,155 @@ function atLeastOne(
 const U32_MAX = 4294967295n;
 
 /**
+ * Figment extracts the document before `validate`. A float, string, or enum
+ * miss on an earlier key is reported before a later zero bound, a missing
+ * store, or a credential. Keys are visited in sorted order.
+ */
+function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void {
+  const admission = asRecord(parsed["admission"]) ?? {};
+  for (const [key, expected, fallback] of [
+    ["max_in_flight", "usize", 1024],
+    ["max_in_flight_per_tenant", "usize", 0],
+    ["max_in_flight_settlements", "usize", 64],
+    ["max_in_flight_streams", "usize", 512],
+    ["max_output_tokens", "u64", 200_000],
+    ["max_pending_settlements", "usize", 0],
+    ["max_prompt_tokens", "u64", 1_000_000],
+    ["max_request_bytes", "usize", 2 * 1024 * 1024],
+    ["max_stream_bytes", "u64", 64 * 1024 * 1024],
+    ["max_stream_duration_ms", "u64", 3_600_000],
+    ["max_tenants", "usize", 1024],
+    ["queue_capacity", "usize", 0],
+    ["queue_wait_ms", "u64", 0],
+    ["settlement_queue_wait_ms", "u64", 10_000],
+    ["settlement_timeout_ms", "u64", 10_000],
+  ] as const) {
+    readTypedInt(toml, "admission", admission, key, expected, fallback);
+  }
+  const catalog = asRecord(parsed["catalog"]) ?? {};
+  for (const [key, expected, fallback] of [
+    ["connect_timeout_ms", "u64", CATALOG_CONNECT_TIMEOUT_MS],
+    ["max_payload_bytes", "usize", CATALOG_MAX_PAYLOAD_BYTES],
+    ["operation_timeout_ms", "u64", CATALOG_OPERATION_TIMEOUT_MS],
+    ["refresh_interval_seconds", "u64", CATALOG_REFRESH_INTERVAL_SECONDS],
+    ["refresh_timeout_seconds", "u64", CATALOG_REFRESH_TIMEOUT_SECONDS],
+    ["retry_initial_seconds", "u64", CATALOG_RETRY_INITIAL_SECONDS],
+    ["retry_max_seconds", "u64", CATALOG_RETRY_MAX_SECONDS],
+  ] as const) {
+    readTypedInt(toml, "catalog", catalog, key, expected, fallback);
+  }
+  readVariant(toml, "catalog", catalog, "source", ["none", "models-dev", "seed"], "CatalogSourceBackend");
+  asArray(parsed["credential"]).forEach((entry, index) => {
+    const row = asRecord(entry);
+    if (!row) {
+      return;
+    }
+    readTypedInt(
+      toml,
+      "credential",
+      row,
+      "weight",
+      "u32",
+      1,
+      `default.credential.${index}.weight`,
+      arrayEntryLiteral(toml, "credential", index, "weight"),
+    );
+  });
+  const pool = asRecord(parsed["credential_pool"]) ?? {};
+  readTypedInt(toml, "credential_pool", pool, "cooldown_seconds", "u64", 30);
+  readTypedInt(toml, "credential_pool", pool, "failure_threshold", "u32", 2);
+  readVariant(toml, "credential_pool", pool, "strategy", ["round-robin", "weighted"], "SelectionStrategy");
+  const discovery = asRecord(parsed["discovery"]) ?? {};
+  readTypedInt(toml, "discovery", discovery, "refresh_interval_seconds", "u64", 300);
+  const failover = asRecord(parsed["failover"]) ?? {};
+  readTypedInt(toml, "failover", failover, "cooldown_seconds", "u64", 30);
+  readTypedInt(toml, "failover", failover, "failure_threshold", "u32", 3);
+  readTypedInt(toml, "failover", failover, "max_attempts", "u32", 3);
+  readTypedInt(toml, "failover", failover, "overall_timeout_ms", "u64", 30_000);
+}
+
+function readVariant(
+  toml: string,
+  section: string,
+  row: Record<string, unknown>,
+  key: string,
+  variants: readonly string[],
+  enumName: string,
+): void {
+  if (!(key in row)) {
+    return;
+  }
+  const literal = sectionFieldLiteral(toml, section, key);
+  const value = row[key];
+  const figmentKey = `default.${section}.${key}`;
+  if (typeof value === "string" && (literal === null || !isFloatToken(literal))) {
+    if (variants.includes(value)) {
+      return;
+    }
+    const list =
+      variants.length === 2
+        ? `\`${variants[0]}\` or \`${variants[1]}\``
+        : `one of ${variants.map((item) => `\`${item}\``).join(", ")}`;
+    throw configLoad(`unknown variant: found \`${value}\`, expected \`${list}\` for key "${figmentKey}"`);
+  }
+  throw configLoad(
+    `invalid type: found ${foundPhrase(value, literal)}, expected enum ${enumName} for key "${figmentKey}"`,
+  );
+}
+
+function foundPhrase(value: unknown, literal: string | null): string {
+  if (literal !== null && isFloatToken(literal)) {
+    return `float \`${rustFloatText(literal)}\``;
+  }
+  if (typeof value === "string") {
+    return `string ${JSON.stringify(value)}`;
+  }
+  if (typeof value === "boolean") {
+    return `bool ${value}`;
+  }
+  if (Array.isArray(value)) {
+    return "sequence";
+  }
+  if (value !== null && typeof value === "object") {
+    return "map";
+  }
+  if (typeof value === "number" && !Number.isInteger(value)) {
+    return `float \`${value}\``;
+  }
+  if (typeof value === "bigint" || typeof value === "number") {
+    const integer = typeof value === "bigint" ? value : BigInt(value);
+    return `signed int \`${integer}\``;
+  }
+  return "sequence";
+}
+
+function arrayEntryLiteral(toml: string, section: string, index: number, key: string): string | null {
+  let entry = -1;
+  let inEntry = false;
+  let found: string | null = null;
+  const header = new RegExp(`^\\[\\[${section}\\]\\]\\s*(?:#.*)?$`);
+  for (const line of toml.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (header.test(trimmed)) {
+      entry += 1;
+      inEntry = entry === index;
+      continue;
+    }
+    if (/^\s*\[/.test(line)) {
+      inEntry = false;
+    }
+    if (!inEntry) {
+      continue;
+    }
+    const assigned = assignmentValue(line, key);
+    if (assigned !== null) {
+      found = assigned;
+    }
+  }
+  return found;
+}
+
+/**
  * A value serde would reject while extracting a `u32` or `u64`. Zero stays a
  * number so the caller can report the Rust bound.
  */
@@ -1074,14 +1226,15 @@ function readTypedInt(
   section: string,
   row: Record<string, unknown>,
   key: string,
-  expected: "u32" | "u64",
+  expected: "u32" | "u64" | "usize",
   fallback: number,
+  figmentKey = `default.${section}.${key}`,
+  literal: string | null | undefined = undefined,
 ): number {
-  const figmentKey = `default.${section}.${key}`;
-  const literal = sectionFieldLiteral(toml, section, key);
-  if (literal !== null && isFloatToken(literal)) {
+  const token = literal === undefined ? sectionFieldLiteral(toml, section, key) : literal;
+  if (token !== null && isFloatToken(token)) {
     throw configLoad(
-      `invalid type: found float \`${rustFloatText(literal)}\`, expected ${expected} for key "${figmentKey}"`,
+      `invalid type: found float \`${rustFloatText(token)}\`, expected ${expected} for key "${figmentKey}"`,
     );
   }
   if (!(key in row)) {
@@ -1292,11 +1445,91 @@ function readServerBind(toml: string, parsed: Record<string, unknown>, secrets: 
   if (override !== null) {
     return finishBind(figmentEnvValue(override), BIND_ENV_KEY, BIND_ENV_LOC);
   }
-  const server = asRecord(parsed["server"]);
-  if (!server || !("bind" in server)) {
+  if (!Object.hasOwn(parsed, "server") || parsed["server"] === undefined) {
     return "0.0.0.0:8080";
   }
-  return finishBind(tomlBindValue(toml, server["bind"]), BIND_KEY, "");
+  const server = parsed["server"];
+  if (Array.isArray(server)) {
+    return bindFromServerArray(toml, server);
+  }
+  const record = asRecord(server);
+  if (!record) {
+    const literal = topLevelAssignment(toml, "server");
+    throw configLoad(
+      `invalid type: found ${foundPhrase(server, literal)}, expected struct Server for key "default.server"`,
+    );
+  }
+  if (!("bind" in record)) {
+    return "0.0.0.0:8080";
+  }
+  return finishBind(tomlBindValue(toml, record["bind"]), BIND_KEY, "");
+}
+
+function bindFromServerArray(toml: string, server: unknown[]): string {
+  if (server.length === 0) {
+    return "0.0.0.0:8080";
+  }
+  const rhs = topLevelAssignment(toml, "server");
+  const token = rhs === null ? null : firstArrayToken(rhs);
+  const head = server[0];
+  if (typeof head === "string" && (token === null || !isFloatToken(token))) {
+    return finishBind({ kind: "string", text: head }, "default.server.0", "");
+  }
+  return finishBind(scalarFromToken(head, token), "default.server.0", "");
+}
+
+function topLevelAssignment(toml: string, key: string): string | null {
+  let found: string | null = null;
+  for (const line of toml.split(/\r?\n/)) {
+    if (/^\s*\[/.test(line)) {
+      continue;
+    }
+    const assigned = assignmentValue(line, key);
+    if (assigned !== null) {
+      found = assigned;
+    }
+  }
+  return found;
+}
+
+function firstArrayToken(rhs: string): string | null {
+  const text = rhs.trim();
+  if (!text.startsWith("[")) {
+    return null;
+  }
+  const inner = text.slice(1).trim();
+  if (inner.startsWith("]")) {
+    return null;
+  }
+  const token = scalarToken(inner);
+  const bracket = token.indexOf("]");
+  return (bracket === -1 ? token : token.slice(0, bracket)).trim();
+}
+
+function scalarFromToken(value: unknown, token: string | null): FigmentScalar {
+  if (token !== null && isFloatToken(token)) {
+    return { kind: "float", text: rustFloatText(token) };
+  }
+  if (typeof value === "boolean") {
+    return { kind: "bool", value };
+  }
+  if (Array.isArray(value)) {
+    return { kind: "sequence" };
+  }
+  if (value !== null && typeof value === "object") {
+    return { kind: "map" };
+  }
+  if (typeof value === "number" && !Number.isInteger(value)) {
+    return { kind: "float", text: String(value) };
+  }
+  if (typeof value === "bigint" || typeof value === "number") {
+    const integer = typeof value === "bigint" ? value : BigInt(value);
+    if (integer > I64_MAX || integer < I64_MIN) {
+      throw configLoad("number too large to fit in target type");
+    }
+    return { kind: "int", text: integer.toString() };
+  }
+  return { kind: "sequence" };
 }
 
 function serverBindOverride(secrets: SecretReader): string | null {

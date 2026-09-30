@@ -617,6 +617,80 @@ namespace = "platform"
   );
 });
 
+test("extract type errors are figment sentences before later bounds", async () => {
+  const reader = envSecretReader({ GW_KEY: "k" }, async () => "");
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, reader),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const typed = (found: string, expected: string, key: string) =>
+    `config: invalid type: found ${found}, expected ${expected} for key "${key}"`;
+  await reject(
+    `${BASE}[admission]\nmax_request_bytes = 1.5\n[failover]\nmax_attempts = 0\n[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\n[[credential]]\nnamespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"\n`,
+    typed("float `1.5`", "usize", "default.admission.max_request_bytes"),
+  );
+  await reject(
+    `${BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", 'server = "x"\n')}[admission]\nmax_request_bytes = 1.0\n`,
+    typed("float `1`", "usize", "default.admission.max_request_bytes"),
+  );
+  await reject(
+    BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", 'server = "x"\n'),
+    typed('string "x"', "struct Server", "default.server"),
+  );
+  await reject(
+    BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", "server = 1\n"),
+    typed("signed int `1`", "struct Server", "default.server"),
+  );
+  await reject(
+    BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", "server = [1]\n"),
+    'config: invalid type: found signed int `1`, expected socket address for key "default.server.0"',
+  );
+  await reject(
+    BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", "server = [1.0]\n"),
+    'config: invalid type: found float `1`, expected socket address for key "default.server.0"',
+  );
+  await reject(
+    BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", 'server = ["localhost:8080"]\n'),
+    'config: invalid socket address syntax for key "default.server.0"',
+  );
+  const fromArray = await loadConfig(
+    BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", 'server = ["0.0.0.0:9", 1]\n'),
+    reader,
+  );
+  assert.equal(fromArray.bind, "0.0.0.0:9");
+  const emptyArray = await loadConfig(BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", "server = []\n"), reader);
+  assert.equal(emptyArray.bind, "0.0.0.0:8080");
+  await reject(
+    `${BASE}[catalog]\nsource = "none"\nrefresh_interval_seconds = 1.0\n`,
+    typed("float `1`", "u64", "default.catalog.refresh_interval_seconds"),
+  );
+  await reject(
+    `${BASE}[catalog]\nsource = "nope"\n`,
+    "config: unknown variant: found `nope`, expected `one of `none`, `models-dev`, `seed`` for key \"default.catalog.source\"",
+  );
+  await reject(
+    `${BASE}[discovery]\nrefresh_interval_seconds = 1.5\n`,
+    typed("float `1.5`", "u64", "default.discovery.refresh_interval_seconds"),
+  );
+  await reject(
+    `${BASE}[[credential]]\nnamespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"\nweight = 1\n[[credential]]\nnamespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"\nweight = 1.0\n`,
+    typed("float `1`", "u32", "default.credential.1.weight"),
+  );
+  await reject(
+    `${BASE}[credential_pool]\nstrategy = "nope"\n`,
+    "config: unknown variant: found `nope`, expected ``round-robin` or `weighted`` for key \"default.credential_pool.strategy\"",
+  );
+  await reject(
+    `${BASE}[credential_pool]\nstrategy = 1\n`,
+    typed("signed int `1`", "enum SelectionStrategy", "default.credential_pool.strategy"),
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),

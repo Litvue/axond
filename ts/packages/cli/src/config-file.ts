@@ -52,6 +52,7 @@ export function wantsFigmentLocation(detail: string): boolean {
   return (
     detail.startsWith("invalid type:") ||
     detail.startsWith("invalid value ") ||
+    detail.startsWith("unknown variant:") ||
     detail.startsWith("number too large to fit in target type") ||
     detail.startsWith("invalid socket address syntax")
   );

@@ -69,7 +69,12 @@ valid bind.
 with `must be at least 1` before a bad credential and before a catalogue URL.
 A float is Figment's type sentence (`expected u32` or `expected u64`).
 Admission, transport, and shutdown bounds are checked in that same pass, so a
-zero `admission.max_request_bytes` is reported before the catalogue.
+zero `admission.max_request_bytes` is reported before the catalogue. A float,
+string, or negative on an admission, catalogue, or discovery integer is
+Figment's extract error, including a float on a disabled catalogue. That
+extract error is reported before a zero failover bound. `server = "x"` is
+`expected struct Server`, and `server = [1]` is a socket-address error at
+`default.server.0`. An empty `server = []` keeps `0.0.0.0:8080`.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

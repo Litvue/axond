@@ -468,6 +468,53 @@ source_url = "http://models.dev/catalog.json"
   }
 });
 
+test("typed_extract_beats_a_later_bound", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-extract-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "admission.toml");
+  await writeFile(
+    config,
+    `
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[credential]]
+namespace = "ghost"
+provider = "openai"
+env = "OPENAI_KEY"
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[failover]
+max_attempts = 0
+[admission]
+max_request_bytes = 1.5
+[catalog]
+source = "models-dev"
+source_url = "http://models.dev/catalog.json"
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        '`: config load: invalid type: found float `1.5`, expected usize for key "default.admission.max_request_bytes" in ' +
+        figmentFileSource(config, root) +
+        " TOML file\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function run(
   config: string,
   cwd: string,
