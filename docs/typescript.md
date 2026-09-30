@@ -206,7 +206,7 @@ SQLite inside the container.
 caching disabled, and bundle the Worker with the extensions it imports. A
 compiled Bun binary loads those same extensions from disk instead. A cron
 trigger (`*/5 * * * *`) runs provider discovery and catalogue import off the
-request path. A failed fetch marks the row stale and leaves the last payload.
+request path. A failed fetch marks the row stale and leaves the last payload. The process writes JSON `msg` `provider_discovery` with the provider id and a bounded reason, and that line omits the credential and the base URL.
 
 `npm run test:workerd` boots that template under workerd. It reads
 `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE` from

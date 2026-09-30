@@ -291,6 +291,8 @@ Not on the inference path. `GET /api/v1/providers/{id}/models` and
 | --- | --- | --- | --- |
 | `refresh_interval_seconds` | integer | `300` | Seconds between refresh rounds. The first round runs at boot; an empty provider set retries with short backoff instead of waiting the full interval. `0` is rejected. |
 
+A failed provider refresh writes JSON `msg` `provider_discovery` with the provider id and reason `no_credential`, `unreachable`, `denied`, `not_json`, or `not_retained`. The previous cache stays in place and is marked stale when the store accepts that write. The line omits the credential, the base URL, and the driver text.
+
 ## `[[credential]]` — outbound provider keys
 
 Explicit `(namespace, provider) → env var` bindings, never inferred from names.

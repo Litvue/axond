@@ -8,6 +8,7 @@ import { createMemoryStore } from "../../gateway/src/memory-store.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
 
 import { discoverOnce } from "./discovery.ts";
+import type { ProviderDiscoveryLog } from "@axond/sdk";
 import { openSqliteStore } from "./sqlite-store.ts";
 
 test("discovery stores provider models and a catalogue document", async () => {
@@ -260,4 +261,123 @@ test("catalogue refusals survive a new store object on the same database", async
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("provider_discovery_log_names_the_provider_and_omits_the_secret", async () => {
+  const store = createMemoryStore();
+  await store.upsertProviderModels({
+    provider: "fake-openai",
+    fetchedAt: "2026-09-29T00:00:00Z",
+    stale: false,
+    data: [{ id: "gpt-test" }],
+    source: "http://upstream",
+  });
+  const secret = "sk-discovery-sentinel";
+  const baseUrl = `http://127.0.0.1:9/${secret}`;
+  const logs: ProviderDiscoveryLog[] = [];
+  const note = (record: { msg: string }) => {
+    if (record.msg === "provider_discovery") {
+      logs.push(record as ProviderDiscoveryLog);
+    }
+  };
+  let calls = 0;
+  await discoverOnce({
+    store,
+    providers: [
+      { id: "fake-openai", kind: "openai", baseUrl },
+      { id: "missing-cred", kind: "openai", baseUrl },
+    ],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "cred-1" }],
+    catalog: { source: "none" },
+    onLog: note,
+    fetchImpl: async () => {
+      calls += 1;
+      throw new Error(`connect ${secret} ${baseUrl}`);
+    },
+  });
+  assert.equal(calls, 1);
+  assert.deepEqual(
+    logs.map((line) => ({ provider: line.provider, reason: line.reason })),
+    [
+      { provider: "fake-openai", reason: "unreachable" },
+      { provider: "missing-cred", reason: "no_credential" },
+    ],
+  );
+  const stale = await store.getProviderModels("fake-openai");
+  assert.equal(stale?.stale, true);
+  assert.deepEqual(stale?.data, [{ id: "gpt-test" }]);
+  assert.equal(await store.getProviderModels("missing-cred"), null);
+  assert.equal(JSON.stringify(logs).includes(secret), false);
+  assert.equal(JSON.stringify(logs).includes("127.0.0.1"), false);
+
+  logs.length = 0;
+  await discoverOnce({
+    store,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "cred-1" }],
+    catalog: { source: "none" },
+    onLog: note,
+    fetchImpl: async () => new Response(secret, { status: 401 }),
+  });
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0]?.reason, "denied");
+  assert.equal(JSON.stringify(logs).includes(secret), false);
+
+  logs.length = 0;
+  await discoverOnce({
+    store,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "cred-1" }],
+    catalog: { source: "none" },
+    onLog: note,
+    fetchImpl: async () => new Response(secret, { status: 200 }),
+  });
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0]?.reason, "not_json");
+  assert.equal(JSON.stringify(logs).includes(secret), false);
+  const kept = await store.getProviderModels("fake-openai");
+  assert.equal(kept?.stale, true);
+  assert.deepEqual(kept?.data, [{ id: "gpt-test" }]);
+
+  const retained: ProviderDiscoveryLog[] = [];
+  const base = createMemoryStore();
+  await discoverOnce({
+    store: {
+      ...base,
+      upsertProviderModels: async () => {
+        throw new Error(`dsn postgres://axond:${secret}@127.0.0.1/axond`);
+      },
+    },
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: "http://upstream" }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "cred-1" }],
+    catalog: { source: "none" },
+    onLog: (record) => {
+      if (record.msg === "provider_discovery") {
+        retained.push(record);
+      }
+    },
+    fetchImpl: async () => new Response(JSON.stringify({ data: [{ id: "gpt-test" }] }), { status: 200 }),
+  });
+  assert.deepEqual(
+    retained.map((line) => line.reason),
+    ["not_retained"],
+  );
+  const encoded = JSON.stringify(retained);
+  assert.equal(encoded.includes(secret), false);
+  assert.equal(encoded.includes("postgres"), false);
+  assert.equal(encoded.includes("127.0.0.1"), false);
+
+  logs.length = 0;
+  await discoverOnce({
+    store,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: "http://upstream" }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "cred-1" }],
+    catalog: { source: "none" },
+    onLog: note,
+    fetchImpl: async () => new Response(JSON.stringify({ data: [{ id: "gpt-test" }] }), { status: 200 }),
+  });
+  assert.equal(logs.length, 0);
+  const fresh = await store.getProviderModels("fake-openai");
+  assert.equal(fresh?.stale, false);
+  assert.deepEqual(fresh?.data, [{ id: "gpt-test" }]);
 });

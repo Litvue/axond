@@ -1,4 +1,12 @@
-import type { CatalogueImportLog, CredentialConfig, ProviderConfig, Store } from "@axond/sdk";
+import type {
+  CatalogueImportLog,
+  CredentialConfig,
+  ProviderConfig,
+  ProviderDiscoveryLog,
+  Store,
+} from "@axond/sdk";
+
+type DiscoveryLog = CatalogueImportLog | ProviderDiscoveryLog;
 
 export interface CatalogConfig {
   source: "none" | "models-dev" | "seed";
@@ -27,47 +35,110 @@ export async function discoverOnce(input: {
   catalog: CatalogConfig;
   fetchImpl?: typeof fetch;
   metrics?: CatalogMetrics;
-  onLog?: (record: CatalogueImportLog) => void;
+  onLog?: (record: DiscoveryLog) => void;
 }): Promise<void> {
   const fetchImpl = input.fetchImpl ?? fetch;
   for (const provider of input.providers) {
-    const credential = input.credentials.find((item) => item.provider === provider.id);
-    if (!credential) {
-      continue;
-    }
-    const headers = new Headers();
-    if (provider.kind === "anthropic") {
-      headers.set("x-api-key", credential.secret);
-      headers.set("anthropic-version", "2023-06-01");
-    } else {
-      headers.set("authorization", `Bearer ${credential.secret}`);
-    }
-    try {
-      const response = await fetchImpl(`${provider.baseUrl.replace(/\/$/, "")}/models`, { headers });
-      if (!response.ok) {
-        await input.store.markProviderModelsStale(provider.id);
-        continue;
-      }
-      const body = (await response.json()) as { data?: unknown };
-      const data = Array.isArray(body.data) ? body.data : [];
-      await input.store.upsertProviderModels({
-        provider: provider.id,
-        fetchedAt: new Date().toISOString(),
-        stale: false,
-        data,
-        source: provider.baseUrl,
-      });
-    } catch {
-      await input.store.markProviderModelsStale(provider.id);
-    }
+    await refreshProvider(input, fetchImpl, provider);
   }
   if (input.catalog.source === "models-dev" && input.catalog.sourceUrl) {
     await refreshCatalog(input, fetchImpl, input.catalog.sourceUrl);
   }
 }
 
+async function refreshProvider(
+  input: {
+    store: Store;
+    credentials: readonly CredentialConfig[];
+    onLog?: (record: DiscoveryLog) => void;
+  },
+  fetchImpl: typeof fetch,
+  provider: ProviderConfig,
+): Promise<void> {
+  const credential = input.credentials.find((item) => item.provider === provider.id);
+  if (!credential) {
+    noteProviderDiscovery(input.onLog, provider.id, "no_credential");
+    try {
+      const existing = await input.store.getProviderModels(provider.id);
+      if (existing) {
+        await input.store.markProviderModelsStale(provider.id);
+      }
+    } catch {
+      noteProviderDiscovery(input.onLog, provider.id, "not_retained");
+    }
+    return;
+  }
+  const headers = new Headers();
+  if (provider.kind === "anthropic") {
+    headers.set("x-api-key", credential.secret);
+    headers.set("anthropic-version", "2023-06-01");
+  } else {
+    headers.set("authorization", `Bearer ${credential.secret}`);
+  }
+  const url = `${provider.baseUrl.replace(/\/$/, "")}/models`;
+  let response: Response;
+  try {
+    response = await fetchImpl(url, { headers });
+  } catch {
+    noteProviderDiscovery(input.onLog, provider.id, "unreachable");
+    await markProviderStale(input, provider.id);
+    return;
+  }
+  if (!response.ok) {
+    const reason = response.status === 401 || response.status === 403 ? "denied" : "unreachable";
+    noteProviderDiscovery(input.onLog, provider.id, reason);
+    await markProviderStale(input, provider.id);
+    return;
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    noteProviderDiscovery(input.onLog, provider.id, "not_json");
+    await markProviderStale(input, provider.id);
+    return;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    noteProviderDiscovery(input.onLog, provider.id, "not_json");
+    await markProviderStale(input, provider.id);
+    return;
+  }
+  const data = Array.isArray((body as { data?: unknown }).data) ? (body as { data: unknown[] }).data : [];
+  try {
+    await input.store.upsertProviderModels({
+      provider: provider.id,
+      fetchedAt: new Date().toISOString(),
+      stale: false,
+      data,
+      source: provider.baseUrl,
+    });
+  } catch {
+    noteProviderDiscovery(input.onLog, provider.id, "not_retained");
+    await markProviderStale(input, provider.id);
+  }
+}
+
+function noteProviderDiscovery(
+  onLog: ((record: DiscoveryLog) => void) | undefined,
+  provider: string,
+  reason: ProviderDiscoveryLog["reason"],
+): void {
+  onLog?.({ msg: "provider_discovery", provider, reason });
+}
+
+async function markProviderStale(
+  input: { store: Store; onLog?: (record: DiscoveryLog) => void },
+  provider: string,
+): Promise<void> {
+  try {
+    await input.store.markProviderModelsStale(provider);
+  } catch {
+    noteProviderDiscovery(input.onLog, provider, "not_retained");
+  }
+}
+
 async function refreshCatalog(
-  input: { store: Store; metrics?: CatalogMetrics; onLog?: (record: CatalogueImportLog) => void },
+  input: { store: Store; metrics?: CatalogMetrics; onLog?: (record: DiscoveryLog) => void },
   fetchImpl: typeof fetch,
   sourceUrl: string,
 ): Promise<void> {
@@ -132,7 +203,7 @@ function catalogStatusReason(status: number): CatalogRefusalReason {
 }
 
 async function noteCatalogRefusal(
-  input: { store: Store; metrics?: CatalogMetrics; onLog?: (record: CatalogueImportLog) => void },
+  input: { store: Store; metrics?: CatalogMetrics; onLog?: (record: DiscoveryLog) => void },
   reason: CatalogRefusalReason,
 ): Promise<void> {
   let next: number;
@@ -180,7 +251,7 @@ export function startDiscovery(input: {
   catalog: CatalogConfig;
   intervalSeconds: number;
   metrics?: CatalogMetrics;
-  onLog?: (record: CatalogueImportLog) => void;
+  onLog?: (record: DiscoveryLog) => void;
 }): () => void {
   const run = () => {
     void discoverOnce(input);

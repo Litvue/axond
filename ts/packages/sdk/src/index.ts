@@ -191,6 +191,18 @@ export interface CatalogueImportLog {
 }
 
 /**
+ * A provider `/models` refresh failed. The previous cache stays in place and
+ * is marked stale when that write is accepted. The line names the provider id
+ * and a bounded reason. The credential, the base URL, and the driver text stay
+ * off it.
+ */
+export interface ProviderDiscoveryLog {
+  msg: "provider_discovery";
+  provider: string;
+  reason: "no_credential" | "unreachable" | "denied" | "not_json" | "not_retained";
+}
+
+/**
  * One step of process shutdown. The CLI writes these on stdout.
  * The line names the signal and the phase. The bind address, the store
  * path, and the gateway key stay off it. `spend_unsettled` is written when
@@ -259,6 +271,7 @@ export type AxondLog =
   | SettlementFailureLog
   | BudgetUnavailableLog
   | CatalogueImportLog
+  | ProviderDiscoveryLog
   | ShutdownLog
   | KeyMaterialLog;
 
@@ -491,12 +504,13 @@ export interface AxondOptions {
    * routed but has not settled, so those fields are absent. A rate-limit
    * rotation, an upstream timeout, a transport failure, a stream duration or
    * byte cap, a settlement bound, a failed Store write, a budget-store outage,
-   * a catalogue import, and a byte-faithful body that stays open until the
-   * post-terminal grace or the stream duration bound are separate lines. The
-   * CLI also writes a shutdown line for each phase, and a `key_material` line
-   * when a gateway-key file is readable by group or others. That line names
-   * the path. None of them carry a body, a credential, a driver message, a
-   * bind address, or a source URL.
+   * a catalogue import, a failed provider model refresh, and a byte-faithful
+   * body that stays open until the post-terminal grace or the stream duration
+   * bound are separate lines. The CLI also writes a shutdown line for each
+   * phase, and a `key_material` line when a gateway-key file is readable by
+   * group or others. That line names the path. A `provider_discovery` line
+   * names the provider id and a bounded reason. None of them carry a body, a
+   * credential, a driver message, a bind address, or a source URL.
    */
   onLog?: (record: AxondLog) => void;
   maxRequestBytes?: number;
