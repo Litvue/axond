@@ -14,6 +14,12 @@ export GW_INBOUND_KEY=...
 ./bin/axond
 ```
 
+`./bin/axond --version` prints `axond` and the workspace version from
+`Cargo.toml`. `--help` and `-h` print the same help text as the Rust binary.
+Both finish before the config file is opened. Any other argument, including
+`mint`, `keygen`, `revoke`, `check`, `migrate`, `admin`, and `budget`, exits 2
+and does not boot.
+
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
 directory of `.ts`, `.js`, or `.mjs` files. Each file's default export is an

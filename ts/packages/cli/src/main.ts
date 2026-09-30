@@ -15,6 +15,7 @@ import {
   loadConfig,
   resolveTelemetry,
 } from "../../gateway/src/index.ts";
+import { cliArguments, parseArgv } from "./argv.ts";
 import { createBackgroundDrain, remainingMs, settleShareMs as flushSettleShare } from "./shutdown-budget.ts";
 import { openUsageDelivery } from "./usage-delivery.ts";
 import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
@@ -27,6 +28,12 @@ import { openSqliteStore } from "./sqlite-store.ts";
 const { Client } = pg;
 
 async function main(): Promise<void> {
+  const argv = parseArgv(cliArguments(process.argv));
+  if (argv.action !== "serve") {
+    const stream = argv.action === "stdout" ? process.stdout : process.stderr;
+    stream.write(argv.text);
+    process.exit(argv.code);
+  }
   const configPath = process.env["AXOND_CONFIG"] ?? "axond.toml";
   const toml = await readFile(configPath, "utf8");
   const config = await loadConfig(
