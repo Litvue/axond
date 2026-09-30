@@ -691,6 +691,58 @@ test("extract type errors are figment sentences before later bounds", async () =
   );
 });
 
+test("a non-table section is refused while figment extracts", async () => {
+  const reader = envSecretReader({ GW_KEY: "k" }, async () => "");
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, reader),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const typed = (found: string, expected: string, key: string) =>
+    `config: invalid type: found ${found}, expected ${expected} for key "${key}"`;
+  await reject(
+    `admission = "x"\n${BASE}[failover]\nmax_attempts = 0\n[[credential]]\nnamespace = "ghost"\nprovider = "openai"\nenv = "OPENAI_KEY"\n[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\n`,
+    typed('string "x"', "struct AdmissionConfigWire", "default.admission"),
+  );
+  await reject(
+    `admission = "y"\n${BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", 'server = "x"\n')}`,
+    typed('string "y"', "struct AdmissionConfigWire", "default.admission"),
+  );
+  await reject(
+    `failover = 1.0\n${BASE}`,
+    typed("float `1`", "struct Failover", "default.failover"),
+  );
+  await reject(
+    `shutdown = "y"\n${BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", 'server = "x"\n')}`,
+    typed('string "x"', "struct Server", "default.server"),
+  );
+  await reject(
+    `shutdown = "y"\n${BASE}`,
+    typed('string "y"', "struct Shutdown", "default.shutdown"),
+  );
+  await reject(
+    `storage = "x"\n${BASE.replace("[storage]\nbackend = \"sqlite\"\npath = \"/tmp/axond.sqlite\"\n", "")}`,
+    typed('string "x"', "struct StorageConfig", "default.storage"),
+  );
+  await reject(
+    BASE.replace("[[namespace]]\nid = \"platform\"\ndefault = true\n", '[namespace]\nid = "platform"\ndefault = true\n'),
+    typed("map", "a sequence", "default.namespace"),
+  );
+  const withoutNamespace = BASE.replace('[[namespace]]\nid = "platform"\ndefault = true\n', "");
+  await reject(
+    `namespace = ["x"]\n${withoutNamespace}`,
+    typed('string "x"', "struct Namespace", "default.namespace.0"),
+  );
+  await reject(
+    `namespace = [1.0]\n${withoutNamespace}`,
+    typed("float `1`", "struct Namespace", "default.namespace.0"),
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),

@@ -159,6 +159,7 @@ export async function loadConfig(
   applyEnvOverrides(parsed, secrets);
   rejectExtractTypes(toml, parsed);
   const bind = readServerBind(toml, parsed, secrets);
+  rejectSectionShapes(toml, parsed, SECTIONS_AFTER_SERVER);
   rejectWithdrawn(parsed);
   rejectCollisions(parsed);
   rejectUsageJournal(parsed);
@@ -1073,7 +1074,34 @@ const U32_MAX = 4294967295n;
  * miss on an earlier key is reported before a later zero bound, a missing
  * store, or a credential. Keys are visited in sorted order.
  */
+type SectionShape = { form: "struct"; name: string } | { form: "seq"; element: string };
+
+/** Keys Figment visits before `server`. A scalar here beats a bad bind. */
+const SECTIONS_BEFORE_SERVER: ReadonlyArray<readonly [string, SectionShape]> = [
+  ["admission", { form: "struct", name: "AdmissionConfigWire" }],
+  ["blocklist", { form: "struct", name: "BlocklistConfig" }],
+  ["catalog", { form: "struct", name: "CatalogConfig" }],
+  ["credential", { form: "seq", element: "Credential" }],
+  ["credential_pool", { form: "struct", name: "CredentialPool" }],
+  ["discovery", { form: "struct", name: "DiscoveryConfig" }],
+  ["failover", { form: "struct", name: "Failover" }],
+  ["gateway_key", { form: "seq", element: "GatewayKey" }],
+  ["namespace", { form: "seq", element: "Namespace" }],
+  ["price", { form: "seq", element: "PriceRule" }],
+  ["provider", { form: "seq", element: "Provider" }],
+];
+
+/** Keys Figment visits after `server`. A bad bind beats these. */
+const SECTIONS_AFTER_SERVER: ReadonlyArray<readonly [string, SectionShape]> = [
+  ["shutdown", { form: "struct", name: "Shutdown" }],
+  ["storage", { form: "struct", name: "StorageConfig" }],
+  ["transport", { form: "struct", name: "Transport" }],
+  ["usage_journal", { form: "struct", name: "UsageJournalConfig" }],
+  ["usage_sink", { form: "seq", element: "UsageSinkConfigWire" }],
+];
+
 function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void {
+  rejectSectionShapes(toml, parsed, SECTIONS_BEFORE_SERVER);
   const admission = asRecord(parsed["admission"]) ?? {};
   for (const [key, expected, fallback] of [
     ["max_in_flight", "usize", 1024],
@@ -1134,6 +1162,67 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
   readTypedInt(toml, "failover", failover, "failure_threshold", "u32", 3);
   readTypedInt(toml, "failover", failover, "max_attempts", "u32", 3);
   readTypedInt(toml, "failover", failover, "overall_timeout_ms", "u64", 30_000);
+}
+
+function rejectSectionShapes(
+  toml: string,
+  parsed: Record<string, unknown>,
+  sections: ReadonlyArray<readonly [string, SectionShape]>,
+): void {
+  for (const [key, shape] of sections) {
+    if (!Object.hasOwn(parsed, key) || parsed[key] === undefined) {
+      continue;
+    }
+    const value = parsed[key];
+    const literal = topLevelAssignment(toml, key);
+    if (shape.form === "struct") {
+      if (asRecord(value) || Array.isArray(value)) {
+        continue;
+      }
+      throw configLoad(
+        `invalid type: found ${foundPhrase(value, literal)}, expected struct ${shape.name} for key "default.${key}"`,
+      );
+    }
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => {
+        if (asRecord(entry)) {
+          return;
+        }
+        const token = literal === null ? null : nthArrayToken(literal, index);
+        throw configLoad(
+          `invalid type: found ${foundPhrase(entry, token)}, expected struct ${shape.element} for key "default.${key}.${index}"`,
+        );
+      });
+      continue;
+    }
+    throw configLoad(
+      `invalid type: found ${foundPhrase(value, literal)}, expected a sequence for key "default.${key}"`,
+    );
+  }
+}
+
+function nthArrayToken(rhs: string, index: number): string | null {
+  const text = rhs.trim();
+  if (!text.startsWith("[")) {
+    return null;
+  }
+  let inner = text.slice(1).trim();
+  for (let cursor = 0; cursor <= index; cursor += 1) {
+    if (inner.length === 0 || inner.startsWith("]")) {
+      return null;
+    }
+    const token = scalarToken(inner);
+    const bracket = token.indexOf("]");
+    const clean = (bracket === -1 ? token : token.slice(0, bracket)).trim();
+    if (cursor === index) {
+      return clean;
+    }
+    inner = inner.slice(token.length).trim();
+    if (inner.startsWith(",")) {
+      inner = inner.slice(1).trim();
+    }
+  }
+  return null;
 }
 
 function readVariant(
@@ -1482,7 +1571,7 @@ function topLevelAssignment(toml: string, key: string): string | null {
   let found: string | null = null;
   for (const line of toml.split(/\r?\n/)) {
     if (/^\s*\[/.test(line)) {
-      continue;
+      break;
     }
     const assigned = assignmentValue(line, key);
     if (assigned !== null) {

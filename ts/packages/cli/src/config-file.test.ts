@@ -515,6 +515,45 @@ source_url = "http://models.dev/catalog.json"
   }
 });
 
+test("section_shape_is_refused_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-shape-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "admission.toml");
+  await writeFile(
+    config,
+    `
+admission = "x"
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[failover]
+max_attempts = 0
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        '`: config load: invalid type: found string "x", expected struct AdmissionConfigWire for key "default.admission" in ' +
+        figmentFileSource(config, root) +
+        " TOML file\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function run(
   config: string,
   cwd: string,
