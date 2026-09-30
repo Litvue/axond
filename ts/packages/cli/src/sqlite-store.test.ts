@@ -77,6 +77,62 @@ test("delete then recreate bumps incarnation so a late settle does not charge", 
   }
 });
 
+test("sqlite usage summary groups in byte order and saturates at the signed cap", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-"));
+  const path = join(directory, "axond.sqlite");
+  try {
+    const store = openSqliteStore(path);
+    await store.putNamespace({
+      id: "wsp_usage",
+      attrs: {},
+      blocklist: null,
+      allowPlatformFallback: true,
+      fromConfig: false,
+    });
+    const settle = (requestId: string, model: string, status: string, cost: bigint | null, period = "p") =>
+      store.settle({
+        requestId,
+        namespace: "wsp_usage",
+        period,
+        model,
+        status,
+        cost,
+        incarnation: 1n,
+      });
+    const half = 9223372036854775807n / 2n + 1n;
+    await settle("r1", "b/m", "ok", 15n);
+    await settle("r2", "b/m", "upstream_error", 1n);
+    await settle("r3", "a/m", "ok", null);
+    await settle("r4", "a/m", "ok", 7n);
+    await settle("r1", "b/m", "ok", 99n);
+    await settle("r5", "😀", "ok", 1n);
+    await settle("r6", "\uFFFF", "ok", 2n);
+    await settle("r7", "c/m", "ok", half);
+    await settle("r8", "c/m", "ok", half);
+    await settle("r9", "d/m", "ok", 9223372036854775807n + 1n);
+    const summary = await store.summarizeUsage("wsp_usage", "p");
+    assert.deepEqual(
+      summary.map((row) => [row.model, row.status, row.count, row.cost_microdollars]),
+      [
+        ["a/m", "ok", 2, 7],
+        ["b/m", "ok", 1, 15],
+        ["b/m", "upstream_error", 1, 1],
+        ["c/m", "ok", 2, "9223372036854775807"],
+        ["d/m", "ok", 1, "9223372036854775807"],
+        ["\uFFFF", "ok", 1, 2],
+        ["😀", "ok", 1, 1],
+      ],
+    );
+    const stored = await store.query(
+      "SELECT CAST(cost_microdollars AS TEXT) AS cost FROM axond_store_usage WHERE request_id = ?",
+      ["r9"],
+    );
+    assert.equal(String(stored.rows[0]?.["cost"]), "9223372036854775807");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("sqlite hides a driver error behind store failure", async () => {
   const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-"));
   const path = join(directory, "axond.sqlite");

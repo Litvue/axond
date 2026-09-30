@@ -413,7 +413,7 @@ export interface SettleInput {
 export interface UsageSummaryRow {
   model: string;
   status: string;
-  count: number;
+  count: number | string;
   cost_microdollars: number | string;
 }
 

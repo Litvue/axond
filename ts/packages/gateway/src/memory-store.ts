@@ -17,6 +17,7 @@ import { monthlyPeriod } from "./namespace.ts";
 import { serdeCanonical, serdeValue } from "./strict-json.ts";
 
 const I64_MAX = 9223372036854775807n;
+const U64_MAX = 18446744073709551615n;
 
 interface BudgetRow {
   limit: bigint;
@@ -243,17 +244,18 @@ export function createMemoryStore(): Store {
         if (usage.has(input.requestId)) {
           return { charged: false };
         }
+        const cost = input.cost === null ? null : saturateMicrodollars(input.cost);
         usage.set(input.requestId, {
           requestId: input.requestId,
           namespace: input.namespace,
           period: input.period,
           model: input.model,
           status: input.status,
-          cost: input.cost,
+          cost,
         });
         const incarnation = incarnations.get(input.namespace) ?? 1n;
         if (
-          input.cost === null ||
+          cost === null ||
           input.period === null ||
           !namespaces.has(input.namespace) ||
           incarnation !== input.incarnation
@@ -264,31 +266,20 @@ export function createMemoryStore(): Store {
         if (!row) {
           return { charged: false };
         }
-        const room = I64_MAX - input.cost;
-        row.spent = row.spent >= room ? I64_MAX : row.spent + input.cost;
+        row.spent = addMicrodollars(row.spent, cost);
         return { charged: true };
       });
     },
     summarizeUsage(namespace, period) {
       return lock(() => {
         requireNamespace(namespace);
-        const grouped = new Map<string, UsageSummaryRow>();
+        const rows = [];
         for (const row of usage.values()) {
-          if (row.namespace !== namespace || row.period !== period) {
-            continue;
+          if (row.namespace === namespace && row.period === period) {
+            rows.push({ model: row.model, status: row.status, cost: row.cost });
           }
-          const slot = `${row.model}\0${row.status}`;
-          const current = grouped.get(slot) ?? {
-            model: row.model,
-            status: row.status,
-            count: 0,
-            cost_microdollars: 0,
-          };
-          current.count += 1;
-          current.cost_microdollars = Number(BigInt(current.cost_microdollars) + (row.cost ?? 0n));
-          grouped.set(slot, current);
         }
-        return [...grouped.values()];
+        return foldUsageSummary(rows);
       });
     },
     listProviderModels() {
@@ -356,6 +347,84 @@ export function money(value: bigint): number | string {
     return Number(value);
   }
   return value.toString();
+}
+
+/** Charge amounts above the signed 64-bit store cap saturate there. */
+export function saturateMicrodollars(value: bigint): bigint {
+  return value > I64_MAX ? I64_MAX : value;
+}
+
+function addMicrodollars(total: bigint, next: bigint): bigint {
+  const amount = saturateMicrodollars(next);
+  if (total >= I64_MAX) {
+    return I64_MAX;
+  }
+  const room = I64_MAX - total;
+  return amount >= room ? I64_MAX : total + amount;
+}
+
+/**
+ * Group usage the way the Rust store does: model, then status, in UTF-8 byte
+ * order. A null cost adds nothing. The count saturates at `u64::MAX` and the
+ * cost at `i64::MAX`.
+ */
+export function foldUsageSummary(
+  rows: Iterable<{ model: string; status: string; cost: bigint | null }>,
+): UsageSummaryRow[] {
+  const grouped = new Map<string, Map<string, { count: bigint; cost: bigint }>>();
+  for (const row of rows) {
+    let statuses = grouped.get(row.model);
+    if (!statuses) {
+      statuses = new Map();
+      grouped.set(row.model, statuses);
+    }
+    const current = statuses.get(row.status) ?? { count: 0n, cost: 0n };
+    current.count = current.count >= U64_MAX ? U64_MAX : current.count + 1n;
+    current.cost = addMicrodollars(current.cost, row.cost ?? 0n);
+    statuses.set(row.status, current);
+  }
+  const summary: UsageSummaryRow[] = [];
+  for (const [model, statuses] of grouped) {
+    for (const [status, totals] of statuses) {
+      summary.push({
+        model,
+        status,
+        count: money(totals.count),
+        cost_microdollars: money(totals.cost),
+      });
+    }
+  }
+  summary.sort((left, right) => {
+    const byModel = compareUtf8(left.model, right.model);
+    return byModel !== 0 ? byModel : compareUtf8(left.status, right.status);
+  });
+  return summary;
+}
+
+/** `GET .../usage` body. Amounts above 2^53 stay decimal digits, as serde emits them. */
+export function usageSummaryBody(namespace: string, period: string, data: readonly UsageSummaryRow[]): string {
+  const rows = data.map(
+    (row) =>
+      `{"model":${JSON.stringify(row.model)},"status":${JSON.stringify(row.status)},"count":${jsonUint(row.count)},"cost_microdollars":${jsonUint(row.cost_microdollars)}}`,
+  );
+  return `{"namespace":${JSON.stringify(namespace)},"period":${JSON.stringify(period)},"data":[${rows.join(",")}]}`;
+}
+
+function jsonUint(value: number | string): string {
+  return typeof value === "number" ? JSON.stringify(value) : value;
+}
+
+function compareUtf8(left: string, right: string): number {
+  const encoded = new TextEncoder();
+  const a = encoded.encode(left);
+  const b = encoded.encode(right);
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i += 1) {
+    if (a[i] !== b[i]) {
+      return a[i]! - b[i]!;
+    }
+  }
+  return a.length - b.length;
 }
 
 export function budgetJson(row: BudgetLedger) {

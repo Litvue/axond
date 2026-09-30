@@ -1780,6 +1780,67 @@ test("management_json_trailing_characters_match_serde", async () => {
   assert.equal(budget.status, 404);
 });
 
+test("usage_summary_matches_the_rust_grouping", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "wsp_usage",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: true,
+    fromConfig: false,
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "wsp_usage",
+  });
+  const headers = { authorization: `Bearer ${KEY}` };
+  const settle = (requestId: string, model: string, status: string, cost: bigint | null, period = "p") =>
+    store.settle({
+      requestId,
+      namespace: "wsp_usage",
+      period,
+      model,
+      status,
+      cost,
+      incarnation: 1n,
+    });
+  const half = 9223372036854775807n / 2n + 1n;
+  await settle("r1", "b/m", "ok", 15n);
+  await settle("r2", "b/m", "upstream_error", 1n);
+  await settle("r3", "a/m", "ok", null);
+  await settle("r4", "a/m", "ok", 7n);
+  await settle("r1", "b/m", "ok", 99n);
+  await settle("r5", "😀", "ok", 1n);
+  await settle("r6", "\uFFFF", "ok", 2n);
+  await settle("r7", "c/m", "ok", half);
+  await settle("r8", "c/m", "ok", half);
+  await settle("r9", "d/m", "ok", 9223372036854775807n + 1n);
+  await settle("r10", "b/m", "ok", 99n, "other");
+  const response = await app.request("http://127.0.0.1/api/v1/namespaces/wsp_usage/usage?period=p", { headers });
+  assert.equal(response.status, 200);
+  assert.equal(
+    await response.text(),
+    '{"namespace":"wsp_usage","period":"p","data":[' +
+      '{"model":"a/m","status":"ok","count":2,"cost_microdollars":7},' +
+      '{"model":"b/m","status":"ok","count":1,"cost_microdollars":15},' +
+      '{"model":"b/m","status":"upstream_error","count":1,"cost_microdollars":1},' +
+      '{"model":"c/m","status":"ok","count":2,"cost_microdollars":9223372036854775807},' +
+      '{"model":"d/m","status":"ok","count":1,"cost_microdollars":9223372036854775807},' +
+      '{"model":"\uFFFF","status":"ok","count":1,"cost_microdollars":2},' +
+      '{"model":"😀","status":"ok","count":1,"cost_microdollars":1}]}',
+  );
+  const other = await app.request("http://127.0.0.1/api/v1/namespaces/wsp_usage/usage?period=other", { headers });
+  assert.equal(other.status, 200);
+  assert.equal(
+    await other.text(),
+    '{"namespace":"wsp_usage","period":"other","data":[{"model":"b/m","status":"ok","count":1,"cost_microdollars":99}]}',
+  );
+  const empty = await app.request("http://127.0.0.1/api/v1/namespaces/wsp_usage/usage?period=unused", { headers });
+  assert.equal(empty.status, 200);
+  assert.equal(await empty.text(), '{"namespace":"wsp_usage","period":"unused","data":[]}');
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });

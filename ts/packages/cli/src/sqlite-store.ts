@@ -11,12 +11,11 @@ import type {
   SettleInput,
   SqlValue,
   Store,
-  UsageSummaryRow,
 } from "@axond/sdk";
 
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { encodeAttrs, serdeValue } from "../../gateway/src/strict-json.ts";
-import { budgetJson } from "../../gateway/src/memory-store.ts";
+import { budgetJson, foldUsageSummary, saturateMicrodollars } from "../../gateway/src/memory-store.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 import { recordStoreCall, type StoreMetrics, type StoreOperation } from "../../gateway/src/store-metrics.ts";
 
@@ -271,17 +270,18 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
         if (!readNamespace(db, namespace)) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
-        return all(
-          db,
-          `SELECT model, status, COUNT(*) AS count, COALESCE(SUM(cost_microdollars), 0) AS cost
-           FROM axond_store_usage WHERE namespace = ? AND period = ? GROUP BY model, status`,
-          [namespace, period],
-        ).map((row) => ({
-          model: String(row["model"]),
-          status: String(row["status"]),
-          count: Number(row["count"]),
-          cost_microdollars: Number(row["cost"]),
-        })) satisfies UsageSummaryRow[];
+        return foldUsageSummary(
+          all(
+            db,
+            `SELECT model, status, CAST(cost_microdollars AS TEXT) AS cost
+             FROM axond_store_usage WHERE namespace = ? AND period = ?`,
+            [namespace, period],
+          ).map((row) => ({
+            model: String(row["model"]),
+            status: String(row["status"]),
+            cost: row["cost"] === null ? null : BigInt(String(row["cost"])),
+          })),
+        );
       });
     },
     listProviderModels() {
@@ -362,6 +362,7 @@ export function applyMigration(dbPath: string, id: string, sql: string): void {
 }
 
 function settleSqlite(db: DatabaseSync, input: SettleInput): { charged: boolean } {
+  const cost = input.cost === null ? null : saturateMicrodollars(input.cost);
   db.exec("BEGIN IMMEDIATE");
   try {
     const inserted = db
@@ -376,9 +377,9 @@ function settleSqlite(db: DatabaseSync, input: SettleInput): { charged: boolean 
         input.period,
         input.model,
         input.status,
-        input.cost === null ? null : input.cost.toString(),
+        cost === null ? null : cost.toString(),
       );
-    if (Number(inserted.changes) !== 1 || input.cost === null || input.period === null) {
+    if (Number(inserted.changes) !== 1 || cost === null || input.period === null) {
       db.exec("COMMIT");
       return { charged: false };
     }
@@ -395,9 +396,9 @@ function settleSqlite(db: DatabaseSync, input: SettleInput): { charged: boolean 
       )
       .run(
         I64_MAX,
-        input.cost,
+        cost,
         I64_MAX,
-        input.cost,
+        cost,
         input.namespace,
         input.period,
         input.namespace,

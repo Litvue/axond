@@ -37,7 +37,7 @@ import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors
 import { globMatch, validateGlob } from "./glob.ts";
 import { isJsonContentType } from "./content-type.ts";
 import { encodeAttrs, readStrictObject, type StrictField } from "./strict-json.ts";
-import { budgetJson, money } from "./memory-store.ts";
+import { budgetJson, usageSummaryBody } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, namespaceIdMessage, validatePeriod, validateTimezone } from "./namespace.ts";
 import { beginTrace, childTrace, formatTraceparent, metricPayload, parseTraceparent, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
 import { sanitizeAttributes } from "./metrics.ts";
@@ -1729,7 +1729,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
       throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
     }
     const data = await opts.store.summarizeUsage(namespace, period);
-    c.res = Response.json({ namespace, period, data });
+    c.res = jsonBody(usageSummaryBody(namespace, period, data));
     return;
   }
   if (c.req.method === "GET" && path === "/api/v1/namespaces") {
@@ -1921,4 +1921,3 @@ export function extensionStoreFor(store: Store, extension: AxondExtension, names
   return extension.trusted ? store : scopeStore(store, namespace);
 }
 
-void money;

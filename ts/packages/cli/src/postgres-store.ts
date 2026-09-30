@@ -12,6 +12,7 @@ import type {
 
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { encodeAttrs } from "../../gateway/src/strict-json.ts";
+import { foldUsageSummary, saturateMicrodollars } from "../../gateway/src/memory-store.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 import {
   recordConnectionDiscarded,
@@ -284,16 +285,17 @@ export function createPostgresStore(
     async summarizeUsage(namespace, period) {
       return withClient("usage_summary", async (client) => {
         const result = await client.query(
-          `SELECT model, status, COUNT(*)::int AS count, COALESCE(SUM(cost_microdollars), 0) AS cost
-           FROM axond_store_usage WHERE namespace = $1 AND period = $2 GROUP BY model, status`,
+          `SELECT model, status, cost_microdollars::text AS cost
+           FROM axond_store_usage WHERE namespace = $1 AND period = $2`,
           [namespace, period],
         );
-        return result.rows.map((row) => ({
-          model: String(row["model"]),
-          status: String(row["status"]),
-          count: Number(row["count"]),
-          cost_microdollars: Number(row["cost"]),
-        }));
+        return foldUsageSummary(
+          result.rows.map((row) => ({
+            model: String(row["model"]),
+            status: String(row["status"]),
+            cost: row["cost"] === null ? null : BigInt(String(row["cost"])),
+          })),
+        );
       });
     },
     async listProviderModels() {
@@ -382,7 +384,7 @@ export async function settlePostgres(client: SqlExecutor, input: SettleInput): P
        RETURNING 1
      )
      SELECT (SELECT COUNT(*) FROM ins) AS inserted, (SELECT COUNT(*) FROM upd) AS charged`,
-    [input.requestId, input.namespace, input.period, input.model, input.status, input.cost.toString(), input.incarnation.toString()],
+    [input.requestId, input.namespace, input.period, input.model, input.status, saturateMicrodollars(input.cost).toString(), input.incarnation.toString()],
   );
   return { charged: Number(result.rows[0]?.["charged"] ?? 0) === 1 };
 }
