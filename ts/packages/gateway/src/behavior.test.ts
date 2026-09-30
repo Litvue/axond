@@ -2173,6 +2173,91 @@ test("an incomplete tail after [DONE] is relayed through eof", async () => {
   }
 });
 
+test("chat_eof_names_an_incomplete_event_and_a_split_character", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const incompleteBytes = 'data: {"choices":[{"delta":{"content":"a"}}]}\n\ndata: {"choices"';
+  const incomplete = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(incompleteBytes);
+  });
+  const splitBytes = Buffer.concat([
+    Buffer.from('data: {"choices":[{"delta":{"content":"a"}}]}\n\n'),
+    Buffer.from([0xf0]),
+  ]);
+  const split = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(splitBytes);
+  });
+  const messagesBytes = Buffer.concat([
+    Buffer.from('event: ping\ndata: {"type":"ping"}\n\n'),
+    Buffer.from([0xf0]),
+  ]);
+  const messages = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(messagesBytes);
+  });
+  try {
+    const chatApp = chatDoneApp(store, incomplete.url, records);
+    const chat = await chatApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+    });
+    assert.equal(chat.status, 200);
+    const chatBody = await chat.text();
+    assert.equal(chatBody.startsWith(incompleteBytes), true);
+    assert.match(chatBody, /stream ended with an incomplete SSE event/);
+    assert.equal(chatBody.includes("sk-live-secret"), false);
+    assert.equal(chatBody.includes(KEY), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+
+    records.length = 0;
+    const splitApp = chatDoneApp(store, split.url, records);
+    const splitResponse = await splitApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+    });
+    assert.equal(splitResponse.status, 200);
+    const splitBody = Buffer.from(await splitResponse.arrayBuffer());
+    assert.equal(splitBody.subarray(0, splitBytes.length).equals(splitBytes), true);
+    assert.equal(splitBody.includes(Buffer.from("stream ended mid-character")), true);
+    assert.equal(splitBody.includes(Buffer.from("sk-live-secret")), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+
+    records.length = 0;
+    const messagesAppLive = messagesApp(store, messages.url, records);
+    const native = await messagesAppLive.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-anthropic/claude-test", stream: true, messages: [], max_tokens: 16 }),
+    });
+    assert.equal(native.status, 200);
+    const nativeBody = Buffer.from(await native.arrayBuffer());
+    assert.equal(nativeBody.subarray(0, messagesBytes.length).equals(messagesBytes), true);
+    assert.equal(nativeBody.includes(Buffer.from("stream ended mid-character")), true);
+    assert.equal(nativeBody.includes(Buffer.from("sk-live-secret")), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+  } finally {
+    incomplete.close();
+    split.close();
+    messages.close();
+  }
+});
+
 test(
   "a connect timeout is upstream_timeout and hides the address",
   { skip: process.versions.bun !== undefined && "Bun fetch does not enforce connect_timeout_ms" },

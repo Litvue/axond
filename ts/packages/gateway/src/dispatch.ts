@@ -710,9 +710,22 @@ function relayStream(
         if (!committed) {
           releaseHeld(controller);
         }
+        let partial = "";
+        if (terminalAt === null) {
+          partial = decoder.decode();
+          const chatTail = pending.trim();
+          if (route === "chat" && chatTail.length > 0 && !(partial.length > 0 && chatTail === "\uFFFD")) {
+            failBound(controller, "stream ended with an incomplete SSE event");
+            return;
+          }
+        }
         const incomplete = sequence?.finish();
         if (incomplete) {
           failBound(controller, incomplete);
+          return;
+        }
+        if (terminalAt === null && partial.length > 0) {
+          failBound(controller, "stream ended mid-character");
           return;
         }
         finish("end");
@@ -728,6 +741,7 @@ function relayStream(
       if (!committed && onBeforeContentRateLimit) {
         held.push(value);
         heldBytes += value.length;
+        decoder.decode(value, { stream: true });
         const text = new TextDecoder().decode(concatBytes(held, heldBytes));
         markUpstream(text);
         const first = firstCompleteData(text);
