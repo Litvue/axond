@@ -83,7 +83,12 @@ place of a table is the same extract error: `admission = "x"` is
 `expected struct AdmissionConfigWire` and is reported before a zero failover
 bound. `[namespace]` (one pair of brackets) is `expected a sequence`. A table
 written as an array fills fields in declaration order and drops extra
-elements. `failover = [0]` is `failover.max_attempts must be at least 1`
+elements. `[storage] backend = "nope"` is Figment's `unknown variant` sentence for
+`sqlite` or `postgres`, before a missing path. `on_unavailable = "nope"` is
+the same sentence for `deny` or `allow`. `create_table = 1.5` is `expected a
+boolean`. An unknown `[shutdown]` key is `unknown field` naming
+`drain_grace_ms`, `deadline_ms`, and `flush_timeout_ms`, and that extract
+error is reported before `admission.max_request_bytes = 0`. `failover = [0]` is `failover.max_attempts must be at least 1`
 before a ghost credential. `failover = [1.5]` is `expected u32` at
 `default.failover.0`. `storage = []` still requires a SQLite path.
 

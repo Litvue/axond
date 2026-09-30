@@ -515,6 +515,52 @@ source_url = "http://models.dev/catalog.json"
   }
 });
 
+test("unknown_shutdown_field_is_refused_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-shutdown-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "shutdown.toml");
+  await writeFile(
+    config,
+    `
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[credential]]
+namespace = "ghost"
+provider = "openai"
+env = "OPENAI_KEY"
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[shutdown]
+nope = 1
+[admission]
+max_request_bytes = 0
+[failover]
+max_attempts = 0
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        "`: config load: unknown field: found `nope`, expected `one of `drain_grace_ms`, `deadline_ms`, `flush_timeout_ms`` for key \"default.shutdown.nope\" in " +
+        figmentFileSource(config, root) +
+        " TOML file\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("admission_zero_beats_a_transport_zero", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-admit-"));
   const db = join(root, "fresh.sqlite");

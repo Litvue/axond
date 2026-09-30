@@ -1116,6 +1116,33 @@ const SECTIONS_AFTER_SERVER: ReadonlyArray<readonly [string, SectionShape]> = [
 function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void {
   rejectSectionShapes(toml, parsed, SECTIONS_BEFORE_SERVER);
   projectPositional(toml, parsed, POSITIONAL_BEFORE_SERVER);
+  rejectStorageExtract(toml, parsed);
+  asArray(parsed["credential"]).forEach((entry, index) => {
+    const row = asRecord(entry);
+    if (!row) {
+      return;
+    }
+    readTypedInt(
+      toml,
+      "credential",
+      row,
+      "weight",
+      "u32",
+      1,
+      `default.credential.${index}.weight`,
+      arrayEntryLiteral(toml, "credential", index, "weight"),
+    );
+  });
+  const pool = asRecord(parsed["credential_pool"]) ?? {};
+  readTypedInt(toml, "credential_pool", pool, "cooldown_seconds", "u64", 30);
+  readTypedInt(toml, "credential_pool", pool, "failure_threshold", "u32", 2);
+  readVariant(toml, "credential_pool", pool, "strategy", ["round-robin", "weighted"], "SelectionStrategy");
+  const failover = asRecord(parsed["failover"]) ?? {};
+  readTypedInt(toml, "failover", failover, "cooldown_seconds", "u64", 30);
+  readTypedInt(toml, "failover", failover, "failure_threshold", "u32", 3);
+  readTypedInt(toml, "failover", failover, "max_attempts", "u32", 3);
+  readTypedInt(toml, "failover", failover, "overall_timeout_ms", "u64", 30_000);
+  rejectShutdownExtract(toml, parsed);
   const admission = asRecord(parsed["admission"]) ?? {};
   for (const [key, expected, fallback] of [
     ["max_in_flight", "usize", 1024],
@@ -1149,33 +1176,64 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
     readTypedInt(toml, "catalog", catalog, key, expected, fallback);
   }
   readVariant(toml, "catalog", catalog, "source", ["none", "models-dev", "seed"], "CatalogSourceBackend");
-  asArray(parsed["credential"]).forEach((entry, index) => {
-    const row = asRecord(entry);
-    if (!row) {
-      return;
-    }
-    readTypedInt(
-      toml,
-      "credential",
-      row,
-      "weight",
-      "u32",
-      1,
-      `default.credential.${index}.weight`,
-      arrayEntryLiteral(toml, "credential", index, "weight"),
-    );
-  });
-  const pool = asRecord(parsed["credential_pool"]) ?? {};
-  readTypedInt(toml, "credential_pool", pool, "cooldown_seconds", "u64", 30);
-  readTypedInt(toml, "credential_pool", pool, "failure_threshold", "u32", 2);
-  readVariant(toml, "credential_pool", pool, "strategy", ["round-robin", "weighted"], "SelectionStrategy");
   const discovery = asRecord(parsed["discovery"]) ?? {};
   readTypedInt(toml, "discovery", discovery, "refresh_interval_seconds", "u64", 300);
-  const failover = asRecord(parsed["failover"]) ?? {};
-  readTypedInt(toml, "failover", failover, "cooldown_seconds", "u64", 30);
-  readTypedInt(toml, "failover", failover, "failure_threshold", "u32", 3);
-  readTypedInt(toml, "failover", failover, "max_attempts", "u32", 3);
-  readTypedInt(toml, "failover", failover, "overall_timeout_ms", "u64", 30_000);
+}
+
+const SHUTDOWN_FIELDS = ["drain_grace_ms", "deadline_ms", "flush_timeout_ms"] as const;
+
+/**
+ * Storage enums and `create_table` fail while Figment extracts, before a
+ * missing path and before a later zero bound. `backend` is before
+ * `on_unavailable`, which is before `create_table`.
+ */
+function rejectStorageExtract(toml: string, parsed: Record<string, unknown>): void {
+  const storage = asRecord(parsed["storage"]);
+  if (!storage) {
+    return;
+  }
+  readVariant(toml, "storage", storage, "backend", ["sqlite", "postgres"], "StorageBackend");
+  readVariant(toml, "storage", storage, "on_unavailable", ["deny", "allow"], "StoreUnavailable");
+  readBool(toml, "storage", storage, "create_table");
+}
+
+/**
+ * Shutdown is extracted before admission. Known fields are typed first, in
+ * declaration order, then `deny_unknown_fields` names the alphabetically
+ * first leftover key.
+ */
+function rejectShutdownExtract(toml: string, parsed: Record<string, unknown>): void {
+  const row = asRecord(parsed["shutdown"]);
+  if (!row) {
+    return;
+  }
+  readTypedInt(toml, "shutdown", row, "drain_grace_ms", "u64", 5_000);
+  readTypedInt(toml, "shutdown", row, "deadline_ms", "u64", 15_000);
+  readTypedInt(toml, "shutdown", row, "flush_timeout_ms", "u64", 5_000);
+  const unknown = Object.keys(row)
+    .filter((key) => !SHUTDOWN_FIELDS.includes(key as (typeof SHUTDOWN_FIELDS)[number]))
+    .sort();
+  const field = unknown[0];
+  if (field === undefined) {
+    return;
+  }
+  throw configLoad(
+    `unknown field: found \`${field}\`, expected \`one of \`drain_grace_ms\`, \`deadline_ms\`, \`flush_timeout_ms\`\` for key "default.shutdown.${field}"`,
+  );
+}
+
+function readBool(toml: string, section: string, row: Record<string, unknown>, key: string): void {
+  if (!(key in row)) {
+    return;
+  }
+  const value = row[key];
+  const literal = sectionFieldLiteral(toml, section, key);
+  if (typeof value === "boolean" && (literal === null || !isFloatToken(literal))) {
+    return;
+  }
+  throw configLoad(
+    `invalid type: found ${foundPhrase(value, literal)}, expected a boolean for key "default.${section}.${key}"`,
+  );
 }
 
 function rejectSectionShapes(

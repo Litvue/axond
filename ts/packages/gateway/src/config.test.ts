@@ -844,6 +844,69 @@ test("a struct written as a sequence fills its fields", async () => {
   assert.equal(empty.transport.maxAttempts, 3);
 });
 
+test("storage enums and unknown shutdown fields are figment extract errors", async () => {
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const variant = (found: string, expected: string, key: string) =>
+    `config: unknown variant: found \`${found}\`, expected \`${expected}\` for key "${key}"`;
+  const unknown = (field: string) =>
+    "config: unknown field: found `" +
+    field +
+    "`, expected `one of `drain_grace_ms`, `deadline_ms`, `flush_timeout_ms`` for key \"default.shutdown." +
+    field +
+    "\"";
+  await reject(
+    BASE.replace('backend = "sqlite"', 'backend = "nope"') + "[failover]\nmax_attempts = 0\n",
+    variant("nope", "`sqlite` or `postgres`", "default.storage.backend"),
+  );
+  await reject(
+    BASE.replace('[storage]\nbackend = "sqlite"\npath = "/tmp/axond.sqlite"\n', '[storage]\nbackend = "nope"\n'),
+    variant("nope", "`sqlite` or `postgres`", "default.storage.backend"),
+  );
+  await reject(
+    BASE.replace(
+      'backend = "sqlite"\npath = "/tmp/axond.sqlite"\n',
+      'on_unavailable = "nope"\nbackend = "nope"\npath = "/tmp/axond.sqlite"\n',
+    ),
+    variant("nope", "`sqlite` or `postgres`", "default.storage.backend"),
+  );
+  await reject(
+    BASE.replace('[storage]\nbackend = "sqlite"\npath = "/tmp/axond.sqlite"\n', '[storage]\nbackend = "sqlite"\non_unavailable = "nope"\n'),
+    variant("nope", "`deny` or `allow`", "default.storage.on_unavailable"),
+  );
+  await reject(
+    BASE.replace(
+      'backend = "sqlite"\npath = "/tmp/axond.sqlite"\n',
+      'create_table = 1.5\nbackend = "nope"\npath = "/tmp/axond.sqlite"\n',
+    ),
+    variant("nope", "`sqlite` or `postgres`", "default.storage.backend"),
+  );
+  await reject(
+    BASE.replace('path = "/tmp/axond.sqlite"\n', 'path = "/tmp/axond.sqlite"\ncreate_table = 1.5\n'),
+    'config: invalid type: found float `1.5`, expected a boolean for key "default.storage.create_table"',
+  );
+  await reject(
+    `${BASE}[shutdown]\nnope = 1\n[admission]\nmax_request_bytes = 1.5\n[failover]\nmax_attempts = 0\n`,
+    unknown("nope"),
+  );
+  await reject(`${BASE}[shutdown]\nnope = 1\naaa = 1\n`, unknown("aaa"));
+  await reject(
+    `${BASE}[shutdown]\nnope = 1\ndrain_grace_ms = 1.5\n`,
+    'config: invalid type: found float `1.5`, expected u64 for key "default.shutdown.drain_grace_ms"',
+  );
+  await reject(
+    `${BASE}[failover]\nmax_attempts = 1.5\n[shutdown]\nnope = 1\n`,
+    'config: invalid type: found float `1.5`, expected u32 for key "default.failover.max_attempts"',
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),
