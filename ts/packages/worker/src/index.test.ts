@@ -365,6 +365,75 @@ test("worker_price_charges_one_request_id_once", async () => {
   }
 });
 
+test("worker_request_abort_settles_client_cancelled", async () => {
+  const upstream = await listen((req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n');
+  });
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000n);
+  const handler = createHandler(
+    {
+      HYPERDRIVE: { connectionString: "postgres://example" },
+      GATEWAY_KEY: "k",
+      PROVIDERS_JSON: JSON.stringify([
+        { id: "fake-openai", kind: "openai", baseUrl: upstream.url, unpricedModels: "allow" },
+      ]),
+      CREDENTIALS_JSON: JSON.stringify([
+        { namespace: "platform", provider: "fake-openai", secret: "sk-worker-secret", id: "plat" },
+      ]),
+      PRICES_JSON: JSON.stringify([
+        {
+          provider: "fake-openai",
+          model: "*",
+          inputMicrodollarsPerMillion: 1_000_000,
+          outputMicrodollarsPerMillion: 1_000_000,
+        },
+      ]),
+    },
+    store,
+  );
+  const pending: Promise<unknown>[] = [];
+  const wait = {
+    waitUntil(promise: Promise<unknown>) {
+      pending.push(promise);
+    },
+  };
+  const controller = new AbortController();
+  try {
+    const response = await handler.fetch(
+      new Request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer k", "content-type": "application/json" },
+        body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [{ role: "user", content: "hi" }] }),
+        signal: controller.signal,
+      }),
+      wait,
+    );
+    assert.equal(response.status, 200);
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    assert.equal(first.done, false);
+    controller.abort();
+    await Promise.all(pending);
+    const summary = await store.summarizeUsage("platform", "compat");
+    assert.equal(summary.length, 1);
+    assert.equal(summary[0]?.status, "client_cancelled");
+    assert.equal(Number(summary[0]?.cost_microdollars) > 0, true);
+    assert.equal(JSON.stringify(summary).includes("sk-worker-secret"), false);
+  } finally {
+    upstream.close();
+  }
+});
+
 function listen(
   onRequest: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void,
 ): Promise<{ url: string; close: () => void }> {

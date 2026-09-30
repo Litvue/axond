@@ -381,6 +381,11 @@ export async function callUpstream(input: {
   onUpstreamFirstToken?: (elapsedMs: number) => void;
   /** Start of the attempt that opened this stream. Absent starts at this call. */
   clockStartedMs?: number;
+  /**
+   * The caller's request. When it aborts, an open stream settles as
+   * `client_cancelled` even if the runtime does not cancel the response body.
+   */
+  clientSignal?: AbortSignal;
 }): Promise<{ response: Response; usage: UsageTokens }> {
   const transport = withTransportDefaults(input.transport);
   const now = input.now ?? Date.now;
@@ -470,6 +475,7 @@ export async function callUpstream(input: {
     input.onUpstreamFirstToken,
     input.clockStartedMs ?? now(),
     input.onTerminalRemain,
+    input.clientSignal,
   );
   const headers = passHeaders(response.headers);
   headers.set("content-type", "text/event-stream");
@@ -529,6 +535,7 @@ function relayStream(
   onUpstreamFirstToken?: (elapsedMs: number) => void,
   clockStartedMs: number = Date.now(),
   onTerminalRemain?: (bound: "grace" | "duration") => void,
+  clientSignal?: AbortSignal,
 ): ReadableStream<Uint8Array> {
   let reader = upstream.getReader();
   const decoder = new TextDecoder();
@@ -639,6 +646,7 @@ function relayStream(
       return;
     }
     done = true;
+    clientSignal?.removeEventListener("abort", onClientAbort);
     if (pending.length > 0) {
       note(pending);
       pending = "";
@@ -646,6 +654,20 @@ function relayStream(
     applyObservedCharge(usage, observedChars, estimatedInputTokens);
     onDone(reason);
   };
+  const onClientAbort = () => {
+    if (done) {
+      return;
+    }
+    finish("cancel");
+    void reader.cancel().catch(() => undefined);
+  };
+  if (clientSignal) {
+    if (clientSignal.aborted) {
+      onClientAbort();
+    } else {
+      clientSignal.addEventListener("abort", onClientAbort, { once: true });
+    }
+  }
   const releaseHeld = (controller: ReadableStreamDefaultController<Uint8Array>) => {
     if (held.length === 0) {
       committed = true;
@@ -701,6 +723,14 @@ function relayStream(
           terminalAt === null ? null : terminalAt + transport.streamTerminalGraceMs
         ), durationAt, onTimeout, onTerminalRemain);
       } catch (error) {
+        if (done) {
+          try {
+            controller.close();
+          } catch {
+            // The client already cancelled this stream.
+          }
+          return;
+        }
         if (terminalAt !== null) {
           if (!(error instanceof GatewayFailure)) {
             onTransport?.("closing", transportFailureReason(error));

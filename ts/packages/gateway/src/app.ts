@@ -962,6 +962,7 @@ async function dispatch(
             estimatedInputTokens: estimatedInputTokens(payload),
             maxStreamDurationMs,
             maxStreamBytes,
+            clientSignal: c.req.raw.signal,
           });
           return opened.response;
         } catch (error) {
@@ -1006,6 +1007,7 @@ async function dispatch(
         estimatedInputTokens: estimatedInputTokens(payload),
         maxStreamDurationMs,
         maxStreamBytes,
+        clientSignal: stream ? c.req.raw.signal : undefined,
       });
       if (!stream) {
         noteServed(axond, opts, credential);
