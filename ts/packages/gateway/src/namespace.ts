@@ -2,20 +2,56 @@ import { GatewayFailure } from "./errors.ts";
 
 const MAX_LEN = 128;
 
+const EMPTY_ID = "a namespace identifier must not be empty";
+const LONG_ID = "a namespace identifier is over the 128-byte limit";
+const CHAR_ID =
+  "a namespace identifier contains a character outside ASCII letters, digits, `.`, `-`, and `_`";
+const BOUNDARY_ID = "a namespace identifier must start and end with an ASCII letter or digit";
+
+function isAsciiAlphanumeric(byte: number): boolean {
+  return (
+    (byte >= 0x30 && byte <= 0x39) ||
+    (byte >= 0x41 && byte <= 0x5a) ||
+    (byte >= 0x61 && byte <= 0x7a)
+  );
+}
+
+/**
+ * Store-facing refusal for a namespace id, in the same order as
+ * `NamespaceId::parse`. The text itself stays out of the message. `null`
+ * means the id is canonical.
+ */
+export function namespaceIdMessage(input: string): string | null {
+  if (input.length === 0) {
+    return EMPTY_ID;
+  }
+  const bytes = new TextEncoder().encode(input);
+  if (bytes.length > MAX_LEN) {
+    return LONG_ID;
+  }
+  for (const byte of bytes) {
+    if (!isAsciiAlphanumeric(byte) && byte !== 0x2d && byte !== 0x5f && byte !== 0x2e) {
+      return CHAR_ID;
+    }
+  }
+  const first = bytes[0]!;
+  const last = bytes[bytes.length - 1]!;
+  if (!isAsciiAlphanumeric(first) || !isAsciiAlphanumeric(last)) {
+    return BOUNDARY_ID;
+  }
+  return null;
+}
+
 /**
  * Canonical namespace id: one URL segment of ASCII letters, digits, `.`, `-`,
  * and `_`, starting and ending with a letter or digit. The text is not decoded
  * and not case-folded. A refused id is never copied into the error.
+ *
+ * Inference paths collapse every refusal to `invalid_namespace`. Management
+ * create uses {@link namespaceIdMessage} as `bad_request`.
  */
 export function parseNamespaceId(input: string): string {
-  if (
-    input.length === 0 ||
-    input.length > MAX_LEN ||
-    !/^[\x00-\x7F]*$/.test(input) ||
-    ![...input].every((char) => /[A-Za-z0-9._-]/.test(char)) ||
-    !/^[A-Za-z0-9]/.test(input) ||
-    !/[A-Za-z0-9]$/.test(input)
-  ) {
+  if (namespaceIdMessage(input) !== null) {
     throw new GatewayFailure("invalid_namespace", 400, "namespace identifier is invalid");
   }
   return input;

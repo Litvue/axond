@@ -37,7 +37,7 @@ import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors
 import { globMatch, validateGlob } from "./glob.ts";
 import { readStrictObject, type StrictField } from "./strict-json.ts";
 import { budgetJson, money, namespaceJson } from "./memory-store.ts";
-import { monthlyPeriod, namespaceFromCanonicalPath, parseNamespaceId, validatePeriod, validateTimezone } from "./namespace.ts";
+import { monthlyPeriod, namespaceFromCanonicalPath, namespaceIdMessage, validatePeriod, validateTimezone } from "./namespace.ts";
 import { beginTrace, childTrace, formatTraceparent, metricPayload, parseTraceparent, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
 import { sanitizeAttributes } from "./metrics.ts";
 import { OPENAPI } from "./openapi.ts";
@@ -1656,7 +1656,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   }
   const budget = path.match(/^\/api\/v1\/namespaces\/([^/]+)\/budgets\/([^/]+)$/);
   if (budget) {
-    const namespace = parseNamespaceId(decodeURIComponent(budget[1]!));
+    const namespace = decodeURIComponent(budget[1]!);
     const period = decodeURIComponent(budget[2]!);
     validatePeriod(period);
     if (c.req.method === "PUT") {
@@ -1678,7 +1678,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   }
   const policy = path.match(/^\/api\/v1\/namespaces\/([^/]+)\/budget$/);
   if (policy) {
-    const namespace = parseNamespaceId(decodeURIComponent(policy[1]!));
+    const namespace = decodeURIComponent(policy[1]!);
     if (c.req.method === "PUT") {
       const body = await readJson(c, BUDGET_POLICY_FIELDS, "PutBudgetPolicyBody");
       const cadence = body["cadence"];
@@ -1717,7 +1717,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   }
   const usage = path.match(/^\/api\/v1\/namespaces\/([^/]+)\/usage$/);
   if (usage && c.req.method === "GET") {
-    const namespace = parseNamespaceId(decodeURIComponent(usage[1]!));
+    const namespace = decodeURIComponent(usage[1]!);
     const period = readUsagePeriod(url.searchParams);
     if (!period) {
       throw badRequest("`period` is required");
@@ -1743,7 +1743,10 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   if (c.req.method === "POST" && path === "/api/v1/namespaces") {
     const body = await readJson(c, NAMESPACE_CREATE_FIELDS, "CreateBody");
     const id = typeof body["id"] === "string" ? body["id"] : "";
-    parseNamespaceId(id);
+    const idMessage = namespaceIdMessage(id);
+    if (idMessage !== null) {
+      throw badRequest(idMessage);
+    }
     const attrs = asAttrs(body["attrs"]);
     const blocklist = asBlocklist(body["blocklist"]);
     const created = await opts.store.putNamespace({
@@ -1763,7 +1766,7 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
   }
   const one = path.match(/^\/api\/v1\/namespaces\/([^/]+)$/);
   if (one) {
-    const id = parseNamespaceId(decodeURIComponent(one[1]!));
+    const id = decodeURIComponent(one[1]!);
     if (c.req.method === "GET") {
       const row = await opts.store.getNamespace(id);
       if (!row) {

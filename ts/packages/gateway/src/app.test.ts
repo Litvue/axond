@@ -1399,6 +1399,100 @@ test("namespace_attrs_and_blocklist_match_the_rust_limits", async () => {
   assert.deepEqual((await kept.json()).blocklist, ["gpt-4o", "claude-*", "*-latest", "*"]);
 });
 
+test("namespace_create_uses_the_rust_identifier_messages", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [],
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const post = (body: string) =>
+    app.request("http://127.0.0.1/api/v1/namespaces", { method: "POST", headers, body });
+  const refused = async (body: string, message: string) => {
+    const response = await post(body);
+    assert.equal(response.status, 400);
+    const payload = await response.json();
+    assert.deepEqual(payload, { error: { type: "bad_request", message } });
+    assert.equal(JSON.stringify(payload).includes("é"), false);
+    assert.equal(JSON.stringify(payload).includes("cafe"), false);
+  };
+  const empty = "a namespace identifier must not be empty";
+  const long = "a namespace identifier is over the 128-byte limit";
+  const character =
+    "a namespace identifier contains a character outside ASCII letters, digits, `.`, `-`, and `_`";
+  const boundary = "a namespace identifier must start and end with an ASCII letter or digit";
+  await refused('{"id":""}', empty);
+  await refused(`{"id":"${"a".repeat(129)}"}`, long);
+  await refused(`{"id":"${"é".repeat(65)}"}`, long);
+  await refused(`{"id":"${"é".repeat(64)}"}`, character);
+  await refused('{"id":"a b"}', character);
+  await refused('{"id":"café"}', character);
+  await refused('{"id":"-"}', boundary);
+  await refused('{"id":"a_"}', boundary);
+  await refused('{"id":"_a"}', boundary);
+  await refused('{"id":"","attrs":{"org":"acme"}}', empty);
+  const longest = await post(`{"id":"${"a".repeat(128)}"}`);
+  assert.equal(longest.status, 201);
+  const shaped = await post('{"id":"Acme_01-prod"}');
+  assert.equal(shaped.status, 201);
+  const absent = await app.request("http://127.0.0.1/api/v1/namespaces/-bad", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(absent.status, 404);
+  assert.deepEqual(await absent.json(), {
+    error: { type: "unknown_namespace", message: "unknown namespace" },
+  });
+  const removed = await app.request("http://127.0.0.1/api/v1/namespaces/-bad", {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(removed.status, 204);
+  const periodFirst = await app.request("http://127.0.0.1/api/v1/namespaces/-bad/usage", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(periodFirst.status, 400);
+  assert.deepEqual(await periodFirst.json(), {
+    error: { type: "bad_request", message: "`period` is required" },
+  });
+  const unknownUsage = await app.request("http://127.0.0.1/api/v1/namespaces/-bad/usage?period=compat", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(unknownUsage.status, 404);
+  assert.deepEqual(await unknownUsage.json(), {
+    error: { type: "unknown_namespace", message: "unknown namespace" },
+  });
+  const unknownBudget = await app.request("http://127.0.0.1/api/v1/namespaces/-bad/budgets/2026-09", {
+    method: "PUT",
+    headers,
+    body: '{"limit_microdollars":1}',
+  });
+  assert.equal(unknownBudget.status, 404);
+  assert.deepEqual(await unknownBudget.json(), {
+    error: { type: "unknown_namespace", message: "unknown namespace" },
+  });
+  const inference = await app.request("http://127.0.0.1/ns/-bad/v1/models", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(inference.status, 400);
+  assert.deepEqual(await inference.json(), {
+    error: { type: "invalid_namespace", message: "namespace identifier is invalid" },
+  });
+  const listed = await app.request("http://127.0.0.1/api/v1/namespaces", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  const ids = (await listed.json()).data.map((row: { id: string }) => row.id);
+  assert.deepEqual(ids.filter((id: string) => id === "" || id === "-bad" || id.includes("é")), []);
+});
+
 test("shutdown bounds default to the rust values and reject an unbounded wait", async () => {
   const toml = `
 [storage]
