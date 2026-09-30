@@ -97,6 +97,50 @@ test("a postgres sink rejects a missing dsn, a bad table, and a batch that does 
   assert.equal(usageBatchSize(clamped.usageSinks[0]!), 100);
 });
 
+test("a postgres usage sink keeps every digit of a batch above 2^53", async () => {
+  const huge = "18446744073709551615";
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${BASE}\n[[usage_sink]]\nkind = "postgres"\ndsn_env = "DSN"\nbuffer_capacity = 1\nmax_batch = ${huge}\n`,
+        secrets,
+      ),
+    new RegExp(
+      "usage_sink `postgres`: max_batch \\(" + huge + "\\) must not exceed buffer_capacity \\(1\\)",
+    ),
+  );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${BASE}\n[[usage_sink]]\nkind = "postgres"\nbuffer_capacity = ${huge}\n`,
+        secrets,
+      ),
+    /usage_sink `postgres`: `dsn_env` must name the env var holding the connection string/,
+  );
+  const loaded = await loadConfig(
+    `${BASE}\n[[usage_sink]]\nkind = "postgres"\ndsn_env = "DSN"\nbuffer_capacity = ${huge}\nflush_interval_ms = ${huge}\n`,
+    secrets,
+  );
+  assert.equal(loaded.usageSinks[0]!.bufferCapacity, Number.MAX_SAFE_INTEGER);
+  assert.equal(loaded.usageSinks[0]!.flushIntervalMs, 2_147_483_647);
+  assert.equal(loaded.usageSinks[0]!.maxBatch, 500);
+  await assert.rejects(
+    () =>
+      loadConfig(
+        BASE,
+        envSecretReader(
+          {
+            GW_KEY: "k",
+            AXOND_USAGE_SINK:
+              '[{kind="postgres",dsn_env="DSN",buffer_capacity=1,max_batch=' + huge + "}]",
+          },
+          async () => "",
+        ),
+      ),
+    /max_batch \(18446744073709551615\) must not exceed buffer_capacity \(1\)/,
+  );
+});
+
 test("storage_fields_match_the_rust_boot_refusals", async () => {
   const instead = (pathBlock: string) => BASE.replace('backend = "sqlite"\npath = "/tmp/axond.sqlite"\n', pathBlock);
   const refuse = async (toml: string, pattern: RegExp) => {

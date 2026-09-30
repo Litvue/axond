@@ -959,16 +959,18 @@ function loadUsageSinks(value: unknown): UsageSinkConfig[] {
       throw configError("usage_sink `postgres`: `create_table` must be a boolean");
     }
     sink.createTable = createTable === true;
-    sink.bufferCapacity = usagePositiveInt(row, "buffer_capacity", DEFAULT_USAGE_BUFFER);
+    const bufferExact = usagePositiveInt(row, "buffer_capacity", DEFAULT_USAGE_BUFFER);
     if (sink.maxBatchExplicit) {
-      sink.maxBatch = usagePositiveInt(row, "max_batch", DEFAULT_USAGE_BATCH);
-      if (sink.maxBatch > sink.bufferCapacity) {
+      const batchExact = usagePositiveInt(row, "max_batch", DEFAULT_USAGE_BATCH);
+      if (asUint(batchExact) > asUint(bufferExact)) {
         throw configError(
-          `usage_sink \`postgres\`: max_batch (${sink.maxBatch}) must not exceed buffer_capacity (${sink.bufferCapacity})`,
+          `usage_sink \`postgres\`: max_batch (${batchExact}) must not exceed buffer_capacity (${bufferExact})`,
         );
       }
+      sink.maxBatch = runtimeCount(batchExact);
     }
-    sink.flushIntervalMs = usagePositiveInt(row, "flush_interval_ms", DEFAULT_USAGE_FLUSH_MS);
+    sink.bufferCapacity = runtimeCount(bufferExact);
+    sink.flushIntervalMs = timerCount(usagePositiveInt(row, "flush_interval_ms", DEFAULT_USAGE_FLUSH_MS));
     const dsnEnv = typeof row["dsn_env"] === "string" ? row["dsn_env"].trim() : "";
     if (dsnEnv.length === 0) {
       throw configError("usage_sink `postgres`: `dsn_env` must name the env var holding the connection string");
@@ -982,18 +984,32 @@ function loadUsageSinks(value: unknown): UsageSinkConfig[] {
   });
 }
 
-function usagePositiveInt(row: Record<string, unknown>, key: string, fallback: number): number {
+function usagePositiveInt(row: Record<string, unknown>, key: string, fallback: number): number | bigint {
   if (!Object.hasOwn(row, key)) {
     return fallback;
   }
-  const value = row[key];
-  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
-    throw configError(`usage_sink \`postgres\`: ${key} must be an integer`);
-  }
-  if (value < 1) {
+  const integer = usageInteger(row[key], key);
+  if (integer < 1n) {
     throw configError(`usage_sink \`postgres\`: ${key} must be at least 1`);
   }
-  return value;
+  return integer <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(integer) : integer;
+}
+
+/** Figment already accepted a usize or u64. Keep every digit for the Rust bound. */
+function usageInteger(value: unknown, key: string): bigint {
+  if (typeof value === "bigint") {
+    if (value < 0n) {
+      throw configError(`usage_sink \`postgres\`: ${key} must be an integer`);
+    }
+    return value;
+  }
+  if (typeof value === "number" && Number.isSafeInteger(value)) {
+    if (value < 0) {
+      throw configError(`usage_sink \`postgres\`: ${key} must be an integer`);
+    }
+    return BigInt(value);
+  }
+  throw configError(`usage_sink \`postgres\`: ${key} must be an integer`);
 }
 
 /** Same identifier rules as the Rust usage sink. The name is interpolated into SQL. */
