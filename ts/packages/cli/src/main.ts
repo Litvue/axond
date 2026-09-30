@@ -151,9 +151,25 @@ async function main(): Promise<void> {
     if (deadlineTimer) {
       clearTimeout(deadlineTimer);
     }
-    const leftovers = await admission.awaitIdle(Math.floor(config.shutdown.flushTimeoutMs / 2));
+    const settleShareMs = Math.floor(config.shutdown.flushTimeoutMs / 2);
+    const leftovers = await admission.awaitIdle(settleShareMs);
+    const inFlight = admission.inFlightRequests();
     if (leftovers.spawned > 0) {
       metrics.record("axond.shutdown.abandoned_settlements", leftovers.spawned);
+    }
+    if (leftovers.spawned > 0 || inFlight > 0) {
+      const unsettled: ShutdownLog = {
+        msg: "shutdown",
+        phase: "spend_unsettled",
+        in_flight: inFlight,
+        unsettled: leftovers.spawned,
+        settlements_queued: leftovers.queued,
+        settlements_executing: leftovers.executing,
+        settlements_reserved: leftovers.reserved,
+        oldest_settlement_ms: leftovers.oldestAgeMs,
+        settle_share_ms: settleShareMs,
+      };
+      writeLog(unsettled);
     }
     process.exit(0);
   };

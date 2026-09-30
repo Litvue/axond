@@ -196,7 +196,11 @@ process mid-flush, discarding the usage records the sequence exists to write.
 The TypeScript process writes each of those as JSON `msg` `shutdown` with
 `phase` `requested`, `second_signal`, `admission_closed`, `signal_ignored`, or
 `deadline_expired`. The line names the signal and the admitted-request count.
-It omits the bind address, the store path, and the gateway key.
+When the settle share ends with a spawned charge or an admitted request still
+open, it also writes `phase` `spend_unsettled` with `settlements_queued`,
+`settlements_executing`, `settlements_reserved`, and `oldest_settlement_ms`.
+A drain that finishes both counts writes neither of those fields. The line
+omits the bind address, the store path, and the gateway key.
 
 ## `[[namespace]]`
 

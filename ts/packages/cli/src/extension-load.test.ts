@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
 import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -319,6 +320,7 @@ test("drain_grace_ms of 0 closes admission on the first signal", async () => {
     assert.equal(requested[0]?.drain_grace_ms, 0);
     assert.equal(records.some((record) => record.phase === "admission_closed"), true);
     assert.equal(records.some((record) => record.phase === "second_signal"), false);
+    assert.equal(records.some((record) => record.phase === "spend_unsettled"), false);
     assert.equal(JSON.stringify(records).includes("test-inbound-key"), false);
   } finally {
     await child.stop();
@@ -367,9 +369,157 @@ test("shutdown_log_names_the_phase_and_omits_the_secret", async () => {
     assert.equal(encoded.includes("axond.sqlite"), false);
     assert.equal(encoded.includes("127.0.0.1"), false);
     assert.equal(encoded.includes(String(port)), false);
+    assert.equal(shutdownRecords(child.log.stdout).some((record) => record.phase === "spend_unsettled"), false);
   } finally {
     socket?.destroy();
     await child.stop();
+  }
+});
+
+test("shutdown_spend_log_names_the_stages_and_omits_the_secret", async () => {
+  const key = "sk-spend-sentinel";
+  const prompt = "PROMPT_SENTINEL_spend";
+  const dir = await mkdtemp(join(tmpdir(), "axond-spend-"));
+  const port = await freePort();
+  const upstream = createHttpServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        id: "chatcmpl-test",
+        object: "chat.completion",
+        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 3, completion_tokens: 2 },
+      }),
+    );
+  });
+  await new Promise<void>((resolve) => {
+    upstream.listen(0, "127.0.0.1", () => resolve());
+  });
+  const upstreamPort = (upstream.address() as AddressInfo).port;
+  await writeFile(
+    join(dir, "hold.ts"),
+    `export default {
+  name: "hold-settle",
+  apiVersion: 1,
+  stage: "pre-dispatch",
+  async middleware(c, next) {
+    c.get("axond").onSettle(() => new Promise((resolve) => setTimeout(resolve, 5000)));
+    await next();
+  },
+};
+`,
+  );
+  await writeFile(
+    join(dir, "axond.toml"),
+    `
+[server]
+bind = "127.0.0.1:${port}"
+
+[storage]
+backend = "sqlite"
+path = "${join(dir, "axond.sqlite")}"
+
+[shutdown]
+drain_grace_ms = 0
+deadline_ms = 300
+flush_timeout_ms = 400
+
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "fake-openai"
+kind = "openai"
+base_url = "http://127.0.0.1:${upstreamPort}"
+
+[[credential]]
+namespace = "platform"
+provider = "fake-openai"
+env = "GW_FAKE_OPENAI_KEY"
+
+[[gateway_key]]
+env = "GW_INBOUND_KEY"
+namespace = "platform"
+
+[[price]]
+provider = "fake-openai"
+model = "*"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
+`,
+  );
+  const child = spawn(BIN.pathname, {
+    env: {
+      ...process.env,
+      AXOND_CONFIG: join(dir, "axond.toml"),
+      AXOND_EXTENSIONS_DIR: dir,
+      GW_INBOUND_KEY: key,
+      GW_FAKE_OPENAI_KEY: "sk-upstream-sentinel",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const log = { stderr: "", stdout: "" };
+  child.stderr?.on("data", (chunk: Buffer) => {
+    log.stderr += chunk.toString();
+  });
+  child.stdout?.on("data", (chunk: Buffer) => {
+    log.stdout += chunk.toString();
+  });
+  const exited = new Promise<number | null>((resolve) => {
+    child.once("exit", (status) => resolve(status));
+  });
+  const stdoutEnded = new Promise<void>((resolve) => {
+    child.stdout?.on("end", () => resolve());
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${port}/healthz`);
+    const budget = await fetch(`http://127.0.0.1:${port}/api/v1/namespaces/platform/budget`, {
+      method: "PUT",
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({ cadence: "monthly", limit_microdollars: 1_000_000_000, timezone: "UTC" }),
+    });
+    const budgetBody = await budget.text();
+    assert.equal(budget.status, 200, budgetBody);
+    const chat = await fetch(`http://127.0.0.1:${port}/ns/platform/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: prompt }] }),
+    });
+    const chatBody = await chat.text();
+    assert.equal(chat.status, 200, chatBody);
+    await new Promise((wake) => setTimeout(wake, 40));
+    child.kill("SIGTERM");
+    const line = await waitForShutdown(() => log.stdout, "spend_unsettled", 3_000);
+    assert.ok(line, log.stderr + log.stdout);
+    assert.equal(line.in_flight, 0);
+    assert.equal(line.unsettled, 1);
+    assert.equal(line.settlements_queued, 0);
+    assert.equal(line.settlements_executing, 1);
+    assert.equal(line.settlements_reserved, 0);
+    assert.equal(line.settle_share_ms, 200);
+    assert.ok((line.oldest_settlement_ms ?? 0) >= 40);
+    const code = await Promise.race([
+      exited,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000)),
+    ]);
+    assert.equal(code, 0, log.stderr);
+    await stdoutEnded;
+    const encoded = JSON.stringify(shutdownRecords(log.stdout));
+    assert.equal(encoded.includes(key), false);
+    assert.equal(encoded.includes(prompt), false);
+    assert.equal(encoded.includes("sk-upstream-sentinel"), false);
+    assert.equal(encoded.includes("axond.sqlite"), false);
+    assert.equal(encoded.includes("127.0.0.1"), false);
+    assert.equal(encoded.includes(String(port)), false);
+    assert.equal(encoded.includes(String(upstreamPort)), false);
+  } finally {
+    upstream.close();
+    if (child.exitCode === null) {
+      child.kill("SIGKILL");
+      await new Promise((done) => child.once("exit", done));
+    }
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
@@ -451,6 +601,12 @@ function shutdownRecords(text: string): Array<{
   drain_grace_ms?: number;
   deadline_ms?: number;
   in_flight?: number;
+  unsettled?: number;
+  settlements_queued?: number;
+  settlements_executing?: number;
+  settlements_reserved?: number;
+  oldest_settlement_ms?: number;
+  settle_share_ms?: number;
 }> {
   const records = [];
   for (const line of text.split("\n")) {
@@ -464,6 +620,12 @@ function shutdownRecords(text: string): Array<{
       drain_grace_ms?: number;
       deadline_ms?: number;
       in_flight?: number;
+      unsettled?: number;
+      settlements_queued?: number;
+      settlements_executing?: number;
+      settlements_reserved?: number;
+      oldest_settlement_ms?: number;
+      settle_share_ms?: number;
     };
     if (parsed.msg === "shutdown") {
       records.push(parsed);

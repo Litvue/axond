@@ -49,6 +49,9 @@ export interface AdmissionHold {
 export interface SettlementBacklog {
   spawned: number;
   oldestAgeMs: number;
+  queued: number;
+  executing: number;
+  reserved: number;
 }
 
 interface MetricSink {
@@ -115,7 +118,9 @@ export function createAdmission(limits: AdmissionLimits) {
     released(metrics, "request");
   };
 
+  const stages = { reserved: 0, queued: 0, executing: 0 };
   const stage = (metrics: MetricSink | undefined, name: "reserved" | "queued" | "executing", delta: number) => {
+    stages[name] += delta;
     record(metrics, "axond.settlement.in_flight", delta, { "axond.settlement.stage": name });
   };
 
@@ -268,7 +273,13 @@ export function createAdmission(limits: AdmissionLimits) {
     },
     observeAge,
     awaitIdle(boundMs: number): Promise<SettlementBacklog> {
-      const snapshot = (): SettlementBacklog => ({ spawned: backlog.length, oldestAgeMs: oldestPendingAgeMs() });
+      const snapshot = (): SettlementBacklog => ({
+        spawned: backlog.length,
+        oldestAgeMs: oldestPendingAgeMs(),
+        queued: stages.queued,
+        executing: stages.executing,
+        reserved: stages.reserved,
+      });
       if (backlog.length === 0 || boundMs <= 0) {
         return Promise.resolve(snapshot());
       }

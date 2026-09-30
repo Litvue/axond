@@ -193,7 +193,9 @@ export interface CatalogueImportLog {
 /**
  * One step of process shutdown. The CLI writes these on stdout.
  * The line names the signal and the phase. The bind address, the store
- * path, and the gateway key stay off it.
+ * path, and the gateway key stay off it. `spend_unsettled` is written when
+ * the settle share ends with a spawned charge or an admitted request still
+ * open, and it names the stage counts and the oldest spawned charge's age.
  */
 export type ShutdownLog =
   | {
@@ -225,6 +227,17 @@ export type ShutdownLog =
       phase: "deadline_expired";
       deadline_ms: number;
       in_flight: number;
+    }
+  | {
+      msg: "shutdown";
+      phase: "spend_unsettled";
+      in_flight: number;
+      unsettled: number;
+      settlements_queued: number;
+      settlements_executing: number;
+      settlements_reserved: number;
+      oldest_settlement_ms: number;
+      settle_share_ms: number;
     };
 
 export type AxondLog =
@@ -579,6 +592,12 @@ export interface AdmissionPermit {
 export interface SettlementBacklog {
   spawned: number;
   oldestAgeMs: number;
+  /** Spawned charges waiting for an execution slot. */
+  queued: number;
+  /** Spawned charges holding an execution slot. */
+  executing: number;
+  /** Admitted requests whose charge has not been spawned. */
+  reserved: number;
 }
 
 export interface AdmissionControl {
