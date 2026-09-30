@@ -1380,10 +1380,17 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
   const hold = admissionHolds.get(axond);
   hold?.claimSettlement();
   hold?.beginSpawned(opts.metrics);
+  const queuedAt = Date.now();
   try {
   const granted = hold ? await hold.acquireExecution(opts.metrics) : true;
   if (!granted) {
     opts.metrics?.record("axond.settlement.failures", 1, { "axond.settlement.reason": "queue_timeout" });
+    emitLog(opts, {
+      msg: "settlement_failure",
+      request_id: axond.requestId,
+      reason: "queue_timeout",
+      waited_ms: Date.now() - queuedAt,
+    });
     hold?.releaseSettlement();
     return;
   }
@@ -1392,6 +1399,12 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
   if (timeoutMs > 0) {
     timer = setTimeout(() => {
       opts.metrics?.record("axond.settlement.failures", 1, { "axond.settlement.reason": "execution_timeout" });
+      emitLog(opts, {
+        msg: "settlement_failure",
+        request_id: axond.requestId,
+        reason: "execution_timeout",
+        waited_ms: Date.now() - queuedAt,
+      });
     }, timeoutMs);
     const unref = timer as { unref?: () => void };
     unref.unref?.();

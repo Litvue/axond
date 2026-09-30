@@ -3030,6 +3030,146 @@ test("a settlement that outlives its deadline still records the charge", async (
   }
 });
 
+test("settlement_failure_log_names_the_reason_and_omits_the_prompt", async () => {
+  const logs: { msg: string; reason?: string; waited_ms?: number; request_id?: string }[] = [];
+  const store = await seeded();
+  let releaseSettle: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    releaseSettle = resolve;
+  });
+  const original = store.settle.bind(store);
+  let entered = 0;
+  store.settle = async (input) => {
+    entered += 1;
+    if (entered === 1) {
+      await gate;
+    }
+    return original(input);
+  };
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":4,"completion_tokens":4}}');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    maxInFlight: 4,
+    maxPendingSettlements: 4,
+    maxInFlightSettlements: 1,
+    settlementQueueWaitMs: 80,
+    settlementTimeoutMs: 0,
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1_000_000n,
+        outputMicrodollarsPerMillion: 1_000_000n,
+      },
+    ],
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  const payload = JSON.stringify({
+    model: "fake-openai/gpt-test",
+    messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+  });
+  try {
+    const first = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: CHAT_HEADERS,
+      body: payload,
+    });
+    assert.equal(first.status, 200);
+    await first.text();
+    for (let attempt = 0; attempt < 50 && entered === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(entered, 1);
+    const second = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: CHAT_HEADERS,
+      body: payload,
+    });
+    assert.equal(second.status, 200);
+    await second.text();
+    await new Promise((wake) => setTimeout(wake, 150));
+    const dropped = logs.filter((line) => line.msg === "settlement_failure" && line.reason === "queue_timeout");
+    assert.equal(dropped.length, 1);
+    assert.ok((dropped[0]!.waited_ms ?? 0) >= 80);
+    assert.ok((dropped[0]!.request_id ?? "").length > 0);
+    releaseSettle();
+    const slow = await seeded();
+    const before = (await slow.getBudget("platform", "compat"))!;
+    const slowOriginal = slow.settle.bind(slow);
+    slow.settle = async (input) => {
+      await new Promise((wake) => setTimeout(wake, 80));
+      return slowOriginal(input);
+    };
+    const slowUpstream = await listen((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"usage":{"prompt_tokens":4,"completion_tokens":4}}');
+    });
+    const slowApp = createAxond({
+      store: slow,
+      gatewayKey: KEY,
+      defaultNamespace: "platform",
+      maxInFlight: 4,
+      maxInFlightSettlements: 1,
+      settlementTimeoutMs: 30,
+      providers: [{ id: "fake-openai", kind: "openai", baseUrl: slowUpstream.url }],
+      credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+      prices: [
+        {
+          provider: "fake-openai",
+          model: "*",
+          inputMicrodollarsPerMillion: 1_000_000n,
+          outputMicrodollarsPerMillion: 1_000_000n,
+        },
+      ],
+      onLog: (record) => {
+        logs.push(record);
+      },
+    });
+    try {
+      const response = await slowApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+        method: "POST",
+        headers: CHAT_HEADERS,
+        body: payload,
+      });
+      assert.equal(response.status, 200);
+      await response.text();
+      let after = before;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        after = (await slow.getBudget("platform", "compat"))!;
+        if (after.spent !== before.spent) {
+          break;
+        }
+        await new Promise((wake) => setTimeout(wake, 10));
+      }
+      assert.equal(after.spent - before.spent, 8n);
+      const timed = logs.filter((line) => line.msg === "settlement_failure" && line.reason === "execution_timeout");
+      assert.equal(timed.length, 1);
+      assert.ok((timed[0]!.waited_ms ?? 0) >= 30);
+      assert.ok((timed[0]!.request_id ?? "").length > 0);
+      const encoded = JSON.stringify(logs);
+      assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+      assert.equal(encoded.includes("sk-live-secret"), false);
+      assert.equal(encoded.includes(KEY), false);
+      assert.equal(encoded.includes(slowUpstream.url), false);
+      assert.equal(encoded.includes(upstream.url), false);
+    } finally {
+      slowUpstream.close();
+    }
+  } finally {
+    releaseSettle();
+    upstream.close();
+  }
+});
+
 test("an admitted request holds a reserved settlement until the charge is spawned", async () => {
   const admission = createAdmission({
     ...defaultAdmission(),

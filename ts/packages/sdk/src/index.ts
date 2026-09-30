@@ -130,6 +130,18 @@ export interface StreamLimitLog {
   limit: "duration" | "bytes";
 }
 
+/**
+ * A charge missed a settlement bound. `queue_timeout` means the charge never
+ * started and spend was not written. `execution_timeout` means Store work
+ * outlived its deadline and still finishes.
+ */
+export interface SettlementFailureLog {
+  msg: "settlement_failure";
+  request_id: string;
+  reason: "queue_timeout" | "execution_timeout";
+  waited_ms: number;
+}
+
 /** A catalogue fetch was stored, or refused without replacing the active document. */
 export interface CatalogueImportLog {
   msg: "catalogue_import";
@@ -144,6 +156,7 @@ export type AxondLog =
   | UpstreamTimeoutLog
   | UpstreamTransportLog
   | StreamLimitLog
+  | SettlementFailureLog
   | CatalogueImportLog;
 
 export interface AxondContext {
@@ -369,8 +382,8 @@ export interface AxondOptions {
    * A buffered charge includes status, tokens, and cost. A stream has been
    * routed but has not settled, so those fields are absent. A rate-limit
    * rotation, an upstream timeout, a transport failure, a stream duration or
-   * byte cap, and a catalogue import are separate lines. None of them carry a
-   * body, a credential, or a source URL.
+   * byte cap, a settlement bound, and a catalogue import are separate lines.
+   * None of them carry a body, a credential, or a source URL.
    */
   onLog?: (record: AxondLog) => void;
   maxRequestBytes?: number;
