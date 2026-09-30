@@ -16,7 +16,7 @@ import {
   resolveTelemetry,
   usageEvent,
 } from "../../gateway/src/index.ts";
-import type { AxondExtension } from "@axond/sdk";
+import type { AxondExtension, ShutdownLog } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
 import { createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
@@ -164,8 +164,22 @@ async function main(): Promise<void> {
     phase = "closing";
     admitting = false;
     metrics.set("axond.shutdown.phase", 2, { "axond.lifecycle_phase": "closing" });
+    const admissionClosed: ShutdownLog = {
+      msg: "shutdown",
+      phase: "admission_closed",
+      deadline_ms: config.shutdown.deadlineMs,
+      in_flight: admission.inFlightRequests(),
+    };
+    writeLog(admissionClosed);
     deadlineTimer = setTimeout(() => {
       const stuck = admission.inFlightRequests();
+      const expired: ShutdownLog = {
+        msg: "shutdown",
+        phase: "deadline_expired",
+        deadline_ms: config.shutdown.deadlineMs,
+        in_flight: stuck,
+      };
+      writeLog(expired);
       if (stuck > 0) {
         metrics.record("axond.shutdown.abandoned_requests", stuck);
       }
@@ -178,16 +192,37 @@ async function main(): Promise<void> {
     });
     server.closeIdleConnections();
   };
-  const shutdown = () => {
+  const shutdown = (signal: string) => {
     if (phase === "closing") {
+      const ignored: ShutdownLog = {
+        msg: "shutdown",
+        phase: "signal_ignored",
+        signal,
+      };
+      writeLog(ignored);
       return;
     }
     if (phase === "draining") {
+      const second: ShutdownLog = {
+        msg: "shutdown",
+        phase: "second_signal",
+        signal,
+      };
+      writeLog(second);
       closeAdmission();
       return;
     }
     phase = "draining";
     metrics.set("axond.shutdown.phase", 1, { "axond.lifecycle_phase": "draining" });
+    const requested: ShutdownLog = {
+      msg: "shutdown",
+      phase: "requested",
+      signal,
+      drain_grace_ms: config.shutdown.drainGraceMs,
+      deadline_ms: config.shutdown.deadlineMs,
+      in_flight: admission.inFlightRequests(),
+    };
+    writeLog(requested);
     stopDiscovery();
     serving = false;
     if (config.shutdown.drainGraceMs === 0) {

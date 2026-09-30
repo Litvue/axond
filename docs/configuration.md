@@ -193,6 +193,10 @@ the first signal closes admission. Once admission is closed — by either route 
 further signals are logged and otherwise ignored, because the deadline and the
 flush budget already bound what is left and honoring one there would kill the
 process mid-flush, discarding the usage records the sequence exists to write.
+The TypeScript process writes each of those as JSON `msg` `shutdown` with
+`phase` `requested`, `second_signal`, `admission_closed`, `signal_ignored`, or
+`deadline_expired`. The line names the signal and the admitted-request count.
+It omits the bind address, the store path, and the gateway key.
 
 ## `[[namespace]]`
 

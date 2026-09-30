@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { connect, createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -311,12 +311,72 @@ test("drain_grace_ms of 0 closes admission on the first signal", async () => {
     ]);
     assert.equal(code, 0, child.log.stderr);
     assert.ok(Date.now() - signaled < 1_500);
+    await child.stdoutEnded;
+    const records = shutdownRecords(child.log.stdout);
+    const requested = records.filter((record) => record.phase === "requested");
+    assert.equal(requested.length, 1);
+    assert.equal(requested[0]?.signal, "SIGTERM");
+    assert.equal(requested[0]?.drain_grace_ms, 0);
+    assert.equal(records.some((record) => record.phase === "admission_closed"), true);
+    assert.equal(records.some((record) => record.phase === "second_signal"), false);
+    assert.equal(JSON.stringify(records).includes("test-inbound-key"), false);
   } finally {
     await child.stop();
   }
 });
 
-async function bootShutdown(shutdown: { drainGraceMs: number; deadlineMs: number; flushTimeoutMs: number }) {
+test("shutdown_log_names_the_phase_and_omits_the_secret", async () => {
+  const key = "sk-shutdown-sentinel";
+  const child = await bootShutdown({ drainGraceMs: 8_000, deadlineMs: 700, flushTimeoutMs: 400 }, key);
+  const port = Number(new URL(child.base).port);
+  let socket: Socket | undefined;
+  try {
+    await waitFor(`${child.base}/healthz`);
+    socket = await holdOpen(port);
+    child.proc.kill("SIGTERM");
+    const requested = await waitForShutdown(() => child.log.stdout, "requested", 2_000);
+    assert.ok(requested, child.log.stderr + child.log.stdout);
+    assert.equal(requested.signal, "SIGTERM");
+    assert.equal(requested.drain_grace_ms, 8_000);
+    assert.equal(requested.deadline_ms, 700);
+    assert.equal(requested.in_flight, 0);
+    child.proc.kill("SIGTERM");
+    const second = await waitForShutdown(() => child.log.stdout, "second_signal", 2_000);
+    assert.ok(second, child.log.stdout);
+    assert.equal(second.signal, "SIGTERM");
+    const closed = await waitForShutdown(() => child.log.stdout, "admission_closed", 1_000);
+    assert.ok(closed, child.log.stdout);
+    assert.equal(closed.deadline_ms, 700);
+    assert.equal(closed.in_flight, 0);
+    child.proc.kill("SIGINT");
+    const ignored = await waitForShutdown(() => child.log.stdout, "signal_ignored", 2_000);
+    assert.ok(ignored, child.log.stdout);
+    assert.equal(ignored.signal, "SIGINT");
+    const expired = await waitForShutdown(() => child.log.stdout, "deadline_expired", 3_000);
+    assert.ok(expired, child.log.stdout);
+    assert.equal(expired.deadline_ms, 700);
+    assert.equal(expired.in_flight, 0);
+    const code = await Promise.race([
+      child.exited,
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3_000)),
+    ]);
+    assert.equal(code, 0, child.log.stderr);
+    await child.stdoutEnded;
+    const encoded = JSON.stringify(shutdownRecords(child.log.stdout));
+    assert.equal(encoded.includes(key), false);
+    assert.equal(encoded.includes("axond.sqlite"), false);
+    assert.equal(encoded.includes("127.0.0.1"), false);
+    assert.equal(encoded.includes(String(port)), false);
+  } finally {
+    socket?.destroy();
+    await child.stop();
+  }
+});
+
+async function bootShutdown(
+  shutdown: { drainGraceMs: number; deadlineMs: number; flushTimeoutMs: number },
+  gatewayKey = "test-inbound-key",
+) {
   const dir = await mkdtemp(join(tmpdir(), "axond-shutdown-"));
   const port = await freePort();
   await writeFile(
@@ -347,21 +407,32 @@ namespace = "platform"
     env: {
       ...process.env,
       AXOND_CONFIG: join(dir, "axond.toml"),
-      GW_INBOUND_KEY: "test-inbound-key",
+      GW_INBOUND_KEY: gatewayKey,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  const log = { stderr: "" };
+  const log = { stderr: "", stdout: "" };
   proc.stderr?.on("data", (chunk: Buffer) => {
     log.stderr += chunk.toString();
   });
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    log.stdout += chunk.toString();
+  });
   const exited = new Promise<number | null>((resolve) => {
     proc.once("exit", (status) => resolve(status));
+  });
+  const stdoutEnded = new Promise<void>((resolve) => {
+    if (!proc.stdout) {
+      resolve();
+      return;
+    }
+    proc.stdout.on("end", () => resolve());
   });
   return {
     proc,
     log,
     exited,
+    stdoutEnded,
     base: `http://127.0.0.1:${port}`,
     stop: async () => {
       if (proc.exitCode === null) {
@@ -371,6 +442,69 @@ namespace = "platform"
       await rm(dir, { recursive: true, force: true });
     },
   };
+}
+
+function shutdownRecords(text: string): Array<{
+  msg: string;
+  phase: string;
+  signal?: string;
+  drain_grace_ms?: number;
+  deadline_ms?: number;
+  in_flight?: number;
+}> {
+  const records = [];
+  for (const line of text.split("\n")) {
+    if (!line.includes('"msg":"shutdown"')) {
+      continue;
+    }
+    const parsed = JSON.parse(line) as {
+      msg: string;
+      phase: string;
+      signal?: string;
+      drain_grace_ms?: number;
+      deadline_ms?: number;
+      in_flight?: number;
+    };
+    if (parsed.msg === "shutdown") {
+      records.push(parsed);
+    }
+  }
+  return records;
+}
+
+async function waitForShutdown(
+  read: () => string,
+  phase: string,
+  boundMs: number,
+): Promise<ReturnType<typeof shutdownRecords>[number] | undefined> {
+  const until = Date.now() + boundMs;
+  while (Date.now() < until) {
+    const found = shutdownRecords(read()).find((record) => record.phase === phase);
+    if (found) {
+      return found;
+    }
+    await new Promise((wake) => setTimeout(wake, 20));
+  }
+  return undefined;
+}
+
+function holdOpen(port: number): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ port, host: "127.0.0.1" });
+    const fail = (error: Error) => {
+      socket.destroy();
+      reject(error);
+    };
+    socket.once("error", fail);
+    socket.once("connect", () => {
+      socket.off("error", fail);
+      socket.on("error", () => {
+        // The deadline closes this socket.
+      });
+      socket.write("POST /api/v1/namespaces HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 64\r\n");
+      resolve(socket);
+    });
+  });
 }
 
 function freePort(): Promise<number> {

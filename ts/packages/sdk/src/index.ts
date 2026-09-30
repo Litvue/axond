@@ -168,6 +168,43 @@ export interface CatalogueImportLog {
   consecutive_refusals: number;
 }
 
+/**
+ * One step of process shutdown. The CLI writes these on stdout.
+ * The line names the signal and the phase. The bind address, the store
+ * path, and the gateway key stay off it.
+ */
+export type ShutdownLog =
+  | {
+      msg: "shutdown";
+      phase: "requested";
+      signal: string;
+      drain_grace_ms: number;
+      deadline_ms: number;
+      in_flight: number;
+    }
+  | {
+      msg: "shutdown";
+      phase: "second_signal";
+      signal: string;
+    }
+  | {
+      msg: "shutdown";
+      phase: "admission_closed";
+      deadline_ms: number;
+      in_flight: number;
+    }
+  | {
+      msg: "shutdown";
+      phase: "signal_ignored";
+      signal: string;
+    }
+  | {
+      msg: "shutdown";
+      phase: "deadline_expired";
+      deadline_ms: number;
+      in_flight: number;
+    };
+
 export type AxondLog =
   | RequestLog
   | CredentialRateLimitLog
@@ -176,7 +213,8 @@ export type AxondLog =
   | StreamLimitLog
   | SettlementFailureLog
   | BudgetUnavailableLog
-  | CatalogueImportLog;
+  | CatalogueImportLog
+  | ShutdownLog;
 
 export interface AxondContext {
   requestId: string;
@@ -402,8 +440,9 @@ export interface AxondOptions {
    * routed but has not settled, so those fields are absent. A rate-limit
    * rotation, an upstream timeout, a transport failure, a stream duration or
    * byte cap, a settlement bound, a failed Store write, a budget-store outage,
-   * and a catalogue import are separate lines. None of them carry a body, a
-   * credential, a driver message, or a source URL.
+   * and a catalogue import are separate lines. The CLI also writes a shutdown
+   * line for each phase. None of them carry a body, a credential, a driver
+   * message, a bind address, or a source URL.
    */
   onLog?: (record: AxondLog) => void;
   maxRequestBytes?: number;
