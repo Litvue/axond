@@ -1463,6 +1463,157 @@ test("management_json_cadence_unit_enum_matches_serde", async () => {
   }
 });
 
+test("management_json_invalid_utf8_matches_serde", async () => {
+  const { app, upstream } = await gateway();
+  try {
+    const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+    const call = (path: string, method: string, body?: Uint8Array) =>
+      app.request(`http://127.0.0.1${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+    const parse = "Failed to parse the request body as JSON";
+    const data = "Failed to deserialize the JSON body into the target type";
+    const utf8 = (...parts: Array<string | number>) => {
+      const out: number[] = [];
+      for (const part of parts) {
+        if (typeof part === "number") {
+          out.push(part);
+        } else {
+          for (const byte of new TextEncoder().encode(part)) {
+            out.push(byte);
+          }
+        }
+      }
+      return Uint8Array.from(out);
+    };
+    const bad = async (path: string, method: string, body: Uint8Array, message: string) => {
+      const response = await call(path, method, body);
+      assert.equal(response.status, 400, `${method} ${path} ${message}`);
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+    };
+    const unicode = "invalid unicode code point";
+    const control = "control character (\\u0000-\\u001F) found while parsing a string";
+    const created = await call("/api/v1/namespaces", "POST", utf8('{"id":"wsp_utf"}'));
+    assert.equal(created.status, 201);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"caf', 0xff, '"}'), `${parse}: id: ${unicode} at line 1 column 12`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"caf', 0xff), `${parse}: id: EOF while parsing a string at line 1 column 11`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"', 0xc3, '"}'), `${parse}: id: ${unicode} at line 1 column 9`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"', 0xc0, 0x80, '"}'), `${parse}: id: ${unicode} at line 1 column 10`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"', 0xc3, 0xa9, 0xff, '"}'), `${parse}: id: ${unicode} at line 1 column 11`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"', 0xed, 0xa0, 0x80, '"}'), `${parse}: id: ${unicode} at line 1 column 11`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"\\n', 0xff, '"}'), `${parse}: id: ${unicode} at line 1 column 11`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"', 0xff, '"}'), `${parse}: id: ${unicode} at line 1 column 9`);
+    await bad("/api/v1/namespaces", "POST", utf8('["', 0xff, '"]'), `${parse}: [0]: ${unicode} at line 1 column 4`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"', 0xff, '":1}'), `${parse}: ${unicode} at line 1 column 4`);
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      utf8('{"id":"a","blocklist":["ok","', 0xff, '"]}'),
+      `${parse}: blocklist[1]: ${unicode} at line 1 column 31`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      utf8('{"id":"a","attrs":{"k":"x', 0xff, '"}}'),
+      `${parse}: attrs.k: ${unicode} at line 1 column 27`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      utf8('{"id":"a","attrs":{"', 0xff, '":1}}'),
+      `${parse}: attrs.?: ${unicode} at line 1 column 22`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      utf8('{"id":"a",\n"attrs":"', 0xff, '"}'),
+      `${parse}: attrs: ${unicode} at line 2 column 11`,
+    );
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"\\q', 0xff, '"}'), `${parse}: id: invalid escape at line 1 column 9`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"', 0xff, 0x01, '"}'), `${parse}: id: ${control} at line 1 column 9`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"\\u12', 0xff, 'Y"}'), `${parse}: id: invalid escape at line 1 column 13`);
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      utf8('{"id":{"a":"', 0xff, '"}}'),
+      `${data}: id: invalid type: map, expected a string at line 1 column 6`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      utf8('{"id":"a","nope":"', 0xff, '"}'),
+      `${data}: nope: unknown field \`nope\`, expected one of \`id\`, \`attrs\`, \`blocklist\` at line 1 column 16`,
+    );
+    await bad("/api/v1/namespaces", "POST", utf8("{", 0xff, '"id":"a"}'), `${parse}: key must be a string at line 1 column 2`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"', 0xff, "}"), `${parse}: expected \`,\` or \`}\` at line 1 column 10`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"x}'), `${parse}: expected \`,\` or \`}\` at line 1 column 10`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}', 0xff), `${parse}: trailing characters at line 1 column 11`);
+    await bad("/api/v1/namespaces", "POST", utf8(" ", 0xff), `${parse}: expected value at line 1 column 2`);
+    await bad("/api/v1/namespaces", "POST", utf8(0xef, 0xbb, 0xbf, '{"id":"a"}'), `${parse}: expected value at line 1 column 1`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":', 0xff, "}"), `${parse}: id: expected value at line 1 column 7`);
+    await bad("/api/v1/namespaces", "POST", utf8('{"id":x}'), `${parse}: id: expected value at line 1 column 7`);
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      utf8('{"id":"', 0xc3, 0xa9, '"}'),
+      "a namespace identifier contains a character outside ASCII letters, digits, `.`, `-`, and `_`",
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      utf8('{"id":"a","attrs":{"k":1', 0xff, "}}"),
+      `${parse}: attrs.?: expected \`,\` or \`}\` at line 1 column 25`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      utf8('{"id":"a","attrs":[', 0xff, "]}"),
+      `${parse}: attrs[0]: expected value at line 1 column 20`,
+    );
+    await bad(
+      "/api/v1/namespaces",
+      "POST",
+      utf8('{"id":"a","attrs":[1', 0xff, "]}"),
+      `${parse}: attrs: expected \`,\` or \`]\` at line 1 column 21`,
+    );
+    await bad(
+      "/api/v1/namespaces/wsp_utf/budgets/2026-09",
+      "PUT",
+      utf8('{"limit_microdollars":1', 0xff, "}"),
+      `${parse}: expected \`,\` or \`}\` at line 1 column 24`,
+    );
+    await bad(
+      "/api/v1/namespaces/wsp_utf/budgets/2026-09",
+      "PUT",
+      utf8('{"limit_microdollars":', 0xff, "}"),
+      `${parse}: limit_microdollars: expected value at line 1 column 23`,
+    );
+    await bad(
+      "/api/v1/namespaces/wsp_utf/budget",
+      "PUT",
+      utf8('{"cadence":"', 0xff, '","limit_microdollars":1}'),
+      `${parse}: cadence: ${unicode} at line 1 column 14`,
+    );
+    await bad(
+      "/api/v1/namespaces/wsp_utf/budget",
+      "PUT",
+      utf8('{"cadence":{"monthly":', 0xff, '},"limit_microdollars":1}'),
+      `${parse}: cadence.monthly: expected value at line 1 column 23`,
+    );
+    const stored = await call("/api/v1/namespaces/wsp_utf", "PUT", utf8('{"attrs":"', 0xef, 0xbf, 0xbd, '"}'));
+    assert.equal(stored.status, 200);
+    assert.equal((await stored.json()).attrs, "\uFFFD");
+    const list = await call("/api/v1/namespaces", "GET");
+    assert.equal(list.status, 200);
+    const ids = ((await list.json()).data as Array<{ id: string }>).map((row) => row.id);
+    assert.equal(ids.includes("wsp_utf"), true);
+    assert.equal(ids.some((id) => id.includes("\uFFFD") || id.includes("caf")), false);
+    const kept = await call("/api/v1/namespaces/wsp_utf", "GET");
+    assert.equal(kept.status, 200);
+    assert.equal((await kept.json()).attrs, "\uFFFD");
+  } finally {
+    upstream.close();
+  }
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });

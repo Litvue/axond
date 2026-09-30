@@ -1859,13 +1859,8 @@ async function readJson(c: Context<AxondEnv>, fields: readonly StrictField[], st
   if (!isJsonContentType(contentType)) {
     throw new GatewayFailure("unsupported_media_type", 415, "expected a `content-type: application/json` request");
   }
-  let raw: string;
-  try {
-    raw = await c.req.text();
-  } catch {
-    throw badRequest("malformed json");
-  }
-  return readStrictObject(raw, fields, structName);
+  const bytes = new Uint8Array(await c.req.arrayBuffer());
+  return readStrictObject(bytes, fields, structName);
 }
 
 function requiredBig(body: Record<string, unknown>, key: string): bigint {

@@ -20,30 +20,40 @@ class Cursor {
   line = 1;
   /** 1-based index of the last consumed byte. 0 before the first byte. */
   col = 0;
-  raw: string;
+  bytes: Uint8Array;
+  /** The last `bump` consumed a byte that is not a UTF-8 scalar. */
+  lastInvalid = false;
 
-  constructor(raw: string) {
-    this.raw = raw;
+  constructor(bytes: Uint8Array) {
+    this.bytes = bytes;
   }
 
   peek(): string {
-    const point = this.raw.codePointAt(this.i);
-    return point === undefined ? "" : String.fromCodePoint(point);
+    const decoded = decodeScalar(this.bytes, this.i);
+    return decoded === null ? (this.i >= this.bytes.length ? "" : "\uFFFD") : decoded.char;
   }
 
   bump(): string {
-    const ch = this.peek();
-    if (ch.length === 0) {
+    if (this.i >= this.bytes.length) {
+      this.lastInvalid = false;
       return "";
     }
-    this.i += ch.length;
-    if (ch === "\n") {
+    const decoded = decodeScalar(this.bytes, this.i);
+    if (decoded === null) {
+      this.i += 1;
+      this.col += 1;
+      this.lastInvalid = true;
+      return "\uFFFD";
+    }
+    this.lastInvalid = false;
+    this.i += decoded.size;
+    if (decoded.char === "\n") {
       this.line += 1;
       this.col = 0;
-      return ch;
+      return decoded.char;
     }
-    this.col += new TextEncoder().encode(ch).length;
-    return ch;
+    this.col += decoded.size;
+    return decoded.char;
   }
 
   loc(): Loc {
@@ -55,6 +65,53 @@ class Cursor {
       this.bump();
     }
   }
+}
+
+/** One Unicode scalar, or null when the next byte is not well-formed UTF-8. */
+function decodeScalar(bytes: Uint8Array, i: number): { char: string; size: number } | null {
+  const b0 = bytes[i];
+  if (b0 === undefined) {
+    return null;
+  }
+  if (b0 < 0x80) {
+    return { char: String.fromCharCode(b0), size: 1 };
+  }
+  if (b0 < 0xc2 || b0 > 0xf4) {
+    return null;
+  }
+  const width = b0 < 0xe0 ? 2 : b0 < 0xf0 ? 3 : 4;
+  if (i + width > bytes.length) {
+    return null;
+  }
+  const b1 = bytes[i + 1]!;
+  if ((b1 & 0xc0) !== 0x80) {
+    return null;
+  }
+  if (width === 2) {
+    return { char: String.fromCharCode(((b0 & 0x1f) << 6) | (b1 & 0x3f)), size: 2 };
+  }
+  const b2 = bytes[i + 2]!;
+  if ((b2 & 0xc0) !== 0x80) {
+    return null;
+  }
+  if (width === 3) {
+    if ((b0 === 0xe0 && b1 < 0xa0) || (b0 === 0xed && b1 >= 0xa0)) {
+      return null;
+    }
+    return {
+      char: String.fromCharCode(((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f)),
+      size: 3,
+    };
+  }
+  const b3 = bytes[i + 3]!;
+  if ((b3 & 0xc0) !== 0x80) {
+    return null;
+  }
+  if ((b0 === 0xf0 && b1 < 0x90) || (b0 === 0xf4 && b1 >= 0x90)) {
+    return null;
+  }
+  const cp = ((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f);
+  return { char: String.fromCodePoint(cp), size: 4 };
 }
 
 function at(loc: Loc): string {
@@ -76,25 +133,25 @@ function fail(message: string): never {
 }
 
 function peekLoc(cur: Cursor): Loc {
-  const ch = cur.peek();
-  if (ch.length === 0) {
+  if (cur.i >= cur.bytes.length) {
     return cur.loc();
   }
-  if (ch === "\n") {
+  if (cur.bytes[cur.i] === 0x0a) {
     return { line: cur.line + 1, column: 0 };
   }
-  return { line: cur.line, column: cur.col + new TextEncoder().encode(ch).length };
+  return { line: cur.line, column: cur.col + 1 };
 }
 
 function parseFail(message: string, loc: Loc): never {
   fail(`${PARSE}: ${message} ${at(loc)}`);
 }
 
-function syntax(cur: Cursor): never {
+function syntax(cur: Cursor, path = ""): never {
+  const prefix = path.length === 0 ? "" : `${path}: `;
   if (cur.peek() === "") {
-    parseFail("EOF while parsing a value", cur.loc());
+    parseFail(`${prefix}EOF while parsing a value`, cur.loc());
   }
-  parseFail("expected value", peekLoc(cur));
+  parseFail(`${prefix}expected value`, peekLoc(cur));
 }
 
 /**
@@ -103,11 +160,12 @@ function syntax(cur: Cursor): never {
  * The column is the last byte serde consumed, or the byte it refused.
  */
 export function readStrictObject(
-  raw: string,
+  raw: string | Uint8Array,
   fields: readonly StrictField[],
   structName: string,
 ): Record<string, unknown> {
-  const cur = new Cursor(raw);
+  const bytes = typeof raw === "string" ? new TextEncoder().encode(raw) : raw;
+  const cur = new Cursor(bytes);
   cur.skipWs();
   if (cur.peek() === "") {
     parseFail("EOF while parsing a value", cur.loc());
@@ -189,7 +247,7 @@ function readObjectFields(cur: Cursor, fields: readonly StrictField[]): Record<s
     }
     afterComma = false;
     if (cur.peek() !== "}") {
-      syntax(cur);
+      parseFail("expected `,` or `}`", peekLoc(cur));
     }
   }
 }
@@ -430,7 +488,7 @@ function readUnitNumber(cur: Cursor, path: string): string {
       cur.bump();
     }
   }
-  return cur.raw.slice(start, cur.i);
+  return asciiSlice(cur, start, cur.i);
 }
 
 function readU64(cur: Cursor, key: string): bigint {
@@ -454,7 +512,7 @@ function readU64(cur: Cursor, key: string): bigint {
     fail(`${DESERIALIZE}: ${key}: invalid type: ${kind}, expected u64 ${at(where)}`);
   }
   if (peek !== "-" && (peek < "0" || peek > "9")) {
-    syntax(cur);
+    syntax(cur, key);
   }
   const token = readNumber(cur);
   const loc = cur.loc();
@@ -491,7 +549,7 @@ function readStringList(cur: Cursor, key: string): string[] | null {
       const kind = cur.peek() === "[" ? "sequence" : "map";
       fail(`${DESERIALIZE}: ${key}: invalid type: ${kind}, expected a sequence ${at(where)}`);
     }
-    const kind = describeOther(cur);
+    const kind = describeOther(cur, key);
     fail(`${DESERIALIZE}: ${key}: invalid type: ${kind}, expected a sequence ${at(cur.loc())}`);
   }
   cur.bump();
@@ -509,7 +567,7 @@ function readStringList(cur: Cursor, key: string): string[] | null {
         const kind = cur.peek() === "[" ? "sequence" : "map";
         fail(`${DESERIALIZE}: ${key}[${index}]: invalid type: ${kind}, expected a string ${at(where)}`);
       }
-      const described = describeOther(cur);
+      const described = describeOther(cur, `${key}[${index}]`);
       fail(`${DESERIALIZE}: ${key}[${index}]: invalid type: ${described}, expected a string ${at(cur.loc())}`);
     }
     items.push(readString(cur, `${key}[${index}]`));
@@ -524,7 +582,7 @@ function readStringList(cur: Cursor, key: string): string[] | null {
       cur.bump();
       return items;
     }
-    syntax(cur);
+    parseFail(`${key}: expected \`,\` or \`]\``, peekLoc(cur));
   }
   syntax(cur);
 }
@@ -536,13 +594,13 @@ function expectString(cur: Cursor, key: string, expected: string): string {
       const kind = cur.peek() === "[" ? "sequence" : "map";
       fail(`${DESERIALIZE}: ${key}: invalid type: ${kind}, expected ${expected} ${at(where)}`);
     }
-    const kind = describeOther(cur);
+    const kind = describeOther(cur, key);
     fail(`${DESERIALIZE}: ${key}: invalid type: ${kind}, expected ${expected} ${at(cur.loc())}`);
   }
   return readString(cur, key);
 }
 
-function describeOther(cur: Cursor): string {
+function describeOther(cur: Cursor, path = ""): string {
   const peek = cur.peek();
   if (peek === "t" || peek === "f") {
     const word = peek === "t" ? "true" : "false";
@@ -560,16 +618,30 @@ function describeOther(cur: Cursor): string {
     }
     return `integer \`${token}\``;
   }
-  syntax(cur);
+  syntax(cur, path);
+}
+
+function asciiSlice(cur: Cursor, start: number, end: number): string {
+  let out = "";
+  for (let i = start; i < end; i += 1) {
+    out += String.fromCharCode(cur.bytes[i]!);
+  }
+  return out;
 }
 
 function jsonValue(cur: Cursor, path: string): unknown {
   const start = cur.i;
   skipValue(cur, path);
+  let text: string;
   try {
-    return JSON.parse(cur.raw.slice(start, cur.i)) as unknown;
+    text = new TextDecoder("utf-8", { fatal: true }).decode(cur.bytes.subarray(start, cur.i));
   } catch {
-    syntax(cur);
+    syntax(cur, path);
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    syntax(cur, path);
   }
 }
 
@@ -632,15 +704,26 @@ function readString(cur: Cursor, path?: string): string {
     syntax(cur);
   }
   const out = { text: "" };
+  let sawInvalid = false;
   while (cur.peek() !== "") {
     const ch = cur.bump();
+    if (cur.lastInvalid) {
+      sawInvalid = true;
+      continue;
+    }
     if (ch === '"') {
+      if (sawInvalid) {
+        stringError(cur, path, "invalid unicode code point");
+      }
       return out.text;
     }
     if (ch === "\\") {
       const esc = cur.bump();
       if (esc === "") {
         stringError(cur, path, "EOF while parsing a string");
+      }
+      if (cur.lastInvalid) {
+        stringError(cur, path, "invalid escape");
       }
       if (esc === '"' || esc === "\\" || esc === "/") {
         out.text += esc;
@@ -713,7 +796,7 @@ function readNumber(cur: Cursor): string {
       cur.bump();
     }
   }
-  return cur.raw.slice(start, cur.i);
+  return asciiSlice(cur, start, cur.i);
 }
 
 function skipValue(cur: Cursor, path = ""): Loc {
@@ -744,7 +827,8 @@ function skipValue(cur: Cursor, path = ""): Loc {
     }
     while (cur.peek() !== "") {
       if (cur.peek() !== '"') {
-        syntax(cur);
+        const prefix = path.length === 0 ? "" : `${path}.?: `;
+        parseFail(`${prefix}key must be a string`, peekLoc(cur));
       }
       const key = readString(cur, path.length === 0 ? undefined : `${path}.?`);
       cur.skipWs();
@@ -763,7 +847,8 @@ function skipValue(cur: Cursor, path = ""): Loc {
         cur.bump();
         return cur.loc();
       }
-      syntax(cur);
+      const prefix = path.length === 0 ? "" : `${path}.?: `;
+      parseFail(`${prefix}expected \`,\` or \`}\``, peekLoc(cur));
     }
     syntax(cur);
   }
@@ -788,11 +873,12 @@ function skipValue(cur: Cursor, path = ""): Loc {
         cur.bump();
         return cur.loc();
       }
-      syntax(cur);
+      const prefix = path.length === 0 ? "" : `${path}: `;
+      parseFail(`${prefix}expected \`,\` or \`]\``, peekLoc(cur));
     }
     syntax(cur);
   }
-  syntax(cur);
+  syntax(cur, path);
 }
 
 function formatRustFloat(token: string): string {
