@@ -205,6 +205,27 @@ function rotationStart(pool: readonly CredentialConfig[], tick: number, strategy
   return count - 1;
 }
 
+/** A provider may echo the credential it rejected. Replace it before classification. */
+function redactUpstreamCredential(body: string, headers: Headers): string {
+  const secrets: string[] = [];
+  const authorization = headers.get("authorization");
+  if (authorization) {
+    const bearer = /^Bearer\s+(\S+)/i.exec(authorization);
+    if (bearer?.[1]) {
+      secrets.push(bearer[1]);
+    }
+  }
+  const apiKey = headers.get("x-api-key");
+  if (apiKey && apiKey.length > 0) {
+    secrets.push(apiKey);
+  }
+  let text = body;
+  for (const secret of secrets) {
+    text = text.split(secret).join("[REDACTED]");
+  }
+  return text;
+}
+
 export function classifyUpstream(status: number, body: string): GatewayFailure {
   let message = "upstream request failed";
   try {
@@ -343,7 +364,10 @@ export async function callUpstream(input: {
   }
   if (!response.ok) {
     const errorBudget = phaseBudget(transport.bufferedBodyTimeoutMs, deadlineAt, now());
-    const text = await readErrorBody(response, transport.maxErrorBytes, errorBudget.ms);
+    const text = redactUpstreamCredential(
+      await readErrorBody(response, transport.maxErrorBytes, errorBudget.ms),
+      input.headers,
+    );
     throw classifyUpstream(response.status, text);
   }
   if (!input.stream || response.body === null) {

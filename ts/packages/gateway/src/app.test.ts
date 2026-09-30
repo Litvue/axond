@@ -662,7 +662,7 @@ test("credential_lease_spans_follow_the_pool_walk", async () => {
     const failedAttempt = third.find((span) => span.name === "axond.upstream.attempt");
     assert.ok(failedAttempt);
     assert.equal(attr(failedAttempt, "axond.upstream.status"), "500");
-    assert.equal(attr(failedAttempt, "axond.upstream.message"), "slow down ");
+    assert.equal(attr(failedAttempt, "axond.upstream.message"), "slow down [REDACTED]");
     assert.equal(attr(failedAttempt, "axond.timeout"), undefined);
     const exported = traces.join("\n");
     assert.equal(exported.includes(KEY), false);

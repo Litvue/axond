@@ -3605,3 +3605,85 @@ test("upstream_redirect_is_not_followed_and_omits_the_secret", async () => {
     target.close();
   }
 });
+
+test("provider_error_replaces_the_echoed_credential", async () => {
+  const openaiSecret = "sk-echo-openai";
+  const anthropicSecret = "sk-echo-anthropic";
+  const upstream = await listen((req, res) => {
+    const messages = (req.url ?? "").includes("/messages");
+    const secret = messages ? anthropicSecret : openaiSecret;
+    assert.equal(messages ? req.headers["x-api-key"] : req.headers.authorization, messages ? secret : `Bearer ${secret}`);
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: `rejected key ${secret}` } }));
+  });
+  const store = await seeded();
+  const logs: unknown[] = [];
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [
+      { id: "fake-openai", kind: "openai", baseUrl: upstream.url },
+      { id: "fake-anthropic", kind: "anthropic", baseUrl: upstream.url },
+    ],
+    credentials: [
+      { namespace: "platform", provider: "fake-openai", secret: openaiSecret, id: "openai" },
+      { namespace: "platform", provider: "fake-anthropic", secret: anthropicSecret, id: "anthropic" },
+    ],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+      {
+        provider: "fake-anthropic",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  try {
+    const chat = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    const chatText = await chat.text();
+    assert.equal(chat.status, 502);
+    const chatBody = JSON.parse(chatText) as { error: { type: string; message: string } };
+    assert.equal(chatBody.error.type, "invalid_request");
+    assert.equal(chatBody.error.message, "rejected key [REDACTED]");
+    assert.equal(chatText.includes(openaiSecret), false);
+    const messages = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-anthropic/claude-test",
+        max_tokens: 16,
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    const messageText = await messages.text();
+    assert.equal(messages.status, 502);
+    const messageBody = JSON.parse(messageText) as { error: { type: string; message: string } };
+    assert.equal(messageBody.error.type, "invalid_request");
+    assert.equal(messageBody.error.message, "rejected key [REDACTED]");
+    assert.equal(messageText.includes(anthropicSecret), false);
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes(openaiSecret), false);
+    assert.equal(encoded.includes(anthropicSecret), false);
+    assert.equal(encoded.includes(KEY), false);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+  } finally {
+    upstream.close();
+  }
+});
