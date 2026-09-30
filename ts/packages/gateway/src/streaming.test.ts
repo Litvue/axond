@@ -114,3 +114,86 @@ test("a buffered fixture is relayed without a keepalive comment", async () => {
   assert.equal(new TextDecoder().decode(got).includes(": keepalive"), false);
   upstream.close();
 });
+
+test("an open stream emits a keepalive comment 15s after the last chunk", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000_000_000n);
+  const upstream = await new Promise<{ url: string; close: () => void }>((resolve) => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write('data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n');
+    });
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("no port");
+      }
+      resolve({
+        url: `http://127.0.0.1:${address.port}`,
+        close: () => {
+          server.closeAllConnections();
+          server.close();
+        },
+      });
+    });
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error("missing body");
+    }
+    const decoder = new TextDecoder();
+    let text = "";
+    let firstAt = 0;
+    while (!text.includes(": keepalive\n\n")) {
+      if (firstAt !== 0 && Date.now() - firstAt > 20_000) {
+        break;
+      }
+      const next = await reader.read();
+      if (firstAt === 0) {
+        firstAt = Date.now();
+      }
+      if (next.done) {
+        break;
+      }
+      text += decoder.decode(next.value, { stream: true });
+    }
+    const elapsed = Date.now() - firstAt;
+    await reader.cancel();
+    assert.equal(text.includes('data: {"choices":[{"delta":{"content":"Hi"}}]}'), true);
+    assert.equal(text.includes(": keepalive\n\n"), true);
+    assert.equal(text.includes("upstream_stream_error"), false);
+    assert.equal(text.includes("[DONE]"), false);
+    assert.ok(elapsed >= 14_000 && elapsed < 20_000);
+  } finally {
+    upstream.close();
+  }
+});
