@@ -126,6 +126,18 @@ export function readStrictObject(
   fail(`${DESERIALIZE}: invalid type: ${described}, expected struct ${structName} ${at(cur.loc())}`);
 }
 
+/**
+ * serde stamps a duplicate or unknown field after `end_map` runs.
+ * Whitespace is consumed. A closing `}` is consumed. Any other byte stays.
+ */
+function fieldErrorLoc(cur: Cursor): Loc {
+  cur.skipWs();
+  if (cur.peek() === "}") {
+    cur.bump();
+  }
+  return cur.loc();
+}
+
 function readObjectFields(cur: Cursor, fields: readonly StrictField[]): Record<string, unknown> {
   cur.bump();
   const names = fields.map((field) => field.name);
@@ -150,17 +162,20 @@ function readObjectFields(cur: Cursor, fields: readonly StrictField[]): Record<s
       parseFail("key must be a string", peekLoc(cur));
     }
     const key = readString(cur);
-    const keyEnd = cur.loc();
+    const field = byName.get(key);
+    if (!field || seen.has(key)) {
+      const loc = fieldErrorLoc(cur);
+      if (!field) {
+        fail(`${DESERIALIZE}: ${key}: unknown field \`${key}\`, ${expectedFields(names)} ${at(loc)}`);
+      }
+      fail(`${DESERIALIZE}: duplicate field \`${key}\` ${at(loc)}`);
+    }
     cur.skipWs();
     if (cur.peek() !== ":") {
       parseFail("expected `:`", peekLoc(cur));
     }
     cur.bump();
     cur.skipWs();
-    const field = byName.get(key);
-    if (!field) {
-      fail(`${DESERIALIZE}: ${key}: unknown field \`${key}\`, ${expectedFields(names)} ${at(keyEnd)}`);
-    }
     out[key] = readField(cur, field, key);
     seen.add(key);
     cur.skipWs();

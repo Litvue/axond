@@ -1109,6 +1109,67 @@ test("management_json_matches_serde_syntax_and_null_attrs", async () => {
   }
 });
 
+test("management_json_rejects_duplicate_fields", async () => {
+  const { app, upstream } = await gateway();
+  try {
+    const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+    const call = (path: string, method: string, body?: string) =>
+      app.request(`http://127.0.0.1${path}`, { method, headers, ...(body === undefined ? {} : { body }) });
+    const bad = async (path: string, method: string, body: string, message: string) => {
+      const response = await call(path, method, body);
+      assert.equal(response.status, 400, `${method} ${path} ${body}`);
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+    };
+    const data = "Failed to deserialize the JSON body into the target type";
+    const parse = "Failed to parse the request body as JSON";
+    await bad("/api/v1/namespaces", "POST", '{"id":"a","id":"b"}', `${data}: duplicate field \`id\` at line 1 column 14`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"a","id":}', `${data}: duplicate field \`id\` at line 1 column 14`);
+    await bad("/api/v1/namespaces", "POST", '{"id" : "a", "id" : "b"}', `${data}: duplicate field \`id\` at line 1 column 18`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"a","id"}', `${data}: duplicate field \`id\` at line 1 column 15`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"a","id" }', `${data}: duplicate field \`id\` at line 1 column 16`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"a","id" : 1}', `${data}: duplicate field \`id\` at line 1 column 15`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"a","id":\n"b"}', `${data}: duplicate field \`id\` at line 1 column 14`);
+    await bad("/api/v1/namespaces", "POST", '{"extra" 1}', `${data}: extra: unknown field \`extra\`, expected one of \`id\`, \`attrs\`, \`blocklist\` at line 1 column 9`);
+    await bad("/api/v1/namespaces", "POST", '{"id" 1}', `${parse}: expected \`:\` at line 1 column 7`);
+    await bad("/api/v1/namespaces", "POST", '{"id":"', `${parse}: id: EOF while parsing a string at line 1 column 7`);
+    const missing = await call("/api/v1/namespaces/wsp_dup", "GET");
+    assert.equal(missing.status, 404);
+
+    const created = await call("/api/v1/namespaces", "POST", '{"id":"wsp_dup","attrs":{"org":"acme"}}');
+    assert.equal(created.status, 201);
+    await bad("/api/v1/namespaces/wsp_dup", "PUT", '{"attrs":1,"attrs":2}', `${data}: duplicate field \`attrs\` at line 1 column 18`);
+    await bad("/api/v1/namespaces/wsp_dup", "PUT", '{"nope"}', `${data}: nope: unknown field \`nope\`, expected \`attrs\` or \`blocklist\` at line 1 column 8`);
+    await bad("/api/v1/namespaces/wsp_dup", "PUT", '{"nope" }', `${data}: nope: unknown field \`nope\`, expected \`attrs\` or \`blocklist\` at line 1 column 9`);
+    const kept = await call("/api/v1/namespaces/wsp_dup", "GET");
+    assert.equal(kept.status, 200);
+    assert.equal((await kept.json()).attrs.org, "acme");
+
+    const nested = await call("/api/v1/namespaces", "POST", '{"id":"wsp_nest","attrs":{"k":"a","k":"b"}}');
+    assert.equal(nested.status, 201);
+    assert.equal((await nested.json()).attrs.k, "b");
+
+    const budget = await call("/api/v1/namespaces/wsp_dup/budgets/2026-09", "PUT", '{"limit_microdollars":7}');
+    assert.equal(budget.status, 200);
+    await bad(
+      "/api/v1/namespaces/wsp_dup/budgets/2026-09",
+      "PUT",
+      '{"limit_microdollars":1,"limit_microdollars":2}',
+      `${data}: duplicate field \`limit_microdollars\` at line 1 column 44`,
+    );
+    const budgetKept = await call("/api/v1/namespaces/wsp_dup/budgets/2026-09", "GET");
+    assert.equal(budgetKept.status, 200);
+    assert.equal((await budgetKept.json()).limit_microdollars, 7);
+    await bad(
+      "/api/v1/namespaces/wsp_dup/budget",
+      "PUT",
+      '{"cadence":"monthly","cadence":"fixed","limit_microdollars":1}',
+      `${data}: duplicate field \`cadence\` at line 1 column 30`,
+    );
+  } finally {
+    upstream.close();
+  }
+});
+
 test("ten settlements of one request_id charge once", async () => {
   const store = createMemoryStore();
   await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: true });
