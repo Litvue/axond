@@ -867,6 +867,26 @@ async function dispatch(
         limit,
       });
     };
+    const noteTerminalRemain = (bound: "grace" | "duration") => {
+      if (bound === "grace") {
+        emitLog(opts, {
+          msg: "terminal_remain",
+          request_id: axond.requestId,
+          provider: provider.id,
+          model: axond.target?.model ?? "",
+          bound: "grace",
+          grace_ms: transport.streamTerminalGraceMs ?? 1_000,
+        });
+        return;
+      }
+      emitLog(opts, {
+        msg: "terminal_remain",
+        request_id: axond.requestId,
+        provider: provider.id,
+        model: axond.target?.model ?? "",
+        bound: "duration",
+      });
+    };
     const noteTransport = (
       phase: "request" | "stream" | "closing",
       reason: TransportFailureReason,
@@ -901,6 +921,7 @@ async function dispatch(
             dispatcher: opts.upstreamDispatcher,
             onTimeout: noteTimeout,
             onStreamLimit: noteStreamLimit,
+            onTerminalRemain: noteTerminalRemain,
             onTransport: noteTransport,
             onUsage: (next) => copyUsage(usage, next),
             onStreamDone: (reason) => finishStream(nextCredential, reason),
@@ -941,6 +962,7 @@ async function dispatch(
         dispatcher: opts.upstreamDispatcher,
         onTimeout: noteTimeout,
         onStreamLimit: noteStreamLimit,
+        onTerminalRemain: noteTerminalRemain,
         onTransport: noteTransport,
         onUsage: (next) => copyUsage(usage, next),
         onStreamDone: (reason) => finishStream(credential, reason),

@@ -131,6 +131,28 @@ export interface StreamLimitLog {
 }
 
 /**
+ * A byte-faithful body stayed open after its terminal event until a close bound.
+ * `grace` is `transport.stream_terminal_grace_ms`. `duration` is the total stream
+ * bound. The socket address stays off this line. The charge remains `ok`.
+ */
+export type TerminalRemainLog =
+  | {
+      msg: "terminal_remain";
+      request_id: string;
+      provider: string;
+      model: string;
+      bound: "grace";
+      grace_ms: number;
+    }
+  | {
+      msg: "terminal_remain";
+      request_id: string;
+      provider: string;
+      model: string;
+      bound: "duration";
+    };
+
+/**
  * A charge missed a settlement bound, or the Store rejected the write.
  * `queue_timeout` means the charge never started and spend was not written.
  * `execution_timeout` means Store work outlived its deadline and still finishes.
@@ -211,6 +233,7 @@ export type AxondLog =
   | UpstreamTimeoutLog
   | UpstreamTransportLog
   | StreamLimitLog
+  | TerminalRemainLog
   | SettlementFailureLog
   | BudgetUnavailableLog
   | CatalogueImportLog
@@ -440,9 +463,10 @@ export interface AxondOptions {
    * routed but has not settled, so those fields are absent. A rate-limit
    * rotation, an upstream timeout, a transport failure, a stream duration or
    * byte cap, a settlement bound, a failed Store write, a budget-store outage,
-   * and a catalogue import are separate lines. The CLI also writes a shutdown
-   * line for each phase. None of them carry a body, a credential, a driver
-   * message, a bind address, or a source URL.
+   * a catalogue import, and a byte-faithful body that stays open until the
+   * post-terminal grace or the stream duration bound are separate lines. The
+   * CLI also writes a shutdown line for each phase. None of them carry a body,
+   * a credential, a driver message, a bind address, or a source URL.
    */
   onLog?: (record: AxondLog) => void;
   maxRequestBytes?: number;

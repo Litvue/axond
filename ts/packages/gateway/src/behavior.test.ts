@@ -716,6 +716,145 @@ test("stream_limit_log_names_the_duration_cap", async () => {
   }
 });
 
+test("terminal_remain_log_names_the_bound_and_omits_the_secret", async () => {
+  const store = await seeded();
+  const logs: { msg: string; bound?: string; grace_ms?: number; provider?: string; model?: string; request_id?: string }[] = [];
+  const records: UsageRecord[] = [];
+  const completed =
+    'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}\n\n';
+  const doneFrame = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\ndata: [DONE]\n\n';
+  let mode: "grace" | "duration" | "eof" = "grace";
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    if (mode === "grace") {
+      res.write(completed);
+      return;
+    }
+    res.write(doneFrame);
+    if (mode === "eof") {
+      res.end();
+    }
+  });
+  const shared = {
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai" as const, baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onLog: (record: { msg: string; bound?: string; grace_ms?: number; provider?: string; model?: string; request_id?: string }) => {
+      logs.push(record);
+    },
+    onUsage: (record: UsageRecord) => {
+      records.push(record);
+    },
+  };
+  const graceApp = createAxond({
+    ...shared,
+    transport: {
+      responseHeaderTimeoutMs: 1_000,
+      bufferedBodyTimeoutMs: 1_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 80,
+      maxResponseBytes: 4096,
+    },
+  });
+  const durationApp = createAxond({
+    ...shared,
+    maxStreamDurationMs: 200,
+    transport: {
+      responseHeaderTimeoutMs: 1_000,
+      bufferedBodyTimeoutMs: 1_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 5_000,
+      maxResponseBytes: 4096,
+    },
+  });
+  const eofApp = createAxond({
+    ...shared,
+    transport: {
+      responseHeaderTimeoutMs: 1_000,
+      bufferedBodyTimeoutMs: 1_000,
+      streamIdleTimeoutMs: 5_000,
+      streamTerminalGraceMs: 800,
+      maxResponseBytes: 4096,
+    },
+  });
+  try {
+    const graceResponse = await graceApp.request("http://127.0.0.1/ns/platform/v1/responses", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, input: "PROMPT_SENTINEL" }),
+    });
+    assert.equal(graceResponse.status, 200);
+    const graceText = await graceResponse.text();
+    assert.equal(graceText, completed);
+    assert.equal(graceText.includes("upstream_stream_error"), false);
+    const grace = logs.find((line) => line.msg === "terminal_remain" && line.bound === "grace");
+    assert.ok(grace);
+    assert.equal(grace.grace_ms, 80);
+    assert.equal(grace.provider, "fake-openai");
+    assert.equal(grace.model, "gpt-test");
+    assert.equal(typeof grace.request_id, "string");
+    assert.equal((grace.request_id ?? "").length > 0, true);
+    mode = "duration";
+    const durationResponse = await durationApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        stream: true,
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(durationResponse.status, 200);
+    const durationText = await durationResponse.text();
+    assert.equal(durationText.includes("data: [DONE]\n\n"), true);
+    assert.equal(durationText.includes("upstream_stream_error"), false);
+    assert.equal(durationText.includes("stream exceeded"), false);
+    const duration = logs.find((line) => line.msg === "terminal_remain" && line.bound === "duration");
+    assert.ok(duration);
+    assert.equal(duration.grace_ms, undefined);
+    assert.equal(duration.provider, "fake-openai");
+    assert.equal(duration.model, "gpt-test");
+    assert.equal(duration.request_id === grace.request_id, false);
+    mode = "eof";
+    const before = logs.filter((line) => line.msg === "terminal_remain").length;
+    const started = Date.now();
+    const eofResponse = await eofApp.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        stream: true,
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    assert.equal(eofResponse.status, 200);
+    assert.equal((await eofResponse.text()).includes("data: [DONE]\n\n"), true);
+    assert.ok(Date.now() - started < 500);
+    assert.equal(logs.filter((line) => line.msg === "terminal_remain").length, before);
+    for (let attempt = 0; attempt < 30 && records.length < 2; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.filter((record) => record.status === "ok").length >= 2, true);
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes("sk-live-secret"), false);
+    assert.equal(encoded.includes(KEY), false);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+    assert.equal(encoded.includes(upstream.url), false);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("transport_failure_reason_is_a_bounded_class", () => {
   const refused = Object.assign(new Error("fetch failed"), {
     cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9"), { code: "ECONNREFUSED" }),

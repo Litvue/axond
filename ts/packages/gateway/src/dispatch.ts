@@ -265,6 +265,11 @@ export async function callUpstream(input: {
   /** An open stream hit its duration or byte cap before a terminal event. */
   onStreamLimit?: (limit: "duration" | "bytes") => void;
   /**
+   * A byte-faithful body stayed open after its terminal event until this bound.
+   * The charge stays `ok`.
+   */
+  onTerminalRemain?: (bound: "grace" | "duration") => void;
+  /**
    * The socket failed. `phase` is `request` before headers, `stream` while
    * relaying, or `closing` after a terminal event. The reason is a class, not
    * the runtime message.
@@ -383,6 +388,7 @@ export async function callUpstream(input: {
     input.onDownstreamFirstToken,
     input.onUpstreamFirstToken,
     input.clockStartedMs ?? now(),
+    input.onTerminalRemain,
   );
   const headers = passHeaders(response.headers);
   headers.set("content-type", "text/event-stream");
@@ -441,6 +447,7 @@ function relayStream(
   onDownstreamFirstToken?: (elapsedMs: number) => void,
   onUpstreamFirstToken?: (elapsedMs: number) => void,
   clockStartedMs: number = Date.now(),
+  onTerminalRemain?: (bound: "grace" | "duration") => void,
 ): ReadableStream<Uint8Array> {
   let reader = upstream.getReader();
   const decoder = new TextDecoder();
@@ -573,7 +580,7 @@ function relayStream(
           inflight = next;
         }, transport.streamIdleTimeoutMs, sawChunkAt, controller, () => (
           terminalAt === null ? null : terminalAt + transport.streamTerminalGraceMs
-        ), durationAt, onTimeout);
+        ), durationAt, onTimeout, onTerminalRemain);
       } catch (error) {
         if (terminalAt !== null) {
           if (!(error instanceof GatewayFailure)) {
@@ -752,6 +759,7 @@ async function readWithIdle(
   graceAt: () => number | null,
   durationAt: number | null,
   onTimeout?: (kind: string, bound: string) => void,
+  onTerminalRemain?: (bound: "grace" | "duration") => void,
 ): Promise<Uint8Array | null | "keepalive" | "duration"> {
   let read = current();
   if (read === null) {
@@ -767,8 +775,14 @@ async function readWithIdle(
     const terminalDeadline = graceAt();
     const graceLeft = terminalDeadline === null ? Number.POSITIVE_INFINITY : terminalDeadline - now;
     const durationLeft = durationAt === null ? Number.POSITIVE_INFINITY : durationAt - now;
+    if (terminalDeadline !== null && graceLeft <= 0 && graceLeft <= durationLeft) {
+      await reader.cancel().catch(() => undefined);
+      onTerminalRemain?.("grace");
+      return null;
+    }
     if (durationLeft <= 0 && terminalDeadline !== null) {
       await reader.cancel().catch(() => undefined);
+      onTerminalRemain?.("duration");
       return null;
     }
     if (durationLeft <= 0 && durationLeft <= idleLeft && durationLeft <= graceLeft) {

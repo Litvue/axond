@@ -367,7 +367,11 @@ Byte-faithful Native and Responses relays may forward provider extension bytes
 after the semantic terminal event, but only for the fixed
 `transport.stream_terminal_grace_ms`. Expiry closes the completed response
 successfully and releases its request, stream, and caller capacity; it is not an
-upstream timeout and does not increment `axond.upstream.timeouts`.
+upstream timeout and does not increment `axond.upstream.timeouts`. The TypeScript
+process writes JSON `msg` `terminal_remain` with `bound` `grace` and `grace_ms`
+when that grace elapses while the socket is still open, and `bound` `duration`
+when the total stream bound elapses first. A clean EOF writes neither line.
+The line omits the endpoint.
 
 A `504` whose phase is `overall` reports the gateway's own spent failover
 budget, so it is attributed to the request and the target's metrics but does not
