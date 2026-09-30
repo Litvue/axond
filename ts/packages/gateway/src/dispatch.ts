@@ -1,6 +1,7 @@
 import type { CredentialConfig, ProviderConfig, TransportLimits } from "@axond/sdk";
 
 import { GatewayFailure } from "./errors.ts";
+import { createNativeMessagesSequence, type NativeMessagesSequence } from "./native-messages.ts";
 import { applyObservedCharge, assignUsage, emptyUsage, noteSseChunk, relayedTextChars, sseTerminalSeen, usageFromJson } from "./usage.ts";
 import type { UsageTokens } from "@axond/sdk";
 
@@ -542,6 +543,9 @@ function relayStream(
     : null;
   const byteLimit = maxStreamBytes !== null && maxStreamBytes > 0 ? maxStreamBytes : null;
   let unscanned = "";
+  const messagesSequence: NativeMessagesSequence | null = route === "messages"
+    ? createNativeMessagesSequence(isRateLimitPayload)
+    : null;
   let rateLimitNoted = false;
   let stopRateLimitScan = false;
   let observedChars = 0;
@@ -685,6 +689,11 @@ function relayStream(
         if (!committed) {
           releaseHeld(controller);
         }
+        const incomplete = messagesSequence?.finish();
+        if (incomplete) {
+          failBound(controller, incomplete);
+          return;
+        }
         finish("end");
         controller.close();
         return;
@@ -742,6 +751,13 @@ function relayStream(
       pending = tail(buffered);
       markDownstream();
       controller.enqueue(value);
+      const sequenceError = messagesSequence?.push(piece);
+      if (sequenceError) {
+        controller.enqueue(streamFailureFrame(route, sequenceError));
+        finish("fail");
+        controller.close();
+        await reader.cancel().catch(() => undefined);
+      }
     },
     cancel(reason) {
       if (!delegated) {

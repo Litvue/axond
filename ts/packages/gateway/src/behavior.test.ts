@@ -1953,7 +1953,7 @@ test("an incomplete tail after the terminal event is relayed through eof", async
 
 const MESSAGES_TERMINAL = [
   'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
-  'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":1}}\n\n',
+  'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
   'event: message_stop\ndata: {"type":"message_stop"}\n\n',
 ].join("");
 
@@ -2599,6 +2599,7 @@ test("a native messages stream does not rotate on a rate-limit event", async () 
   assert.equal(response.status, 200);
   const body = await response.text();
   assert.match(body, /rate_limit_error/);
+  assert.match(body, /provider stream was rate limited: Anthropic stream rate limited/);
   assert.deepEqual(seen, ["bad-key"]);
   const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
   const rows = (await status.json()).data as { credential_id: string; state: string }[];
@@ -4329,6 +4330,67 @@ test("messages_wire_headers_default_the_version_and_keep_the_caller_pin", async 
     assert.notEqual(seen[3]?.accept, "text/plain");
     assert.equal(seen.some((headers) => headers.authorization?.includes(KEY)), false);
     assert.equal(seen.some((headers) => headers.apiKey === KEY), false);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("native_messages_sequence_ends_an_invalid_stream", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const upstreamBytes = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(upstreamBytes);
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-anthropic", kind: "anthropic", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-anthropic", secret: "sk-sequence", id: "one" }],
+    prices: [
+      {
+        provider: "fake-anthropic",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-anthropic/claude-test",
+        stream: true,
+        messages: [],
+        max_tokens: 16,
+      }),
+    });
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.equal(text.startsWith(upstreamBytes), true);
+    assert.match(
+      text,
+      /provider stream was invalid: native Messages message_stop arrived before a complete message sequence/,
+    );
+    assert.equal(text.includes("sk-sequence"), false);
+    assert.equal(text.includes(KEY), false);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "upstream_error");
+    const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", {
+      headers: { authorization: `Bearer ${KEY}` },
+    });
+    const rows = (await status.json()).data as { credential_id: string; state: string }[];
+    assert.equal(rows.find((row) => row.credential_id === "one")?.state, "healthy");
   } finally {
     upstream.close();
   }
