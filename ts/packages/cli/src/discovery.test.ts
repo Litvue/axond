@@ -445,6 +445,7 @@ test("provider_listing_walks_the_pool_and_omits_the_secret", async () => {
 
   urls.length = 0;
   logs.length = 0;
+  await store.markProviderModelsStale("fake-openai");
   await store.upsertProviderModels({
     provider: "fake-openai",
     fetchedAt: "2026-09-29T00:01:00Z",
