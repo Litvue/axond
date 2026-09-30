@@ -44,6 +44,7 @@ import { sanitizeAttributes } from "./metrics.ts";
 import { OPENAPI } from "./openapi.ts";
 import { costMicrodollars, lookupPrice } from "./pricing.ts";
 import { parseCredentialQuery, rawSearch, readListQuery, readUsagePeriod } from "./query.ts";
+import { mintRequestId } from "./request-id.ts";
 import { scopeStore } from "./scoped-store.ts";
 import { emptyUsage } from "./usage.ts";
 
@@ -373,7 +374,7 @@ function assertExtensionMetric(name: string): void {
 
 function createContext(c: Context<AxondEnv>, opts: AxondOptions): MutableContext {
   const header = c.req.header("x-request-id");
-  const requestId = header && /^[A-Za-z0-9._:-]{1,128}$/.test(header) ? header : crypto.randomUUID();
+  const requestId = header && /^[A-Za-z0-9._:-]{1,128}$/.test(header) ? header : mintRequestId();
   const ctx: MutableContext = {
     requestId,
     startedMs: Date.now(),

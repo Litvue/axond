@@ -42,6 +42,8 @@ meaning, and how they are allowed to change. The design rationale is
 | `started_at` | `timestamptz` | `recorded_at - latency_ms`. |
 | `recorded_at` | `timestamptz` | When the gateway settled the request. Excludes the sink's own batching delay. |
 
+A `request_id` minted by the gateway is `req_` plus a lowercase canonical UUIDv7, and ids minted in one process sort in the order they were minted. The TypeScript gateway uses a caller `x-request-id` of 1–128 characters from `[A-Za-z0-9._:-]` as that id.
+
 `status` describes the terminal outcome the gateway observed, not proof that a
 peer received an HTTP body. For buffered requests, `ok` means provider work and
 response middleware completed and the response was eligible to return;

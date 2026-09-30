@@ -285,6 +285,68 @@ test("usage_event_copies_admission_attrs", async () => {
   }
 });
 
+const MINTED_REQUEST_ID = /^req_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+test("minted_request_id_is_a_uuid7", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}');
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    onUsage: (record) => {
+      records.push(record);
+    },
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const chat = async (requestId?: string) => {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: requestId === undefined ? headers : { ...headers, "x-request-id": requestId },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [] }),
+    });
+    assert.equal(response.status, 200);
+    await response.text();
+  };
+  try {
+    await chat();
+    await chat();
+    await chat("worker-price-once");
+    await chat("bad id");
+    await chat("a".repeat(129));
+    await chat("b".repeat(128));
+    for (let attempt = 0; attempt < 20 && records.length < 6; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 6);
+    const [first, second, kept, spaced, tooLong, maxLength] = records;
+    assert.match(first!.requestId, MINTED_REQUEST_ID);
+    assert.equal(first!.requestId.length, 40);
+    assert.match(second!.requestId, MINTED_REQUEST_ID);
+    assert.equal(first!.requestId < second!.requestId, true);
+    assert.equal(kept!.requestId, "worker-price-once");
+    assert.match(spaced!.requestId, MINTED_REQUEST_ID);
+    assert.match(tooLong!.requestId, MINTED_REQUEST_ID);
+    assert.equal(maxLength!.requestId, "b".repeat(128));
+  } finally {
+    upstream.close();
+  }
+});
+
 test("a stalled stream settles upstream_error for the text already relayed", async () => {
   const store = await seeded();
   const before = (await store.getBudget("platform", "compat"))!;
