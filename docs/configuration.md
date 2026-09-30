@@ -291,7 +291,7 @@ Not on the inference path. `GET /api/v1/providers/{id}/models` and
 | --- | --- | --- | --- |
 | `refresh_interval_seconds` | integer | `300` | Seconds between refresh rounds. The first round runs at boot; an empty provider set retries with short backoff instead of waiting the full interval. `0` is rejected. |
 
-The refresh tries each credential in the platform pool and keeps the first complete listing. With no platform credential it uses the lexicographically first tenant pool. Anthropic `has_more` and `last_id` pages are followed, up to 20 pages. Objects without an id are dropped. A listing that does not end inside that bound logs reason `page_bound` and does not store a partial page list. The first round in the process may replace a row fetched from another base URL. A later round leaves a fresh row from another base URL in place and does not call the provider.
+The refresh tries each credential in the platform pool and keeps the first complete listing. With no platform credential it uses the lexicographically first tenant pool. Anthropic `has_more` and `last_id` pages are followed, up to 20 pages. Objects without an id are dropped. A listing that does not end inside that bound logs reason `page_bound` and does not store a partial page list. The first round in the process may replace a row fetched from another base URL. A later round leaves a fresh row from another base URL in place and does not call the provider. A `3xx` from `GET /models` is not followed. The credential stays on the configured URL, the cache is marked stale, and the reason is `unreachable`.
 
 A failed provider refresh writes JSON `msg` `provider_discovery` with the provider id and reason `no_credential`, `unreachable`, `denied`, `not_json`, `not_retained`, or `page_bound`. The previous cache stays in place and is marked stale when the store accepts that write. The line omits the credential, the base URL, and the driver text.
 
@@ -817,7 +817,10 @@ must still name the exact supported `/catalog.json` document.
 The configured URL is the provenance every snapshot records. A document anyone
 on the path could substitute would become the rates a request is charged at, so
 this gateway will not follow redirects: a `3xx` is a bounded refusal naming its
-status rather than an import of whatever the answer pointed at.
+status rather than an import of whatever the answer pointed at. The TypeScript
+importer does the same. A catalogue `3xx` is reason `unsupported_endpoint`. A
+model listing or an inference call keeps the credential on the configured URL
+and leaves the `Location` target unread.
 
 Refreshes are conditional: the stored ETag and `Last-Modified` are sent back, and
 a `304` confirms the active snapshot's freshness without producing new content.

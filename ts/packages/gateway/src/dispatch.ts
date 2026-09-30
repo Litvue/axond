@@ -323,6 +323,7 @@ export async function callUpstream(input: {
       headers: input.headers,
       body: input.body,
       signal: controller.signal,
+      redirect: "manual",
     };
     if (input.dispatcher) {
       init.dispatcher = input.dispatcher;

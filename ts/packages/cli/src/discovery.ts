@@ -184,7 +184,7 @@ async function fetchListing(
     const url = after === null ? `${base}/models` : `${base}/models?after_id=${encodeQueryComponent(after)}`;
     let response: Response;
     try {
-      response = await fetchImpl(url, { headers });
+      response = await fetchImpl(url, { headers, redirect: "manual" });
     } catch {
       return { ok: false, reason: "unreachable" };
     }
@@ -275,7 +275,7 @@ async function refreshCatalog(
 ): Promise<void> {
   let response: Response;
   try {
-    response = await fetchImpl(sourceUrl);
+    response = await fetchImpl(sourceUrl, { redirect: "manual" });
   } catch {
     await input.store.markProviderModelsStale("catalog").catch(() => undefined);
     await noteCatalogRefusal(input, "unreachable");

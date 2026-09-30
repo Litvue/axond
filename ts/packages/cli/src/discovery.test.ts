@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -553,4 +554,84 @@ test("provider_listing_walks_the_pool_and_omits_the_secret", async () => {
   const broken = await store.getProviderModels("broken-page");
   assert.equal(broken?.stale, true);
   assert.deepEqual(broken?.data, []);
+});
+
+function listen(handler: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void) {
+  const server = createServer(handler);
+  return new Promise<{ url: string; close: () => void }>((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        throw new Error("no port");
+      }
+      resolve({
+        url: `http://127.0.0.1:${address.port}`,
+        close: () => {
+          server.closeAllConnections();
+          server.close();
+        },
+      });
+    });
+  });
+}
+
+test("catalogue_and_listing_redirects_are_not_followed_and_omit_the_secret", async () => {
+  const secret = "sk-redirect-sentinel";
+  let targetHits = 0;
+  const target = await listen((_req, res) => {
+    targetHits += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: [{ id: secret }] }));
+  });
+  const moved = await listen((_req, res) => {
+    res.writeHead(302, { location: `${target.url}/landed/${secret}` });
+    res.end();
+  });
+  const store = createMemoryStore();
+  await store.upsertProviderModels({
+    provider: "catalog",
+    fetchedAt: "2026-09-29T00:00:00Z",
+    stale: false,
+    data: [{ id: "kept-catalog" }],
+    source: `${moved.url}/catalog.json`,
+  });
+  await store.upsertProviderModels({
+    provider: "fake-openai",
+    fetchedAt: "2026-09-29T00:00:00Z",
+    stale: false,
+    data: [{ id: "kept-models" }],
+    source: moved.url,
+  });
+  const logs: Array<{ msg: string; reason?: string; outcome?: string }> = [];
+  try {
+    await discoverOnce({
+      store,
+      replaceForeignSource: true,
+      providers: [{ id: "fake-openai", kind: "openai", baseUrl: moved.url }],
+      credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "one" }],
+      catalog: { source: "models-dev", sourceUrl: `${moved.url}/catalog.json` },
+      onLog: (record) => {
+        logs.push(record);
+      },
+    });
+    assert.equal(targetHits, 0);
+    assert.deepEqual(
+      logs.map((line) => (line.msg === "provider_discovery" ? line.reason : `${line.outcome}:${line.reason}`)),
+      ["unreachable", "refused:unsupported_endpoint"],
+    );
+    const models = await store.getProviderModels("fake-openai");
+    assert.equal(models?.stale, true);
+    assert.deepEqual(models?.data, [{ id: "kept-models" }]);
+    assert.equal(models?.source, moved.url);
+    const catalog = await store.getProviderModels("catalog");
+    assert.equal(catalog?.stale, true);
+    assert.deepEqual(catalog?.data, [{ id: "kept-catalog" }]);
+    assert.equal(catalog?.source, `${moved.url}/catalog.json`);
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes(secret), false);
+    assert.equal(encoded.includes(target.url), false);
+  } finally {
+    moved.close();
+    target.close();
+  }
 });

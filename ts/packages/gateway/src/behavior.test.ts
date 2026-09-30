@@ -3545,3 +3545,63 @@ test("a spawned charge's age climbs until the charge finishes", async () => {
     upstream.close();
   }
 });
+
+test("upstream_redirect_is_not_followed_and_omits_the_secret", async () => {
+  const secret = "sk-redirect-sentinel";
+  let targetHits = 0;
+  const target = await listen((_req, res) => {
+    targetHits += 1;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id: secret, choices: [{ message: { content: secret } }] }));
+  });
+  const moved = await listen((req, res) => {
+    assert.equal(req.headers.authorization, `Bearer ${secret}`);
+    res.writeHead(302, { location: `${target.url}/landed/${secret}` });
+    res.end();
+  });
+  const store = await seeded();
+  const logs: unknown[] = [];
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: moved.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 2_500_000n,
+        outputMicrodollarsPerMillion: 10_000_000n,
+      },
+    ],
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-openai/gpt-test",
+        messages: [{ role: "user", content: "PROMPT_SENTINEL" }],
+      }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 400);
+    const body = JSON.parse(text) as { error: { type: string; message: string } };
+    assert.equal(body.error.type, "invalid_request");
+    assert.equal(body.error.message, "upstream request failed");
+    assert.equal(targetHits, 0);
+    assert.equal(text.includes(secret), false);
+    assert.equal(text.includes(target.url), false);
+    const encoded = JSON.stringify(logs);
+    assert.equal(encoded.includes(secret), false);
+    assert.equal(encoded.includes(target.url), false);
+    assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
+  } finally {
+    moved.close();
+    target.close();
+  }
+});
