@@ -279,6 +279,17 @@ test("otlp json joins traceparent and omits the prompt", async () => {
     assert.equal(span.traceId, "4bf92f3577b34da6a3ce929d0e0e4736");
     assert.equal(span.parentSpanId, "00f067aa0ba902b7");
     assert.equal(span.name, "http.server.request");
+    assert.equal(span.attributes.find((item) => item.key === "axond.subject")?.value.stringValue, "gateway-key");
+    assert.equal(span.attributes.find((item) => item.key === "axond.target.provider")?.value.stringValue, "fake-openai");
+    assert.equal(span.attributes.find((item) => item.key === "axond.target.model")?.value.stringValue, "gpt-test");
+    assert.equal(span.attributes.find((item) => item.key === "axond.credential_source")?.value.stringValue, "platform");
+    assert.equal(span.attributes.find((item) => item.key === "axond.status")?.value.stringValue, "ok");
+    assert.equal(span.attributes.find((item) => item.key === "axond.retry_count")?.value.stringValue, "0");
+    assert.equal(span.attributes.find((item) => item.key === "gen_ai.usage.input_tokens")?.value.stringValue, "12");
+    assert.equal(span.attributes.find((item) => item.key === "gen_ai.usage.output_tokens")?.value.stringValue, "7");
+    assert.equal(span.attributes.find((item) => item.key === "axond.cost_microdollars")?.value.stringValue, "100");
+    assert.ok(span.attributes.find((item) => item.key === "axond.latency_ms"));
+    assert.ok(span.attributes.find((item) => item.key === "axond.ttft_ms"));
     assert.equal(attempt.traceId, span.traceId);
     assert.equal(attempt.parentSpanId, span.spanId);
     assert.equal(attempt.attributes.find((item) => item.key === "axond.target.provider")?.value.stringValue, "fake-openai");

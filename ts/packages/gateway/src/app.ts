@@ -63,6 +63,8 @@ interface MutableContext extends AxondContext {
   upstreamAttempts: number;
   /** Milliseconds to the first released provider byte. Null when no token was observed. */
   ttftMs: number | null;
+  /** Buffered settlement known before the handler returns. Streams settle later and leave this empty. */
+  settlement: { status: string; usage: UsageTokens; cost: bigint | null } | null;
 }
 
 /**
@@ -136,7 +138,9 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
               ...httpAttributes,
               "axond.request_id": axond?.requestId ?? "",
               "axond.namespace": axond?.namespace?.id ?? "",
+              "axond.subject": axond?.subject ?? "",
               "gen_ai.request.model": axond?.alias ?? "",
+              ...serverSpanAttributes(axond, ended),
             },
             secretValues(opts),
           );
@@ -375,6 +379,7 @@ function createContext(c: Context<AxondEnv>, opts: AxondOptions): MutableContext
     servedCredentialSource: "platform",
     upstreamAttempts: 0,
     ttftMs: null,
+    settlement: null,
     store: scopeStore(opts.store, ""),
     metrics: {
       record(name, value, attributes) {
@@ -905,6 +910,8 @@ async function dispatch(
         noteServed(axond, opts, credential);
         axond.ttftMs = Math.max(0, Date.now() - walkStarted);
         scheduleSettle(opts, axond, upstream.usage, "ok");
+      } else {
+        noteServed(axond, opts, credential);
       }
       if (!stream) {
         noteCredentialSuccess(pools, record.id, provider.id, credential.id);
@@ -1181,7 +1188,60 @@ function noteServed(axond: MutableContext, opts: AxondOptions, credential: Crede
   axond.upstreamAttempts = 1;
 }
 
+function settlementCost(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): bigint | null {
+  const price = lookupPrice(opts.prices ?? [], axond.target?.provider ?? "", axond.target?.model ?? "");
+  const priced = price ? costMicrodollars(price, usage) : null;
+  const measured =
+    usage.inputTokens > 0n
+    || usage.outputTokens > 0n
+    || usage.cacheReadTokens > 0n
+    || usage.cacheWriteTokens > 0n;
+  return status === "upstream_error" && !measured ? 0n : priced;
+}
+
+function serverSpanAttributes(axond: MutableContext | undefined, endedMs: number): Record<string, string> {
+  if (!axond?.target) {
+    return {};
+  }
+  const attributes: Record<string, string> = {
+    "axond.target.provider": axond.target.provider,
+    "axond.target.model": axond.target.model,
+  };
+  if (axond.servedCredentialId.length > 0) {
+    attributes["axond.credential_source"] = axond.servedCredentialSource;
+  }
+  const settlement = axond.settlement;
+  if (!settlement) {
+    return attributes;
+  }
+  attributes["axond.status"] = settlement.status;
+  attributes["axond.retry_count"] = String(Math.max(0, axond.upstreamAttempts - 1));
+  attributes["gen_ai.usage.input_tokens"] = settlement.usage.inputTokens.toString();
+  attributes["gen_ai.usage.output_tokens"] = settlement.usage.outputTokens.toString();
+  attributes["gen_ai.usage.cache_read_tokens"] = settlement.usage.cacheReadTokens.toString();
+  attributes["gen_ai.usage.cache_write_tokens"] = settlement.usage.cacheWriteTokens.toString();
+  if (settlement.cost !== null) {
+    attributes["axond.cost_microdollars"] = settlement.cost.toString();
+  }
+  attributes["axond.latency_ms"] = String(Math.max(0, endedMs - axond.startedMs));
+  if (axond.ttftMs !== null) {
+    attributes["axond.ttft_ms"] = String(axond.ttftMs);
+  }
+  return attributes;
+}
+
 function scheduleSettle(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): void {
+  axond.settlement = {
+    status,
+    usage: {
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      reasoningTokens: usage.reasoningTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+    },
+    cost: settlementCost(opts, axond, usage, status),
+  };
   const task = settle(opts, axond, usage, status);
   if (opts.waitUntil) {
     opts.waitUntil(task);
@@ -1211,16 +1271,9 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
     unref.unref?.();
   }
   try {
-  const price = lookupPrice(opts.prices ?? [], axond.target?.provider ?? "", axond.target?.model ?? "");
-  const priced = price ? costMicrodollars(price, usage) : null;
-  const measured =
-    usage.inputTokens > 0n
-    || usage.outputTokens > 0n
-    || usage.cacheReadTokens > 0n
-    || usage.cacheWriteTokens > 0n;
   // A provider failure with no measured usage records cost 0 and adds nothing
   // to spent. A stream that already relayed text keeps that measured cost.
-  const cost = status === "upstream_error" && !measured ? 0n : priced;
+  const cost = settlementCost(opts, axond, usage, status);
   const result = await opts.store.settle({
     requestId: axond.requestId,
     namespace: axond.namespace?.id ?? "",
