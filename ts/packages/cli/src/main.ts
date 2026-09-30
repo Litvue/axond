@@ -133,6 +133,7 @@ async function main(): Promise<void> {
     providers: config.providers,
     credentials: config.credentials,
     catalog: config.catalog,
+    platformNamespace: config.defaultNamespace,
     metrics,
     onLog: writeLog,
   });
@@ -141,6 +142,7 @@ async function main(): Promise<void> {
     providers: config.providers,
     credentials: config.credentials,
     catalog: config.catalog,
+    platformNamespace: config.defaultNamespace,
     intervalSeconds: config.discoveryIntervalSeconds,
     metrics,
     onLog: writeLog,

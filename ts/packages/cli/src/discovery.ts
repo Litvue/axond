@@ -24,6 +24,15 @@ export interface CatalogMetrics {
 /** Used only when the durable streak write fails. */
 const catalogStreaks = new WeakMap<object, number>();
 
+/** Anthropic's default page is 20; twenty pages is the hard ceiling. */
+const MAX_MODEL_PAGES = 20;
+
+/**
+ * The first round in this process may replace a row fetched from another
+ * base URL. Later rounds leave a fresh foreign row alone.
+ */
+let replaceForeignSource = true;
+
 /**
  * Refresh provider `/models` caches and, when configured, a catalogue URL.
  * Failures mark the row stale and leave the previous payload in place.
@@ -33,30 +42,61 @@ export async function discoverOnce(input: {
   providers: readonly ProviderConfig[];
   credentials: readonly CredentialConfig[];
   catalog: CatalogConfig;
+  /** Namespace whose pool is tried first. Defaults to `platform`. */
+  platformNamespace?: string;
+  /**
+   * When true, a row fetched from another base URL is marked stale so this
+   * round can replace it. When omitted, only the first round in the process does.
+   */
+  replaceForeignSource?: boolean;
   fetchImpl?: typeof fetch;
   metrics?: CatalogMetrics;
   onLog?: (record: DiscoveryLog) => void;
 }): Promise<void> {
   const fetchImpl = input.fetchImpl ?? fetch;
+  const allowReplace = input.replaceForeignSource ?? replaceForeignSource;
+  replaceForeignSource = false;
   for (const provider of input.providers) {
-    await refreshProvider(input, fetchImpl, provider);
+    await refreshProvider(input, fetchImpl, provider, allowReplace);
   }
   if (input.catalog.source === "models-dev" && input.catalog.sourceUrl) {
     await refreshCatalog(input, fetchImpl, input.catalog.sourceUrl);
   }
 }
 
+type ListingReason = "unreachable" | "denied" | "not_json" | "page_bound";
+
+function discoveryCredentials(
+  credentials: readonly CredentialConfig[],
+  providerId: string,
+  platformNamespace: string,
+): CredentialConfig[] {
+  const forProvider = credentials.filter((item) => item.provider === providerId);
+  const platform = forProvider.filter((item) => item.namespace === platformNamespace);
+  if (platform.length > 0) {
+    return platform;
+  }
+  const namespaces = [...new Set(forProvider.map((item) => item.namespace))].sort();
+  const first = namespaces[0];
+  if (!first) {
+    return [];
+  }
+  return forProvider.filter((item) => item.namespace === first);
+}
+
 async function refreshProvider(
   input: {
     store: Store;
     credentials: readonly CredentialConfig[];
+    platformNamespace?: string;
     onLog?: (record: DiscoveryLog) => void;
   },
   fetchImpl: typeof fetch,
   provider: ProviderConfig,
+  allowReplace: boolean,
 ): Promise<void> {
-  const credential = input.credentials.find((item) => item.provider === provider.id);
-  if (!credential) {
+  const credentials = discoveryCredentials(input.credentials, provider.id, input.platformNamespace ?? "platform");
+  if (credentials.length === 0) {
     noteProviderDiscovery(input.onLog, provider.id, "no_credential");
     try {
       const existing = await input.store.getProviderModels(provider.id);
@@ -68,6 +108,68 @@ async function refreshProvider(
     }
     return;
   }
+  if (!(await prepareForeignSource(input, provider, allowReplace))) {
+    return;
+  }
+  let last: ListingReason | null = null;
+  for (const credential of credentials) {
+    const listing = await fetchListing(fetchImpl, provider, credential);
+    if (!listing.ok) {
+      last = listing.reason;
+      continue;
+    }
+    try {
+      await input.store.upsertProviderModels({
+        provider: provider.id,
+        fetchedAt: new Date().toISOString(),
+        stale: false,
+        data: listing.data,
+        source: provider.baseUrl,
+      });
+    } catch {
+      noteProviderDiscovery(input.onLog, provider.id, "not_retained");
+      await markProviderStale(input, provider.id);
+    }
+    return;
+  }
+  if (last) {
+    noteProviderDiscovery(input.onLog, provider.id, last);
+    await markProviderStale(input, provider.id);
+  }
+}
+
+/** False when this round must leave a fresh foreign row untouched. */
+async function prepareForeignSource(
+  input: { store: Store; onLog?: (record: DiscoveryLog) => void },
+  provider: ProviderConfig,
+  allowReplace: boolean,
+): Promise<boolean> {
+  let existing;
+  try {
+    existing = await input.store.getProviderModels(provider.id);
+  } catch {
+    return true;
+  }
+  if (!existing || existing.stale || existing.source === null || existing.source === provider.baseUrl) {
+    return true;
+  }
+  if (!allowReplace) {
+    return false;
+  }
+  try {
+    await input.store.markProviderModelsStale(provider.id);
+  } catch {
+    noteProviderDiscovery(input.onLog, provider.id, "not_retained");
+    return false;
+  }
+  return true;
+}
+
+async function fetchListing(
+  fetchImpl: typeof fetch,
+  provider: ProviderConfig,
+  credential: CredentialConfig,
+): Promise<{ ok: true; data: unknown[] } | { ok: false; reason: ListingReason }> {
   const headers = new Headers();
   if (provider.kind === "anthropic") {
     headers.set("x-api-key", credential.secret);
@@ -75,47 +177,76 @@ async function refreshProvider(
   } else {
     headers.set("authorization", `Bearer ${credential.secret}`);
   }
-  const url = `${provider.baseUrl.replace(/\/$/, "")}/models`;
-  let response: Response;
-  try {
-    response = await fetchImpl(url, { headers });
-  } catch {
-    noteProviderDiscovery(input.onLog, provider.id, "unreachable");
-    await markProviderStale(input, provider.id);
-    return;
+  const base = provider.baseUrl.replace(/\/$/, "");
+  const data: unknown[] = [];
+  let after: string | null = null;
+  for (let page = 0; page < MAX_MODEL_PAGES; page += 1) {
+    const url = after === null ? `${base}/models` : `${base}/models?after_id=${encodeQueryComponent(after)}`;
+    let response: Response;
+    try {
+      response = await fetchImpl(url, { headers });
+    } catch {
+      return { ok: false, reason: "unreachable" };
+    }
+    if (!response.ok) {
+      return { ok: false, reason: response.status === 401 || response.status === 403 ? "denied" : "unreachable" };
+    }
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      return { ok: false, reason: "not_json" };
+    }
+    const parsed = parsePage(body);
+    if (!parsed) {
+      return { ok: false, reason: "not_json" };
+    }
+    data.push(...parsed.data);
+    if (parsed.nextAfter === null) {
+      return { ok: true, data };
+    }
+    if (page + 1 === MAX_MODEL_PAGES) {
+      return { ok: false, reason: "page_bound" };
+    }
+    after = parsed.nextAfter;
   }
-  if (!response.ok) {
-    const reason = response.status === 401 || response.status === 403 ? "denied" : "unreachable";
-    noteProviderDiscovery(input.onLog, provider.id, reason);
-    await markProviderStale(input, provider.id);
-    return;
-  }
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    noteProviderDiscovery(input.onLog, provider.id, "not_json");
-    await markProviderStale(input, provider.id);
-    return;
-  }
+  return { ok: false, reason: "page_bound" };
+}
+
+function parsePage(body: unknown): { data: unknown[]; nextAfter: string | null } | null {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
-    noteProviderDiscovery(input.onLog, provider.id, "not_json");
-    await markProviderStale(input, provider.id);
-    return;
+    return null;
   }
-  const data = Array.isArray((body as { data?: unknown }).data) ? (body as { data: unknown[] }).data : [];
-  try {
-    await input.store.upsertProviderModels({
-      provider: provider.id,
-      fetchedAt: new Date().toISOString(),
-      stale: false,
-      data,
-      source: provider.baseUrl,
-    });
-  } catch {
-    noteProviderDiscovery(input.onLog, provider.id, "not_retained");
-    await markProviderStale(input, provider.id);
+  const record = body as { data?: unknown; has_more?: unknown; last_id?: unknown };
+  if (!Array.isArray(record.data)) {
+    return null;
   }
+  const data = record.data.filter(
+    (item) => item !== null && typeof item === "object" && !Array.isArray(item) && typeof (item as { id?: unknown }).id === "string",
+  );
+  if (record.has_more !== true) {
+    return { data, nextAfter: null };
+  }
+  if (typeof record.last_id !== "string" || record.last_id.length === 0) {
+    return null;
+  }
+  return { data, nextAfter: record.last_id };
+}
+
+function encodeQueryComponent(value: string): string {
+  let out = "";
+  for (const byte of new TextEncoder().encode(value)) {
+    const unreserved =
+      (byte >= 0x41 && byte <= 0x5a) ||
+      (byte >= 0x61 && byte <= 0x7a) ||
+      (byte >= 0x30 && byte <= 0x39) ||
+      byte === 0x2d ||
+      byte === 0x5f ||
+      byte === 0x2e ||
+      byte === 0x7e;
+    out += unreserved ? String.fromCharCode(byte) : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return out;
 }
 
 function noteProviderDiscovery(
@@ -249,6 +380,8 @@ export function startDiscovery(input: {
   providers: readonly ProviderConfig[];
   credentials: readonly CredentialConfig[];
   catalog: CatalogConfig;
+  platformNamespace?: string;
+  replaceForeignSource?: boolean;
   intervalSeconds: number;
   metrics?: CatalogMetrics;
   onLog?: (record: DiscoveryLog) => void;

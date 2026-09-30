@@ -199,7 +199,7 @@ export interface CatalogueImportLog {
 export interface ProviderDiscoveryLog {
   msg: "provider_discovery";
   provider: string;
-  reason: "no_credential" | "unreachable" | "denied" | "not_json" | "not_retained";
+  reason: "no_credential" | "unreachable" | "denied" | "not_json" | "not_retained" | "page_bound";
 }
 
 /**

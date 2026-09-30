@@ -265,15 +265,15 @@ test("catalogue refusals survive a new store object on the same database", async
 
 test("provider_discovery_log_names_the_provider_and_omits_the_secret", async () => {
   const store = createMemoryStore();
+  const secret = "sk-discovery-sentinel";
+  const baseUrl = `http://127.0.0.1:9/${secret}`;
   await store.upsertProviderModels({
     provider: "fake-openai",
     fetchedAt: "2026-09-29T00:00:00Z",
     stale: false,
     data: [{ id: "gpt-test" }],
-    source: "http://upstream",
+    source: baseUrl,
   });
-  const secret = "sk-discovery-sentinel";
-  const baseUrl = `http://127.0.0.1:9/${secret}`;
   const logs: ProviderDiscoveryLog[] = [];
   const note = (record: { msg: string }) => {
     if (record.msg === "provider_discovery") {
@@ -380,4 +380,176 @@ test("provider_discovery_log_names_the_provider_and_omits_the_secret", async () 
   const fresh = await store.getProviderModels("fake-openai");
   assert.equal(fresh?.stale, false);
   assert.deepEqual(fresh?.data, [{ id: "gpt-test" }]);
+});
+
+test("provider_listing_walks_the_pool_and_omits_the_secret", async () => {
+  const secret = "sk-listing-sentinel";
+  const store = createMemoryStore();
+  await store.upsertProviderModels({
+    provider: "fake-openai",
+    fetchedAt: "2026-09-29T00:00:00Z",
+    stale: false,
+    data: [{ id: "old" }],
+    source: "http://old.example/v1",
+  });
+  const logs: ProviderDiscoveryLog[] = [];
+  const urls: string[] = [];
+  const keys: string[] = [];
+  await discoverOnce({
+    store,
+    replaceForeignSource: true,
+    providers: [{ id: "fake-openai", kind: "anthropic", baseUrl: "http://upstream" }],
+    credentials: [
+      { namespace: "zeta", provider: "fake-openai", secret: "tenant-zeta", id: "zeta" },
+      { namespace: "platform", provider: "fake-openai", secret, id: "bad" },
+      { namespace: "platform", provider: "fake-openai", secret: "sk-second", id: "good" },
+      { namespace: "alpha", provider: "fake-openai", secret: "tenant-alpha", id: "alpha" },
+    ],
+    catalog: { source: "none" },
+    onLog: (record) => {
+      if (record.msg === "provider_discovery") {
+        logs.push(record);
+      }
+    },
+    fetchImpl: async (url, init) => {
+      urls.push(String(url));
+      const key = new Headers(init?.headers).get("x-api-key") ?? "";
+      keys.push(key);
+      if (key === secret) {
+        return new Response(secret, { status: 401 });
+      }
+      if (!String(url).includes("after_id")) {
+        return new Response(
+          JSON.stringify({
+            data: [{ id: "claude-3" }, { object: "model" }, { id: "" }],
+            has_more: true,
+            last_id: "claude-3 opus",
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ data: [{ id: "claude-4" }, { id: 4 }], has_more: false }), { status: 200 });
+    },
+  });
+  assert.deepEqual(logs, []);
+  assert.deepEqual(keys, [secret, "sk-second", "sk-second"]);
+  assert.deepEqual(urls, [
+    "http://upstream/models",
+    "http://upstream/models",
+    "http://upstream/models?after_id=claude-3%20opus",
+  ]);
+  const replaced = await store.getProviderModels("fake-openai");
+  assert.equal(replaced?.stale, false);
+  assert.equal(replaced?.source, "http://upstream");
+  assert.deepEqual(replaced?.data, [{ id: "claude-3" }, { id: "" }, { id: "claude-4" }]);
+
+  urls.length = 0;
+  logs.length = 0;
+  await store.upsertProviderModels({
+    provider: "fake-openai",
+    fetchedAt: "2026-09-29T00:01:00Z",
+    stale: false,
+    data: [{ id: "kept" }],
+    source: "http://foreign.example/v1",
+  });
+  await discoverOnce({
+    store,
+    replaceForeignSource: false,
+    providers: [{ id: "fake-openai", kind: "anthropic", baseUrl: "http://upstream" }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "bad" }],
+    catalog: { source: "none" },
+    onLog: (record) => {
+      if (record.msg === "provider_discovery") {
+        logs.push(record);
+      }
+    },
+    fetchImpl: async (url) => {
+      urls.push(String(url));
+      return new Response(JSON.stringify({ data: [{ id: "should-not-store" }] }), { status: 200 });
+    },
+  });
+  assert.deepEqual(urls, []);
+  assert.deepEqual(logs, []);
+  const kept = await store.getProviderModels("fake-openai");
+  assert.equal(kept?.stale, false);
+  assert.deepEqual(kept?.data, [{ id: "kept" }]);
+  assert.equal(kept?.source, "http://foreign.example/v1");
+
+  logs.length = 0;
+  let pages = 0;
+  await discoverOnce({
+    store,
+    replaceForeignSource: true,
+    providers: [{ id: "fake-openai", kind: "anthropic", baseUrl: "http://foreign.example/v1" }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "bad" }],
+    catalog: { source: "none" },
+    onLog: (record) => {
+      if (record.msg === "provider_discovery") {
+        logs.push(record);
+      }
+    },
+    fetchImpl: async () => {
+      pages += 1;
+      return new Response(JSON.stringify({ data: [{ id: `m${pages}` }], has_more: true, last_id: `m${pages}` }), {
+        status: 200,
+      });
+    },
+  });
+  assert.equal(pages, 20);
+  assert.deepEqual(
+    logs.map((line) => line.reason),
+    ["page_bound"],
+  );
+  const bounded = await store.getProviderModels("fake-openai");
+  assert.equal(bounded?.stale, true);
+  assert.deepEqual(bounded?.data, [{ id: "kept" }]);
+  assert.equal(JSON.stringify(logs).includes(secret), false);
+
+  logs.length = 0;
+  await discoverOnce({
+    store,
+    replaceForeignSource: true,
+    providers: [{ id: "tenant-only", kind: "openai", baseUrl: "http://tenant" }],
+    credentials: [
+      { namespace: "zeta", provider: "tenant-only", secret: "zeta-secret", id: "zeta" },
+      { namespace: "alpha", provider: "tenant-only", secret: "alpha-secret", id: "alpha" },
+    ],
+    catalog: { source: "none" },
+    onLog: (record) => {
+      if (record.msg === "provider_discovery") {
+        logs.push(record);
+      }
+    },
+    fetchImpl: async (_url, init) => {
+      const key = new Headers(init?.headers).get("authorization") ?? "";
+      assert.equal(key, "Bearer alpha-secret");
+      return new Response(JSON.stringify({ data: [{ id: "t" }, { name: "drop" }] }), { status: 200 });
+    },
+  });
+  assert.deepEqual(logs, []);
+  assert.deepEqual((await store.getProviderModels("tenant-only"))?.data, [{ id: "t" }]);
+
+  logs.length = 0;
+  await discoverOnce({
+    store,
+    replaceForeignSource: true,
+    providers: [{ id: "broken-page", kind: "anthropic", baseUrl: `http://upstream/${secret}` }],
+    credentials: [{ namespace: "platform", provider: "broken-page", secret, id: "bad" }],
+    catalog: { source: "none" },
+    onLog: (record) => {
+      if (record.msg === "provider_discovery") {
+        logs.push(record);
+      }
+    },
+    fetchImpl: async () => new Response(JSON.stringify({ data: [{ id: "x" }], has_more: true }), { status: 200 }),
+  });
+  assert.deepEqual(
+    logs.map((line) => line.reason),
+    ["not_json"],
+  );
+  assert.equal(JSON.stringify(logs).includes(secret), false);
+  assert.equal(JSON.stringify(logs).includes("upstream"), false);
+  const broken = await store.getProviderModels("broken-page");
+  assert.equal(broken?.stale, true);
+  assert.deepEqual(broken?.data, []);
 });

@@ -291,7 +291,9 @@ Not on the inference path. `GET /api/v1/providers/{id}/models` and
 | --- | --- | --- | --- |
 | `refresh_interval_seconds` | integer | `300` | Seconds between refresh rounds. The first round runs at boot; an empty provider set retries with short backoff instead of waiting the full interval. `0` is rejected. |
 
-A failed provider refresh writes JSON `msg` `provider_discovery` with the provider id and reason `no_credential`, `unreachable`, `denied`, `not_json`, or `not_retained`. The previous cache stays in place and is marked stale when the store accepts that write. The line omits the credential, the base URL, and the driver text.
+The refresh tries each credential in the platform pool and keeps the first complete listing. With no platform credential it uses the lexicographically first tenant pool. Anthropic `has_more` and `last_id` pages are followed, up to 20 pages. Objects without an id are dropped. A listing that does not end inside that bound logs reason `page_bound` and does not store a partial page list. The first round in the process may replace a row fetched from another base URL. A later round leaves a fresh row from another base URL in place and does not call the provider.
+
+A failed provider refresh writes JSON `msg` `provider_discovery` with the provider id and reason `no_credential`, `unreachable`, `denied`, `not_json`, `not_retained`, or `page_bound`. The previous cache stays in place and is marked stale when the store accepts that write. The line omits the credential, the base URL, and the driver text.
 
 ## `[[credential]]` — outbound provider keys
 
