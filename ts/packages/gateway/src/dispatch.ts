@@ -226,17 +226,70 @@ function redactUpstreamCredential(body: string, headers: Headers): string {
   return text;
 }
 
-export function classifyUpstream(status: number, body: string): GatewayFailure {
-  let message = "upstream request failed";
+/** Longest provider diagnostic kept, before the truncation marker. */
+const MAX_DIAGNOSTIC_BYTES = 4096;
+
+/** Appended when a diagnostic hit the byte bound, so a short message stays distinct. */
+const DIAGNOSTIC_TRUNCATION_MARKER = "… [truncated]";
+
+const CONTEXT_LIMIT_SIGNALS = [
+  "context_length_exceeded",
+  "context length",
+  "context window",
+  "prompt is too long",
+  "prompt too long",
+  "maximum number of tokens",
+  "too many tokens",
+  "maximum prompt length",
+];
+
+/** `/error/message`, then a top-level `message`, then the body itself. */
+function extractUpstreamMessage(body: string): string {
   try {
-    const parsed = JSON.parse(body) as { error?: { message?: string } };
-    if (typeof parsed.error?.message === "string" && parsed.error.message.length > 0) {
-      message = parsed.error.message.slice(0, 512);
+    const parsed = JSON.parse(body) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const record = parsed as { error?: unknown; message?: unknown };
+      const error = record.error;
+      if (error && typeof error === "object" && !Array.isArray(error)) {
+        const nested = (error as { message?: unknown }).message;
+        if (typeof nested === "string") {
+          return nested;
+        }
+      }
+      if (typeof record.message === "string") {
+        return record.message;
+      }
     }
   } catch {
-    if (body.length > 0 && body.length < 512) {
-      message = body;
-    }
+    // The body itself is the diagnostic.
+  }
+  return body;
+}
+
+function isContextLengthError(text: string): boolean {
+  const lower = text.toLowerCase();
+  return CONTEXT_LIMIT_SIGNALS.some((signal) => lower.includes(signal));
+}
+
+/** Cut on a UTF-8 boundary and mark the cut. A short diagnostic is unchanged. */
+function boundDiagnostic(message: string): string {
+  const bytes = new TextEncoder().encode(message);
+  if (bytes.length <= MAX_DIAGNOSTIC_BYTES) {
+    return message;
+  }
+  let cut = MAX_DIAGNOSTIC_BYTES;
+  while (cut > 0 && (bytes[cut]! & 0xc0) === 0x80) {
+    cut -= 1;
+  }
+  return new TextDecoder().decode(bytes.subarray(0, cut)) + DIAGNOSTIC_TRUNCATION_MARKER;
+}
+
+export function classifyUpstream(status: number, body: string): GatewayFailure {
+  const extracted = extractUpstreamMessage(body);
+  const message = extracted.length === 0 ? "upstream request failed" : boundDiagnostic(extracted);
+  if (isContextLengthError(body) || isContextLengthError(extracted)) {
+    const httpStatus = status === 401 || status === 403 ? 502 : 400;
+    return upstreamFailure("context_window_exceeded", httpStatus, message, false, status);
   }
   if (status === 401 || status === 403) {
     return upstreamFailure("invalid_request", 502, message, false, status);
@@ -249,9 +302,6 @@ export function classifyUpstream(status: number, body: string): GatewayFailure {
   }
   if (status >= 500) {
     return upstreamFailure("provider_dependency_failed", 502, message, false, status);
-  }
-  if (message.toLowerCase().includes("context window")) {
-    return upstreamFailure("context_window_exceeded", 400, message, false, status);
   }
   return upstreamFailure("invalid_request", 400, message, false, status);
 }

@@ -239,7 +239,10 @@ attributes in `crates/gateway/src/telemetry/`, log call sites, and the retention
 or delivery guarantees of usage records.
 
 Provider failure diagnostics on attempt spans are bounded to 4 KiB and omit
-the known outbound API key before truncation. The gateway does not attach
+the known outbound API key before truncation. The TypeScript attempt span does
+the same, and the caller body keeps that prefix plus `… [truncated]` when the
+provider text is longer. `provider_diagnostics_keep_context_limits_and_a_bounded_message`
+covers the context-limit vocabulary, that marker, and the span bound. The gateway does not attach
 request or successful-response bodies, but provider error messages can echo
 caller input; trace access is therefore diagnostic-data access. The regression
 `provider_refusals_keep_their_class_and_export_bounded_attempt_diagnostics`

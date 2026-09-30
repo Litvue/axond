@@ -6,7 +6,7 @@ import { Agent } from "undici";
 
 import { createAdmission, defaultAdmission } from "./admission.ts";
 import { createAxond } from "./app.ts";
-import { isRateLimitPayload, targetAttemptCap, transportFailureReason } from "./dispatch.ts";
+import { classifyUpstream, isRateLimitPayload, targetAttemptCap, transportFailureReason } from "./dispatch.ts";
 import { StoreFailure } from "./errors.ts";
 import { createMemoryStore } from "./memory-store.ts";
 import { createMetrics } from "./metrics.ts";
@@ -3685,5 +3685,203 @@ test("provider_error_replaces_the_echoed_credential", async () => {
     assert.equal(encoded.includes("PROMPT_SENTINEL"), false);
   } finally {
     upstream.close();
+  }
+});
+
+test("provider_diagnostics_keep_context_limits_and_a_bounded_message", async () => {
+  const marker = "… [truncated]";
+  const markerBytes = new TextEncoder().encode(marker).length;
+  const cases: Array<{ status: number; body: string; http: number; type: string; message: string; rateLimited: boolean }> = [
+    {
+      status: 400,
+      body: JSON.stringify({ error: { code: "context_length_exceeded", message: "too long" } }),
+      http: 400,
+      type: "context_window_exceeded",
+      message: "too long",
+      rateLimited: false,
+    },
+    {
+      status: 400,
+      body: JSON.stringify({ error: { message: "prompt is too long: 250000 tokens" } }),
+      http: 400,
+      type: "context_window_exceeded",
+      message: "prompt is too long: 250000 tokens",
+      rateLimited: false,
+    },
+    {
+      status: 400,
+      body: JSON.stringify({ message: "input exceeds the maximum number of tokens" }),
+      http: 400,
+      type: "context_window_exceeded",
+      message: "input exceeds the maximum number of tokens",
+      rateLimited: false,
+    },
+    {
+      status: 401,
+      body: JSON.stringify({ error: { code: "context_length_exceeded", message: "too long" } }),
+      http: 502,
+      type: "context_window_exceeded",
+      message: "too long",
+      rateLimited: false,
+    },
+    {
+      status: 429,
+      body: JSON.stringify({ error: { message: "context window exceeded" } }),
+      http: 400,
+      type: "context_window_exceeded",
+      message: "context window exceeded",
+      rateLimited: false,
+    },
+    {
+      status: 500,
+      body: "prompt is too long",
+      http: 400,
+      type: "context_window_exceeded",
+      message: "prompt is too long",
+      rateLimited: false,
+    },
+    {
+      status: 500,
+      body: "upstream unavailable",
+      http: 502,
+      type: "provider_dependency_failed",
+      message: "upstream unavailable",
+      rateLimited: false,
+    },
+    {
+      status: 302,
+      body: "",
+      http: 400,
+      type: "invalid_request",
+      message: "upstream request failed",
+      rateLimited: false,
+    },
+  ];
+  for (const item of cases) {
+    const failure = classifyUpstream(item.status, item.body);
+    assert.equal(failure.status, item.http, item.body);
+    assert.equal(failure.type, item.type, item.body);
+    assert.equal(failure.message, item.message, item.body);
+    assert.equal(failure.rateLimited, item.rateLimited, item.body);
+    assert.equal(failure.message.endsWith(marker), false, item.body);
+  }
+  const plain = classifyUpstream(500, "x".repeat(4 * 4096));
+  assert.equal(plain.type, "provider_dependency_failed");
+  assert.equal(plain.message.endsWith(marker), true);
+  assert.ok(new TextEncoder().encode(plain.message).length <= 4096 + markerBytes);
+  const nested = classifyUpstream(500, JSON.stringify({ error: { message: "y".repeat(64 * 1024) } }));
+  assert.equal(nested.message.endsWith(marker), true);
+  assert.ok(new TextEncoder().encode(nested.message).length <= 4096 + markerBytes);
+  assert.equal(nested.message.includes("y".repeat(5000)), false);
+  const euros = classifyUpstream(500, "€".repeat(4096));
+  assert.equal(euros.message.endsWith(marker), true);
+  assert.ok(euros.message.slice(0, -marker.length).split("").every((character) => character === "€"));
+  assert.ok(new TextEncoder().encode(euros.message).length <= 4096 + markerBytes);
+
+  const secret = "sk-context-sentinel";
+  const traces: string[] = [];
+  const collector = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    if ((req.url ?? "") === "/v1/traces") {
+      traces.push(Buffer.concat(chunks).toString("utf8"));
+    }
+    res.writeHead(200);
+    res.end();
+  });
+  const collectorAddress = await new Promise<import("node:net").AddressInfo>((resolve) => {
+    collector.listen(0, "127.0.0.1", () => {
+      const address = collector.address();
+      if (!address || typeof address === "string") {
+        throw new Error("no port");
+      }
+      resolve(address);
+    });
+  });
+  let hits = 0;
+  const upstream = await listen((_req, res) => {
+    hits += 1;
+    if (hits === 1) {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { code: "context_length_exceeded", message: `too long ${secret}` } }));
+      return;
+    }
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: `rejected key ${secret}; ${"y".repeat(6000)}` } }));
+  });
+  const store = await seeded();
+  const logs: unknown[] = [];
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "one" }],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    telemetry: { endpoint: `http://127.0.0.1:${collectorAddress.port}` },
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const chat = (content: string) =>
+    app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content }] }),
+    });
+  try {
+    const context = await chat("PROMPT_SENTINEL");
+    const contextText = await context.text();
+    assert.equal(context.status, 400);
+    const contextBody = JSON.parse(contextText) as { error: { type: string; message: string } };
+    assert.equal(contextBody.error.type, "context_window_exceeded");
+    assert.equal(contextBody.error.message, "too long [REDACTED]");
+    assert.equal(contextText.includes(secret), false);
+
+    const refused = await chat("PROMPT_SENTINEL");
+    const refusedText = await refused.text();
+    assert.equal(refused.status, 502);
+    const refusedBody = JSON.parse(refusedText) as { error: { type: string; message: string } };
+    assert.equal(refusedBody.error.type, "invalid_request");
+    assert.equal(refusedBody.error.message.startsWith("rejected key [REDACTED]"), true);
+    assert.equal(refusedBody.error.message.endsWith(marker), true);
+    assert.ok(new TextEncoder().encode(refusedBody.error.message).length <= 4096 + markerBytes);
+    assert.equal(refusedText.includes(secret), false);
+    assert.equal(refusedBody.error.message.includes("y".repeat(5000)), false);
+
+    const deadline = Date.now() + 2_000;
+    while (traces.length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(traces.length >= 2, true);
+    const spans = JSON.parse(traces[1]!).resourceSpans[0].scopeSpans[0].spans as {
+      name: string;
+      attributes: { key: string; value: { stringValue: string } }[];
+    }[];
+    const attempt = spans.find((span) => span.name === "axond.upstream.attempt");
+    assert.ok(attempt);
+    const recorded = attempt.attributes.find((item) => item.key === "axond.upstream.message")?.value.stringValue ?? "";
+    assert.equal(recorded.startsWith("rejected key [REDACTED]"), true);
+    assert.equal(recorded.endsWith(marker), false);
+    assert.ok(new TextEncoder().encode(recorded).length <= 4096);
+    assert.ok(new TextEncoder().encode(recorded).length > 512);
+    const exported = `${traces.join("\n")}\n${JSON.stringify(logs)}`;
+    assert.equal(exported.includes(secret), false);
+    assert.equal(exported.includes(KEY), false);
+    assert.equal(exported.includes("PROMPT_SENTINEL"), false);
+  } finally {
+    upstream.close();
+    collector.closeAllConnections();
+    collector.close();
   }
 });
