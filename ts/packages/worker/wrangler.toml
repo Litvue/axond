@@ -16,7 +16,7 @@ id = "00000000000000000000000000000000"
 [vars]
 GATEWAY_KEY = "replace-me"
 PROVIDERS_JSON = "[]"
-# Optional. Discovery reads these on the cron trigger, not on the request path.
+# Optional. The request path and the cron both read this list.
 # CREDENTIALS_JSON = "[]"
 # CATALOG_SOURCE = "models-dev"
 # CATALOG_SOURCE_URL = "https://models.dev/api.json"

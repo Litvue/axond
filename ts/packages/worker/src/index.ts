@@ -32,11 +32,11 @@ interface WaitContext {
 let metrics: ReturnType<typeof createMetrics> | undefined;
 let admission = createAdmission(defaultAdmission());
 
-export function createHandler(env: WorkerEnv) {
+export function createHandler(env: WorkerEnv, storeOverride?: Store) {
   metrics ??= createMetrics([env.GATEWAY_KEY]);
   let schema: Promise<void> | null = null;
   const extensions = [rateLimitExtension({ limit: 60, windowMs: 60_000, mode: "isolate" })];
-  const store = createPostgresStore(async () => {
+  const store = storeOverride ?? createPostgresStore(async () => {
     const client = new Client({ connectionString: env.HYPERDRIVE.connectionString });
     await client.connect();
     if (schema === null) {
@@ -81,6 +81,7 @@ export function createHandler(env: WorkerEnv) {
         gatewayKey: env.GATEWAY_KEY,
         defaultNamespace: "platform",
         providers,
+        credentials,
         extensions,
         waitUntil: (promise) => ctx.waitUntil(promise),
         admissionControl: admission,
