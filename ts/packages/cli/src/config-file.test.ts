@@ -425,6 +425,49 @@ namespace = "platform"
   }
 });
 
+test("bounds_boot_matches_the_rust_order", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-bounds-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "attempts.toml");
+  await writeFile(
+    config,
+    `
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[credential]]
+namespace = "ghost"
+provider = "openai"
+env = "OPENAI_KEY"
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[failover]
+max_attempts = 0
+[catalog]
+source = "models-dev"
+source_url = "http://models.dev/catalog.json"
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        "`: invalid config: failover.max_attempts must be at least 1\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function run(
   config: string,
   cwd: string,

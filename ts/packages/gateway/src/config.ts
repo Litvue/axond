@@ -258,28 +258,107 @@ export async function loadConfig(
   if (strategyRaw !== undefined && strategyRaw !== "round-robin" && strategyRaw !== "weighted") {
     throw configError("`[credential_pool] strategy` must be `round-robin` or `weighted`");
   }
-  const failureThreshold = numberField(poolRaw, "failure_threshold", 2);
-  if (!Number.isInteger(failureThreshold) || failureThreshold < 1) {
-    throw configError("credential_pool.failure_threshold must be at least 1");
-  }
-  const cooldownSeconds = numberField(poolRaw, "cooldown_seconds", 30);
-  if (!Number.isInteger(cooldownSeconds) || cooldownSeconds < 1) {
-    throw configError("credential_pool.cooldown_seconds must be at least 1");
-  }
+  const failureThreshold = atLeastOne(toml, "credential_pool", poolRaw, "failure_threshold", "u32", 2);
+  const cooldownSeconds = atLeastOne(toml, "credential_pool", poolRaw, "cooldown_seconds", "u64", 30);
   const credentialPool: LoadedConfig["credentialPool"] = {
     strategy: strategyRaw === "weighted" ? "weighted" : "round-robin",
     failureThreshold,
     cooldownSeconds,
   };
-  const failoverEarly = asRecord(parsed["failover"]) ?? {};
-  const targetFailures = numberField(failoverEarly, "failure_threshold", 3);
-  if (!Number.isInteger(targetFailures) || targetFailures < 1) {
-    throw configError("failover.failure_threshold must be at least 1");
+  const failoverRaw = asRecord(parsed["failover"]) ?? {};
+  const maxAttempts = atLeastOne(toml, "failover", failoverRaw, "max_attempts", "u32", 3);
+  const overallTimeoutMs = atLeastOne(toml, "failover", failoverRaw, "overall_timeout_ms", "u64", 30_000);
+  const targetFailures = atLeastOne(toml, "failover", failoverRaw, "failure_threshold", "u32", 3);
+  const targetCooldown = atLeastOne(toml, "failover", failoverRaw, "cooldown_seconds", "u64", 30);
+  const transportRaw = asRecord(parsed["transport"]) ?? {};
+  const maxResponseBytes = atLeastOne(toml, "transport", transportRaw, "max_response_bytes", "u64", DEFAULT_TRANSPORT.maxResponseBytes);
+  const maxErrorBytes = atLeastOne(
+    toml,
+    "transport",
+    transportRaw,
+    "max_error_bytes",
+    "u64",
+    DEFAULT_TRANSPORT.maxErrorBytes ?? 64 * 1024,
+  );
+  if (maxErrorBytes > maxResponseBytes) {
+    throw configError(
+      "transport.max_error_bytes must not exceed transport.max_response_bytes: an error body is a response body",
+    );
   }
-  const targetCooldown = numberField(failoverEarly, "cooldown_seconds", 30);
-  if (!Number.isInteger(targetCooldown) || targetCooldown < 1) {
-    throw configError("failover.cooldown_seconds must be at least 1");
+  const transport: TransportLimits = {
+    responseHeaderTimeoutMs: atLeastOne(
+      toml,
+      "transport",
+      transportRaw,
+      "response_header_timeout_ms",
+      "u64",
+      DEFAULT_TRANSPORT.responseHeaderTimeoutMs,
+    ),
+    bufferedBodyTimeoutMs: atLeastOne(
+      toml,
+      "transport",
+      transportRaw,
+      "buffered_body_timeout_ms",
+      "u64",
+      DEFAULT_TRANSPORT.bufferedBodyTimeoutMs,
+    ),
+    streamIdleTimeoutMs: atLeastOne(
+      toml,
+      "transport",
+      transportRaw,
+      "stream_idle_timeout_ms",
+      "u64",
+      DEFAULT_TRANSPORT.streamIdleTimeoutMs,
+    ),
+    connectTimeoutMs: atLeastOne(
+      toml,
+      "transport",
+      transportRaw,
+      "connect_timeout_ms",
+      "u64",
+      DEFAULT_TRANSPORT.connectTimeoutMs ?? 5_000,
+    ),
+    streamTerminalGraceMs: atLeastOne(
+      toml,
+      "transport",
+      transportRaw,
+      "stream_terminal_grace_ms",
+      "u64",
+      DEFAULT_TRANSPORT.streamTerminalGraceMs ?? 1_000,
+    ),
+    maxResponseBytes,
+    maxErrorBytes,
+    overallTimeoutMs,
+    maxAttempts,
+  };
+  const admissionRaw = asRecord(parsed["admission"]) ?? {};
+  const maxRequestBytes = numberField(admissionRaw, "max_request_bytes", 2 * 1024 * 1024);
+  if (!Number.isInteger(maxRequestBytes) || maxRequestBytes < 1) {
+    throw configError("admission.max_request_bytes must be at least 1");
   }
+  const maxPromptTokens = numberField(admissionRaw, "max_prompt_tokens", 1_000_000);
+  if (!Number.isInteger(maxPromptTokens) || maxPromptTokens < 0) {
+    throw configError("admission.max_prompt_tokens must be an integer of at least 0");
+  }
+  const maxOutputTokens = numberField(admissionRaw, "max_output_tokens", 200_000);
+  if (!Number.isInteger(maxOutputTokens) || maxOutputTokens < 0) {
+    throw configError("admission.max_output_tokens must be an integer of at least 0");
+  }
+  const maxStreamDurationMs = numberField(admissionRaw, "max_stream_duration_ms", 3_600_000);
+  if (!Number.isInteger(maxStreamDurationMs) || maxStreamDurationMs < 0) {
+    throw configError("admission.max_stream_duration_ms must be an integer of at least 0");
+  }
+  const maxStreamBytes = numberField(admissionRaw, "max_stream_bytes", 64 * 1024 * 1024);
+  if (!Number.isInteger(maxStreamBytes) || maxStreamBytes < 0) {
+    throw configError("admission.max_stream_bytes must be an integer of at least 0");
+  }
+  const admission = loadAdmission(admissionRaw);
+  try {
+    validateAdmission(admission);
+  } catch (error) {
+    throw configError(error instanceof Error ? error.message : "invalid admission");
+  }
+  const shutdown = loadShutdown(toml, asRecord(parsed["shutdown"]) ?? {});
   const catalog = validateCatalog(asRecord(parsed["catalog"]) ?? {});
 
   const credentials: CredentialConfig[] = [];
@@ -381,76 +460,6 @@ export async function loadConfig(
     validateGlob(pattern);
     return pattern;
   });
-
-  const transportRaw = asRecord(parsed["transport"]) ?? {};
-  const maxResponseBytes = numberField(transportRaw, "max_response_bytes", DEFAULT_TRANSPORT.maxResponseBytes);
-  if (!Number.isInteger(maxResponseBytes) || maxResponseBytes < 1) {
-    throw configError("transport.max_response_bytes must be at least 1");
-  }
-  const maxErrorBytes = numberField(transportRaw, "max_error_bytes", DEFAULT_TRANSPORT.maxErrorBytes ?? 64 * 1024);
-  if (!Number.isInteger(maxErrorBytes) || maxErrorBytes < 1) {
-    throw configError("transport.max_error_bytes must be at least 1");
-  }
-  if (maxErrorBytes > maxResponseBytes) {
-    throw configError(
-      "transport.max_error_bytes must not exceed transport.max_response_bytes: an error body is a response body",
-    );
-  }
-  const failoverRaw = asRecord(parsed["failover"]) ?? {};
-  const transport: TransportLimits = {
-    responseHeaderTimeoutMs: boundedMillis(transportRaw, "response_header_timeout_ms", DEFAULT_TRANSPORT.responseHeaderTimeoutMs),
-    bufferedBodyTimeoutMs: boundedMillis(transportRaw, "buffered_body_timeout_ms", DEFAULT_TRANSPORT.bufferedBodyTimeoutMs),
-    streamIdleTimeoutMs: boundedMillis(transportRaw, "stream_idle_timeout_ms", DEFAULT_TRANSPORT.streamIdleTimeoutMs),
-    connectTimeoutMs: boundedMillis(transportRaw, "connect_timeout_ms", DEFAULT_TRANSPORT.connectTimeoutMs ?? 5_000),
-    streamTerminalGraceMs: boundedMillis(
-      transportRaw,
-      "stream_terminal_grace_ms",
-      DEFAULT_TRANSPORT.streamTerminalGraceMs ?? 1_000,
-    ),
-    maxResponseBytes,
-    maxErrorBytes,
-    overallTimeoutMs: boundedMillis(
-      failoverRaw,
-      "overall_timeout_ms",
-      DEFAULT_TRANSPORT.overallTimeoutMs ?? 30_000,
-      "failover.overall_timeout_ms",
-    ),
-    maxAttempts: positiveInteger(
-      failoverRaw,
-      "max_attempts",
-      DEFAULT_TRANSPORT.maxAttempts ?? 3,
-      "failover.max_attempts",
-    ),
-  };
-  const admissionRaw = asRecord(parsed["admission"]) ?? {};
-  const maxRequestBytes = numberField(admissionRaw, "max_request_bytes", 2 * 1024 * 1024);
-  if (!Number.isInteger(maxRequestBytes) || maxRequestBytes < 1) {
-    throw configError("admission.max_request_bytes must be at least 1");
-  }
-  const maxPromptTokens = numberField(admissionRaw, "max_prompt_tokens", 1_000_000);
-  if (!Number.isInteger(maxPromptTokens) || maxPromptTokens < 0) {
-    throw configError("admission.max_prompt_tokens must be an integer of at least 0");
-  }
-  const maxOutputTokens = numberField(admissionRaw, "max_output_tokens", 200_000);
-  if (!Number.isInteger(maxOutputTokens) || maxOutputTokens < 0) {
-    throw configError("admission.max_output_tokens must be an integer of at least 0");
-  }
-  const maxStreamDurationMs = numberField(admissionRaw, "max_stream_duration_ms", 3_600_000);
-  if (!Number.isInteger(maxStreamDurationMs) || maxStreamDurationMs < 0) {
-    throw configError("admission.max_stream_duration_ms must be an integer of at least 0");
-  }
-  const maxStreamBytes = numberField(admissionRaw, "max_stream_bytes", 64 * 1024 * 1024);
-  if (!Number.isInteger(maxStreamBytes) || maxStreamBytes < 0) {
-    throw configError("admission.max_stream_bytes must be an integer of at least 0");
-  }
-  const admission = loadAdmission(admissionRaw);
-  try {
-    validateAdmission(admission);
-  } catch (error) {
-    throw configError(error instanceof Error ? error.message : "invalid admission");
-  }
-
-  const shutdown = loadShutdown(asRecord(parsed["shutdown"]) ?? {});
 
   const extensions = asRecord(parsed["extensions"]);
   const extensionsDir = typeof extensions?.["dir"] === "string" ? extensions["dir"] : null;
@@ -659,18 +668,15 @@ function nonNegative(row: Record<string, unknown>, key: string, fallback: number
   return value;
 }
 
-function loadShutdown(row: Record<string, unknown>): LoadedConfig["shutdown"] {
-  const drainGraceMs = numberField(row, "drain_grace_ms", 5_000);
-  const deadlineMs = numberField(row, "deadline_ms", 15_000);
-  const flushTimeoutMs = numberField(row, "flush_timeout_ms", 5_000);
-  if (!Number.isInteger(drainGraceMs) || drainGraceMs < 0) {
-    throw configError("shutdown.drain_grace_ms must be an integer of at least 0");
-  }
+function loadShutdown(toml: string, row: Record<string, unknown>): LoadedConfig["shutdown"] {
+  const drainGraceMs = readTypedInt(toml, "shutdown", row, "drain_grace_ms", "u64", 5_000);
+  const deadlineMs = readTypedInt(toml, "shutdown", row, "deadline_ms", "u64", 15_000);
+  const flushTimeoutMs = readTypedInt(toml, "shutdown", row, "flush_timeout_ms", "u64", 5_000);
   for (const [field, value] of [
     ["deadline_ms", deadlineMs],
     ["flush_timeout_ms", flushTimeoutMs],
   ] as const) {
-    if (!Number.isInteger(value) || value < 1) {
+    if (value < 1) {
       throw configError(`shutdown.${field} must be at least 1: shutdown waits are bounded`);
     }
   }
@@ -1042,30 +1048,112 @@ function bigField(row: Record<string, unknown>, key: string): bigint {
   throw configError(`\`${key}\` must be an integer`);
 }
 
-function boundedMillis(
+function atLeastOne(
+  toml: string,
+  section: string,
   row: Record<string, unknown>,
   key: string,
+  expected: "u32" | "u64",
   fallback: number,
-  label = `transport.${key}`,
 ): number {
-  const value = numberField(row, key, fallback);
-  if (!Number.isInteger(value) || value < 1) {
-    throw configError(`${label} must be at least 1`);
+  const value = readTypedInt(toml, section, row, key, expected, fallback);
+  if (value < 1) {
+    throw configError(`${section}.${key} must be at least 1`);
   }
   return value;
 }
 
-function positiveInteger(
+const U32_MAX = 4294967295n;
+
+/**
+ * A value serde would reject while extracting a `u32` or `u64`. Zero stays a
+ * number so the caller can report the Rust bound.
+ */
+function readTypedInt(
+  toml: string,
+  section: string,
   row: Record<string, unknown>,
   key: string,
+  expected: "u32" | "u64",
   fallback: number,
-  label: string,
 ): number {
-  const value = numberField(row, key, fallback);
-  if (!Number.isInteger(value) || value < 1) {
-    throw configError(`${label} must be an integer of at least 1`);
+  const figmentKey = `default.${section}.${key}`;
+  const literal = sectionFieldLiteral(toml, section, key);
+  if (literal !== null && isFloatToken(literal)) {
+    throw configLoad(
+      `invalid type: found float \`${rustFloatText(literal)}\`, expected ${expected} for key "${figmentKey}"`,
+    );
   }
-  return value;
+  if (!(key in row)) {
+    return fallback;
+  }
+  const value = row[key];
+  const typeError = (found: string): never => {
+    throw configLoad(`invalid type: found ${found}, expected ${expected} for key "${figmentKey}"`);
+  };
+  if (typeof value === "string") {
+    typeError(`string ${JSON.stringify(value)}`);
+  }
+  if (typeof value === "boolean") {
+    typeError(`bool ${value}`);
+  }
+  if (Array.isArray(value)) {
+    typeError("sequence");
+  }
+  if (value !== null && typeof value === "object") {
+    typeError("map");
+  }
+  let integer: bigint;
+  if (typeof value === "bigint") {
+    integer = value;
+  } else if (typeof value === "number" && Number.isInteger(value)) {
+    integer = BigInt(value);
+  } else if (typeof value === "number") {
+    typeError(`float \`${value}\``);
+  } else {
+    typeError("sequence");
+  }
+  const max = expected === "u32" ? U32_MAX : TARGET_UINT_MAX;
+  if (integer < 0n || (expected === "u32" && integer > U32_MAX)) {
+    throw configLoad(`invalid value signed int \`${integer}\`, expected ${expected} for key "${figmentKey}"`);
+  }
+  if (integer > max) {
+    throw configLoad("number too large to fit in target type");
+  }
+  if (integer > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw configError(`\`${key}\` must be an integer`);
+  }
+  return Number(integer);
+}
+
+function sectionFieldLiteral(toml: string, section: string, key: string): string | null {
+  let inSection = false;
+  let found: string | null = null;
+  const header = new RegExp(`^\\[${section}\\]\\s*(?:#.*)?$`);
+  const inline = new RegExp(`(?:^|[{,]\\s*)(?:"${key}"|'${key}'|${key})\\s*=\\s*([\\s\\S]*)$`);
+  for (const line of toml.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (header.test(trimmed)) {
+      inSection = true;
+      continue;
+    }
+    if (inSection && /^\s*\[/.test(line)) {
+      inSection = false;
+    }
+    const dotted = assignmentValue(line, `${section}.${key}`);
+    if (dotted !== null) {
+      found = scalarToken(dotted);
+      continue;
+    }
+    if (!inSection) {
+      continue;
+    }
+    const match = inline.exec(trimmed);
+    if (match) {
+      found = scalarToken(match[1] ?? "");
+    }
+  }
+  return found;
 }
 
 function numberField(row: Record<string, unknown>, key: string, fallback: number): number {

@@ -2447,7 +2447,7 @@ namespace = "platform"
         envSecretReader({ GW_KEY: "k" }, async () => ""),
       ),
     (error: unknown) => {
-      assert.match(error instanceof Error ? error.message : "", /failover\.max_attempts must be an integer of at least 1/);
+      assert.equal(error instanceof Error ? error.message : "", "failover.max_attempts must be at least 1");
       return true;
     },
   );
@@ -2458,7 +2458,10 @@ namespace = "platform"
         envSecretReader({ GW_KEY: "k" }, async () => ""),
       ),
     (error: unknown) => {
-      assert.match(error instanceof Error ? error.message : "", /failover\.max_attempts must be an integer of at least 1/);
+      assert.equal(
+        error instanceof Error ? error.message : "",
+        'config: invalid type: found float `1.5`, expected u32 for key "default.failover.max_attempts"',
+      );
       return true;
     },
   );

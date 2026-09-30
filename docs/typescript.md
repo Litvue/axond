@@ -65,6 +65,12 @@ overrides the file and names the `AXOND_` environment, including when the
 value is numeric. An omitted bind stays `0.0.0.0:8080`. `[::1]:8080` is a
 valid bind.
 
+`failover.max_attempts = 0` and `failover.overall_timeout_ms = 0` fail boot
+with `must be at least 1` before a bad credential and before a catalogue URL.
+A float is Figment's type sentence (`expected u32` or `expected u64`).
+Admission, transport, and shutdown bounds are checked in that same pass, so a
+zero `admission.max_request_bytes` is reported before the catalogue.
+
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
 directory of `.ts`, `.js`, or `.mjs` files. Each file's default export is an

@@ -559,6 +559,64 @@ test("server bind matches the rust socket address refusal", async () => {
   assert.equal(quoted.bind, "[::]:8080");
 });
 
+test("process local bounds are refused before credentials and the catalogue", async () => {
+  const reader = envSecretReader({ GW_KEY: "k" }, async () => "");
+  const base = `
+[storage]
+backend = "sqlite"
+path = "/tmp/axond.sqlite"
+[[namespace]]
+id = "platform"
+default = true
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "http://127.0.0.1:9"
+[[credential]]
+namespace = "ghost"
+provider = "openai"
+env = "OPENAI_KEY"
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`;
+  const reject = async (extra: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(`${base}${extra}`, reader),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  await reject("[failover]\nmax_attempts = 0\n", "failover.max_attempts must be at least 1");
+  await reject(
+    "[failover]\nmax_attempts = 1.0\n",
+    'config: invalid type: found float `1`, expected u32 for key "default.failover.max_attempts"',
+  );
+  await reject(
+    "[failover]\nmax_attempts = -1\n",
+    'config: invalid value signed int `-1`, expected u32 for key "default.failover.max_attempts"',
+  );
+  await reject(
+    "[failover]\noverall_timeout_ms = 1.5\n",
+    'config: invalid type: found float `1.5`, expected u64 for key "default.failover.overall_timeout_ms"',
+  );
+  await reject("[admission]\nmax_request_bytes = 0\n", "admission.max_request_bytes must be at least 1");
+  await reject(
+    '[failover]\nmax_attempts = 0\n[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\n',
+    "failover.max_attempts must be at least 1",
+  );
+  await reject(
+    '[admission]\nmax_request_bytes = 0\n[catalog]\nsource = "models-dev"\nsource_url = "http://models.dev/catalog.json"\n',
+    "admission.max_request_bytes must be at least 1",
+  );
+  await reject(
+    "[transport]\nconnect_timeout_ms = 0\n[[credential]]\nnamespace = \"ghost\"\nprovider = \"openai\"\nenv = \"OPENAI_KEY\"\n",
+    "transport.connect_timeout_ms must be at least 1",
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),
