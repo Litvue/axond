@@ -481,6 +481,84 @@ test("catalogue boot matches the rust refusals", async () => {
   );
 });
 
+test("server bind matches the rust socket address refusal", async () => {
+  const withBind = (line: string) => BASE.replace('bind = "127.0.0.1:9"', line);
+  const reject = async (toml: string, message: string, env: Record<string, string | undefined> = {}) => {
+    await assert.rejects(
+      () => loadConfig(toml, envSecretReader({ GW_KEY: "k", ...env }, async () => "")),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const syntax = 'config: invalid socket address syntax for key "default.server.bind"';
+  const typed = (found: string) =>
+    `config: invalid type: found ${found}, expected socket address for key "default.server.bind"`;
+  await reject(withBind('bind = "localhost:8080"'), syntax);
+  await reject(withBind('bind = "not-a-socket"'), syntax);
+  await reject(withBind('bind = ""'), syntax);
+  await reject(withBind('bind = "127.0.0.1"'), syntax);
+  await reject(withBind('bind = "127.0.0.1:99999"'), syntax);
+  await reject(withBind('bind = "127.0.0.01:80"'), syntax);
+  await reject(withBind('bind = "[::1]"'), syntax);
+  await reject('[server]\nbind = "localhost:8080"\n', syntax);
+  await reject(withBind("bind = 8080"), typed("signed int `8080`"));
+  await reject(withBind("bind = -1"), typed("signed int `-1`"));
+  await reject(withBind("bind = 1.0"), typed("float `1`"));
+  await reject(withBind("bind = 1.5"), typed("float `1.5`"));
+  await reject(withBind("bind = inf"), typed("float `inf`"));
+  await reject(withBind("bind = nan"), typed("float `NaN`"));
+  await reject(withBind("bind = true"), typed("bool true"));
+  await reject(withBind('bind = ["127.0.0.1", 8080]'), typed("sequence"));
+  await reject(withBind('bind = { host = "127.0.0.1", port = 8080 }'), typed("map"));
+  await reject(withBind("bind = 9223372036854775808"), "config: number too large to fit in target type");
+  await reject(
+    `${withBind('bind = "localhost:8080"')}\n[budget]\nenabled = true\n`,
+    syntax,
+  );
+  await reject('server.bind = "localhost:8080"\n[storage]\npath = "/tmp/axond.sqlite"\n', syntax);
+  await reject("server = { bind = 1.0 }\n[storage]\npath = \"/tmp/axond.sqlite\"\n", typed("float `1`"));
+
+  const envSyntax =
+    "config: invalid socket address syntax for key \"SERVER.BIND\" in `AXOND_` environment variable(s)";
+  const envTyped = (found: string) =>
+    `config: invalid type: found ${found}, expected socket address for key "SERVER.BIND" in \`AXOND_\` environment variable(s)`;
+  await reject(BASE, envSyntax, { AXOND_SERVER__BIND: "localhost:8080" });
+  await reject(BASE, envSyntax, { AXOND_SERVER__BIND: "" });
+  await reject(BASE, envSyntax, { axond_server__bind: "not-a-socket" });
+  await reject(BASE, envTyped("unsigned int `8080`"), { AXOND_SERVER__BIND: "8080" });
+  await reject(BASE, envTyped("unsigned int `8`"), { AXOND_SERVER__BIND: "+8" });
+  await reject(BASE, envTyped("signed int `-1`"), { AXOND_SERVER__BIND: "-1" });
+  await reject(BASE, envTyped("float `1`"), { AXOND_SERVER__BIND: "1.0" });
+  await reject(BASE, envTyped("float `1.5`"), { AXOND_SERVER__BIND: "1.5" });
+  await reject(BASE, envTyped("bool true"), { AXOND_SERVER__BIND: "true" });
+  await reject(BASE, envTyped("sequence"), { AXOND_SERVER__BIND: "[1]" });
+  await reject(BASE, envTyped("map"), { AXOND_SERVER__BIND: "{a=1}" });
+  await reject(withBind('bind = "localhost:8080"'), envSyntax, { AXOND_SERVER__BIND: "localhost:8080" });
+
+  const ipv6 = await loadConfig(withBind('bind = "[::1]:080"'), secrets);
+  assert.equal(ipv6.bind, "[::1]:80");
+  const mapped = await loadConfig(withBind('bind = "[::ffff:127.0.0.1]:80"'), secrets);
+  assert.equal(mapped.bind, "[::ffff:127.0.0.1]:80");
+  const zero = await loadConfig(withBind('bind = "0.0.0.0:0"'), secrets);
+  assert.equal(zero.bind, "0.0.0.0:0");
+  const padded = await loadConfig(withBind('bind = "127.0.0.1:08080"'), secrets);
+  assert.equal(padded.bind, "127.0.0.1:8080");
+  const omitted = await loadConfig(BASE.replace("[server]\nbind = \"127.0.0.1:9\"\n", ""), secrets);
+  assert.equal(omitted.bind, "0.0.0.0:8080");
+  const fromEnv = await loadConfig(withBind('bind = "localhost:8080"'), envSecretReader(
+    { GW_KEY: "k", AXOND_SERVER__BIND: "  127.0.0.1:9  " },
+    async () => "",
+  ));
+  assert.equal(fromEnv.bind, "127.0.0.1:9");
+  const quoted = await loadConfig(BASE, envSecretReader(
+    { GW_KEY: "k", AXOND_SERVER__BIND: '"[::]:8080"' },
+    async () => "",
+  ));
+  assert.equal(quoted.bind, "[::]:8080");
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),

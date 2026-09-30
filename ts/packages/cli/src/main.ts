@@ -311,7 +311,12 @@ async function readGatewayKeyFile(path: string): Promise<string> {
 
 function splitBind(bind: string): [string, string] {
   const index = bind.lastIndexOf(":");
-  return [bind.slice(0, index), bind.slice(index + 1)];
+  let host = bind.slice(0, index);
+  const port = bind.slice(index + 1);
+  if (host.startsWith("[") && host.endsWith("]")) {
+    host = host.slice(1, -1);
+  }
+  return [host, port];
 }
 
 /** Node's fetch honors an undici agent. Bun's fetch ignores it, so the binary does not set one. */

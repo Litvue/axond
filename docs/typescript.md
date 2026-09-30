@@ -57,6 +57,14 @@ timeout above the interval, and a retry ceiling above the interval fail boot.
 `discovery.refresh_interval_seconds = 0` is reported before those catalogue
 errors. A disabled catalogue ignores `source_url`.
 
+`[server] bind` is a socket address. `localhost:8080`, a bare port, or any
+other value that is not an IP and port fails boot with Figment's
+`invalid socket address syntax` line, and the store file is not created. A
+number, bool, array, or table uses Figment's type sentence. `AXOND_SERVER__BIND`
+overrides the file and names the `AXOND_` environment, including when the
+value is numeric. An omitted bind stays `0.0.0.0:8080`. `[::1]:8080` is a
+valid bind.
+
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
 directory of `.ts`, `.js`, or `.mjs` files. Each file's default export is an

@@ -157,12 +157,11 @@ export async function loadConfig(
     throw new GatewayFailure("bad_request", 400, `config: ${error instanceof Error ? error.message : "unreadable toml"}`);
   }
   applyEnvOverrides(parsed, secrets);
+  const bind = readServerBind(toml, parsed, secrets);
   rejectWithdrawn(parsed);
   rejectCollisions(parsed);
   rejectUsageJournal(parsed);
 
-  const server = asRecord(parsed["server"]) ?? {};
-  const bind = typeof server["bind"] === "string" ? server["bind"] : "0.0.0.0:8080";
   const storageRaw = asRecord(parsed["storage"]);
   if (!storageRaw) {
     throw configError(
@@ -1186,6 +1185,417 @@ function readUsageIndexInt(
 
 function configLoad(message: string): GatewayFailure {
   return new GatewayFailure("bad_request", 400, `config: ${message}`);
+}
+
+const BIND_KEY = 'default.server.bind';
+const BIND_ENV_KEY = "SERVER.BIND";
+const BIND_ENV_LOC = " in `AXOND_` environment variable(s)";
+const I64_MAX = 9223372036854775807n;
+const I64_MIN = -9223372036854775808n;
+const U64_MAX = 18446744073709551615n;
+
+/**
+ * `server.bind` is a `SocketAddr`. Figment rejects it while extracting, before
+ * withdrawn sections and before the store opens. `AXOND_SERVER__BIND` is the
+ * env provider, whose key and source differ from the file.
+ */
+function readServerBind(toml: string, parsed: Record<string, unknown>, secrets: SecretReader): string {
+  const override = serverBindOverride(secrets);
+  if (override !== null) {
+    return finishBind(figmentEnvValue(override), BIND_ENV_KEY, BIND_ENV_LOC);
+  }
+  const server = asRecord(parsed["server"]);
+  if (!server || !("bind" in server)) {
+    return "0.0.0.0:8080";
+  }
+  return finishBind(tomlBindValue(toml, server["bind"]), BIND_KEY, "");
+}
+
+function serverBindOverride(secrets: SecretReader): string | null {
+  let found: string | null = null;
+  for (const [name, value] of secrets.entries()) {
+    if (value === undefined || !name.toLowerCase().startsWith("axond_")) {
+      continue;
+    }
+    const parts = name.slice(6).toLowerCase().split("__");
+    if (parts.length === 2 && parts[0] === "server" && parts[1] === "bind") {
+      found = value;
+    }
+  }
+  return found;
+}
+
+type FigmentScalar =
+  | { kind: "string"; text: string }
+  | { kind: "bool"; value: boolean }
+  | { kind: "float"; text: string }
+  | { kind: "uint"; text: string }
+  | { kind: "int"; text: string }
+  | { kind: "sequence" }
+  | { kind: "map" };
+
+function finishBind(value: FigmentScalar, key: string, loc: string): string {
+  const head = `expected socket address for key "${key}"${loc}`;
+  switch (value.kind) {
+    case "string": {
+      const parsed = parseSocketAddr(value.text);
+      if (parsed === null) {
+        throw configLoad(`invalid socket address syntax for key "${key}"${loc}`);
+      }
+      return parsed;
+    }
+    case "bool":
+      throw configLoad(`invalid type: found bool ${value.value}, ${head}`);
+    case "float":
+      throw configLoad(`invalid type: found float \`${value.text}\`, ${head}`);
+    case "uint":
+      throw configLoad(`invalid type: found unsigned int \`${value.text}\`, ${head}`);
+    case "int":
+      throw configLoad(`invalid type: found signed int \`${value.text}\`, ${head}`);
+    case "sequence":
+      throw configLoad(`invalid type: found sequence, ${head}`);
+    case "map":
+      throw configLoad(`invalid type: found map, ${head}`);
+  }
+}
+
+function tomlBindValue(toml: string, value: unknown): FigmentScalar {
+  const literal = bindLiteral(toml);
+  if (literal !== null && isFloatToken(literal)) {
+    return { kind: "float", text: rustFloatText(literal) };
+  }
+  if (typeof value === "string") {
+    return { kind: "string", text: value };
+  }
+  if (typeof value === "boolean") {
+    return { kind: "bool", value };
+  }
+  if (Array.isArray(value)) {
+    return { kind: "sequence" };
+  }
+  if (value !== null && typeof value === "object") {
+    return { kind: "map" };
+  }
+  if (typeof value === "number" && !Number.isInteger(value)) {
+    const text = Object.is(value, Infinity)
+      ? "inf"
+      : Object.is(value, -Infinity)
+        ? "-inf"
+        : Number.isNaN(value)
+          ? "NaN"
+          : String(value);
+    return { kind: "float", text };
+  }
+  if (typeof value === "bigint" || typeof value === "number") {
+    const integer = typeof value === "bigint" ? value : BigInt(value);
+    if (integer > I64_MAX || integer < I64_MIN) {
+      throw configLoad("number too large to fit in target type");
+    }
+    return { kind: "int", text: integer.toString() };
+  }
+  return { kind: "sequence" };
+}
+
+function bindLiteral(toml: string): string | null {
+  let inServer = false;
+  let found: string | null = null;
+  for (const line of toml.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (/^\[server\]\s*(?:#.*)?$/.test(trimmed)) {
+      inServer = true;
+      continue;
+    }
+    if (inServer && /^\s*\[/.test(line)) {
+      inServer = false;
+    }
+    const dotted = assignmentValue(line, "server.bind");
+    if (dotted !== null) {
+      found = scalarToken(dotted);
+      continue;
+    }
+    if (!inServer && !/^\s*server\s*=/.test(line)) {
+      continue;
+    }
+    const inline = /(?:^|[{,]\s*)(?:"bind"|'bind'|bind)\s*=\s*([\s\S]*)$/.exec(trimmed);
+    if (inline) {
+      found = scalarToken(inline[1] ?? "");
+    }
+  }
+  return found;
+}
+
+function scalarToken(raw: string): string {
+  const text = raw.trim();
+  if (text.startsWith('"') || text.startsWith("'")) {
+    return tomlRhs(text);
+  }
+  const cut = text.search(/[#},]/);
+  return (cut === -1 ? text : text.slice(0, cut)).trim();
+}
+
+function parseSocketAddr(text: string): string | null {
+  if (text.startsWith("[")) {
+    const end = text.indexOf("]");
+    if (end <= 1 || text[end + 1] !== ":") {
+      return null;
+    }
+    const host = text.slice(1, end);
+    const port = parsePort(text.slice(end + 2));
+    if (port === null || !isIpv6(host)) {
+      return null;
+    }
+    return `[${host}]:${port}`;
+  }
+  const colon = text.lastIndexOf(":");
+  if (colon <= 0) {
+    return null;
+  }
+  const host = text.slice(0, colon);
+  const port = parsePort(text.slice(colon + 1));
+  if (port === null || !isIpv4(host)) {
+    return null;
+  }
+  return `${host}:${port}`;
+}
+
+function parsePort(text: string): number | null {
+  if (!/^\d{1,10}$/.test(text)) {
+    return null;
+  }
+  const port = Number(text);
+  if (!Number.isInteger(port) || port > 65535) {
+    return null;
+  }
+  return port;
+}
+
+function isIpv4(host: string): boolean {
+  const parts = host.split(".");
+  if (parts.length !== 4) {
+    return false;
+  }
+  return parts.every((part) => /^(?:0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255);
+}
+
+function isIpv6(host: string): boolean {
+  if (host.length === 0 || host.includes("%")) {
+    return false;
+  }
+  const halves = host.split("::");
+  if (halves.length > 2) {
+    return false;
+  }
+  const expand = (side: string): number | null => {
+    if (side.length === 0) {
+      return 0;
+    }
+    const bits = side.split(":");
+    if (bits.some((bit) => bit.length === 0)) {
+      return null;
+    }
+    const last = bits[bits.length - 1]!;
+    if (last.includes(".")) {
+      if (!isIpv4(last)) {
+        return null;
+      }
+      bits.pop();
+      if (bits.some((bit) => !/^[0-9a-fA-F]{1,4}$/.test(bit))) {
+        return null;
+      }
+      return bits.length + 2;
+    }
+    if (bits.some((bit) => !/^[0-9a-fA-F]{1,4}$/.test(bit))) {
+      return null;
+    }
+    return bits.length;
+  };
+  if (halves.length === 1) {
+    return expand(halves[0]!) === 8;
+  }
+  const left = expand(halves[0]!);
+  const right = expand(halves[1]!);
+  if (left === null || right === null) {
+    return false;
+  }
+  return left + right < 8;
+}
+
+function figmentEnvValue(raw: string): FigmentScalar {
+  const parsed = parseEnvAt(raw, 0);
+  if (!parsed || skipAscii(raw, parsed.end) !== raw.length) {
+    return { kind: "string", text: raw };
+  }
+  return parsed.value;
+}
+
+function parseEnvAt(raw: string, index: number): { value: FigmentScalar; end: number } | null {
+  let cursor = skipAscii(raw, index);
+  if (cursor >= raw.length) {
+    return null;
+  }
+  if (raw.startsWith("true", cursor) || raw.startsWith("false", cursor)) {
+    const word = raw.startsWith("true", cursor) ? "true" : "false";
+    return { value: { kind: "bool", value: word === "true" }, end: skipAscii(raw, cursor + word.length) };
+  }
+  const head = raw[cursor];
+  if (head === "[") {
+    return parseEnvArray(raw, cursor);
+  }
+  if (head === "{") {
+    return parseEnvDict(raw, cursor);
+  }
+  if (head === '"') {
+    const quoted = parseEnvString(raw, cursor);
+    return quoted === null ? null : { value: { kind: "string", text: quoted.text }, end: skipAscii(raw, quoted.end) };
+  }
+  if (head === "'") {
+    if (raw[cursor + 2] !== "'") {
+      return null;
+    }
+    return { value: { kind: "string", text: raw[cursor + 1] ?? "" }, end: skipAscii(raw, cursor + 3) };
+  }
+  const start = cursor;
+  while (cursor < raw.length && !",{}[]".includes(raw[cursor]!)) {
+    cursor += 1;
+  }
+  return { value: classifyEnvToken(raw.slice(start, cursor).trim()), end: skipAscii(raw, cursor) };
+}
+
+function parseEnvArray(raw: string, index: number): { value: FigmentScalar; end: number } | null {
+  let cursor = skipAscii(raw, index + 1);
+  if (raw[cursor] === "]") {
+    return { value: { kind: "sequence" }, end: skipAscii(raw, cursor + 1) };
+  }
+  while (cursor < raw.length) {
+    const item = parseEnvAt(raw, cursor);
+    if (!item) {
+      return null;
+    }
+    cursor = skipAscii(raw, item.end);
+    if (raw[cursor] === ",") {
+      cursor = skipAscii(raw, cursor + 1);
+      continue;
+    }
+    if (raw[cursor] === "]") {
+      return { value: { kind: "sequence" }, end: skipAscii(raw, cursor + 1) };
+    }
+    return null;
+  }
+  return null;
+}
+
+function parseEnvDict(raw: string, index: number): { value: FigmentScalar; end: number } | null {
+  let cursor = skipAscii(raw, index + 1);
+  if (raw[cursor] === "}") {
+    return { value: { kind: "map" }, end: skipAscii(raw, cursor + 1) };
+  }
+  while (cursor < raw.length) {
+    const keyEnd = readEnvKey(raw, cursor);
+    if (keyEnd === null || raw[keyEnd] !== "=") {
+      return null;
+    }
+    const item = parseEnvAt(raw, keyEnd + 1);
+    if (!item) {
+      return null;
+    }
+    cursor = skipAscii(raw, item.end);
+    if (raw[cursor] === ",") {
+      cursor = skipAscii(raw, cursor + 1);
+      continue;
+    }
+    if (raw[cursor] === "}") {
+      return { value: { kind: "map" }, end: skipAscii(raw, cursor + 1) };
+    }
+    return null;
+  }
+  return null;
+}
+
+function readEnvKey(raw: string, index: number): number | null {
+  let cursor = skipAscii(raw, index);
+  if (raw[cursor] === '"') {
+    return parseEnvString(raw, cursor)?.end ?? null;
+  }
+  const start = cursor;
+  while (cursor < raw.length && /[A-Za-z0-9_-]/.test(raw[cursor]!)) {
+    cursor += 1;
+  }
+  if (cursor === start) {
+    return null;
+  }
+  return skipAscii(raw, cursor);
+}
+
+function parseEnvString(raw: string, index: number): { text: string; end: number } | null {
+  let cursor = index + 1;
+  let text = "";
+  while (cursor < raw.length) {
+    const char = raw[cursor]!;
+    if (char === "\\") {
+      const next = raw[cursor + 1];
+      const mapped: Record<string, string> = { n: "\n", t: "\t", r: "\r", "\\": "\\", '"': '"', "0": "\0" };
+      if (next === undefined || !(next in mapped)) {
+        return null;
+      }
+      text += mapped[next];
+      cursor += 2;
+      continue;
+    }
+    if (char === '"') {
+      return { text, end: cursor + 1 };
+    }
+    text += char;
+    cursor += 1;
+  }
+  return null;
+}
+
+function classifyEnvToken(token: string): FigmentScalar {
+  if (token.includes(".")) {
+    const float = Number(token);
+    if (Number.isFinite(float) && /^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/.test(token)) {
+      return { kind: "float", text: String(float) };
+    }
+  }
+  const uint = rustUint(token);
+  if (uint !== null) {
+    return { kind: "uint", text: uint };
+  }
+  const signed = rustSigned(token);
+  if (signed !== null) {
+    return { kind: "int", text: signed };
+  }
+  return { kind: "string", text: token };
+}
+
+function rustUint(token: string): string | null {
+  if (!/^\+?\d+$/.test(token)) {
+    return null;
+  }
+  const digits = token.replace(/^\+/, "").replace(/^0+(?=\d)/, "") || "0";
+  if (BigInt(digits) > U64_MAX) {
+    return null;
+  }
+  return digits;
+}
+
+function rustSigned(token: string): string | null {
+  if (!/^-\d+$/.test(token)) {
+    return null;
+  }
+  const integer = BigInt(token);
+  if (integer < I64_MIN) {
+    return null;
+  }
+  return integer.toString();
+}
+
+function skipAscii(text: string, index: number): number {
+  let cursor = index;
+  while (cursor < text.length && /[ \t\n\r\f]/.test(text[cursor]!)) {
+    cursor += 1;
+  }
+  return cursor;
 }
 
 function usageIndexLiteral(toml: string, key: string): string | null {

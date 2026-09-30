@@ -361,6 +361,70 @@ namespace = "platform"
   }
 });
 
+test("bind_boot_matches_the_rust_socket_addr", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-bind-"));
+  const db = join(root, "fresh.sqlite");
+  const body = `
+[storage]
+backend = "sqlite"
+path = "${db}"
+[budget]
+enabled = true
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`;
+  try {
+    const host = join(root, "host.toml");
+    await writeFile(host, `[server]\nbind = "localhost:8080"\n${body}`);
+    const hostRun = await run(host, root, { GW_KEY: "k" });
+    assert.equal(hostRun.code, 1);
+    assert.equal(hostRun.stdout, "");
+    assert.equal(
+      hostRun.stderr,
+      "Error: failed to load config from `" +
+        host +
+        '`: config load: invalid socket address syntax for key "default.server.bind" in ' +
+        figmentFileSource(host, root) +
+        " TOML file\n",
+    );
+    await assert.rejects(() => stat(db));
+
+    const integer = join(root, "integer.toml");
+    await writeFile(integer, `[server]\nbind = 8080\n${body}`);
+    const integerRun = await run(integer, root, { GW_KEY: "k" });
+    assert.equal(integerRun.code, 1);
+    assert.equal(integerRun.stdout, "");
+    assert.equal(
+      integerRun.stderr,
+      "Error: failed to load config from `" +
+        integer +
+        '`: config load: invalid type: found signed int `8080`, expected socket address for key "default.server.bind" in ' +
+        figmentFileSource(integer, root) +
+        " TOML file\n",
+    );
+    await assert.rejects(() => stat(db));
+
+    const fromEnv = join(root, "env.toml");
+    await writeFile(fromEnv, `[server]\nbind = "127.0.0.1:9"\n${body}`);
+    const envRun = await run(fromEnv, root, { GW_KEY: "k", AXOND_SERVER__BIND: "localhost:8080" });
+    assert.equal(envRun.code, 1);
+    assert.equal(envRun.stdout, "");
+    assert.equal(
+      envRun.stderr,
+      "Error: failed to load config from `" +
+        fromEnv +
+        "`: config load: invalid socket address syntax for key \"SERVER.BIND\" in `AXOND_` environment variable(s)\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function run(
   config: string,
   cwd: string,

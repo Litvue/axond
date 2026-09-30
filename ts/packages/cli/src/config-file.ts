@@ -46,10 +46,14 @@ export function figmentFileSource(located: string, cwd = process.cwd()): string 
 
 /** A Figment extract failure names the file. A TOML parse error does not. */
 export function wantsFigmentLocation(detail: string): boolean {
+  if (detail.includes(" in `AXOND_` environment variable(s)") || detail.endsWith(" TOML file")) {
+    return false;
+  }
   return (
     detail.startsWith("invalid type:") ||
     detail.startsWith("invalid value ") ||
-    detail.startsWith("number too large to fit in target type")
+    detail.startsWith("number too large to fit in target type") ||
+    detail.startsWith("invalid socket address syntax")
   );
 }
 
