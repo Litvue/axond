@@ -161,12 +161,14 @@ export function noteSseChunk(route: string, usage: UsageTokens, text: string): v
       const type = record["type"];
       if (type === "message_start" && record["message"] && typeof record["message"] === "object") {
         const message = record["message"] as Record<string, unknown>;
-        const next = usageFromJson(route, { usage: message["usage"] });
-        copyPresent(usage, next);
+        const block = message["usage"];
+        if (block && typeof block === "object" && !Array.isArray(block)) {
+          mergeAnthropicUsage(usage, block as Record<string, unknown>);
+        }
       } else if (type === "message_delta") {
-        const next = usageFromJson(route, record);
-        if (next.outputTokens > 0n) {
-          usage.outputTokens = next.outputTokens;
+        const block = record["usage"];
+        if (block && typeof block === "object" && !Array.isArray(block)) {
+          mergeAnthropicUsage(usage, block as Record<string, unknown>);
         }
       }
       continue;
@@ -300,21 +302,26 @@ export function assignUsage(target: UsageTokens, next: UsageTokens): void {
   target.cacheWriteTokens = next.cacheWriteTokens;
 }
 
-function copyPresent(target: UsageTokens, next: UsageTokens): void {
-  if (next.inputTokens > 0n) {
-    target.inputTokens = next.inputTokens;
+/**
+ * Anthropic reports split usage: input and cache on `message_start`, output on
+ * `message_delta`. A key that is present replaces that counter, including zero.
+ * A key that is absent leaves the earlier value in place.
+ */
+function mergeAnthropicUsage(target: UsageTokens, block: Record<string, unknown>): void {
+  if ("input_tokens" in block) {
+    target.inputTokens = asBig(block["input_tokens"]);
   }
-  if (next.outputTokens > 0n) {
-    target.outputTokens = next.outputTokens;
+  if ("output_tokens" in block) {
+    target.outputTokens = asBig(block["output_tokens"]);
   }
-  if (next.reasoningTokens > 0n) {
-    target.reasoningTokens = next.reasoningTokens;
+  if ("reasoning_tokens" in block) {
+    target.reasoningTokens = asBig(block["reasoning_tokens"]);
   }
-  if (next.cacheReadTokens > 0n) {
-    target.cacheReadTokens = next.cacheReadTokens;
+  if ("cache_read_input_tokens" in block) {
+    target.cacheReadTokens = asBig(block["cache_read_input_tokens"]);
   }
-  if (next.cacheWriteTokens > 0n) {
-    target.cacheWriteTokens = next.cacheWriteTokens;
+  if ("cache_creation_input_tokens" in block) {
+    target.cacheWriteTokens = asBig(block["cache_creation_input_tokens"]);
   }
 }
 

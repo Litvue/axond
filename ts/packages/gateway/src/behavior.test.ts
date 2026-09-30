@@ -2033,6 +2033,49 @@ test("a transport error after message_stop keeps the completed body", async () =
   }
 });
 
+test("native_messages_usage_folds_message_delta_counters", async () => {
+  const store = await seeded();
+  const records: UsageRecord[] = [];
+  const wire = [
+    'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":0,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}}\n\n',
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9,"reasoning_tokens":2}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+  ].join("");
+  const upstream = await listen((_req, res) => {
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end(wire);
+  });
+  const app = messagesApp(store, upstream.url, records);
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "fake-anthropic/claude-test",
+        stream: true,
+        messages: [],
+        max_tokens: 16,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), wire);
+    for (let attempt = 0; attempt < 20 && records.length === 0; attempt += 1) {
+      await new Promise((wake) => setTimeout(wake, 10));
+    }
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.status, "ok");
+    assert.equal(records[0]!.inputTokens, 12n);
+    assert.equal(records[0]!.outputTokens, 9n);
+    assert.equal(records[0]!.reasoningTokens, 2n);
+    assert.equal(records[0]!.cacheReadTokens, 3n);
+    assert.equal(records[0]!.cacheWriteTokens, 2n);
+    const rendered = JSON.stringify(records[0], (_key, value) => typeof value === "bigint" ? value.toString() : value);
+    assert.equal(rendered.includes("sk-live-secret"), false);
+  } finally {
+    upstream.close();
+  }
+});
+
 test("an incomplete tail after message_stop is relayed through eof", async () => {
   const store = await seeded();
   const records: UsageRecord[] = [];

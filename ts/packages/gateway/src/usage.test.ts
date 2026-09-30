@@ -64,6 +64,42 @@ test("a complete terminal frame starts the post-terminal grace", () => {
   );
 });
 
+test("native messages usage folds message_delta counters", () => {
+  const usage = emptyUsage();
+  const start = [
+    "event: message_start",
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":0,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}}',
+    "",
+    "",
+  ].join("\n");
+  const delta = [
+    "event: message_delta",
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9,"reasoning_tokens":2}}',
+    "",
+    "",
+  ].join("\n");
+  noteSseChunk("messages", usage, start + delta);
+  assert.equal(usage.inputTokens, 12n);
+  assert.equal(usage.outputTokens, 9n);
+  assert.equal(usage.reasoningTokens, 2n);
+  assert.equal(usage.cacheReadTokens, 3n);
+  assert.equal(usage.cacheWriteTokens, 2n);
+
+  const cleared = emptyUsage();
+  const clearDelta = [
+    "event: message_delta",
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4,"input_tokens":8,"cache_read_input_tokens":0}}',
+    "",
+    "",
+  ].join("\n");
+  noteSseChunk("messages", cleared, start + clearDelta);
+  assert.equal(cleared.inputTokens, 8n);
+  assert.equal(cleared.outputTokens, 4n);
+  assert.equal(cleared.reasoningTokens, 0n);
+  assert.equal(cleared.cacheReadTokens, 0n);
+  assert.equal(cleared.cacheWriteTokens, 2n);
+});
+
 test("anthropic cache tokens stay disjoint from input", () => {
   const usage = usageFromJson("messages", {
     usage: { input_tokens: 19, output_tokens: 7, cache_read_input_tokens: 3, cache_creation_input_tokens: 1 },
