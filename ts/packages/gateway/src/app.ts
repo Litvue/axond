@@ -26,7 +26,7 @@ import {
   credentialState,
   noteCredentialFailure,
   noteCredentialSuccess,
-  planCredentials,
+  planCredentialWalk,
   targetAttemptCap,
   type CredentialPool,
 } from "./dispatch.ts";
@@ -694,7 +694,7 @@ async function dispatch(
   const maxStreamDurationMs = ceiling(opts.maxStreamDurationMs, DEFAULT_MAX_STREAM_DURATION_MS);
   const maxStreamBytes = ceiling(opts.maxStreamBytes, DEFAULT_MAX_STREAM_BYTES);
   const policy = credentialPolicy(opts.credentialPool);
-  const planned = planCredentials(
+  const walk = planCredentialWalk(
     opts.credentials ?? [],
     pools,
     record.id,
@@ -704,6 +704,7 @@ async function dispatch(
     now,
     policy,
   );
+  const planned = walk.attempts;
   let upstream: Awaited<ReturnType<typeof callUpstream>> | null = null;
   let lastError: unknown;
   const payload = await axond.body.json<Record<string, unknown>>();
@@ -908,7 +909,7 @@ async function dispatch(
       if (!stream) {
         noteCredentialSuccess(pools, record.id, provider.id, credential.id);
       }
-      noteAttempt(c, opts, axond, credential, attempt, attemptStarted, "ok", false);
+      noteAttempt(c, opts, axond, credential, attempt, attemptStarted, "ok", false, walk.parked, "served");
       break;
     } catch (error) {
       lastError = error;
@@ -917,6 +918,7 @@ async function dispatch(
       if (axond.ttftMs === null && !upstreamTtftRecorded) {
         streamClock = null;
       }
+      const rateLimited = error instanceof GatewayFailure && error.rateLimited;
       noteAttempt(
         c,
         opts,
@@ -926,8 +928,9 @@ async function dispatch(
         attemptStarted,
         error instanceof GatewayFailure ? error.type : "error",
         true,
+        walk.parked,
+        rateLimited ? "rate_limited" : "error",
       );
-      const rateLimited = error instanceof GatewayFailure && error.rateLimited;
       if (rateLimited) {
         noteCredentialFailure(pools, record.id, provider.id, credential.id, now, policy.failureThreshold);
       }
@@ -980,15 +983,19 @@ function noteAttempt(
   startedMs: number,
   status: string,
   error: boolean,
+  parked: readonly CredentialConfig[],
+  lease: "served" | "rate_limited" | "error",
 ): void {
   const parent = requestTrace.get(c.req.raw);
   if (!parent || !opts.telemetry) {
     return;
   }
   const spans = requestAttempts.get(c.req.raw) ?? [];
+  const attemptTrace = childTrace(parent);
+  const source = credential.namespace === opts.defaultNamespace ? "platform" : "byok";
   spans.push({
     name: "axond.upstream.attempt",
-    trace: childTrace(parent),
+    trace: attemptTrace,
     startMs: startedMs,
     endMs: Date.now(),
     kind: 1,
@@ -1000,13 +1007,47 @@ function noteAttempt(
         "axond.target.model": axond.target?.model ?? "",
         "axond.status": status,
         "axond.credential.id": credential.id,
-        "axond.credential_source": credential.namespace === opts.defaultNamespace ? "platform" : "byok",
+        "axond.credential_source": source,
         "axond.latency_ms": String(Date.now() - startedMs),
       },
       secretValues(opts),
     ),
   });
+  if (attempt === 0) {
+    for (let index = 0; index < parked.length; index += 1) {
+      noteLease(spans, attemptTrace, opts, parked[index]!, index, "parked", startedMs);
+    }
+  }
+  noteLease(spans, attemptTrace, opts, credential, parked.length + attempt, lease, startedMs);
   requestAttempts.set(c.req.raw, spans);
+}
+
+function noteLease(
+  spans: ExportedSpan[],
+  parent: TraceContext,
+  opts: AxondOptions,
+  credential: CredentialConfig,
+  index: number,
+  status: "served" | "rate_limited" | "error" | "parked",
+  startedMs: number,
+): void {
+  spans.push({
+    name: "axond.credential.lease",
+    trace: childTrace(parent),
+    startMs: startedMs,
+    endMs: Date.now(),
+    kind: 1,
+    error: status === "rate_limited" || status === "error",
+    attributes: sanitizeAttributes(
+      {
+        "axond.credential.id": credential.id,
+        "axond.credential_source": credential.namespace === opts.defaultNamespace ? "platform" : "byok",
+        "axond.credential.index": String(index),
+        "axond.status": status,
+      },
+      secretValues(opts),
+    ),
+  });
 }
 
 async function publishTelemetry(opts: AxondOptions, spans: readonly ExportedSpan[]): Promise<void> {

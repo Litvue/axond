@@ -283,6 +283,14 @@ test("otlp json joins traceparent and omits the prompt", async () => {
     assert.equal(attempt.parentSpanId, span.spanId);
     assert.equal(attempt.attributes.find((item) => item.key === "axond.target.provider")?.value.stringValue, "fake-openai");
     assert.equal(attempt.attributes.find((item) => item.key === "axond.status")?.value.stringValue, "ok");
+    const lease = spans.find((item) => item.name === "axond.credential.lease");
+    assert.ok(lease);
+    assert.equal(lease.traceId, span.traceId);
+    assert.equal(lease.parentSpanId, attempt.spanId);
+    assert.equal(lease.attributes.find((item) => item.key === "axond.credential.id")?.value.stringValue, "openai");
+    assert.equal(lease.attributes.find((item) => item.key === "axond.credential_source")?.value.stringValue, "platform");
+    assert.equal(lease.attributes.find((item) => item.key === "axond.credential.index")?.value.stringValue, "0");
+    assert.equal(lease.attributes.find((item) => item.key === "axond.status")?.value.stringValue, "served");
     assert.equal(upstream.requests[0]!.traceparent, `00-${span.traceId}-${span.spanId}-01`);
     const exported = `${traces.body}\n${metricsBody.body}`;
     assert.equal(exported.includes(KEY), false);
@@ -292,6 +300,181 @@ test("otlp json joins traceparent and omits the prompt", async () => {
     assert.equal(JSON.parse(metricsBody.body).resourceMetrics[0].scopeMetrics[0].metrics.some(
       (metric: { name: string }) => metric.name === "axond.http.server.requests",
     ), true);
+  } finally {
+    upstream.close();
+    collector.closeAllConnections();
+    collector.close();
+  }
+});
+
+test("credential_lease_spans_follow_the_pool_walk", async () => {
+  const traces: string[] = [];
+  const collector = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    if ((req.url ?? "") === "/v1/traces") {
+      traces.push(Buffer.concat(chunks).toString("utf8"));
+    }
+    res.writeHead(200);
+    res.end();
+  });
+  collector.listen(0, "127.0.0.1");
+  await once(collector, "listening");
+  const collectorAddress = collector.address();
+  if (!collectorAddress || typeof collectorAddress === "string") {
+    throw new Error("no collector port");
+  }
+  const seen: string[] = [];
+  let mode: "rotate" | "down" = "rotate";
+  const upstream = createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(chunk as Buffer);
+    }
+    await Buffer.concat(chunks);
+    const authorization = req.headers.authorization ?? "";
+    seen.push(authorization);
+    if (authorization.includes("bad-key") || mode === "down") {
+      const status = mode === "down" ? 500 : 429;
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end('{"error":{"message":"slow down"}}');
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}');
+  });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  const upstreamAddress = upstream.address();
+  if (!upstreamAddress || typeof upstreamAddress === "string") {
+    throw new Error("no upstream port");
+  }
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000_000_000n);
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    configNamespaces: ["platform"],
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: `http://127.0.0.1:${upstreamAddress.port}` }],
+    credentials: [
+      { namespace: "platform", provider: "fake-openai", secret: "bad-key", id: "bad" },
+      { namespace: "platform", provider: "fake-openai", secret: "good-key", id: "good" },
+    ],
+    prices: [
+      {
+        provider: "fake-openai",
+        model: "*",
+        inputMicrodollarsPerMillion: 1n,
+        outputMicrodollarsPerMillion: 1n,
+      },
+    ],
+    credentialPool: { failureThreshold: 1, cooldownMs: 60_000 },
+    telemetry: { endpoint: `http://127.0.0.1:${collectorAddress.port}` },
+  });
+  const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+  const body = JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "PROMPT_SENTINEL" }] });
+  type Span = {
+    name: string;
+    spanId: string;
+    parentSpanId?: string;
+    attributes: { key: string; value: { stringValue: string } }[];
+  };
+  const attr = (span: Span, key: string) => span.attributes.find((item) => item.key === key)?.value.stringValue;
+  const waitTraces = async (count: number) => {
+    const deadline = Date.now() + 2_000;
+    while (traces.length < count && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(traces.length >= count, true);
+  };
+  try {
+    const rotated = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body,
+    });
+    assert.equal(rotated.status, 200);
+    await rotated.text();
+    await waitTraces(1);
+    const first = JSON.parse(traces[0]!).resourceSpans[0].scopeSpans[0].spans as Span[];
+    const firstServer = first.find((span) => span.name === "http.server.request");
+    const firstAttempts = first.filter((span) => span.name === "axond.upstream.attempt");
+    const firstLeases = first.filter((span) => span.name === "axond.credential.lease");
+    assert.ok(firstServer);
+    assert.equal(firstAttempts.length, 2);
+    assert.equal(firstLeases.length, 2);
+    const limited = firstLeases.find((span) => attr(span, "axond.credential.id") === "bad");
+    const served = firstLeases.find((span) => attr(span, "axond.credential.id") === "good");
+    assert.ok(limited);
+    assert.ok(served);
+    assert.equal(attr(limited, "axond.status"), "rate_limited");
+    assert.equal(attr(limited, "axond.credential.index"), "0");
+    assert.equal(attr(limited, "axond.credential_source"), "platform");
+    assert.equal(attr(served, "axond.status"), "served");
+    assert.equal(attr(served, "axond.credential.index"), "1");
+    assert.equal(limited.parentSpanId, firstAttempts[0]!.spanId);
+    assert.equal(served.parentSpanId, firstAttempts[1]!.spanId);
+    assert.equal(firstAttempts[0]!.parentSpanId, firstServer.spanId);
+    assert.equal(firstAttempts[1]!.parentSpanId, firstServer.spanId);
+    assert.equal(attr(firstAttempts[0]!, "axond.status"), "provider_dependency_failed");
+    assert.equal(attr(firstAttempts[1]!, "axond.status"), "ok");
+
+    const skipped = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body,
+    });
+    assert.equal(skipped.status, 200);
+    await skipped.text();
+    await waitTraces(2);
+    const second = JSON.parse(traces[1]!).resourceSpans[0].scopeSpans[0].spans as Span[];
+    const secondAttempts = second.filter((span) => span.name === "axond.upstream.attempt");
+    const secondLeases = second.filter((span) => span.name === "axond.credential.lease");
+    assert.equal(secondAttempts.length, 1);
+    assert.equal(secondLeases.length, 2);
+    const parked = secondLeases.find((span) => attr(span, "axond.status") === "parked");
+    const stillServed = secondLeases.find((span) => attr(span, "axond.status") === "served");
+    assert.ok(parked);
+    assert.ok(stillServed);
+    assert.equal(attr(parked, "axond.credential.id"), "bad");
+    assert.equal(attr(parked, "axond.credential.index"), "0");
+    assert.equal(attr(stillServed, "axond.credential.id"), "good");
+    assert.equal(attr(stillServed, "axond.credential.index"), "1");
+    assert.equal(parked.parentSpanId, secondAttempts[0]!.spanId);
+    assert.equal(stillServed.parentSpanId, secondAttempts[0]!.spanId);
+    assert.deepEqual(seen, ["Bearer bad-key", "Bearer good-key", "Bearer good-key"]);
+
+    mode = "down";
+    const down = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers,
+      body,
+    });
+    assert.equal(down.status, 502);
+    await down.text();
+    await waitTraces(3);
+    const third = JSON.parse(traces[2]!).resourceSpans[0].scopeSpans[0].spans as Span[];
+    const failed = third.find(
+      (span) => span.name === "axond.credential.lease" && attr(span, "axond.credential.id") === "good",
+    );
+    assert.ok(failed);
+    assert.equal(attr(failed, "axond.status"), "error");
+    assert.equal(attr(failed, "axond.credential.index"), "1");
+    const exported = traces.join("\n");
+    assert.equal(exported.includes(KEY), false);
+    assert.equal(exported.includes("bad-key"), false);
+    assert.equal(exported.includes("good-key"), false);
+    assert.equal(exported.includes("PROMPT_SENTINEL"), false);
   } finally {
     upstream.close();
     collector.closeAllConnections();

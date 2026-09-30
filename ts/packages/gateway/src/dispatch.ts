@@ -51,11 +51,18 @@ export function targetAttemptCap(pinned: boolean, configured: number | undefined
   return configured ?? 3;
 }
 
+/** Credentials this request will call, and the parked ones it will skip. */
+export interface CredentialWalk {
+  attempts: CredentialConfig[];
+  parked: CredentialConfig[];
+}
+
 /**
  * One request's credential walk. A pinned route returns the first credential
  * and does not read or advance health. Otherwise the rotation cursor moves
  * once, a cooldown-elapsed credential is taken as the single half-open probe,
- * and parked credentials are skipped unless every key is parked.
+ * and parked credentials are skipped unless every key is parked. A key forced
+ * through because the whole pool is parked is an attempt, not a skip.
  */
 export function planCredentials(
   credentials: readonly CredentialConfig[],
@@ -67,9 +74,22 @@ export function planCredentials(
   now: number,
   policy: CredentialPoolPolicy,
 ): CredentialConfig[] {
+  return planCredentialWalk(credentials, pools, namespace, provider, fallbackNamespace, pinned, now, policy).attempts;
+}
+
+export function planCredentialWalk(
+  credentials: readonly CredentialConfig[],
+  pools: Map<string, CredentialPool>,
+  namespace: string,
+  provider: string,
+  fallbackNamespace: string | null,
+  pinned: boolean,
+  now: number,
+  policy: CredentialPoolPolicy,
+): CredentialWalk {
   const pool = credentialPool(credentials, namespace, provider, fallbackNamespace);
   if (pinned) {
-    return [pool[0]!];
+    return { attempts: [pool[0]!], parked: [] };
   }
   const state = poolState(pools, namespace, provider);
   const start = rotationStart(pool, state.tick, policy.strategy);
@@ -92,12 +112,12 @@ export function planCredentials(
     parked.push(candidate);
   }
   if (probe) {
-    return [probe, ...healthy];
+    return { attempts: [probe, ...healthy], parked };
   }
   if (healthy.length > 0) {
-    return healthy;
+    return { attempts: healthy, parked };
   }
-  return [parked[0]!];
+  return { attempts: [parked[0]!], parked: parked.slice(1) };
 }
 
 export function noteCredentialFailure(

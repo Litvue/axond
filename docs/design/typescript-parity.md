@@ -34,8 +34,8 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 | Minted tokens, revocation, redaction | Extensions (`@axond/tokens`, `@axond/redact`). Core still rejects an `axt1.` credential that no extension accepts. |
 | Billing-grade usage journal (ADR 0049) | Not built. The usage insert is the charge key. |
 | Redis budget backend | Not an SDK dependency. |
-| Hot reload of config | Withdrawn. Extensions load at process start. |
-| OTLP/HTTP protobuf traces, metrics, and usage logs | OTLP/HTTP JSON traces and metrics when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. `grpc` and `http/protobuf` fail boot. Request logs are one JSON object on stdout and omit prompts, completions, and credentials. |
+| Hot reload of config, including the `axond.revision.converge` span | Withdrawn. Extensions load at process start. |
+| OTLP/HTTP protobuf traces, metrics, and usage logs | OTLP/HTTP JSON traces and metrics when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. `grpc` and `http/protobuf` fail boot. Request logs are one JSON object on stdout and omit prompts, completions, and credentials. Each upstream attempt has an `axond.credential.lease` child: `served`, `rate_limited`, `error`, or `parked`, with parked credentials numbered before the ones that were called. `credential_lease_spans_follow_the_pool_walk` covers a 429 rotation and the next request's parked skip. |
 | Separate connect timeout on the Bun binary and on Workers | The header and failover budgets still bound the attempt. Node applies `connect_timeout_ms` with its HTTP client. |
 | Postgres session pool (`axond.store.connections_reused`, `axond.store.pool.sessions`) and a separate usage-index append (`usage_append`) | Each Postgres call opens one client and closes it. The usage row and the spend update are one `budget_charge`. Extension `query` is not a catalogue operation. |
 | Target circuit gauge `axond.upstream.circuit_state` | Not recorded. Credential parking is the pool circuit. Target breakers stay out of core. |
