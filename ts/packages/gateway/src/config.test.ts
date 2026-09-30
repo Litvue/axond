@@ -1266,6 +1266,72 @@ test("axond env overrides are figment values and cite the environment", async ()
   );
   await reject({ AXOND_BLOCKLIST__MODELS: "gpt" }, envTyped('string "gpt"', "a sequence", "BLOCKLIST.MODELS"));
   await reject({ AXOND_SERVER: "1.5" }, envTyped("float `1.5`", "struct Server", "SERVER"));
+  await reject({ AXOND_NAMESPACE: "[1]" }, envTyped("unsigned int `1`", "struct Namespace", "NAMESPACE.0"));
+  await reject({ AXOND_NAMESPACE: "platform" }, envTyped('string "platform"', "a sequence", "NAMESPACE"));
+  await reject(
+    { AXOND_NAMESPACE: '[{id=1,default=true}]' },
+    envTyped("unsigned int `1`", "a string", "NAMESPACE.0.ID"),
+  );
+  await reject(
+    { AXOND_NAMESPACE: '[{id="platform",default=1.5}]' },
+    envTyped("float `1.5`", "a boolean", "NAMESPACE.0.DEFAULT"),
+  );
+  await reject({ AXOND_GATEWAY_KEY: '["k"]' }, envTyped('string "k"', "struct GatewayKey", "GATEWAY_KEY.0"));
+  await reject(
+    { AXOND_GATEWAY_KEY: '[{env="GW_KEY",namespace=1}]' },
+    envTyped("unsigned int `1`", "a string", "GATEWAY_KEY.0.NAMESPACE"),
+  );
+  await reject({ AXOND_FAILOVER: "[1.5]" }, envTyped("float `1.5`", "u32", "FAILOVER.0"));
+  await reject({ AXOND_FAILOVER: "[0]" }, "failover.max_attempts must be at least 1");
+  await reject({ AXOND_ADMISSION: "[1.5]" }, envTyped("float `1.5`", "usize", "ADMISSION.0"));
+  await reject({ AXOND_ADMISSION: "[0,1.5]" }, envTyped("float `1.5`", "usize", "ADMISSION.1"));
+  await reject(
+    { AXOND_ADMISSION: "[1.5,1.5]" },
+    envTyped("float `1.5`", "usize", "ADMISSION.0"),
+  );
+  await reject(
+    { AXOND_FAILOVER: "[1.5]" },
+    'config: invalid type: found float `1.5`, expected usize for key "default.admission.max_request_bytes"',
+    `${BASE}[admission]\nmax_request_bytes = 1.5\n`,
+  );
+  await reject(
+    { AXOND_CREDENTIAL: '[{namespace="platform",provider="openai",weight=1.5}]' },
+    envTyped("float `1.5`", "u32", "CREDENTIAL.0.WEIGHT"),
+  );
+  await reject(
+    { AXOND_CREDENTIAL: '[{provider="openai"}]' },
+    'config: missing field `namespace` for key "CREDENTIAL.0" in `AXOND_` environment variable(s)',
+  );
+  await reject(
+    { AXOND_PRICE: '[{provider=1,model="gpt",input_microdollars_per_million=1,output_microdollars_per_million=1}]' },
+    envTyped("unsigned int `1`", "a string", "PRICE.0.PROVIDER"),
+  );
+  await reject(
+    { AXOND_PRICE: '[{model="gpt",input_microdollars_per_million=1,output_microdollars_per_million=1}]' },
+    'config: missing field `provider` for key "PRICE.0" in `AXOND_` environment variable(s)',
+  );
+  await reject(
+    {
+      AXOND_PRICE:
+        '[{provider="openai",model="gpt",input_microdollars_per_million=1,output_microdollars_per_million=1,reasoning_microdollars_per_million=1.5}]',
+    },
+    envTyped("float `1.5`", "u64", "PRICE.0"),
+  );
+  await reject(
+    { AXOND_PROVIDER: '[{id="openai",kind="nope",base_url="http://x"}]' },
+    'config: unknown variant: found `nope`, expected `one of `openai`, `anthropic`, `openai-compatible`` for key "PROVIDER.0.KIND" in `AXOND_` environment variable(s)',
+  );
+  await reject(
+    { AXOND_USAGE_SINK: '[{kind="redis"}]' },
+    'config: unknown variant: found `redis`, expected `one of `stdout`, `postgres`, `otlp`` for key "USAGE_SINK.0.KIND" in `AXOND_` environment variable(s)',
+  );
+  await reject(
+    { AXOND_USAGE_SINK: '[{kind="stdout",buffer_capacity=1.5}]' },
+    envTyped("float `1.5`", "usize", "USAGE_SINK.0.BUFFER_CAPACITY"),
+  );
+  await reject({ AXOND_STORAGE: "[1.5]" }, envTyped("float `1.5`", "enum StorageBackend", "STORAGE.0"));
+  await reject({ AXOND_SERVER: "[1.5]" }, envTyped("float `1.5`", "socket address", "SERVER.0"));
+  await reject({ AXOND_BLOCKLIST: "[[1]]" }, envTyped("unsigned int `1`", "a string", "BLOCKLIST.0.0"));
   const raised = await loadConfig(BASE, envSecretReader({ GW_KEY: "k", AXOND_FAILOVER__MAX_ATTEMPTS: "+8" }, async () => ""));
   assert.equal(raised.transport.maxAttempts, 8);
   const replaced = await loadConfig(
@@ -1273,6 +1339,24 @@ test("axond env overrides are figment values and cite the environment", async ()
     envSecretReader({ GW_KEY: "k", AXOND_FAILOVER__MAX_ATTEMPTS: "3" }, async () => ""),
   );
   assert.equal(replaced.transport.maxAttempts, 3);
+  const sequenced = await loadConfig(
+    `${BASE}[failover]\nmax_attempts = 1.5\n`,
+    envSecretReader({ GW_KEY: "k", AXOND_FAILOVER: "[4,2,3,4,5]" }, async () => ""),
+  );
+  assert.equal(sequenced.transport.maxAttempts, 4);
+  const renamed = await loadConfig(
+    BASE.replace('id = "platform"', 'id = "file-ns"'),
+    envSecretReader({ GW_KEY: "k", AXOND_NAMESPACE: '[{id="platform",default=true}]' }, async () => ""),
+  );
+  assert.deepEqual(
+    renamed.namespaces.map((namespace) => namespace.id),
+    ["platform"],
+  );
+  const sink = await loadConfig(
+    BASE,
+    envSecretReader({ GW_KEY: "k", AXOND_USAGE_SINK: '[{kind="stdout"}]' }, async () => ""),
+  );
+  assert.equal(sink.usageSinks[0]?.kind, "stdout");
 });
 
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {

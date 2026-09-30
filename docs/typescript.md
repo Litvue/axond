@@ -65,7 +65,7 @@ overrides the file and names the `AXOND_` environment, including when the
 value is numeric. An omitted bind stays `0.0.0.0:8080`. `[::1]:8080` is a
 valid bind.
 
-`AXOND_` overrides are Figment values, merged over the file. `AXOND_FAILOVER__MAX_ATTEMPTS=1.5` is `expected u32` at key `FAILOVER.MAX_ATTEMPTS` in the `AXOND_` environment, before a later price float, and the store file is not created. `=0` is `failover.max_attempts must be at least 1`. A file float on `admission.max_request_bytes` is still reported before that env float. `AXOND_CREDENTIAL__0__WEIGHT` is `expected a sequence` at `CREDENTIAL`. `AXOND_SHUTDOWN__NOPE` is `unknown field` at `SHUTDOWN.NOPE`.
+`AXOND_` overrides are Figment values, merged over the file. `AXOND_FAILOVER__MAX_ATTEMPTS=1.5` is `expected u32` at key `FAILOVER.MAX_ATTEMPTS` in the `AXOND_` environment, before a later price float, and the store file is not created. `=0` is `failover.max_attempts must be at least 1`. A file float on `admission.max_request_bytes` is still reported before that env float. `AXOND_CREDENTIAL__0__WEIGHT` is `expected a sequence` at `CREDENTIAL`. `AXOND_NAMESPACE=[1]` is `expected struct Namespace` at `NAMESPACE.0`. `AXOND_FAILOVER=[1.5]` is `expected u32` at `FAILOVER.0`, and `[0]` is `failover.max_attempts must be at least 1`. `AXOND_ADMISSION=[0,1.5]` is `expected usize` at `ADMISSION.1`. `AXOND_STORAGE=[1.5]` is `expected enum StorageBackend` at `STORAGE.0`. A price array cites `PRICE.0.PROVIDER` for a named field and `PRICE.0` for a flattened integer. `AXOND_SHUTDOWN__NOPE` is `unknown field` at `SHUTDOWN.NOPE`.
 
 `failover.max_attempts = 0` and `failover.overall_timeout_ms = 0` fail boot
 with `must be at least 1` before a bad credential and before a catalogue URL.

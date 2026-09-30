@@ -991,6 +991,9 @@ function rejectCollisions(parsed: Record<string, unknown>): void {
 }
 
 const ENV_LOC = " in `AXOND_` environment variable(s)";
+const ENV_WHOLE = "*";
+const ENV_MERGED = "@";
+const ENV_ELEMENT = "";
 const SEQUENCE_OVERRIDE_KEYS = [
   "credential",
   "gateway_key",
@@ -999,6 +1002,13 @@ const SEQUENCE_OVERRIDE_KEYS = [
   "provider",
   "usage_sink",
 ] as const;
+const FLATTENED_PRICE_FIELDS = new Set([
+  "cache_read_microdollars_per_million",
+  "cache_write_microdollars_per_million",
+  "input_microdollars_per_million",
+  "output_microdollars_per_million",
+  "reasoning_microdollars_per_million",
+]);
 
 type EnvLeaf = { key: string; scalar: FigmentScalar };
 
@@ -1131,14 +1141,123 @@ function applyEnvOverrides(parsed: Record<string, unknown>, secrets: SecretReade
       continue;
     }
     const scalar = figmentEnvValue(value);
-    if ((SEQUENCE_OVERRIDE_KEYS as readonly string[]).includes(head) && scalar.kind !== "sequence") {
+    // A nested `__` path into an array section builds a map. Figment then
+    // reports `expected a sequence` at the section, whatever the leaf was.
+    if ((SEQUENCE_OVERRIDE_KEYS as readonly string[]).includes(head) && !(parts.length === 1 && scalar.kind === "sequence")) {
       const found: FigmentScalar = parts.length > 1 || scalar.kind === "map" ? { kind: "map" } : scalar;
       parsed[head] = found.kind === "map" ? {} : jsFromEnvScalar(found);
       markEnv(parsed, head, { key: head.toUpperCase(), scalar: found });
       continue;
     }
+    if (parts.length === 1 && scalar.kind === "sequence") {
+      applyEnvSequence(parsed, head, scalar);
+      continue;
+    }
     assignEnvLeaf(parsed, parts, scalar, parts.map((part) => part.toUpperCase()));
   }
+}
+
+/**
+ * A sequence merged over a section replaces that section. Structs fill in
+ * declaration order and cite `SECTION.INDEX`. Arrays of structs cite
+ * `SECTION.INDEX` for a non-struct element and `SECTION.INDEX.FIELD` for a
+ * named field. Flattened price integers keep the parent key.
+ */
+function applyEnvSequence(parsed: Record<string, unknown>, head: string, scalar: FigmentScalar): void {
+  const items = scalar.items ?? [];
+  const sectionKey = head.toUpperCase();
+  if (head === "server") {
+    const record: Record<string, unknown> = {};
+    markEnv(record, ENV_WHOLE, { key: sectionKey, scalar });
+    const item = items[0];
+    if (item) {
+      record["bind"] = jsFromEnvScalar(item);
+      markEnv(record, "bind", { key: `${sectionKey}.0`, scalar: item });
+    }
+    parsed[head] = record;
+    return;
+  }
+  const fields = positionalFields(head);
+  if (fields) {
+    const record: Record<string, unknown> = {};
+    markEnv(record, ENV_WHOLE, { key: sectionKey, scalar });
+    const count = Math.min(items.length, fields.length);
+    for (let index = 0; index < count; index += 1) {
+      placePositional(record, fields[index]!, items[index]!, `${sectionKey}.${index}`);
+    }
+    parsed[head] = record;
+    return;
+  }
+  const rows: unknown[] = [];
+  items.forEach((item, index) => {
+    const leafKey = `${sectionKey}.${index}`;
+    if (item.kind === "map") {
+      const row: Record<string, unknown> = {};
+      markEnv(row, ENV_ELEMENT, { key: leafKey, scalar: item });
+      for (const entry of item.entries ?? []) {
+        const keyPath =
+          head === "price" && FLATTENED_PRICE_FIELDS.has(entry.key) ? [leafKey] : [leafKey, entry.key.toUpperCase()];
+        assignEnvLeaf(row, [entry.key], entry.value, keyPath);
+      }
+      rows.push(row);
+      return;
+    }
+    rows.push(jsFromEnvScalar(item));
+  });
+  items.forEach((item, index) => {
+    if (item.kind !== "map") {
+      markEnv(rows, String(index), { key: `${sectionKey}.${index}`, scalar: item });
+    }
+  });
+  parsed[head] = rows;
+}
+
+function positionalFields(head: string): readonly PositionalField[] | null {
+  for (const table of [POSITIONAL_BEFORE_SERVER, POSITIONAL_AFTER_SERVER]) {
+    const found = table.find((entry) => entry[0] === head);
+    if (found) {
+      return found[1];
+    }
+  }
+  return null;
+}
+
+function placePositional(
+  record: Record<string, unknown>,
+  field: PositionalField,
+  item: FigmentScalar,
+  key: string,
+): void {
+  if (field.kind === "struct" && item.kind === "map") {
+    const nested: Record<string, unknown> = {};
+    markEnv(nested, ENV_MERGED, { key, scalar: item });
+    for (const entry of item.entries ?? []) {
+      assignEnvLeaf(nested, [entry.key], entry.value, [key, entry.key.toUpperCase()]);
+    }
+    record[field.name] = nested;
+    return;
+  }
+  if (field.kind === "struct" && item.kind === "sequence") {
+    const nested: Record<string, unknown> = {};
+    markEnv(nested, ENV_WHOLE, { key, scalar: item });
+    const nestedItems = item.items ?? [];
+    const count = Math.min(nestedItems.length, field.fields.length);
+    for (let index = 0; index < count; index += 1) {
+      placePositional(nested, field.fields[index]!, nestedItems[index]!, `${key}.${index}`);
+    }
+    record[field.name] = nested;
+    return;
+  }
+  record[field.name] = jsFromEnvScalar(item);
+  markEnv(record, field.name, { key, scalar: item });
+}
+
+function replacedByEnv(row: object): boolean {
+  return (
+    envMark(row, ENV_WHOLE) !== undefined ||
+    envMark(row, ENV_MERGED) !== undefined ||
+    envMark(row, ENV_ELEMENT) !== undefined
+  );
 }
 
 function configError(message: string): GatewayFailure {
@@ -1235,6 +1354,7 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
   // Figment visits top-level keys in sorted order. `admission` is before
   // `catalog`, `credential`, `discovery`, `failover`, and `namespace`.
   const admission = asRecord(parsed["admission"]) ?? {};
+  realizePositionalEnv(admission, positionalFields("admission") ?? []);
   for (const [key, expected, fallback] of [
     ["max_in_flight", "usize", 1024],
     ["max_in_flight_per_tenant", "usize", 0],
@@ -1263,6 +1383,7 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
     rejectCatalogExtract(toml, catalog);
   }
   asArray(parsed["credential"]).forEach((entry, index) => {
+    rejectEnvElement(parsed["credential"], index, "Credential");
     const row = asRecord(entry);
     if (!row) {
       return;
@@ -1283,22 +1404,26 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
     // Required keys are checked after present keys, in declaration order.
     for (const key of ["namespace", "provider"] as const) {
       if (!(key in row)) {
-        throw configLoad(`missing field \`${key}\` for key "default.credential.${index}"`);
+        missingField(row, key, `default.credential.${index}`);
       }
     }
   });
   const pool = asRecord(parsed["credential_pool"]) ?? {};
+  realizePositionalEnv(pool, positionalFields("credential_pool") ?? []);
   readTypedInt(toml, "credential_pool", pool, "cooldown_seconds", "u64", 30);
   readTypedInt(toml, "credential_pool", pool, "failure_threshold", "u32", 2);
   readVariant(toml, "credential_pool", pool, "strategy", ["round-robin", "weighted"], "SelectionStrategy");
   const discovery = asRecord(parsed["discovery"]) ?? {};
+  realizePositionalEnv(discovery, positionalFields("discovery") ?? []);
   readTypedInt(toml, "discovery", discovery, "refresh_interval_seconds", "u64", 300);
   const failover = asRecord(parsed["failover"]) ?? {};
+  realizePositionalEnv(failover, positionalFields("failover") ?? []);
   readTypedInt(toml, "failover", failover, "cooldown_seconds", "u64", 30);
   readTypedInt(toml, "failover", failover, "failure_threshold", "u32", 3);
   readTypedInt(toml, "failover", failover, "max_attempts", "u32", 3);
   readTypedInt(toml, "failover", failover, "overall_timeout_ms", "u64", 30_000);
   asArray(parsed["gateway_key"]).forEach((entry, index) => {
+    rejectEnvElement(parsed["gateway_key"], index, "GatewayKey");
     const row = asRecord(entry);
     if (!row) {
       return;
@@ -1307,10 +1432,11 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
       readEntryString(toml, "gateway_key", index, row, key);
     }
     if (!("namespace" in row)) {
-      throw configLoad(`missing field \`namespace\` for key "default.gateway_key.${index}"`);
+      missingField(row, "namespace", `default.gateway_key.${index}`);
     }
   });
   asArray(parsed["namespace"]).forEach((entry, index) => {
+    rejectEnvElement(parsed["namespace"], index, "Namespace");
     const row = asRecord(entry);
     if (!row) {
       return;
@@ -1319,10 +1445,11 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
     readEntryBool(toml, "namespace", index, row, "default");
     readEntryString(toml, "namespace", index, row, "id");
     if (!("id" in row)) {
-      throw configLoad(`missing field \`id\` for key "default.namespace.${index}"`);
+      missingField(row, "id", `default.namespace.${index}`);
     }
   });
   asArray(parsed["price"]).forEach((entry, index) => {
+    rejectEnvElement(parsed["price"], index, "PriceRule");
     const row = asRecord(entry);
     if (!row) {
       return;
@@ -1330,6 +1457,7 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
     rejectPriceExtract(toml, index, row);
   });
   asArray(parsed["provider"]).forEach((entry, index) => {
+    rejectEnvElement(parsed["provider"], index, "Provider");
     const row = asRecord(entry);
     if (!row) {
       return;
@@ -1340,6 +1468,7 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
 
 /** `[catalog]` keys sort `bootstrap` before `create_table` before `source`. */
 function rejectCatalogExtract(toml: string, row: Record<string, unknown>): void {
+  realizePositionalEnv(row, positionalFields("catalog") ?? []);
   readVariant(toml, "catalog", row, "bootstrap", ["empty", "seed"], "CatalogBootstrap");
   readTypedInt(toml, "catalog", row, "connect_timeout_ms", "u64", CATALOG_CONNECT_TIMEOUT_MS);
   readBool(toml, "catalog", row, "create_table");
@@ -1363,6 +1492,16 @@ function readEntryString(
   row: Record<string, unknown>,
   key: string,
 ): void {
+  const marked = envMark(row, key);
+  if (marked) {
+    if (marked.scalar.kind === "string") {
+      row[key] = marked.scalar.text;
+      return;
+    }
+    throw configLoad(
+      `invalid type: found ${envFound(marked.scalar)}, expected a string for key "${marked.key}"${ENV_LOC}`,
+    );
+  }
   if (!(key in row)) {
     return;
   }
@@ -1383,6 +1522,16 @@ function readEntryBool(
   row: Record<string, unknown>,
   key: string,
 ): void {
+  const marked = envMark(row, key);
+  if (marked) {
+    if (marked.scalar.kind === "bool") {
+      row[key] = marked.scalar.value;
+      return;
+    }
+    throw configLoad(
+      `invalid type: found ${envFound(marked.scalar)}, expected a boolean for key "${marked.key}"${ENV_LOC}`,
+    );
+  }
   if (!(key in row)) {
     return;
   }
@@ -1409,6 +1558,7 @@ function rejectAfterServerExtract(toml: string, parsed: Record<string, unknown>)
   if (Array.isArray(parsed["usage_sink"])) {
     const literal = topLevelAssignment(toml, "usage_sink");
     parsed["usage_sink"].forEach((entry, index) => {
+      rejectEnvElement(parsed["usage_sink"], index, "UsageSinkConfigWire");
       const row = asRecord(entry);
       if (!row) {
         const token = literal === null ? null : nthArrayToken(literal, index);
@@ -1423,6 +1573,7 @@ function rejectAfterServerExtract(toml: string, parsed: Record<string, unknown>)
 
 /** Journal keys are visited even when `backend = "none"` leaves the section inert. */
 function rejectUsageJournalExtract(toml: string, row: Record<string, unknown>): void {
+  realizePositionalEnv(row, positionalFields("usage_journal") ?? []);
   readVariant(toml, "usage_journal", row, "backend", ["none", "postgres"], "UsageJournalBackend");
   readVariant(toml, "usage_journal", row, "capacity_policy", ["refuse", "drop-oldest"], "UsageCapacityPolicy");
   readTypedInt(toml, "usage_journal", row, "claim_batch", "usize", 1);
@@ -1444,35 +1595,38 @@ function rejectUsageJournalExtract(toml: string, row: Record<string, unknown>): 
 /** Sink keys sort `buffer_capacity` before `create_table` before `kind`. */
 function rejectUsageSinkExtract(toml: string, index: number, row: Record<string, unknown>): void {
   if ("buffer_capacity" in row) {
-    positionalInt(
-      row["buffer_capacity"],
-      arrayEntryLiteral(toml, "usage_sink", index, "buffer_capacity"),
+    readEnvOrPositionalInt(
+      row,
+      "buffer_capacity",
       "usize",
+      replacedByEnv(row) ? null : arrayEntryLiteral(toml, "usage_sink", index, "buffer_capacity"),
       `default.usage_sink.${index}.buffer_capacity`,
     );
   }
   readEntryBool(toml, "usage_sink", index, row, "create_table");
   readEntryString(toml, "usage_sink", index, row, "dsn_env");
   if ("flush_interval_ms" in row) {
-    positionalInt(
-      row["flush_interval_ms"],
-      arrayEntryLiteral(toml, "usage_sink", index, "flush_interval_ms"),
+    readEnvOrPositionalInt(
+      row,
+      "flush_interval_ms",
       "u64",
+      replacedByEnv(row) ? null : arrayEntryLiteral(toml, "usage_sink", index, "flush_interval_ms"),
       `default.usage_sink.${index}.flush_interval_ms`,
     );
   }
   readEntryVariant(toml, "usage_sink", index, row, "kind", ["stdout", "postgres", "otlp"], "UsageSinkKind");
   if ("max_batch" in row) {
-    positionalInt(
-      row["max_batch"],
-      arrayEntryLiteral(toml, "usage_sink", index, "max_batch"),
+    readEnvOrPositionalInt(
+      row,
+      "max_batch",
       "usize",
+      replacedByEnv(row) ? null : arrayEntryLiteral(toml, "usage_sink", index, "max_batch"),
       `default.usage_sink.${index}.max_batch`,
     );
   }
   readEntryString(toml, "usage_sink", index, row, "table");
   if (!("kind" in row)) {
-    throw configLoad(`missing field \`kind\` for key "default.usage_sink.${index}"`);
+    missingField(row, "kind", `default.usage_sink.${index}`);
   }
 }
 
@@ -1516,10 +1670,10 @@ function rejectPriceExtract(toml: string, index: number, row: Record<string, unk
   readEntryString(toml, "price", index, row, "model");
   readEntryString(toml, "price", index, row, "provider");
   if (!("provider" in row)) {
-    throw configLoad(`missing field \`provider\` for key "default.price.${index}"`);
+    missingField(row, "provider", `default.price.${index}`);
   }
   if (!("model" in row)) {
-    throw configLoad(`missing field \`model\` for key "default.price.${index}"`);
+    missingField(row, "model", `default.price.${index}`);
   }
   for (const key of [
     "cache_read_microdollars_per_million",
@@ -1531,16 +1685,17 @@ function rejectPriceExtract(toml: string, index: number, row: Record<string, unk
     if (!(key in row)) {
       continue;
     }
-    positionalInt(
-      row[key],
-      arrayEntryLiteral(toml, "price", index, key),
+    readEnvOrPositionalInt(
+      row,
+      key,
       "u64",
+      replacedByEnv(row) ? null : arrayEntryLiteral(toml, "price", index, key),
       `default.price.${index}`,
     );
   }
   for (const key of ["input_microdollars_per_million", "output_microdollars_per_million"]) {
     if (!(key in row)) {
-      throw configLoad(`missing field \`${key}\` for key "default.price.${index}"`);
+      missingField(row, key, `default.price.${index}`);
     }
   }
 }
@@ -1561,7 +1716,7 @@ function rejectProviderExtract(toml: string, index: number, row: Record<string, 
   readEntryVariant(toml, "provider", index, row, "unpriced_models", ["deny", "allow"], "UnpricedModels");
   for (const key of ["id", "kind", "base_url"] as const) {
     if (!(key in row)) {
-      throw configLoad(`missing field \`${key}\` for key "default.provider.${index}"`);
+      missingField(row, key, `default.provider.${index}`);
     }
   }
 }
@@ -1575,6 +1730,25 @@ function readEntryVariant(
   variants: readonly string[],
   enumName: string,
 ): void {
+  const marked = envMark(row, key);
+  if (marked) {
+    if (marked.scalar.kind === "string") {
+      row[key] = marked.scalar.text;
+      if (variants.includes(marked.scalar.text)) {
+        return;
+      }
+      const list =
+        variants.length === 2
+          ? `\`${variants[0]}\` or \`${variants[1]}\``
+          : `one of ${variants.map((item) => `\`${item}\``).join(", ")}`;
+      throw configLoad(
+        `unknown variant: found \`${marked.scalar.text}\`, expected \`${list}\` for key "${marked.key}"${ENV_LOC}`,
+      );
+    }
+    throw configLoad(
+      `invalid type: found ${envFound(marked.scalar)}, expected enum ${enumName} for key "${marked.key}"${ENV_LOC}`,
+    );
+  }
   if (!(key in row)) {
     return;
   }
@@ -1629,6 +1803,7 @@ function extractStruct(
  * bad `path`.
  */
 function rejectStorageExtract(toml: string, storage: Record<string, unknown>): void {
+  realizePositionalEnv(storage, positionalFields("storage") ?? []);
   readVariant(toml, "storage", storage, "backend", ["sqlite", "postgres"], "StorageBackend");
   readBool(toml, "storage", storage, "create_table");
   readString(toml, "storage", storage, "dsn_env");
@@ -1652,6 +1827,7 @@ function rejectStorageExtract(toml: string, storage: Record<string, unknown>): v
 
 /** Transport keys are visited in sorted order, after `shutdown`. */
 function rejectTransportExtract(toml: string, row: Record<string, unknown>): void {
+  realizePositionalEnv(row, positionalFields("transport") ?? []);
   const fields = [
     ["buffered_body_timeout_ms", DEFAULT_TRANSPORT.bufferedBodyTimeoutMs],
     ["connect_timeout_ms", DEFAULT_TRANSPORT.connectTimeoutMs ?? 5_000],
@@ -1668,6 +1844,7 @@ function rejectTransportExtract(toml: string, row: Record<string, unknown>): voi
 
 /** `[shutdown]` walks sorted keys, so an earlier unknown name wins over a later float. */
 function rejectShutdownExtract(toml: string, row: Record<string, unknown>): void {
+  realizePositionalEnv(row, positionalFields("shutdown") ?? []);
   for (const field of Object.keys(row).sort()) {
     if (field === "deadline_ms") {
       readTypedInt(toml, "shutdown", row, "deadline_ms", "u64", 15_000);
@@ -1705,7 +1882,7 @@ function readString(toml: string, section: string, row: Record<string, unknown>,
     return;
   }
   const value = row[key];
-  const literal = sectionFieldLiteral(toml, section, key);
+  const literal = replacedByEnv(row) ? null : sectionFieldLiteral(toml, section, key);
   if (typeof value === "string" && (literal === null || !isFloatToken(literal))) {
     return;
   }
@@ -1729,7 +1906,7 @@ function readBool(toml: string, section: string, row: Record<string, unknown>, k
     return;
   }
   const value = row[key];
-  const literal = sectionFieldLiteral(toml, section, key);
+  const literal = replacedByEnv(row) ? null : sectionFieldLiteral(toml, section, key);
   if (typeof value === "boolean" && (literal === null || !isFloatToken(literal))) {
     return;
   }
@@ -1771,6 +1948,9 @@ function rejectSectionShapes(
     }
     if (Array.isArray(value)) {
       value.forEach((entry, index) => {
+        if (envMark(value, String(index))) {
+          return;
+        }
         if (asRecord(entry)) {
           return;
         }
@@ -2060,6 +2240,124 @@ function positionalValue(
   );
 }
 
+function missingField(row: Record<string, unknown>, field: string, fallback: string): never {
+  const marked = envMark(row, ENV_ELEMENT);
+  if (marked) {
+    throw configLoad(`missing field \`${field}\` for key "${marked.key}"${ENV_LOC}`);
+  }
+  throw configLoad(`missing field \`${field}\` for key "${fallback}"`);
+}
+
+function rejectEnvElement(list: unknown, index: number, structName: string): void {
+  if (!Array.isArray(list)) {
+    return;
+  }
+  const marked = envMark(list, String(index));
+  if (!marked) {
+    return;
+  }
+  throw configLoad(
+    `invalid type: found ${envFound(marked.scalar)}, expected struct ${structName} for key "${marked.key}"${ENV_LOC}`,
+  );
+}
+
+function readEnvOrPositionalInt(
+  row: Record<string, unknown>,
+  key: string,
+  expected: "u32" | "u64" | "usize",
+  token: string | null,
+  figmentKey: string,
+): void {
+  const marked = envMark(row, key);
+  if (marked) {
+    const integer = coerceEnvInt(marked, expected);
+    row[key] = integer <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(integer) : integer;
+    return;
+  }
+  positionalInt(row[key], token, expected, figmentKey);
+}
+
+/** A struct filled from an env sequence reports `SECTION.INDEX` in declaration order. */
+function realizePositionalEnv(row: Record<string, unknown>, fields: readonly PositionalField[]): void {
+  if (!envMark(row, ENV_WHOLE)) {
+    return;
+  }
+  for (const field of fields) {
+    if (field.kind === "struct") {
+      const nested = asRecord(row[field.name]);
+      if (nested && envMark(nested, ENV_WHOLE)) {
+        realizePositionalEnv(nested, field.fields);
+      }
+    }
+    const marked = envMark(row, field.name);
+    if (!marked) {
+      continue;
+    }
+    coercePositionalMark(row, field, marked);
+    envMarks.get(row)?.delete(field.name);
+  }
+}
+
+function coercePositionalMark(row: Record<string, unknown>, field: PositionalField, marked: EnvLeaf): void {
+  const fail = (expected: string): never => {
+    throw configLoad(
+      `invalid type: found ${envFound(marked.scalar)}, expected ${expected} for key "${marked.key}"${ENV_LOC}`,
+    );
+  };
+  if (field.kind === "int") {
+    const integer = coerceEnvInt(marked, field.expected);
+    row[field.name] = integer <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(integer) : integer;
+    return;
+  }
+  if (field.kind === "string") {
+    if (marked.scalar.kind !== "string") {
+      fail("a string");
+    }
+    row[field.name] = marked.scalar.text;
+    return;
+  }
+  if (field.kind === "bool") {
+    if (marked.scalar.kind !== "bool") {
+      fail("a boolean");
+    }
+    row[field.name] = marked.scalar.value;
+    return;
+  }
+  if (field.kind === "enum") {
+    if (marked.scalar.kind !== "string") {
+      fail(`enum ${field.enumName}`);
+    }
+    row[field.name] = marked.scalar.text;
+    if (!field.variants.includes(marked.scalar.text)) {
+      const list =
+        field.variants.length === 2
+          ? `\`${field.variants[0]}\` or \`${field.variants[1]}\``
+          : `one of ${field.variants.map((item) => `\`${item}\``).join(", ")}`;
+      throw configLoad(
+        `unknown variant: found \`${marked.scalar.text}\`, expected \`${list}\` for key "${marked.key}"${ENV_LOC}`,
+      );
+    }
+    return;
+  }
+  if (field.kind === "strings") {
+    if (marked.scalar.kind !== "sequence") {
+      fail("a sequence");
+    }
+    const items = marked.scalar.items ?? [];
+    items.forEach((item, index) => {
+      if (item.kind === "string") {
+        return;
+      }
+      throw configLoad(
+        `invalid type: found ${envFound(item)}, expected a string for key "${marked.key}.${index}"${ENV_LOC}`,
+      );
+    });
+    row[field.name] = items.map((item) => (item.kind === "string" ? item.text : ""));
+    return;
+  }
+  fail(`struct ${field.structName}`);
+}
+
 function positionalInt(
   value: unknown,
   token: string | null,
@@ -2136,7 +2434,7 @@ function readVariant(
   if (!(key in row)) {
     return;
   }
-  const literal = sectionFieldLiteral(toml, section, key);
+  const literal = replacedByEnv(row) ? null : sectionFieldLiteral(toml, section, key);
   const value = row[key];
   const figmentKey = `default.${section}.${key}`;
   if (typeof value === "string" && (literal === null || !isFloatToken(literal))) {
@@ -2230,7 +2528,7 @@ function readTypedInt(
     row[key] = number;
     return number;
   }
-  const token = literal === undefined ? sectionFieldLiteral(toml, section, key) : literal;
+  const token = replacedByEnv(row) ? null : literal === undefined ? sectionFieldLiteral(toml, section, key) : literal;
   if (token !== null && isFloatToken(token)) {
     throw configLoad(
       `invalid type: found float \`${rustFloatText(token)}\`, expected ${expected} for key "${figmentKey}"`,
@@ -2362,6 +2660,13 @@ const TARGET_UINT_MAX = 18446744073709551615n;
  */
 function validateUsageIndex(toml: string, storageRaw: Record<string, unknown>): void {
   const index = asRecord(storageRaw["usage_index"]) ?? {};
+  if (!asRecord(storageRaw["usage_index"]) && replacedByEnv(storageRaw)) {
+    markEnv(index, ENV_WHOLE, { key: "STORAGE", scalar: { kind: "map" } });
+  }
+  const nested = asRecord(storageRaw["usage_index"]);
+  if (nested) {
+    realizePositionalEnv(nested, USAGE_INDEX_FIELDS);
+  }
   const buffer = readUsageIndexInt(toml, index, "buffer_capacity", "usize", 1024n);
   const batch = readUsageIndexInt(toml, index, "max_batch", "usize", 256n);
   const flush = readUsageIndexInt(toml, index, "flush_interval_ms", "u64", 50n);
@@ -2404,7 +2709,7 @@ function readUsageIndexInt(
     index[key] = integer <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(integer) : integer;
     return integer;
   }
-  const literal = usageIndexLiteral(toml, key);
+  const literal = replacedByEnv(index) ? null : usageIndexLiteral(toml, key);
   if (literal !== null && isFloatToken(literal)) {
     throw configLoad(
       `invalid type: found float \`${rustFloatText(literal)}\`, expected ${expected} for key "default.storage.usage_index.${key}"`,
