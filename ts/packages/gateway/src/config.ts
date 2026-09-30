@@ -1117,32 +1117,8 @@ const SECTIONS_AFTER_SERVER: ReadonlyArray<readonly [string, SectionShape]> = [
 function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void {
   rejectSectionShapes(toml, parsed, SECTIONS_BEFORE_SERVER);
   projectPositional(toml, parsed, POSITIONAL_BEFORE_SERVER);
-  rejectStorageExtract(toml, parsed);
-  asArray(parsed["credential"]).forEach((entry, index) => {
-    const row = asRecord(entry);
-    if (!row) {
-      return;
-    }
-    readTypedInt(
-      toml,
-      "credential",
-      row,
-      "weight",
-      "u32",
-      1,
-      `default.credential.${index}.weight`,
-      arrayEntryLiteral(toml, "credential", index, "weight"),
-    );
-  });
-  const pool = asRecord(parsed["credential_pool"]) ?? {};
-  readTypedInt(toml, "credential_pool", pool, "cooldown_seconds", "u64", 30);
-  readTypedInt(toml, "credential_pool", pool, "failure_threshold", "u32", 2);
-  readVariant(toml, "credential_pool", pool, "strategy", ["round-robin", "weighted"], "SelectionStrategy");
-  const failover = asRecord(parsed["failover"]) ?? {};
-  readTypedInt(toml, "failover", failover, "cooldown_seconds", "u64", 30);
-  readTypedInt(toml, "failover", failover, "failure_threshold", "u32", 3);
-  readTypedInt(toml, "failover", failover, "max_attempts", "u32", 3);
-  readTypedInt(toml, "failover", failover, "overall_timeout_ms", "u64", 30_000);
+  // Figment visits top-level keys in sorted order. `admission` is before
+  // `catalog`, `credential`, `discovery`, `failover`, and `namespace`.
   const admission = asRecord(parsed["admission"]) ?? {};
   for (const [key, expected, fallback] of [
     ["max_in_flight", "usize", 1024],
@@ -1163,21 +1139,116 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
   ] as const) {
     readTypedInt(toml, "admission", admission, key, expected, fallback);
   }
-  const catalog = asRecord(parsed["catalog"]) ?? {};
-  for (const [key, expected, fallback] of [
-    ["connect_timeout_ms", "u64", CATALOG_CONNECT_TIMEOUT_MS],
-    ["max_payload_bytes", "usize", CATALOG_MAX_PAYLOAD_BYTES],
-    ["operation_timeout_ms", "u64", CATALOG_OPERATION_TIMEOUT_MS],
-    ["refresh_interval_seconds", "u64", CATALOG_REFRESH_INTERVAL_SECONDS],
-    ["refresh_timeout_seconds", "u64", CATALOG_REFRESH_TIMEOUT_SECONDS],
-    ["retry_initial_seconds", "u64", CATALOG_RETRY_INITIAL_SECONDS],
-    ["retry_max_seconds", "u64", CATALOG_RETRY_MAX_SECONDS],
-  ] as const) {
-    readTypedInt(toml, "catalog", catalog, key, expected, fallback);
+  const catalog = asRecord(parsed["catalog"]);
+  if (catalog) {
+    rejectCatalogExtract(toml, catalog);
   }
-  readVariant(toml, "catalog", catalog, "source", ["none", "models-dev", "seed"], "CatalogSourceBackend");
+  asArray(parsed["credential"]).forEach((entry, index) => {
+    const row = asRecord(entry);
+    if (!row) {
+      return;
+    }
+    for (const key of ["env", "id", "namespace", "provider"] as const) {
+      readEntryString(toml, "credential", index, row, key);
+    }
+    readTypedInt(
+      toml,
+      "credential",
+      row,
+      "weight",
+      "u32",
+      1,
+      `default.credential.${index}.weight`,
+      arrayEntryLiteral(toml, "credential", index, "weight"),
+    );
+  });
+  const pool = asRecord(parsed["credential_pool"]) ?? {};
+  readTypedInt(toml, "credential_pool", pool, "cooldown_seconds", "u64", 30);
+  readTypedInt(toml, "credential_pool", pool, "failure_threshold", "u32", 2);
+  readVariant(toml, "credential_pool", pool, "strategy", ["round-robin", "weighted"], "SelectionStrategy");
   const discovery = asRecord(parsed["discovery"]) ?? {};
   readTypedInt(toml, "discovery", discovery, "refresh_interval_seconds", "u64", 300);
+  const failover = asRecord(parsed["failover"]) ?? {};
+  readTypedInt(toml, "failover", failover, "cooldown_seconds", "u64", 30);
+  readTypedInt(toml, "failover", failover, "failure_threshold", "u32", 3);
+  readTypedInt(toml, "failover", failover, "max_attempts", "u32", 3);
+  readTypedInt(toml, "failover", failover, "overall_timeout_ms", "u64", 30_000);
+  asArray(parsed["gateway_key"]).forEach((entry, index) => {
+    const row = asRecord(entry);
+    if (!row) {
+      return;
+    }
+    for (const key of ["env", "file", "namespace"] as const) {
+      readEntryString(toml, "gateway_key", index, row, key);
+    }
+  });
+  asArray(parsed["namespace"]).forEach((entry, index) => {
+    const row = asRecord(entry);
+    if (!row) {
+      return;
+    }
+    readEntryBool(toml, "namespace", index, row, "allow_platform_fallback");
+    readEntryBool(toml, "namespace", index, row, "default");
+    readEntryString(toml, "namespace", index, row, "id");
+  });
+}
+
+/** `[catalog]` keys sort `bootstrap` before `create_table` before `source`. */
+function rejectCatalogExtract(toml: string, row: Record<string, unknown>): void {
+  readVariant(toml, "catalog", row, "bootstrap", ["empty", "seed"], "CatalogBootstrap");
+  readTypedInt(toml, "catalog", row, "connect_timeout_ms", "u64", CATALOG_CONNECT_TIMEOUT_MS);
+  readBool(toml, "catalog", row, "create_table");
+  readString(toml, "catalog", row, "dsn_env");
+  readTypedInt(toml, "catalog", row, "max_payload_bytes", "usize", CATALOG_MAX_PAYLOAD_BYTES);
+  readTypedInt(toml, "catalog", row, "operation_timeout_ms", "u64", CATALOG_OPERATION_TIMEOUT_MS);
+  readTypedInt(toml, "catalog", row, "refresh_interval_seconds", "u64", CATALOG_REFRESH_INTERVAL_SECONDS);
+  readTypedInt(toml, "catalog", row, "refresh_timeout_seconds", "u64", CATALOG_REFRESH_TIMEOUT_SECONDS);
+  readTypedInt(toml, "catalog", row, "retry_initial_seconds", "u64", CATALOG_RETRY_INITIAL_SECONDS);
+  readTypedInt(toml, "catalog", row, "retry_max_seconds", "u64", CATALOG_RETRY_MAX_SECONDS);
+  readString(toml, "catalog", row, "schema");
+  readVariant(toml, "catalog", row, "source", ["none", "models-dev", "seed"], "CatalogSourceBackend");
+  readString(toml, "catalog", row, "source_url");
+  readVariant(toml, "catalog", row, "store", ["in-memory", "postgres"], "CatalogStoreBackend");
+}
+
+function readEntryString(
+  toml: string,
+  section: string,
+  index: number,
+  row: Record<string, unknown>,
+  key: string,
+): void {
+  if (!(key in row)) {
+    return;
+  }
+  const literal = arrayEntryLiteral(toml, section, index, key);
+  const value = row[key];
+  if (typeof value === "string" && (literal === null || !isFloatToken(literal))) {
+    return;
+  }
+  throw configLoad(
+    `invalid type: found ${foundPhrase(value, literal)}, expected a string for key "default.${section}.${index}.${key}"`,
+  );
+}
+
+function readEntryBool(
+  toml: string,
+  section: string,
+  index: number,
+  row: Record<string, unknown>,
+  key: string,
+): void {
+  if (!(key in row)) {
+    return;
+  }
+  const literal = arrayEntryLiteral(toml, section, index, key);
+  const value = row[key];
+  if (typeof value === "boolean" && (literal === null || !isFloatToken(literal))) {
+    return;
+  }
+  throw configLoad(
+    `invalid type: found ${foundPhrase(value, literal)}, expected a boolean for key "default.${section}.${index}.${key}"`,
+  );
 }
 
 /**

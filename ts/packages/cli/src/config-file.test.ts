@@ -515,6 +515,51 @@ source_url = "http://models.dev/catalog.json"
   }
 });
 
+test("catalog_create_table_float_beats_a_later_refresh", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-catalog-order-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "catalog.toml");
+  await writeFile(
+    config,
+    `
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[credential]]
+namespace = "ghost"
+provider = "openai"
+env = "OPENAI_KEY"
+weight = 1.5
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[catalog]
+create_table = 1.5
+refresh_interval_seconds = 1.5
+source = "nope"
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        '`: config load: invalid type: found float `1.5`, expected a boolean for key "default.catalog.create_table" in ' +
+        figmentFileSource(config, root) +
+        " TOML file\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("shutdown_unknown_field_beats_a_transport_float", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-transport-"));
   const db = join(root, "fresh.sqlite");

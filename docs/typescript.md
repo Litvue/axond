@@ -96,7 +96,14 @@ before `drain_grace_ms = 1.5`. Inside `[transport]`,
 `buffered_body_timeout_ms = 1.5` is reported before `connect_timeout_ms = 1.5`.
 A bad `server.bind` is reported before `[shutdown]` and `[storage]`.
 `create_table = 1.5` is reported before `path = 1`. `path = 1` is `expected a
-string`, and a bad `backend` is still reported first. `failover = [0]` is `failover.max_attempts must be at least 1`
+string`, and a bad `backend` is still reported first. `[catalog]
+create_table = 1.5` is reported before `refresh_interval_seconds = 1.5`.
+`bootstrap = "nope"` is reported before `source = "nope"`. `store = "nope"`
+names `in-memory` or `postgres`. `source_url = 1` is `expected a string` when
+`source = "none"`. A credential `namespace = 1` is reported before
+`weight = 1.5`. A namespace `allow_platform_fallback = 1.5` is reported before
+`id = 1`. An admission float is reported before that credential weight.
+`failover = [0]` is `failover.max_attempts must be at least 1`
 before a ghost credential. `failover = [1.5]` is `expected u32` at
 `default.failover.0`. `storage = []` still requires a SQLite path.
 

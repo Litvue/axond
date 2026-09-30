@@ -957,6 +957,71 @@ test("storage enums and unknown shutdown fields are figment extract errors", asy
   );
 });
 
+test("catalog credential and namespace keys follow figment order", async () => {
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const typed = (found: string, expected: string, key: string) =>
+    `config: invalid type: found ${found}, expected ${expected} for key "${key}"`;
+  const variant = (found: string, expected: string, key: string) =>
+    `config: unknown variant: found \`${found}\`, expected \`${expected}\` for key "${key}"`;
+  await reject(
+    `${BASE}[catalog]\ncreate_table = 1.5\nrefresh_interval_seconds = 1.5\n`,
+    typed("float `1.5`", "a boolean", "default.catalog.create_table"),
+  );
+  await reject(
+    `${BASE}[catalog]\nbootstrap = "nope"\nsource = "nope"\nrefresh_interval_seconds = 1.5\n`,
+    variant("nope", "`empty` or `seed`", "default.catalog.bootstrap"),
+  );
+  await reject(
+    `${BASE}[catalog]\nstore = "nope"\n`,
+    variant("nope", "`in-memory` or `postgres`", "default.catalog.store"),
+  );
+  await reject(
+    `${BASE}[catalog]\nsource = "none"\nsource_url = 1\n`,
+    typed("signed int `1`", "a string", "default.catalog.source_url"),
+  );
+  await reject(
+    `${BASE}[catalog]\nconnect_timeout_ms = 1.5\nsource = "nope"\n`,
+    typed("float `1.5`", "u64", "default.catalog.connect_timeout_ms"),
+  );
+  const kept = await loadConfig(
+    `${BASE}[catalog]\nbootstrap = "empty"\nstore = "in-memory"\ncreate_table = false\nsource = "none"\n`,
+    secrets,
+  );
+  assert.deepEqual(kept.catalog, { source: "none" });
+  await reject(
+    `${BASE}[[credential]]\nnamespace = 1\nweight = 1.5\n`,
+    typed("signed int `1`", "a string", "default.credential.0.namespace"),
+  );
+  await reject(
+    `${BASE}[[credential]]\nenv = 1\nweight = 1.5\n`,
+    typed("signed int `1`", "a string", "default.credential.0.env"),
+  );
+  await reject(
+    `${BASE}[admission]\nmax_request_bytes = 1.5\n[[credential]]\nnamespace = "platform"\nprovider = "openai"\nenv = "OPENAI_KEY"\nweight = 1.5\n`,
+    typed("float `1.5`", "usize", "default.admission.max_request_bytes"),
+  );
+  await reject(
+    BASE.replace('id = "platform"\ndefault = true\n', "allow_platform_fallback = 1.5\nid = 1\ndefault = 1.5\n"),
+    typed("float `1.5`", "a boolean", "default.namespace.0.allow_platform_fallback"),
+  );
+  await reject(
+    BASE.replace('id = "platform"', "id = 1").replace('bind = "127.0.0.1:9"', "bind = 1"),
+    typed("signed int `1`", "a string", "default.namespace.0.id"),
+  );
+  await reject(
+    BASE.replace('env = "GW_KEY"\n', 'file = 1\nenv = "GW_KEY"\n'),
+    typed("signed int `1`", "a string", "default.gateway_key.0.file"),
+  );
+});
+
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {
   await assert.rejects(
     () => loadConfig(`${BASE}\n[[usage_sink]]\nkind = "redis"\n`, secrets),
