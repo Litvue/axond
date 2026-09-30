@@ -451,8 +451,18 @@ async function bindNamespace(
       axond.resolvedPeriod = null;
       (axond as MutableContext & { admitted?: boolean }).admitted = true;
       (axond as MutableContext & { record?: NamespaceWrite }).record = record;
+      emitLog(opts, {
+        msg: "budget_unavailable",
+        request_id: axond.requestId,
+        stance: "allow",
+      });
       return;
     }
+    emitLog(opts, {
+      msg: "budget_unavailable",
+      request_id: axond.requestId,
+      stance: "deny",
+    });
     throw new GatewayFailure("budget_unavailable", 503, "budget store is unavailable");
   }
   if (!resolved) {

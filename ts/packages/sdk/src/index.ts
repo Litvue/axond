@@ -142,6 +142,16 @@ export interface SettlementFailureLog {
   waited_ms: number;
 }
 
+/**
+ * A charging route could not read the budget. `deny` refused the request.
+ * `allow` served it and did not charge. The driver text stays off this line.
+ */
+export interface BudgetUnavailableLog {
+  msg: "budget_unavailable";
+  request_id: string;
+  stance: "deny" | "allow";
+}
+
 /** A catalogue fetch was stored, or refused without replacing the active document. */
 export interface CatalogueImportLog {
   msg: "catalogue_import";
@@ -157,6 +167,7 @@ export type AxondLog =
   | UpstreamTransportLog
   | StreamLimitLog
   | SettlementFailureLog
+  | BudgetUnavailableLog
   | CatalogueImportLog;
 
 export interface AxondContext {
@@ -382,8 +393,9 @@ export interface AxondOptions {
    * A buffered charge includes status, tokens, and cost. A stream has been
    * routed but has not settled, so those fields are absent. A rate-limit
    * rotation, an upstream timeout, a transport failure, a stream duration or
-   * byte cap, a settlement bound, and a catalogue import are separate lines.
-   * None of them carry a body, a credential, or a source URL.
+   * byte cap, a settlement bound, a budget-store outage, and a catalogue
+   * import are separate lines. None of them carry a body, a credential, a
+   * driver message, or a source URL.
    */
   onLog?: (record: AxondLog) => void;
   maxRequestBytes?: number;

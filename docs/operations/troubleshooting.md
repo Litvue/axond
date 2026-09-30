@@ -43,7 +43,7 @@ Boot errors name references and identifiers, not secret values.
 | `502 upstream_body_too_large` | A buffered provider body exceeded `transport.max_response_bytes`. | Whether the workload really returns bodies that size; otherwise treat the target as misbehaving. |
 | `502 invalid_request` | Provider returned a non-retryable request/auth error. | Provider credential, model deployment, and provider body. |
 | `503 usage_not_durable` | Billing-grade delivery is on and the request's usage event could not be made durable, so the gateway will not report success for a request it cannot bill. | `axond.usage.journal.appends` by outcome, and depth against capacity: a full outbox usually means delivery has stalled, not that appends are too fast — or a retired `consumer` name is still registered and holding retention open ([usage outbox](./usage-outbox.md#when-a-request-is-refused)). |
-| `503 budget_unavailable` | The Store failed under `[storage] on_unavailable = "deny"`. | SQLite/Postgres health and latency. |
+| `503 budget_unavailable` | The Store failed under `[storage] on_unavailable = "deny"`. The TypeScript process writes JSON `msg` `budget_unavailable` with `stance` `deny`. `allow` writes the same `msg` with `stance` `allow`, serves the request, and does not charge. That line omits the driver text. | SQLite/Postgres health and latency. |
 | `503 continuation_affinity_unavailable` | A request carrying `previous_response_id` cannot safely use its pinned first target or credential. | First-target circuit and first-credential state; retry later. |
 
 All error bodies use `{"error":{"type":...,"message":...}}`.

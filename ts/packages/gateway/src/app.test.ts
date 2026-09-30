@@ -1601,6 +1601,109 @@ test("allow serves a chat when the budget read fails and does not charge", async
   upstream.close();
 });
 
+test("budget_store_log_names_the_stance_and_omits_the_driver_text", async () => {
+  const driver = "password=secret host=db.internal:5432/axond ECONNREFUSED";
+  const prompt = "PROMPT_SENTINEL";
+  const logs: { msg: string; stance?: string; request_id?: string }[] = [];
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  await store.putBudget("platform", "compat", 1_000_000n);
+  const down = new Proxy(store, {
+    get(target, prop, receiver) {
+      if (prop === "resolveNamespace") {
+        return async () => {
+          const failure = new StoreFailure();
+          failure.message = driver;
+          throw failure;
+        };
+      }
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const prices = [
+    {
+      provider: "fake-openai",
+      model: "*",
+      inputMicrodollarsPerMillion: 2_500_000n,
+      outputMicrodollarsPerMillion: 10_000_000n,
+    },
+  ];
+  const denied = createAxond({
+    store: down,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: "http://127.0.0.1:9" }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream-secret", id: "one" }],
+    prices,
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  const chat = await denied.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: prompt }] }),
+  });
+  assert.equal(chat.status, 503);
+  const chatBody = await chat.text();
+  assert.equal(JSON.parse(chatBody).error.type, "budget_unavailable");
+  assert.equal(chatBody.includes(driver), false);
+  assert.equal(chatBody.includes(prompt), false);
+  const models = await denied.request("http://127.0.0.1/ns/platform/v1/models", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(models.status, 503);
+  assert.equal((await models.json()).error.type, "store_unavailable");
+  const deniedBudget = logs.filter((record) => record.msg === "budget_unavailable");
+  assert.equal(deniedBudget.length, 1);
+  assert.equal(deniedBudget[0]?.stance, "deny");
+  assert.equal(typeof deniedBudget[0]?.request_id, "string");
+  assert.equal((deniedBudget[0]?.request_id ?? "").length > 0, true);
+
+  const upstream = await listenUpstream();
+  const allowed = createAxond({
+    store: down,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    onStoreUnavailable: "allow",
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: upstream.url }],
+    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream-secret", id: "one" }],
+    prices,
+    onLog: (record) => {
+      logs.push(record);
+    },
+  });
+  const served = await allowed.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+    method: "POST",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: prompt }] }),
+  });
+  assert.equal(served.status, 200);
+  await served.json();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const budget = await store.getBudget("platform", "compat");
+  assert.equal(budget?.spent, 0n);
+  const allowedBudget = logs.filter((record) => record.msg === "budget_unavailable" && record.stance === "allow");
+  assert.equal(allowedBudget.length, 1);
+  assert.equal(typeof allowedBudget[0]?.request_id, "string");
+  assert.equal(allowedBudget[0]?.request_id === deniedBudget[0]?.request_id, false);
+  const encoded = JSON.stringify(logs);
+  assert.equal(encoded.includes(driver), false);
+  assert.equal(encoded.includes("db.internal"), false);
+  assert.equal(encoded.includes(prompt), false);
+  assert.equal(encoded.includes(KEY), false);
+  assert.equal(encoded.includes("upstream-secret"), false);
+  assert.equal(encoded.includes("ECONNREFUSED"), false);
+  upstream.close();
+});
+
 test("closed admission returns draining before authentication", async () => {
   const store = createMemoryStore();
   await store.putNamespace({
