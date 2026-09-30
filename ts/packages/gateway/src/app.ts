@@ -1423,15 +1423,29 @@ async function settle(opts: AxondOptions, axond: MutableContext, usage: UsageTok
   // A provider failure with no measured usage records cost 0 and adds nothing
   // to spent. A stream that already relayed text keeps that measured cost.
   const cost = settlementCost(opts, axond, usage, status);
-  const result = await opts.store.settle({
-    requestId: axond.requestId,
-    namespace: axond.namespace?.id ?? "",
-    period: axond.resolvedPeriod,
-    model: axond.alias,
-    status,
-    cost,
-    incarnation: axond.resolvedIncarnation,
-  });
+  let result: { charged: boolean };
+  try {
+    result = await opts.store.settle({
+      requestId: axond.requestId,
+      namespace: axond.namespace?.id ?? "",
+      period: axond.resolvedPeriod,
+      model: axond.alias,
+      status,
+      cost,
+      incarnation: axond.resolvedIncarnation,
+    });
+  } catch (error) {
+    if (!(error instanceof StoreFailure)) {
+      throw error;
+    }
+    opts.metrics?.record("axond.settlement.failures", 1, { "axond.settlement.reason": "charge_failed" });
+    emitLog(opts, {
+      msg: "settlement_failure",
+      request_id: axond.requestId,
+      reason: "charge_failed",
+    });
+    return;
+  }
   const settlement: Settlement = {
     requestId: axond.requestId,
     namespace: axond.namespace?.id ?? "",

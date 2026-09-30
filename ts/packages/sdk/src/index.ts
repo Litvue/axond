@@ -131,16 +131,24 @@ export interface StreamLimitLog {
 }
 
 /**
- * A charge missed a settlement bound. `queue_timeout` means the charge never
- * started and spend was not written. `execution_timeout` means Store work
- * outlived its deadline and still finishes.
+ * A charge missed a settlement bound, or the Store rejected the write.
+ * `queue_timeout` means the charge never started and spend was not written.
+ * `execution_timeout` means Store work outlived its deadline and still finishes.
+ * `charge_failed` means the Store write threw and spend was not written.
+ * The driver text stays off this line.
  */
-export interface SettlementFailureLog {
-  msg: "settlement_failure";
-  request_id: string;
-  reason: "queue_timeout" | "execution_timeout";
-  waited_ms: number;
-}
+export type SettlementFailureLog =
+  | {
+      msg: "settlement_failure";
+      request_id: string;
+      reason: "queue_timeout" | "execution_timeout";
+      waited_ms: number;
+    }
+  | {
+      msg: "settlement_failure";
+      request_id: string;
+      reason: "charge_failed";
+    };
 
 /**
  * A charging route could not read the budget. `deny` refused the request.
@@ -393,9 +401,9 @@ export interface AxondOptions {
    * A buffered charge includes status, tokens, and cost. A stream has been
    * routed but has not settled, so those fields are absent. A rate-limit
    * rotation, an upstream timeout, a transport failure, a stream duration or
-   * byte cap, a settlement bound, a budget-store outage, and a catalogue
-   * import are separate lines. None of them carry a body, a credential, a
-   * driver message, or a source URL.
+   * byte cap, a settlement bound, a failed Store write, a budget-store outage,
+   * and a catalogue import are separate lines. None of them carry a body, a
+   * credential, a driver message, or a source URL.
    */
   onLog?: (record: AxondLog) => void;
   maxRequestBytes?: number;
