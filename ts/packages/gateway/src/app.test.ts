@@ -19,6 +19,7 @@ const KEY = "test-inbound-key";
 async function gateway(
   metrics?: ReturnType<typeof createMetrics>,
   telemetry?: { endpoint: string; instanceId?: string },
+  responseBody?: string,
 ) {
   const store = createMemoryStore();
   await store.putNamespace({
@@ -37,7 +38,7 @@ async function gateway(
   });
   await store.putBudget("platform", "compat", 1_000_000_000_000n);
   await store.putBudget("tenant", "compat", 1_000_000_000_000n);
-  const upstream = await listenUpstream();
+  const upstream = await listenUpstream(responseBody);
   const app = createAxond({
     store,
     gatewayKey: KEY,
@@ -122,6 +123,28 @@ test("a buffered chat forwards duplicate keys, field order, and integers above 2
     assert.equal(sent.body, '{"z":1,"model": "gpt-test","n":9007199254740993,"a":1,"a":2}');
     assert.equal(sent.authorization, "Bearer upstream-openai");
     const parsed = JSON.parse(sent.body) as { n: number; a: number };
+    assert.equal(parsed.n, 9007199254740992);
+    assert.equal(parsed.a, 2);
+  } finally {
+    upstream.close();
+  }
+});
+
+test("a buffered chat returns the provider bytes, including duplicate keys and integers above 2^53", async () => {
+  const raw =
+    '{"z":1,"id":"chatcmpl-test","n":9007199254740993,"a":1,"a":2,"choices":[{"message":{"role":"assistant","content":"ok"}}]}';
+  const { app, upstream } = await gateway(undefined, undefined, raw);
+  try {
+    const response = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({ model: "fake-openai/gpt-test", messages: [{ role: "user", content: "hi" }] }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("content-type"), "application/json");
+    const text = await response.text();
+    assert.equal(text, raw);
+    const parsed = JSON.parse(text) as { n: number; a: number };
     assert.equal(parsed.n, 9007199254740992);
     assert.equal(parsed.a, 2);
   } finally {
@@ -1268,7 +1291,7 @@ test("openapi is 3.1 and lists the management routes", async () => {
   upstream.close();
 });
 
-async function listenUpstream(): Promise<{
+async function listenUpstream(responseBody?: string): Promise<{
   url: string;
   requests: { path: string; authorization: string; body: string; traceparent: string }[];
   close: () => void;
@@ -1292,7 +1315,7 @@ async function listenUpstream(): Promise<{
       usage: { prompt_tokens: 12, completion_tokens: 7 },
     };
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify(payload));
+    res.end(responseBody ?? JSON.stringify(payload));
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
