@@ -34,7 +34,7 @@ import {
   type TransportFailureReason,
 } from "./dispatch.ts";
 import { GatewayFailure, StoreFailure, badRequest, gatewayError } from "./errors.ts";
-import { globMatch } from "./glob.ts";
+import { globMatch, validateGlob } from "./glob.ts";
 import { budgetJson, money, namespaceJson } from "./memory-store.ts";
 import { monthlyPeriod, namespaceFromCanonicalPath, parseNamespaceId, validatePeriod, validateTimezone } from "./namespace.ts";
 import { beginTrace, childTrace, formatTraceparent, metricPayload, parseTraceparent, postOtlp, resourceAttributes, tracePayload, type ExportedSpan, type TraceContext } from "./otel.ts";
@@ -1864,11 +1864,14 @@ function asAttrs(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw badRequest("attrs must be an object");
   }
-  const encoded = JSON.stringify(value);
-  if (encoded.length > 4 * 1024) {
+  if (jsonUtf8Length(value) > 4 * 1024) {
     throw badRequest("attrs exceeds 4096 byte limit");
   }
   return value as Record<string, unknown>;
+}
+
+function jsonUtf8Length(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length;
 }
 
 function asBlocklist(value: unknown): string[] | null {
@@ -1878,15 +1881,17 @@ function asBlocklist(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
     throw badRequest("blocklist must be a list of strings");
   }
-  for (const pattern of value) {
-    if (typeof pattern === "string") {
-      // Invalid globs are a request error.
-      if (![...pattern].every((char) => char === "*" || char.trim() !== "" || true)) {
-        throw badRequest("blocklist must be a list of strings");
-      }
-    }
+  const patterns = value as string[];
+  if (patterns.length > 64) {
+    throw badRequest("namespace blocklist exceeds 64 entries");
   }
-  return value as string[];
+  if (jsonUtf8Length(patterns) > 4096) {
+    throw badRequest("namespace blocklist exceeds 4 KiB");
+  }
+  for (const pattern of patterns) {
+    validateGlob(pattern);
+  }
+  return patterns;
 }
 
 export function extensionStoreFor(store: Store, extension: AxondExtension, namespace: string): ExtensionStore {

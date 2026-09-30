@@ -1006,6 +1006,102 @@ test("gateway_key_subject_is_the_source_label", async () => {
   assert.equal(JSON.stringify(logs).includes("sk-subject-sentinel"), false);
 });
 
+test("namespace_attrs_and_blocklist_match_the_rust_limits", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  const app = createAxond({
+    store,
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    providers: [],
+  });
+  const post = (body: unknown) =>
+    app.request("http://127.0.0.1/api/v1/namespaces", {
+      method: "POST",
+      headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  const utf8 = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).length;
+  const wideAttrs = { n: "é".repeat(2045) };
+  assert.ok(JSON.stringify(wideAttrs).length <= 4096);
+  assert.ok(utf8(wideAttrs) > 4096);
+  const wide = await post({ id: "wide-attrs", attrs: wideAttrs });
+  assert.equal(wide.status, 400);
+  assert.deepEqual(await wide.json(), {
+    error: { type: "bad_request", message: "attrs exceeds 4096 byte limit" },
+  });
+  const fittingAttrs = { n: "é".repeat(2044) };
+  assert.equal(utf8(fittingAttrs), 4096);
+  const fitting = await post({ id: "fits-attrs", attrs: fittingAttrs });
+  assert.equal(fitting.status, 201);
+
+  const many = await post({ id: "many-globs", blocklist: Array.from({ length: 65 }, () => "foo*bar") });
+  assert.equal(many.status, 400);
+  assert.deepEqual(await many.json(), {
+    error: { type: "bad_request", message: "namespace blocklist exceeds 64 entries" },
+  });
+  const hugePatterns = Array.from({ length: 64 }, () => "a".repeat(61));
+  assert.ok(utf8(hugePatterns) > 4096);
+  const huge = await post({ id: "huge-globs", blocklist: hugePatterns });
+  assert.equal(huge.status, 400);
+  assert.deepEqual(await huge.json(), {
+    error: { type: "bad_request", message: "namespace blocklist exceeds 4 KiB" },
+  });
+  const sizedBeforeGlob = ["a*a" + "b".repeat(4090)];
+  assert.ok(utf8(sizedBeforeGlob) > 4096);
+  const sized = await post({ id: "sized-glob", blocklist: sizedBeforeGlob });
+  assert.equal(sized.status, 400);
+  assert.deepEqual(await sized.json(), {
+    error: { type: "bad_request", message: "namespace blocklist exceeds 4 KiB" },
+  });
+  const atSize = Array.from({ length: 64 }, () => "a".repeat(60));
+  assert.ok(utf8(atSize) <= 4096);
+  const held = await post({ id: "held-globs", blocklist: atSize });
+  assert.equal(held.status, 201);
+
+  const middle = await post({ id: "bad-glob", blocklist: ["foo*bar"] });
+  assert.equal(middle.status, 400);
+  assert.deepEqual(await middle.json(), {
+    error: {
+      type: "bad_request",
+      message: "blocklist glob `foo*bar` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
+    },
+  });
+  const empty = await post({ id: "empty-glob", blocklist: [""] });
+  assert.equal(empty.status, 400);
+  assert.deepEqual(await empty.json(), {
+    error: {
+      type: "bad_request",
+      message: "blocklist glob `` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
+    },
+  });
+  const created = await post({ id: "ok-globs", blocklist: ["gpt-4o", "claude-*", "*-latest", "*"] });
+  assert.equal(created.status, 201);
+  const replaced = await app.request("http://127.0.0.1/api/v1/namespaces/ok-globs", {
+    method: "PUT",
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
+    body: JSON.stringify({ blocklist: ["*middle*"] }),
+  });
+  assert.equal(replaced.status, 400);
+  assert.deepEqual(await replaced.json(), {
+    error: {
+      type: "bad_request",
+      message: "blocklist glob `*middle*` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
+    },
+  });
+  const kept = await app.request("http://127.0.0.1/api/v1/namespaces/ok-globs", {
+    headers: { authorization: `Bearer ${KEY}` },
+  });
+  assert.equal(kept.status, 200);
+  assert.deepEqual((await kept.json()).blocklist, ["gpt-4o", "claude-*", "*-latest", "*"]);
+});
+
 test("shutdown bounds default to the rust values and reject an unbounded wait", async () => {
   const toml = `
 [storage]
