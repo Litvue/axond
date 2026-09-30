@@ -1142,6 +1142,7 @@ function rejectExtractTypes(toml: string, parsed: Record<string, unknown>): void
   readTypedInt(toml, "failover", failover, "failure_threshold", "u32", 3);
   readTypedInt(toml, "failover", failover, "max_attempts", "u32", 3);
   readTypedInt(toml, "failover", failover, "overall_timeout_ms", "u64", 30_000);
+  rejectTransportExtract(toml, parsed);
   rejectShutdownExtract(toml, parsed);
   const admission = asRecord(parsed["admission"]) ?? {};
   for (const [key, expected, fallback] of [
@@ -1193,8 +1194,36 @@ function rejectStorageExtract(toml: string, parsed: Record<string, unknown>): vo
     return;
   }
   readVariant(toml, "storage", storage, "backend", ["sqlite", "postgres"], "StorageBackend");
+  readString(toml, "storage", storage, "path");
+  readString(toml, "storage", storage, "dsn_env");
   readVariant(toml, "storage", storage, "on_unavailable", ["deny", "allow"], "StoreUnavailable");
   readBool(toml, "storage", storage, "create_table");
+  const index = asRecord(storage["usage_index"]);
+  if (index) {
+    readUsageIndexInt(toml, index, "buffer_capacity", "usize", 1024n);
+    readUsageIndexInt(toml, index, "max_batch", "usize", 256n);
+    readUsageIndexInt(toml, index, "flush_interval_ms", "u64", 50n);
+  }
+}
+
+/** Transport is extracted after failover and before shutdown. */
+function rejectTransportExtract(toml: string, parsed: Record<string, unknown>): void {
+  const row = asRecord(parsed["transport"]);
+  if (!row) {
+    return;
+  }
+  const fields = [
+    ["connect_timeout_ms", DEFAULT_TRANSPORT.connectTimeoutMs ?? 5_000],
+    ["response_header_timeout_ms", DEFAULT_TRANSPORT.responseHeaderTimeoutMs],
+    ["buffered_body_timeout_ms", DEFAULT_TRANSPORT.bufferedBodyTimeoutMs],
+    ["stream_idle_timeout_ms", DEFAULT_TRANSPORT.streamIdleTimeoutMs],
+    ["stream_terminal_grace_ms", DEFAULT_TRANSPORT.streamTerminalGraceMs ?? 1_000],
+    ["max_response_bytes", DEFAULT_TRANSPORT.maxResponseBytes],
+    ["max_error_bytes", DEFAULT_TRANSPORT.maxErrorBytes ?? 64 * 1024],
+  ] as const;
+  for (const [key, fallback] of fields) {
+    readTypedInt(toml, "transport", row, key, "u64", fallback);
+  }
 }
 
 /**
@@ -1219,6 +1248,20 @@ function rejectShutdownExtract(toml: string, parsed: Record<string, unknown>): v
   }
   throw configLoad(
     `unknown field: found \`${field}\`, expected \`one of \`drain_grace_ms\`, \`deadline_ms\`, \`flush_timeout_ms\`\` for key "default.shutdown.${field}"`,
+  );
+}
+
+function readString(toml: string, section: string, row: Record<string, unknown>, key: string): void {
+  if (!(key in row)) {
+    return;
+  }
+  const value = row[key];
+  const literal = sectionFieldLiteral(toml, section, key);
+  if (typeof value === "string" && (literal === null || !isFloatToken(literal))) {
+    return;
+  }
+  throw configLoad(
+    `invalid type: found ${foundPhrase(value, literal)}, expected a string for key "default.${section}.${key}"`,
   );
 }
 

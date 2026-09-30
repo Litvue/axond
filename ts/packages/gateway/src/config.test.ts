@@ -905,6 +905,26 @@ test("storage enums and unknown shutdown fields are figment extract errors", asy
     `${BASE}[failover]\nmax_attempts = 1.5\n[shutdown]\nnope = 1\n`,
     'config: invalid type: found float `1.5`, expected u32 for key "default.failover.max_attempts"',
   );
+  await reject(
+    `${BASE}[transport]\nconnect_timeout_ms = 1.5\n[shutdown]\nnope = 1\n[admission]\nmax_request_bytes = 0\n`,
+    'config: invalid type: found float `1.5`, expected u64 for key "default.transport.connect_timeout_ms"',
+  );
+  await reject(
+    `${BASE}[transport]\nmax_response_bytes = 1.5\nconnect_timeout_ms = 1.0\n`,
+    'config: invalid type: found float `1`, expected u64 for key "default.transport.connect_timeout_ms"',
+  );
+  await reject(
+    `${BASE}[failover]\nmax_attempts = 1.5\n[transport]\nconnect_timeout_ms = 1.5\n`,
+    'config: invalid type: found float `1.5`, expected u32 for key "default.failover.max_attempts"',
+  );
+  await reject(
+    BASE.replace('path = "/tmp/axond.sqlite"', "path = 1"),
+    'config: invalid type: found signed int `1`, expected a string for key "default.storage.path"',
+  );
+  await reject(
+    BASE.replace('backend = "sqlite"\npath = "/tmp/axond.sqlite"', 'path = 1\nbackend = "nope"'),
+    variant("nope", "`sqlite` or `postgres`", "default.storage.backend"),
+  );
 });
 
 test("an unknown usage sink kind and an enabled usage journal fail boot", async () => {

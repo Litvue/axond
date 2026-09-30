@@ -88,7 +88,10 @@ elements. `[storage] backend = "nope"` is Figment's `unknown variant` sentence f
 the same sentence for `deny` or `allow`. `create_table = 1.5` is `expected a
 boolean`. An unknown `[shutdown]` key is `unknown field` naming
 `drain_grace_ms`, `deadline_ms`, and `flush_timeout_ms`, and that extract
-error is reported before `admission.max_request_bytes = 0`. `failover = [0]` is `failover.max_attempts must be at least 1`
+error is reported before `admission.max_request_bytes = 0`. A transport float
+is reported before that unknown key: `connect_timeout_ms = 1.5` is `expected
+u64`. `path = 1` is `expected a string`, and a bad `backend` is still reported
+first. `failover = [0]` is `failover.max_attempts must be at least 1`
 before a ghost credential. `failover = [1.5]` is `expected u32` at
 `default.failover.0`. `storage = []` still requires a SQLite path.
 

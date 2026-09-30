@@ -515,6 +515,52 @@ source_url = "http://models.dev/catalog.json"
   }
 });
 
+test("transport_float_beats_a_shutdown_field", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-transport-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "transport.toml");
+  await writeFile(
+    config,
+    `
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[credential]]
+namespace = "ghost"
+provider = "openai"
+env = "OPENAI_KEY"
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+[transport]
+connect_timeout_ms = 1.5
+[shutdown]
+nope = 1
+[admission]
+max_request_bytes = 0
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        '`: config load: invalid type: found float `1.5`, expected u64 for key "default.transport.connect_timeout_ms" in ' +
+        figmentFileSource(config, root) +
+        " TOML file\n",
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("unknown_shutdown_field_is_refused_before_the_store_opens", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-shutdown-"));
   const db = join(root, "fresh.sqlite");
