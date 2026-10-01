@@ -19,6 +19,11 @@ export interface TokenClaims {
  */
 const claimsByRequest = new Map<string, TokenClaims>();
 
+/** How many verified tokens are still held after their request finished. */
+export function heldTokenClaims(): number {
+  return claimsByRequest.size;
+}
+
 export function tokensExtension(signingKey: string): AxondExtension[] {
   const routes = new Hono<AxondEnv>();
   routes.post("/api/v1/tokens", async (c) => {
@@ -83,7 +88,11 @@ export function tokensExtension(signingKey: string): AxondExtension[] {
       if (claims.cap !== null) {
         axond.spendCapMicrodollars = BigInt(claims.cap);
       }
-      await next();
+      try {
+        await next();
+      } finally {
+        claimsByRequest.delete(axond.requestId);
+      }
     },
   };
   const revoke: AxondExtension = {

@@ -4,10 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import pg from "pg";
+
 import { createAxond } from "../../gateway/src/index.ts";
+import { applyPostgresMigration, createPostgresStore, POSTGRES_SCHEMA } from "../../cli/src/postgres-store.ts";
 import { applyMigration, openSqliteStore } from "../../cli/src/sqlite-store.ts";
 
-import { signToken, tokensExtension } from "./index.ts";
+import { heldTokenClaims, signToken, tokensExtension } from "./index.ts";
 
 const KEY = "signing-key";
 
@@ -119,7 +122,86 @@ test("a minted token authorizes one namespace until it is revoked or its epoch m
     });
     assert.equal(epoch.status, 401);
     assert.equal((await epoch.json()).error.type, "token_expired");
+    assert.equal(heldTokenClaims(), 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a minted token revokes on postgres and drops its claims", { skip: !process.env["AXOND_TEST_POSTGRES"] }, async () => {
+  const dsn = process.env["AXOND_TEST_POSTGRES"] ?? "";
+  const extensions = tokensExtension(KEY);
+  const setup = new pg.Client({ connectionString: dsn });
+  await setup.connect();
+  try {
+    await setup.query(POSTGRES_SCHEMA);
+    await setup.query("DROP TABLE IF EXISTS axond_ext_tokens_revocation");
+    await setup.query("DROP TABLE IF EXISTS axond_ext_tokens_epoch");
+    await setup.query("DELETE FROM axond_schema_migrations WHERE id IN ('tokens:0', 'tokens:1')");
+    await setup.query("DELETE FROM axond_namespace WHERE id = 'tok-platform'");
+  } finally {
+    await setup.end();
+  }
+  const migrations = extensions.flatMap((extension) => extension.migrations ?? []);
+  for (const [index, sql] of migrations.entries()) {
+    await applyPostgresMigration(dsn, `tokens:${index}`, sql);
+  }
+  const store = createPostgresStore(async () => {
+    const client = new pg.Client({ connectionString: dsn });
+    await client.connect();
+    return {
+      client: {
+        query: async (sql, params) => {
+          const result = await client.query(sql, params ? [...params] : []);
+          return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+        },
+      },
+      release: () => client.end(),
+    };
+  });
+  try {
+    await store.putNamespace({
+      id: "tok-platform",
+      attrs: {},
+      blocklist: null,
+      allowPlatformFallback: false,
+      fromConfig: true,
+    });
+    const app = createAxond({
+      store,
+      gatewayKey: KEY,
+      defaultNamespace: "tok-platform",
+      providers: [],
+      extensions,
+    });
+    const token = await signToken(KEY, {
+      sub: "ada",
+      namespace: "tok-platform",
+      scope: ["models"],
+      globs: ["*"],
+      cap: null,
+      exp: Math.floor(Date.now() / 1000) + 60,
+      epoch: 1,
+      jti: "jti-pg",
+    });
+    const ok = await app.request("http://127.0.0.1/ns/tok-platform/v1/models", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(heldTokenClaims(), 0);
+    await store.query("INSERT INTO axond_ext_tokens_revocation (jti, namespace) VALUES (?, ?)", ["jti-pg", "tok-platform"]);
+    const revoked = await app.request("http://127.0.0.1/ns/tok-platform/v1/models", {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    assert.equal(revoked.status, 401);
+    assert.equal((await revoked.json()).error.type, "token_revoked");
+    assert.equal(heldTokenClaims(), 0);
+  } finally {
+    const cleanup = new pg.Client({ connectionString: dsn });
+    await cleanup.connect();
+    await cleanup.query("DROP TABLE IF EXISTS axond_ext_tokens_revocation");
+    await cleanup.query("DROP TABLE IF EXISTS axond_ext_tokens_epoch");
+    await cleanup.query("DELETE FROM axond_namespace WHERE id = 'tok-platform'");
+    await cleanup.end();
   }
 });
