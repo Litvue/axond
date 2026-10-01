@@ -3429,6 +3429,10 @@ function scanTomlDocument(source: string, index: number, leaps: number[] = []): 
     if (failure) {
       return { end: at, hit: { index: at, message: failure }, bail: false };
     }
+    const tail = documentLineTail(source, value.end);
+    if (tail) {
+      return tail;
+    }
     cursor = value.end;
   }
   return { end: cursor, hit: null, bail: false };
@@ -3438,6 +3442,21 @@ type TomlContainer = "document" | "array" | "inline";
 
 const DOCUMENT_AFTER_VALUE = "expected newline, `#`";
 const ARRAY_AFTER_VALUE = "invalid array\nexpected `]`";
+const LEADING_FLOAT = "invalid floating-point number\nexpected leading digit";
+const LEADING_INTEGER = "invalid integer\nexpected leading digit";
+
+/** After a value, Figment allows spaces, a comment, and the end of the line. */
+function documentLineTail(source: string, index: number): TomlScan | null {
+  const cursor = skipInlineWs(source, index);
+  const char = source[cursor] ?? "";
+  if (char === "" || char === "\n" || char === "#") {
+    return null;
+  }
+  if (char === "\r" && source[cursor + 1] === "\n") {
+    return null;
+  }
+  return { end: cursor, hit: { index: cursor, message: DOCUMENT_AFTER_VALUE }, bail: false };
+}
 
 function afterZeroMessage(container: TomlContainer): string {
   if (container === "array") {
@@ -3490,8 +3509,9 @@ function scanTomlValue(source: string, index: number, container: TomlContainer, 
     return tagTomlValue(scanTomlArray(source, cursor, leaps), cursor);
   }
   const word = tomlWord(source, cursor);
-  if (word === "true" || word === "false" || word === "inf" || word === "nan") {
-    return { end: cursor + word.length, hit: null, bail: false, token: cursor };
+  const keyword = (["false", "true", "inf", "nan"] as const).find((name) => word.startsWith(name));
+  if (keyword) {
+    return { end: cursor + keyword.length, hit: null, bail: false, token: cursor };
   }
   if ((char === "+" || char === "-") && (source.startsWith("inf", cursor + 1) || source.startsWith("nan", cursor + 1))) {
     const end = cursor + 1 + (source.startsWith("inf", cursor + 1) ? 3 : 3);
@@ -3499,6 +3519,16 @@ function scanTomlValue(source: string, index: number, container: TomlContainer, 
   }
   if (char === "+" || char === "-" || isTomlDigit(char)) {
     return tagTomlValue(scanTomlNumber(source, cursor, container, leaps), cursor);
+  }
+  if (char === "." || char === "_") {
+    if (container === "array") {
+      return { end: cursor, hit: { index: cursor, message: ARRAY_AFTER_VALUE }, bail: false };
+    }
+    return {
+      end: cursor,
+      hit: { index: cursor, message: char === "." ? LEADING_FLOAT : LEADING_INTEGER },
+      bail: false,
+    };
   }
   return { end: cursor, hit: null, bail: true };
 }
@@ -3530,7 +3560,7 @@ function scanTomlArray(source: string, index: number, leaps: number[]): TomlScan
     if (source[cursor] === "]") {
       return { end: cursor + 1, hit: null, bail: false };
     }
-    return { end: cursor, hit: null, bail: true };
+    return { end: cursor, hit: { index: cursor, message: ARRAY_AFTER_VALUE }, bail: false };
   }
 }
 
@@ -3643,7 +3673,7 @@ function scanTomlInline(source: string, index: number, leaps: number[]): TomlSca
     if (pending) {
       return { end: mark, hit: { index: mark, message: pending }, bail: false };
     }
-    return { end: cursor, hit: null, bail: true };
+    return inlineTableHit(cursor);
   }
 }
 

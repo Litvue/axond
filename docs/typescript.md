@@ -199,7 +199,13 @@ the caret on `[`. `a = 1` followed by `a.b = 2` is `` dotted key `a` attempted
 to extend non-table type (integer) ``. An inline `{ a = 1, a = 2 }` reports
 `` duplicate key `a` `` on the first character inside `{`, including when a
 trailing comma follows. `a.b = 1` together with `a.c = 2` still parses, and
-`[[namespace]]` may repeat.
+`[[namespace]]` may repeat. A value that starts with `.` is `invalid
+floating-point number` and `expected leading digit` on that dot, before
+extract and before a later integer. A value that starts with `_` is
+`invalid integer` and `expected leading digit`. Inside an array both are
+`invalid array` and `` expected `]` ``. After a finished value, `1 _2` and
+`0x1g` are `` expected newline, `#` ``. An inline table reports its closer on
+that `_`. `n = 1 # comment` and `0x10` still parse.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
