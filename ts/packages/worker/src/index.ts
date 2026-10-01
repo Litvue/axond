@@ -1,6 +1,7 @@
 import { Client } from "pg";
 
 import { createAdmission, createAxond, createMetrics, defaultAdmission, resolveTelemetry, usageLine } from "@axond/gateway";
+import { StoreFailure } from "../../gateway/src/errors.ts";
 import { rateLimitExtension } from "@axond/rate-limit";
 import type { AxondExtension, CredentialConfig, PriceRule, ProviderConfig, Store } from "@axond/sdk";
 
@@ -47,6 +48,18 @@ const handlers = new Map<string, ReturnType<typeof createHandler>>();
  * One in-flight attempt. A rejection is dropped so the next caller can try
  * again. A success stays, including for callers that arrived while it ran.
  */
+/**
+ * The client response stays `store is unavailable`. A schema message we wrote
+ * is logged. A driver message is not, so a DSN cannot reach the log.
+ */
+export function rethrowSchemaFailure(error: unknown): never {
+  const message = error instanceof Error ? error.message : "";
+  if (message.startsWith("postgres schema is missing ") || /^extension migration \S+ failed$/.test(message)) {
+    console.log(JSON.stringify({ msg: "schema_unavailable", detail: message }));
+  }
+  throw new StoreFailure();
+}
+
 export function schemaAttempt(): { run(apply: () => Promise<void>): Promise<void> } {
   let pending: Promise<void> | null = null;
   return {
@@ -79,7 +92,7 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
       await schema.run(() => prepareWorkerSchema(client, extensions));
     } catch (error) {
       await client.end().catch(() => undefined);
-      throw error;
+      rethrowSchemaFailure(error);
     }
     return {
       client: {

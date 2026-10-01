@@ -5,7 +5,9 @@ import test from "node:test";
 
 import { createMemoryStore } from "../../gateway/src/memory-store.ts";
 
-import { createHandler, discoverOnSchedule, handlerFor, schemaAttempt } from "./index.ts";
+import { StoreFailure } from "../../gateway/src/errors.ts";
+
+import { createHandler, discoverOnSchedule, handlerFor, rethrowSchemaFailure, schemaAttempt } from "./index.ts";
 
 test("worker_schema_attempt_retries_after_rejection", async () => {
   const gate = schemaAttempt();
@@ -35,6 +37,38 @@ test("worker_schema_attempt_retries_after_rejection", async () => {
     calls += 1;
   });
   assert.equal(calls, 2);
+});
+
+test("worker_schema_failure_logs_a_missing_column_and_hides_the_driver", () => {
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map((part) => String(part)).join(" "));
+  };
+  try {
+    assert.throws(
+      () => rethrowSchemaFailure(new Error("postgres schema is missing axond_namespace.allow_platform_fallback, axond_namespace.from_config")),
+      (error: unknown) => error instanceof StoreFailure && error.message === "store is unavailable",
+    );
+    assert.equal(
+      lines.includes(
+        JSON.stringify({
+          msg: "schema_unavailable",
+          detail: "postgres schema is missing axond_namespace.allow_platform_fallback, axond_namespace.from_config",
+        }),
+      ),
+      true,
+    );
+    lines.length = 0;
+    assert.throws(
+      () => rethrowSchemaFailure(new Error("password=secret")),
+      (error: unknown) => error instanceof StoreFailure,
+    );
+    assert.equal(lines.join("\n").includes("password=secret"), false);
+    assert.equal(lines.join("\n").includes("schema_unavailable"), false);
+  } finally {
+    console.log = original;
+  }
 });
 
 test("the worker handler is a static bundle of the gateway and an extension", async () => {
