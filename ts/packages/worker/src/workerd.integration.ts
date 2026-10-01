@@ -241,4 +241,99 @@ test("workerd_hyperdrive_logs_missing_namespace_columns", { skip: !dsn }, async 
     await drop.end();
   }
 });
+
+test("workerd_hyperdrive_serves_a_role_that_cannot_create", { skip: !dsn }, async (t) => {
+  const admin = new pg.Client({ connectionString: dsn });
+  await admin.connect();
+  const role = await admin.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+  if (role.rows[0]?.["rolsuper"] !== true) {
+    await admin.end();
+    t.skip("the test role cannot create a database");
+    return;
+  }
+  const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  const dbName = `axond_wrok_${suffix}`;
+  const roleName = `axond_wrokr_${suffix}`;
+  const password = `pw_${suffix}`;
+  const lines: string[] = [];
+  const write = process.stdout.write;
+  const writeError = process.stderr.write;
+  process.stdout.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding, callback?: (error?: Error | null) => void) => {
+    lines.push(String(chunk));
+    return write.call(process.stdout, chunk, encoding, callback);
+  }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding, callback?: (error?: Error | null) => void) => {
+    lines.push(String(chunk));
+    return writeError.call(process.stderr, chunk, encoding, callback);
+  }) as typeof process.stderr.write;
+  let worker: Awaited<ReturnType<typeof unstable_dev>> | undefined;
+  let owner: pg.Client | undefined;
+  try {
+    await admin.query(`CREATE DATABASE ${dbName}`);
+    await admin.query(`CREATE ROLE ${roleName} LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE`);
+    const ownerUrl = new URL(dsn!);
+    ownerUrl.pathname = `/${dbName}`;
+    owner = new pg.Client({ connectionString: ownerUrl.toString() });
+    await owner.connect();
+    await owner.query("REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+    await owner.query(`GRANT USAGE ON SCHEMA public TO ${roleName}`);
+    await owner.query(`GRANT pg_read_all_data, pg_write_all_data TO ${roleName}`);
+    const { applyPostgresSchema } = await import("../../cli/src/postgres-store.ts");
+    await applyPostgresSchema({
+      query: async (sql, params) => {
+        const result = params === undefined ? await owner!.query(sql) : await owner!.query(sql, [...params]);
+        const row = Array.isArray(result) ? result[result.length - 1] : result;
+        return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
+      },
+    });
+    await owner.end();
+    owner = undefined;
+    const restrictedUrl = new URL(ownerUrl.toString());
+    restrictedUrl.username = roleName;
+    restrictedUrl.password = password;
+    process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = restrictedUrl.toString();
+    worker = await unstable_dev(new URL("./index.ts", import.meta.url).pathname, {
+      config: new URL("../wrangler.toml", import.meta.url).pathname,
+      local: true,
+      ip: "127.0.0.1",
+      vars: { GATEWAY_KEY: key, PROVIDERS_JSON: "[]" },
+      logLevel: "log",
+      experimental: { disableExperimentalWarning: true, disableDevRegistry: true },
+    });
+    const headers = { authorization: `Bearer ${key}`, "content-type": "application/json" };
+    const id = `ps${suffix}`;
+    const created = await worker.fetch("http://127.0.0.1/api/v1/namespaces", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ id }),
+    });
+    const createdBody = await created.text();
+    assert.equal(created.status, 201, createdBody);
+    assert.equal(createdBody.includes(password), false);
+    const listed = await worker.fetch("http://127.0.0.1/api/v1/namespaces", {
+      headers: { authorization: `Bearer ${key}` },
+    });
+    const listedBody = await listed.text();
+    assert.equal(listed.status, 200, listedBody);
+    const body = JSON.parse(listedBody) as { data: { id: string }[] };
+    assert.equal(body.data.some((row) => row.id === id), true);
+    assert.equal(listedBody.includes(password), false);
+    const logs = lines.join("");
+    assert.equal(logs.includes(password), false);
+    assert.equal(logs.includes("schema_unavailable"), false, logs);
+  } finally {
+    process.stdout.write = write;
+    process.stderr.write = writeError;
+    await worker?.stop();
+    await owner?.end().catch(() => undefined);
+    await admin.end().catch(() => undefined);
+    const drop = new pg.Client({ connectionString: dsn });
+    await drop.connect();
+    await drop.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [dbName]);
+    await drop.query(`DROP DATABASE IF EXISTS ${dbName}`);
+    await drop.query(`REVOKE pg_read_all_data, pg_write_all_data FROM ${roleName}`).catch(() => undefined);
+    await drop.query(`DROP ROLE IF EXISTS ${roleName}`);
+    await drop.end();
+  }
+});
 });
