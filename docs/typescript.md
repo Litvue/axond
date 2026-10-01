@@ -161,12 +161,16 @@ sequence that is out of range also says `value is out of range`. `\u0041` and
 `\U00000041` still decode. A literal string keeps the backslash. A decimal
 integer that is only `0` stops there. A following digit, `_`, or a signed
 `+0x` is `expected newline, `#`` at that character, before extract and before
-a later integer. Inside an array the same spot is `invalid array` and
+a later integer. A local time `07:32:00` and a four-digit year `0123-01-01`
+still parse. Inside an array the same spot is `invalid array` and
 `` expected `]` ``. Inside an inline table it is the inline closer. `0`,
 `0.5`, `0e1`, and `0x10` still parse. A decimal float that overflows to
 positive infinity is `invalid floating-point number` at the start of the
 number, before extract and before a later integer. `-1e309`, `1e308`,
-`1e-400`, and `inf` still parse.
+`1e-400`, and `inf` still parse. A calendar day that month does not have is
+`invalid date-time` and `value is out of range` on the day, before extract
+and before a later integer. `2024-02-29`, `1900-02-28`, and a quoted
+`2024-02-30` still parse.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

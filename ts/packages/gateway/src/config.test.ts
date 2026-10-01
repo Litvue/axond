@@ -550,6 +550,66 @@ test("a float past the finite range is a parse error before extract", async () =
   }
 });
 
+test("an impossible calendar day is a parse error before extract", async () => {
+  const message = "invalid date-time\nvalue is out of range";
+  const diagram = (source: string, index: number) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index));
+        return true;
+      },
+    );
+  };
+  const beforeShutdown = `n = 2024-02-30\n[shutdown]\nnope = 1\n${BASE}`;
+  const day = beforeShutdown.indexOf("2024-02-30") + 8;
+  const dateMessage = diagram(beforeShutdown, day);
+  await reject(beforeShutdown, day);
+  assert.equal(dateMessage.includes("unknown field"), false);
+  assert.equal(dateMessage.includes("number too large"), false);
+  const later = `n = 2024-02-30T12:00:00Z\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf("2024-02-30") + 8);
+  const earlier = `n = 9223372036854775808\nn = 2024-02-30\n${BASE}`;
+  await assert.rejects(() => loadConfig(earlier, secrets), /number too large to fit in target type/);
+  const april = `n = [2024-04-31]\n${BASE}`;
+  await reject(april, april.indexOf("2024-04-31") + 8);
+  const leap = `n = { a = 2023-02-29 }\n${BASE}`;
+  await reject(leap, leap.indexOf("2023-02-29") + 8);
+  const century = `n = 2100-02-29\n${BASE}`;
+  await reject(century, century.indexOf("2100-02-29") + 8);
+  const month = `n = 2024-13-01\n${BASE}`;
+  await reject(month, month.indexOf("2024-13-01") + 5);
+  for (const line of [
+    "n = 2024-02-29",
+    "n = 2000-02-29",
+    "n = 1900-02-28",
+    "n = 2024-04-30",
+    'n = "2024-02-30"',
+    "n = 07:32:00",
+    "n = 00:00:00",
+    "n = 0123-01-01",
+    "n = 1979-05-27T07:32:00Z",
+  ]) {
+    const loaded = await loadConfig(`${line}\n${BASE}`, secrets);
+    assert.equal(loaded.storage.path, "/tmp/axond.sqlite");
+  }
+});
+
 test("storage_fields_match_the_rust_boot_refusals", async () => {
   const instead = (pathBlock: string) => BASE.replace('backend = "sqlite"\npath = "/tmp/axond.sqlite"\n', pathBlock);
   const refuse = async (toml: string, pattern: RegExp) => {

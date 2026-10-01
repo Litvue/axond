@@ -3163,11 +3163,14 @@ const U64_MAX = 18446744073709551615n;
  * at the character after `u` or `U`. A complete hex sequence that is out of
  * range also says `value is out of range`. A decimal integer that is only
  * `0` (optional sign) stops there: a following digit, `_`, or radix letter
- * is `expected newline, `#`` at that character. Inside an array that is
+ * is `expected newline, `#`` at that character. A local time `07:32:00`
+ * and a four-digit year are not that diagram. Inside an array that is
  * `invalid array` / `expected `]``. Inside an inline table it is the inline
  * closer. `0.5`, `0e1`, and `0x10` still parse. A decimal float that
  * parses as positive infinity is `invalid floating-point number` at the
  * start of that number. `-1e309`, `1e308`, `1e-400`, and `inf` still parse.
+ * A calendar day that month does not have is `invalid date-time` and
+ * `value is out of range` on the day. `2024-02-29` and `1900-02-28` still parse.
  */
 function firstTomlIntegerOutsideI64(source: string): { index: number; message: string } | null {
   return scanTomlDocument(source, 0).hit;
@@ -3440,7 +3443,7 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer)
   }
   if (source[cursor] === "0") {
     const next = source[cursor + 1] ?? "";
-    if (next !== "." && next !== "e" && next !== "E") {
+    if (next !== "." && next !== "e" && next !== "E" && !isTomlDateOrTime(source, cursor)) {
       if (isCompletedZeroBoundary(next, container)) {
         return { end: cursor + 1, hit: null, bail: false };
       }
@@ -3464,7 +3467,8 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer)
   }
   if (next === "-" || next === ":") {
     const end = skipTomlDate(source, cursor);
-    return { end, hit: null, bail: false };
+    const date = invalidTomlDate(source, index, end);
+    return date === null ? { end, hit: null, bail: false } : { end, hit: date, bail: false };
   }
   const raw = source.slice(index, cursor).replaceAll("_", "");
   let integer: bigint;
@@ -3555,6 +3559,40 @@ function skipTomlFloat(source: string, index: number): number | null {
     }
   }
   return cursor;
+}
+
+function isTomlDateOrTime(source: string, index: number): boolean {
+  const head = source.slice(index, index + 2);
+  if (/^\d\d$/.test(head) && source[index + 2] === ":") {
+    return true;
+  }
+  return /^\d{4}-\d{2}-\d{2}/.test(source.slice(index, index + 10));
+}
+
+const DATE_OUT_OF_RANGE = "invalid date-time\nvalue is out of range";
+
+function invalidTomlDate(
+  source: string,
+  index: number,
+  end: number,
+): { index: number; message: string } | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(source.slice(index, end));
+  if (match === null) {
+    return null;
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12) {
+    return { index: index + 5, message: DATE_OUT_OF_RANGE };
+  }
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const shortMonth = month === 4 || month === 6 || month === 9 || month === 11;
+  const maxDay = month === 2 ? (leap ? 29 : 28) : shortMonth ? 30 : 31;
+  if (day < 1 || day > maxDay) {
+    return { index: index + 8, message: DATE_OUT_OF_RANGE };
+  }
+  return null;
 }
 
 function skipTomlDate(source: string, index: number): number {
