@@ -3186,6 +3186,28 @@ const U64_MAX = 18446744073709551615n;
  * `expected digit, digit`. An exponent `1e1_` is `expected digit`. `1e_`
  * is the float label only. `1_000`, `0x1_0`, `1.0_1`, and `1e1_0` still parse.
  */
+/** UTF-8 length of one code point. ASCII is one byte and one caret. */
+function tomlUtf8Bytes(codePoint: number): number {
+  if (codePoint <= 0x7f) {
+    return 1;
+  }
+  if (codePoint <= 0x7ff) {
+    return 2;
+  }
+  if (codePoint <= 0xffff) {
+    return 3;
+  }
+  return 4;
+}
+
+function tomlUtf8Length(text: string): number {
+  let bytes = 0;
+  for (const char of text) {
+    bytes += tomlUtf8Bytes(char.codePointAt(0) ?? 0);
+  }
+  return bytes;
+}
+
 function formatTomlIntegerRange(source: string, index: number, message: string): string {
   // toml_edit clamps an index past the last byte onto that byte and keeps the
   // extra columns. A trailing newline stays on that line, one column past the end.
@@ -3199,7 +3221,22 @@ function formatTomlIntegerRange(source: string, index: number, message: string):
   const lineStart = source.lastIndexOf("\n", Math.max(0, at - 1)) + 1;
   const lineEnd = source.indexOf("\n", at);
   const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
-  const column = [...source.slice(lineStart, at + 1)].length - 1 + columnOffset;
+  const prefix = source.slice(lineStart, at);
+  // A multi-byte character fails as a byte span. The column is that byte
+  // offset, and the caret is as wide as the character.
+  const onChar = index < source.length;
+  const codePoint = onChar ? (source.codePointAt(at) ?? 0) : 0;
+  const charBytes = tomlUtf8Bytes(codePoint);
+  const multibyte = onChar && charBytes > 1;
+  const column = (multibyte ? tomlUtf8Length(prefix) : [...prefix].length) + columnOffset;
+  let highlight = 1;
+  if (multibyte) {
+    const room = tomlUtf8Length(content) - column;
+    highlight = Math.min(charBytes, room);
+    if (highlight < 1) {
+      highlight = 1;
+    }
+  }
   const lineNum = line + 1;
   const gutter = String(lineNum).length;
   const pad = " ".repeat(gutter + 1);
@@ -3207,7 +3244,7 @@ function formatTomlIntegerRange(source: string, index: number, message: string):
     `TOML parse error at line ${lineNum}, column ${column + 1}\n` +
     `${pad}|\n` +
     `${lineNum} | ${content}\n` +
-    `${pad}|${" ".repeat(column + 1)}^\n` +
+    `${pad}|${" ".repeat(column + 1)}${"^".repeat(highlight)}\n` +
     `${message}\n`
   );
 }

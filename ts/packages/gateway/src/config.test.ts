@@ -1078,6 +1078,85 @@ test("an unfinished local time is a parse error before extract", async () => {
   assert.equal(frac.storage.path, "/tmp/axond.sqlite");
 });
 
+test("a non-ascii key is a parse error before extract", async () => {
+  const equals = "expected `.`, `=`";
+  const header = "invalid table header\nexpected `.`, `]`";
+  const string = "invalid string\nexpected `\"`, `'`";
+  const diagram = (source: string, index: number, message: string) => {
+    let at = index;
+    let columnOffset = 0;
+    if (source.length > 0 && at >= source.length) {
+      columnOffset = at - (source.length - 1);
+      at = source.length - 1;
+    }
+    const line = source.slice(0, at).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, at - 1)) + 1;
+    const lineEnd = source.indexOf("\n", at);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const prefix = source.slice(lineStart, at);
+    const onChar = index < source.length;
+    const codePoint = onChar ? (source.codePointAt(at) ?? 0) : 0;
+    const charBytes = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    const multibyte = onChar && charBytes > 1;
+    const utf8 = (value: string) => {
+      let bytes = 0;
+      for (const char of value) {
+        const point = char.codePointAt(0) ?? 0;
+        bytes += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+      }
+      return bytes;
+    };
+    const column = (multibyte ? utf8(prefix) : [...prefix].length) + columnOffset;
+    let highlight = 1;
+    if (multibyte) {
+      highlight = Math.min(charBytes, utf8(content) - column);
+      if (highlight < 1) {
+        highlight = 1;
+      }
+    }
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}${"^".repeat(highlight)}\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index, message));
+        return true;
+      },
+    );
+  };
+  const beforeShutdown = `café = 1\n[shutdown]\nnope = 1\n${BASE}`;
+  const mark = beforeShutdown.indexOf("é");
+  const markMessage = diagram(beforeShutdown, mark, equals);
+  await reject(beforeShutdown, mark, equals);
+  assert.equal(markMessage.includes("unknown field"), false);
+  assert.equal(markMessage.includes("number too large"), false);
+  assert.equal(markMessage.includes("^^"), true);
+  const later = `café = 1\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf("é"), equals);
+  const earlier = `n = 9223372036854775808\ncafé = 1\n${BASE}`;
+  await reject(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type");
+  const euro = `a€ = 1\n${BASE}`;
+  await reject(euro, euro.indexOf("€"), equals);
+  const emoji = `a😀 = 1\n${BASE}`;
+  await reject(emoji, emoji.indexOf("😀"), equals);
+  const lead = `éé = 1\n${BASE}`;
+  await reject(lead, lead.indexOf("é"), "invalid key");
+  const table = `[café]\n${BASE}`;
+  await reject(table, table.indexOf("é"), header);
+  const value = `n = café\n${BASE}`;
+  await reject(value, value.indexOf("c"), string);
+  const ascii = await loadConfig(`cafe = 1\n${BASE}`, secrets);
+  assert.equal(ascii.storage.path, "/tmp/axond.sqlite");
+});
+
 test("a file that ends inside a value is a parse error before extract", async () => {
   const inline = "invalid inline table\nexpected `}`";
   const array = "invalid array\nexpected `]`";

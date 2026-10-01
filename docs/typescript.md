@@ -229,7 +229,11 @@ inline table` and `` expected `}` `` one past the last character.
 value. `n =` followed by a newline is `invalid string` and
 `` expected `"`, `'` `` on the newline. A backslash at the end of
 `n = "foo\` is `invalid basic string`. The same text followed by a
-newline keeps the escape diagram on that line.
+newline keeps the escape diagram on that line. `café = 1` is
+`` expected `.`, `=` `` on `é`, with one caret for each UTF-8 byte.
+`é` at the start of a key is `invalid key` with that same width.
+`a€` uses three carets and `a😀` uses four. `n = café` stays one
+caret, on `c`.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
