@@ -134,6 +134,14 @@ before `server.bind = 1`. A credential that names `provider` and omits
 `failover = [0]` is `failover.max_attempts must be at least 1`
 before a ghost credential. `failover = [1.5]` is `expected u32` at
 `default.failover.0`. `storage = []` still requires a SQLite path.
+`namespace = [[1]]` fills that element in declaration order and is
+`expected a string` at `default.namespace.0.0`. `namespace = [[]]` is
+`invalid length 0, expected struct Namespace with 3 elements`.
+`gateway_key = [[]]` is `invalid length 2` because the two leading sources
+are defaulted and `namespace` is not. `price = [[1]]` stays
+`expected struct PriceRule`, because a flattened price cannot be filled from
+a sequence. `AXOND_NAMESPACE=[[1]]` is the same string sentence at
+`NAMESPACE.0.0` in the `AXOND_` environment. The store file is not created.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

@@ -834,6 +834,38 @@ source_url = "http://models.dev/catalog.json"
   }
 });
 
+test("sequence_element_is_refused_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-seq-el-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "namespace.toml");
+  await writeFile(
+    config,
+    `
+namespace = [[1]]
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" +
+        config +
+        '`: config load: invalid type: found signed int `1`, expected a string for key "default.namespace.0.0" in namespace.toml TOML file\n',
+    );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("section_shape_is_refused_before_the_store_opens", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-shape-"));
   const db = join(root, "fresh.sqlite");

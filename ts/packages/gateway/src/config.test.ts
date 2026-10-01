@@ -933,6 +933,69 @@ test("a struct written as a sequence fills its fields", async () => {
   assert.equal(bind.bind, "127.0.0.1:9");
   const empty = await loadConfig(`failover = []\n${BASE}`, secrets);
   assert.equal(empty.transport.maxAttempts, 3);
+  const withoutNamespace = BASE.replace('[[namespace]]\nid = "platform"\ndefault = true\n', "");
+  await reject(
+    `namespace = [[1]]\n${withoutNamespace}`,
+    typed("signed int `1`", "a string", "default.namespace.0.0"),
+  );
+  await reject(
+    `namespace = [[]]\n${withoutNamespace}`,
+    'config: invalid length 0, expected struct Namespace with 3 elements for key "default.namespace.0"',
+  );
+  await reject(
+    `namespace = [["ok", 1]]\n${withoutNamespace}`,
+    typed("signed int `1`", "a boolean", "default.namespace.0.1"),
+  );
+  await reject(
+    `failover = [1.5]\nnamespace = [[1]]\n${withoutNamespace}`,
+    typed("float `1.5`", "u32", "default.failover.0"),
+  );
+  await reject(
+    `credential = [[1]]\n${BASE}`,
+    typed("signed int `1`", "a string", "default.credential.0.0"),
+  );
+  await reject(
+    `credential = [["only"]]\n${BASE}`,
+    'config: invalid length 1, expected struct Credential with 5 elements for key "default.credential.0"',
+  );
+  await reject(
+    `credential = [["ns", "p", "ENV", "id", 1.5]]\n${BASE}`,
+    typed("float `1.5`", "u32", "default.credential.0.4"),
+  );
+  await reject(
+    `provider = [["openai", "nope"]]\n${BASE}`,
+    'config: unknown variant: found `nope`, expected `one of `openai`, `anthropic`, `openai-compatible`` for key "default.provider.0.1"',
+  );
+  await reject(
+    `provider = [["openai"]]\n${BASE}`,
+    'config: invalid length 1, expected struct Provider with 4 elements for key "default.provider.0"',
+  );
+  await reject(
+    `gateway_key = [[]]\n${BASE.replace("[[gateway_key]]\nenv = \"GW_KEY\"\nnamespace = \"platform\"\n", "")}`,
+    'config: invalid length 2, expected struct GatewayKey with 3 elements for key "default.gateway_key.0"',
+  );
+  await reject(
+    `price = [[1]]\n${BASE}`,
+    typed("sequence", "struct PriceRule", "default.price.0"),
+  );
+  await reject(
+    `usage_sink = [[1]]\n${BASE}`,
+    typed("signed int `1`", "enum UsageSinkKind", "default.usage_sink.0.0"),
+  );
+  await reject(
+    `usage_sink = [["nope"]]\n${BASE}`,
+    'config: unknown variant: found `nope`, expected `one of `stdout`, `postgres`, `otlp`` for key "default.usage_sink.0.0"',
+  );
+  await reject(
+    `usage_sink = [[]]\n${BASE}`,
+    'config: invalid length 0, expected struct UsageSinkConfigWire with 7 elements for key "default.usage_sink.0"',
+  );
+  const named = await loadConfig(`namespace = [["platform", true, false, "extra"]]\n${withoutNamespace}`, secrets);
+  assert.equal(named.namespaces[0]?.id, "platform");
+  assert.equal(named.namespaces[0]?.default, true);
+  assert.equal(named.namespaces[0]?.allowPlatformFallback, false);
+  const sink = await loadConfig(`usage_sink = [["stdout"]]\n${BASE}`, secrets);
+  assert.equal(sink.usageSinks[0]?.kind, "stdout");
 });
 
 test("storage enums and unknown shutdown fields are figment extract errors", async () => {
@@ -1507,6 +1570,31 @@ namespace = "platform"
     `failover = [1.5]\n${tail}`,
     typed("float `1.5`", "u32", "default.failover.0"),
     { AXOND_NAMESPACE: "[1]" },
+  );
+  await reject(
+    `failover = [1.5]\n${tail}`,
+    typed("float `1.5`", "u32", "default.failover.0"),
+    { AXOND_NAMESPACE: "[[1]]" },
+  );
+  await reject(
+    tail,
+    typed("unsigned int `1`", "a string", "NAMESPACE.0.0") + " in `AXOND_` environment variable(s)",
+    { AXOND_NAMESPACE: "[[1]]" },
+  );
+  await reject(
+    tail,
+    'config: unknown variant: found `nope`, expected `one of `openai`, `anthropic`, `openai-compatible`` for key "PROVIDER.0.1" in `AXOND_` environment variable(s)',
+    { AXOND_PROVIDER: '[["openai", "nope"]]' },
+  );
+  await reject(
+    tail,
+    typed("sequence", "struct PriceRule", "PRICE.0") + " in `AXOND_` environment variable(s)",
+    { AXOND_PRICE: "[[1]]" },
+  );
+  await reject(
+    tail,
+    'config: invalid length 2, expected struct GatewayKey with 3 elements for key "GATEWAY_KEY.0" in `AXOND_` environment variable(s)',
+    { AXOND_GATEWAY_KEY: "[[]]" },
   );
 });
 

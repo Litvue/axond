@@ -1758,6 +1758,7 @@ function rejectAfterServerExtract(toml: string, parsed: Record<string, unknown>)
   extractStruct(toml, parsed, "storage", "StorageConfig", (row) => rejectStorageExtract(toml, row));
   extractStruct(toml, parsed, "transport", "Transport", (row) => rejectTransportExtract(toml, row));
   extractStruct(toml, parsed, "usage_journal", "UsageJournalConfig", (row) => rejectUsageJournalExtract(toml, row));
+  realizeSequenceElements(toml, parsed, "usage_sink");
   if (Array.isArray(parsed["usage_sink"])) {
     const literal = topLevelAssignment(toml, "usage_sink");
     parsed["usage_sink"].forEach((entry, index) => {
@@ -2150,11 +2151,9 @@ function rejectSectionShapes(
       );
     }
     if (Array.isArray(value)) {
+      realizeSequenceElements(toml, parsed, key);
       value.forEach((entry, index) => {
-        if (envMark(value, String(index))) {
-          return;
-        }
-        if (asRecord(entry)) {
+        if (envMark(value, String(index)) || asRecord(entry)) {
           return;
         }
         const token = literal === null ? null : nthArrayToken(literal, index);
@@ -2186,6 +2185,84 @@ type PositionalField =
   | { name: string; kind: "enum"; enumName: string; variants: readonly string[] }
   | { name: string; kind: "strings" }
   | { name: string; kind: "struct"; structName: string; fields: readonly PositionalField[] };
+
+/**
+ * One element of `[[namespace]]` and the other sequence sections, in
+ * declaration order. `defaults[i]` is a `#[serde(default)]` field: a short
+ * sequence leaves it unset, and the first field without one is `invalid length`.
+ * `[[price]]` is absent because `#[serde(flatten)]` cannot be filled from a
+ * sequence, so that element stays `expected struct PriceRule`.
+ */
+type ElementSpec = {
+  name: string;
+  fields: readonly PositionalField[];
+  defaults: readonly boolean[];
+};
+
+const NAMESPACE_ELEMENT: ElementSpec = {
+  name: "Namespace",
+  fields: [
+    { name: "id", kind: "string" },
+    { name: "default", kind: "bool" },
+    { name: "allow_platform_fallback", kind: "bool" },
+  ],
+  defaults: [false, true, true],
+};
+
+const PROVIDER_ELEMENT: ElementSpec = {
+  name: "Provider",
+  fields: [
+    { name: "id", kind: "string" },
+    { name: "kind", kind: "enum", enumName: "ProviderKind", variants: ["openai", "anthropic", "openai-compatible"] },
+    { name: "base_url", kind: "string" },
+    { name: "unpriced_models", kind: "enum", enumName: "UnpricedModels", variants: ["deny", "allow"] },
+  ],
+  defaults: [false, false, false, true],
+};
+
+const CREDENTIAL_ELEMENT: ElementSpec = {
+  name: "Credential",
+  fields: [
+    { name: "namespace", kind: "string" },
+    { name: "provider", kind: "string" },
+    { name: "env", kind: "string" },
+    { name: "id", kind: "string" },
+    { name: "weight", kind: "int", expected: "u32" },
+  ],
+  defaults: [false, false, true, true, true],
+};
+
+const GATEWAY_KEY_ELEMENT: ElementSpec = {
+  name: "GatewayKey",
+  fields: [
+    { name: "env", kind: "string" },
+    { name: "file", kind: "string" },
+    { name: "namespace", kind: "string" },
+  ],
+  defaults: [true, true, false],
+};
+
+const USAGE_SINK_ELEMENT: ElementSpec = {
+  name: "UsageSinkConfigWire",
+  fields: [
+    { name: "kind", kind: "enum", enumName: "UsageSinkKind", variants: ["stdout", "postgres", "otlp"] },
+    { name: "dsn_env", kind: "string" },
+    { name: "table", kind: "string" },
+    { name: "create_table", kind: "bool" },
+    { name: "buffer_capacity", kind: "int", expected: "usize" },
+    { name: "max_batch", kind: "int", expected: "usize" },
+    { name: "flush_interval_ms", kind: "int", expected: "u64" },
+  ],
+  defaults: [false, true, true, true, true, true, true],
+};
+
+const SEQUENCE_ELEMENT_SPECS: Readonly<Record<string, ElementSpec>> = {
+  namespace: NAMESPACE_ELEMENT,
+  provider: PROVIDER_ELEMENT,
+  credential: CREDENTIAL_ELEMENT,
+  gateway_key: GATEWAY_KEY_ELEMENT,
+  usage_sink: USAGE_SINK_ELEMENT,
+};
 
 const USAGE_INDEX_FIELDS: readonly PositionalField[] = [
   { name: "buffer_capacity", kind: "int", expected: "usize" },
@@ -2347,6 +2424,109 @@ function projectNestedStructs(
       `default.${section}.${field.name}`,
     );
   }
+}
+
+/**
+ * A `[[namespace]]`-style element written as an array fills that struct in
+ * declaration order. A short array keeps defaulted fields unset. `[[price]]`
+ * is not filled: flatten refuses the sequence as `expected struct PriceRule`.
+ */
+function realizeSequenceElements(toml: string, parsed: Record<string, unknown>, key: string): void {
+  const spec = SEQUENCE_ELEMENT_SPECS[key];
+  const value = parsed[key];
+  if (!spec || !Array.isArray(value)) {
+    return;
+  }
+  const literal = topLevelAssignment(toml, key);
+  value.forEach((entry, index) => {
+    const marked = envMark(value, String(index));
+    if (marked?.scalar.kind === "sequence") {
+      value[index] = recordFromEnvSequence(marked.scalar, spec, marked.key);
+      unmarkEnv(value, String(index));
+      return;
+    }
+    if (marked || asRecord(entry) || !Array.isArray(entry)) {
+      return;
+    }
+    const token = literal === null ? null : nthArrayToken(literal, index);
+    value[index] = recordFromSequence(entry, token === null ? [] : arrayElements(token), spec, `default.${key}.${index}`);
+  });
+}
+
+function recordFromSequence(
+  values: unknown[],
+  tokens: string[],
+  spec: ElementSpec,
+  keyPrefix: string,
+): Record<string, unknown> {
+  const record: Record<string, unknown> = {};
+  spec.fields.forEach((field, index) => {
+    if (index < values.length) {
+      record[field.name] = positionalValue(values[index], field, tokens[index] ?? null, `${keyPrefix}.${index}`);
+      return;
+    }
+    if (!spec.defaults[index]) {
+      throw configLoad(
+        `invalid length ${index}, expected struct ${spec.name} with ${spec.fields.length} elements for key "${keyPrefix}"`,
+      );
+    }
+  });
+  return record;
+}
+
+function recordFromEnvSequence(scalar: FigmentScalar, spec: ElementSpec, keyPrefix: string): Record<string, unknown> {
+  const items = scalar.items ?? [];
+  const record: Record<string, unknown> = {};
+  spec.fields.forEach((field, index) => {
+    const item = items[index];
+    if (item) {
+      record[field.name] = valueFromEnvField(item, field, `${keyPrefix}.${index}`);
+      return;
+    }
+    if (!spec.defaults[index]) {
+      throw configLoad(
+        `invalid length ${index}, expected struct ${spec.name} with ${spec.fields.length} elements for key "${keyPrefix}"${ENV_LOC}`,
+      );
+    }
+  });
+  return record;
+}
+
+function valueFromEnvField(scalar: FigmentScalar, field: PositionalField, key: string): unknown {
+  const loc = ` for key "${key}"${ENV_LOC}`;
+  if (field.kind === "string") {
+    if (scalar.kind === "string") {
+      return scalar.text;
+    }
+    throw configLoad(`invalid type: found ${envFound(scalar)}, expected a string${loc}`);
+  }
+  if (field.kind === "bool") {
+    if (scalar.kind === "bool") {
+      return scalar.value;
+    }
+    throw configLoad(`invalid type: found ${envFound(scalar)}, expected a boolean${loc}`);
+  }
+  if (field.kind === "int") {
+    const integer = coerceEnvInt({ key, scalar }, field.expected);
+    return integer <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(integer) : integer;
+  }
+  if (field.kind === "enum") {
+    if (scalar.kind === "float") {
+      throw configLoad(`invalid type: found float \`${scalar.text}\`, expected enum ${field.enumName}${loc}`);
+    }
+    if (scalar.kind === "string") {
+      if (field.variants.includes(scalar.text)) {
+        return scalar.text;
+      }
+      const list =
+        field.variants.length === 2
+          ? `\`${field.variants[0]}\` or \`${field.variants[1]}\``
+          : `one of ${field.variants.map((item) => `\`${item}\``).join(", ")}`;
+      throw configLoad(`unknown variant: found \`${scalar.text}\`, expected \`${list}\`${loc}`);
+    }
+    throw configLoad(`invalid type: found ${envFound(scalar)}, expected enum ${field.enumName}${loc}`);
+  }
+  throw configLoad(`invalid type: found ${envFound(scalar)}, expected a sequence${loc}`);
 }
 
 function structFromSequence(
