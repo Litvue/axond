@@ -76,9 +76,17 @@ export function createPostgresStore(
       });
     },
     async resolveNamespace(id, nowMs) {
-      return withClient("namespace_resolve", (client) => withTransaction(client, async (client) => {
+      return withClient("namespace_resolve", async (client) => {
         const found = await client.query(
-          "SELECT id, attrs, blocklist, allow_platform_fallback, from_config FROM axond_namespace WHERE id = $1",
+          `SELECT n.id, n.attrs, n.blocklist, n.allow_platform_fallback, n.from_config,
+                  c.cadence, c.limit_microdollars AS cadence_limit, c.timezone,
+                  a.period AS active_period, b.limit_microdollars, b.spent_microdollars, i.n
+           FROM axond_namespace n
+           LEFT JOIN axond_store_budget_cadence c ON c.namespace = n.id
+           LEFT JOIN axond_store_budget_active a ON a.namespace = n.id
+           LEFT JOIN axond_store_budget b ON b.namespace = a.namespace AND b.period = a.period
+           LEFT JOIN axond_namespace_incarnation i ON i.id = n.id
+           WHERE n.id = $1`,
           [id],
         );
         const row = found.rows[0];
@@ -86,44 +94,44 @@ export function createPostgresStore(
           return null;
         }
         const record = namespaceFrom(row);
-        const policy = await client.query(
-          "SELECT cadence, limit_microdollars, timezone FROM axond_store_budget_cadence WHERE namespace = $1",
-          [id],
-        );
-        let period: string | null = null;
-        if (policy.rows[0]?.["cadence"] === "monthly") {
-          period = monthlyPeriod(nowMs, String(policy.rows[0]["timezone"]));
-          await lockNamespace(client, id);
-          const still = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [id]);
-          if (!still.rows[0]) {
-            return null;
-          }
-          await client.query(
-            `INSERT INTO axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
-             VALUES ($1, $2, $3, 0)
-             ON CONFLICT (namespace, period) DO NOTHING`,
-            [id, period, policy.rows[0]["limit_microdollars"]],
+        const incarnation = row["n"] == null ? 1n : BigInt(String(row["n"]));
+        if (row["cadence"] === "monthly") {
+          const period = monthlyPeriod(nowMs, String(row["timezone"]));
+          const existing = await client.query(
+            "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget WHERE namespace = $1 AND period = $2",
+            [id, period],
           );
-        } else {
-          const active = await client.query("SELECT period FROM axond_store_budget_active WHERE namespace = $1", [id]);
-          period = active.rows[0] ? String(active.rows[0]["period"]) : null;
+          if (existing.rows[0]) {
+            return admittedBudget(record, period, existing.rows[0], incarnation);
+          }
+          return withTransaction(client, async (client) => {
+            await lockNamespace(client, id);
+            const still = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [id]);
+            if (!still.rows[0]) {
+              return null;
+            }
+            await client.query(
+              `INSERT INTO axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
+               VALUES ($1, $2, $3, 0)
+               ON CONFLICT (namespace, period) DO NOTHING`,
+              [id, period, row["cadence_limit"]],
+            );
+            const created = await client.query(
+              "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget WHERE namespace = $1 AND period = $2",
+              [id, period],
+            );
+            if (!created.rows[0]) {
+              return { record, period, limit: null, spent: null, incarnation, admitted: false };
+            }
+            return admittedBudget(record, period, created.rows[0], incarnation);
+          });
         }
-        const incarnation = await client.query("SELECT n FROM axond_namespace_incarnation WHERE id = $1", [id]);
-        const n = incarnation.rows[0] ? BigInt(String(incarnation.rows[0]["n"])) : 1n;
-        if (!period) {
-          return { record, period: null, limit: null, spent: null, incarnation: n, admitted: false };
+        const period = row["active_period"] == null ? null : String(row["active_period"]);
+        if (period === null || row["limit_microdollars"] == null) {
+          return { record, period, limit: null, spent: null, incarnation, admitted: false };
         }
-        const budget = await client.query(
-          "SELECT limit_microdollars, spent_microdollars FROM axond_store_budget WHERE namespace = $1 AND period = $2",
-          [id, period],
-        );
-        if (!budget.rows[0]) {
-          return { record, period, limit: null, spent: null, incarnation: n, admitted: false };
-        }
-        const limit = BigInt(String(budget.rows[0]["limit_microdollars"]));
-        const spent = BigInt(String(budget.rows[0]["spent_microdollars"]));
-        return { record, period, limit, spent, incarnation: n, admitted: spent < limit };
-      }));
+        return admittedBudget(record, period, row, incarnation);
+      });
     },
     async putNamespace(record) {
       return withClient("namespace_write", (client) => withTransaction(client, async (client) => {
@@ -557,6 +565,17 @@ async function readBudget(client: SqlExecutor, namespace: string, period: string
     spent: BigInt(String(row["spent_microdollars"])),
     active,
   };
+}
+
+function admittedBudget(
+  record: NamespaceWrite,
+  period: string,
+  row: Record<string, unknown>,
+  incarnation: bigint,
+): { record: NamespaceWrite; period: string; limit: bigint; spent: bigint; incarnation: bigint; admitted: boolean } {
+  const limit = BigInt(String(row["limit_microdollars"]));
+  const spent = BigInt(String(row["spent_microdollars"]));
+  return { record, period, limit, spent, incarnation, admitted: spent < limit };
 }
 
 function namespaceFrom(row: Record<string, unknown>): NamespaceWrite {

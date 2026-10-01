@@ -434,6 +434,81 @@ test("a budget write waits on the namespace lock and does not orphan a ledger", 
   }
 });
 
+test("a monthly admit locks only while creating the period row", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  const id = "month-lock";
+  const march = Date.parse("2026-03-15T12:00:00Z");
+  const april = Date.parse("2026-04-15T12:00:00Z");
+  await db.putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  await db.putBudgetPolicy({
+    namespace: id,
+    cadence: "monthly",
+    limit: 100n,
+    timezone: "UTC",
+    period: null,
+    nowMs: march,
+  });
+  const holder = await connect();
+  const look = await connect();
+  try {
+    await holder.client.query("BEGIN");
+    await holder.client.query(
+      "INSERT INTO axond_namespace_lock (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+      [id],
+    );
+    const holderPid = await holder.client.query("SELECT pg_backend_pid() AS pid");
+    const pid = holderPid.rows[0]?.["pid"];
+    const open = await Promise.race([
+      db.resolveNamespace(id, march),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+    ]);
+    assert.ok(open);
+    assert.equal(open.period, "2026-03");
+    assert.equal(open.admitted, true);
+    assert.equal(open.spent, 0n);
+    let failure: unknown;
+    const write = db.resolveNamespace(id, april).then(
+      (resolved) => resolved,
+      (error: unknown) => {
+        failure = error;
+        return null;
+      },
+    );
+    const started = Date.now();
+    let waiting = false;
+    while (Date.now() - started < 2000) {
+      const locks = await look.client.query(
+        "SELECT count(*)::int AS n FROM pg_stat_activity WHERE $1::int = ANY (pg_blocking_pids(pid))",
+        [pid],
+      );
+      if (Number(locks.rows[0]?.["n"] ?? 0) > 0) {
+        waiting = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(waiting, true);
+    assert.equal(failure, undefined);
+    await holder.client.query("COMMIT");
+    const created = await write;
+    assert.equal(created?.period, "2026-04");
+    assert.equal(created?.admitted, true);
+    assert.equal(created?.limit, 100n);
+    assert.equal(created?.spent, 0n);
+  } finally {
+    await holder.client.query("ROLLBACK").catch(() => undefined);
+    await holder.release();
+    await look.release();
+  }
+});
+
 test("a write role keeps an existing postgres schema and names a missing table", async () => {
   const tables = postgresSchemaTables();
   assert.equal(tables.includes("axond_namespace"), true);
