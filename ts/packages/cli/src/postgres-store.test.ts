@@ -5,7 +5,7 @@ import pg from "pg";
 
 import { StoreFailure } from "../../gateway/src/errors.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
-import { applyPostgresMigration, createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
+import { applyPostgresMigration, applyPostgresMigrationOn, createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
 import type { Store } from "@axond/sdk";
 
@@ -45,6 +45,33 @@ async function reset(): Promise<void> {
   `);
   await opened.release();
 }
+
+test("the postgres schema seeds a row lock and does not take an advisory lock", () => {
+  assert.equal(POSTGRES_SCHEMA.includes("CREATE TABLE IF NOT EXISTS axond_schema_lock"), true);
+  assert.equal(POSTGRES_SCHEMA.includes("INSERT INTO axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO NOTHING"), true);
+  assert.equal(POSTGRES_SCHEMA.toLowerCase().includes("pg_advisory"), false);
+});
+
+test("an extension migration locks a row and skips an advisory lock", async () => {
+  const seen: string[] = [];
+  await applyPostgresMigrationOn(
+    {
+      async query(sql) {
+        seen.push(sql);
+        if (sql.includes("FROM axond_schema_migrations")) {
+          return { rows: [], rowCount: 0 };
+        }
+        return { rows: [{ id: 1 }], rowCount: 1 };
+      },
+    },
+    "demo:0",
+    "CREATE TABLE axond_ext_demo (id int)",
+  );
+  assert.equal(seen.some((sql) => sql.toLowerCase().includes("pg_advisory")), false);
+  assert.equal(seen.some((sql) => sql.includes("INSERT INTO axond_schema_lock") && sql.includes("DO UPDATE")), true);
+  assert.equal(seen.includes("CREATE TABLE axond_ext_demo (id int)"), true);
+  assert.equal(seen.at(-1), "COMMIT");
+});
 
 test("a postgres connection error drops the driver message", async () => {
   const db = createPostgresStore(async () => {
@@ -218,6 +245,23 @@ test("applying the postgres schema twice is idempotent", { skip: !dsn }, async (
   await opened.client.query(POSTGRES_SCHEMA);
   await opened.client.query(POSTGRES_SCHEMA);
   await opened.release();
+});
+
+test("postgres_extension_migration_serializes_on_a_row_lock", { skip: !dsn }, async () => {
+  await reset();
+  const id = "demo:race";
+  const sql = "CREATE TABLE axond_ext_lock_race (id integer primary key)";
+  await Promise.all([applyPostgresMigration(dsn!, id, sql), applyPostgresMigration(dsn!, id, sql)]);
+  const opened = await connect();
+  try {
+    const rows = await opened.client.query("SELECT id FROM axond_schema_migrations WHERE id = $1", [id]);
+    assert.equal(rows.rows.length, 1);
+    const table = await opened.client.query("SELECT to_regclass('axond_ext_lock_race') AS name");
+    assert.equal(table.rows[0]?.["name"], "axond_ext_lock_race");
+  } finally {
+    await opened.client.query("DROP TABLE IF EXISTS axond_ext_lock_race");
+    await opened.release();
+  }
 });
 
 test("postgres_extension_migration_applies_once_and_omits_the_driver_text", { skip: !dsn }, async () => {

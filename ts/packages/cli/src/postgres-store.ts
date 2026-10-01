@@ -438,6 +438,10 @@ CREATE TABLE IF NOT EXISTS axond_schema_migrations (
     id text PRIMARY KEY NOT NULL,
     applied_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS axond_schema_lock (
+    id integer PRIMARY KEY CHECK (id = 1)
+);
+INSERT INTO axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 `;
 
 async function readPolicy(client: SqlExecutor, namespace: string, nowMs: number) {
@@ -526,7 +530,8 @@ function namespaceFrom(row: Record<string, unknown>): NamespaceWrite {
  * Apply one extension migration if its id is not already recorded.
  * A second call leaves the database unchanged. A failed statement is rolled
  * back and is not recorded. The thrown error names the id and omits the
- * driver text.
+ * driver text. The applier locks `axond_schema_lock` with a row update.
+ * Hyperdrive does not support advisory locks.
  */
 export async function applyPostgresMigration(dsn: string, id: string, sql: string): Promise<void> {
   const client = new pg.Client({ connectionString: dsn });
@@ -553,11 +558,21 @@ export async function applyPostgresMigration(dsn: string, id: string, sql: strin
   }
 }
 
-/** Run one migration on an open client. The caller owns connect and close. */
+/**
+ * Run one migration on an open client. The caller owns connect and close.
+ * `INSERT ... ON CONFLICT DO UPDATE` locks the singleton row until commit, so
+ * two appliers cannot both run `sql`. A write is the lock: Hyperdrive rejects
+ * `pg_advisory_xact_lock` and can cache a bare `SELECT`.
+ */
 export async function applyPostgresMigrationOn(client: SqlExecutor, id: string, sql: string): Promise<void> {
   try {
     await client.query("BEGIN");
-    await client.query("SELECT pg_advisory_xact_lock(hashtext($1::text)::bigint)", [id]);
+    const lock = await client.query(
+      "INSERT INTO axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id RETURNING id",
+    );
+    if (lock.rows.length !== 1) {
+      throw new Error("schema lock row is missing");
+    }
     const existing = await client.query("SELECT id FROM axond_schema_migrations WHERE id = $1", [id]);
     if (existing.rows.length === 0) {
       await client.query(sql);

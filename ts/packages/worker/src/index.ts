@@ -30,6 +30,7 @@ interface WaitContext {
  * them. The process binary loads the same contract from `AXOND_EXTENSIONS_DIR`
  * at startup instead. Hyperdrive supplies the Postgres connection string;
  * each call opens one client and closes it, with no session-level SET.
+ * Extension migrations lock `axond_schema_lock` with a row update Hyperdrive can run.
  * A failed schema apply is not kept, so the next request can retry. A
  * successful apply stays for the isolate.
  * `PRICES_JSON` is the price list a chat uses when it settles.
