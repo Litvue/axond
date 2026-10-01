@@ -489,7 +489,7 @@ test("a restricted role uses a schema an owner already applied", { skip: !dsn },
   await admin.client.query(`ALTER ROLE axond_rw PASSWORD '${password}'`);
   const exists = await admin.client.query("SELECT 1 FROM pg_database WHERE datname = 'axond_rw'");
   if (exists.rows.length === 0) {
-    await admin.client.query("CREATE DATABASE axond_rw OWNER CURRENT_USER");
+    await admin.client.query("CREATE DATABASE axond_rw");
   }
   await admin.release();
   const ownerUrl = new URL(dsn!);
