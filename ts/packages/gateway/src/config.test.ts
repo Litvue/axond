@@ -651,6 +651,64 @@ test("an empty dotted key is a parse error before extract", async () => {
   await assert.rejects(() => loadConfig(`a.b = 1\n[shutdown]\nnope = 1\n${BASE}`, secrets), /unknown field/);
 });
 
+test("a control character in a string is a parse error before extract", async () => {
+  const basic = "invalid basic string";
+  const literal = "invalid literal string";
+  const multi = "invalid multiline basic string";
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index, message));
+        return true;
+      },
+    );
+  };
+  const beforeShutdown = `n = "a\u0001b"\n[shutdown]\nnope = 1\n${BASE}`;
+  const mark = beforeShutdown.indexOf("\u0001");
+  const markMessage = diagram(beforeShutdown, mark, basic);
+  await reject(beforeShutdown, mark, basic);
+  assert.equal(markMessage.includes("unknown field"), false);
+  assert.equal(markMessage.includes("number too large"), false);
+  const newline = `n = "foo\nbar"\n${BASE}`;
+  await reject(newline, newline.indexOf("\n"), basic);
+  const later = `n = "a\u0001b"\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf("\u0001"), basic);
+  const earlier = `n = 9223372036854775808\nn = "a\u0001b"\n${BASE}`;
+  await reject(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type");
+  const quoted = `n = 'a\u0001b'\n${BASE}`;
+  await reject(quoted, quoted.indexOf("\u0001"), literal);
+  const wide = `n = """a\u0001b"""\n${BASE}`;
+  await reject(wide, wide.indexOf("\u0001"), multi);
+  const header = `["a\u0001"]\n${BASE}`;
+  await reject(header, header.indexOf("\u0001"), basic);
+  const comment = `# a\u0001b\n${BASE}`;
+  await reject(comment, comment.indexOf("\u0001"), "");
+  const deleted = `n = "a\u007fb"\n${BASE}`;
+  await reject(deleted, deleted.indexOf("\u007f"), basic);
+  const tab = await loadConfig(`n = "a\tb"\n${BASE}`, secrets);
+  assert.equal(tab.storage.path, "/tmp/axond.sqlite");
+  const lines = await loadConfig(`n = """a\nb"""\n${BASE}`, secrets);
+  assert.equal(lines.storage.path, "/tmp/axond.sqlite");
+  const noted = await loadConfig(`# a tab\there\n${BASE}`, secrets);
+  assert.equal(noted.storage.path, "/tmp/axond.sqlite");
+});
+
 test("a float past the finite range is a parse error before extract", async () => {
   const message = "invalid floating-point number";
   const diagram = (source: string, index: number) => {

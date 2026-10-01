@@ -3209,7 +3209,11 @@ type TomlScan = { end: number; hit: { index: number; message: string } | null; b
 function scanTomlDocument(source: string, index: number, leaps: number[] = []): TomlScan {
   let cursor = index;
   while (cursor < source.length) {
-    cursor = skipTomlTrivia(source, cursor);
+    const leading = scanTomlTrivia(source, cursor);
+    if (leading.hit) {
+      return leading;
+    }
+    cursor = leading.end;
     if (cursor >= source.length) {
       break;
     }
@@ -3225,7 +3229,11 @@ function scanTomlDocument(source: string, index: number, leaps: number[] = []): 
     if (key.hit || key.bail) {
       return key;
     }
-    cursor = skipTomlTrivia(source, key.end);
+    const between = scanTomlTrivia(source, key.end);
+    if (between.hit) {
+      return between;
+    }
+    cursor = between.end;
     if (source[cursor] !== "=") {
       return { end: cursor, hit: null, bail: true };
     }
@@ -3268,7 +3276,11 @@ function isCompletedZeroBoundary(char: string, container: TomlContainer): boolea
 }
 
 function scanTomlValue(source: string, index: number, container: TomlContainer, leaps: number[]): TomlScan {
-  const cursor = skipTomlTrivia(source, index);
+  const leading = scanTomlTrivia(source, index);
+  if (leading.hit) {
+    return leading;
+  }
+  const cursor = leading.end;
   if (cursor >= source.length) {
     return { end: cursor, hit: null, bail: true };
   }
@@ -3299,7 +3311,11 @@ function scanTomlValue(source: string, index: number, container: TomlContainer, 
 function scanTomlArray(source: string, index: number, leaps: number[]): TomlScan {
   let cursor = index + 1;
   for (;;) {
-    cursor = skipTomlTrivia(source, cursor);
+    const leading = scanTomlTrivia(source, cursor);
+    if (leading.hit) {
+      return leading;
+    }
+    cursor = leading.end;
     if (source[cursor] === "]") {
       return { end: cursor + 1, hit: null, bail: false };
     }
@@ -3307,7 +3323,11 @@ function scanTomlArray(source: string, index: number, leaps: number[]): TomlScan
     if (value.hit || value.bail) {
       return value;
     }
-    cursor = skipTomlTrivia(source, value.end);
+    const between = scanTomlTrivia(source, value.end);
+    if (between.hit) {
+      return between;
+    }
+    cursor = between.end;
     if (source[cursor] === ",") {
       cursor += 1;
       continue;
@@ -3755,16 +3775,30 @@ function skipTomlDate(source: string, index: number): number {
   return cursor;
 }
 
-function skipTomlTrivia(source: string, index: number): number {
+function isTomlCommentChar(char: string): boolean {
+  const code = char.codePointAt(0) ?? 0;
+  return code === 0x09 || (code >= 0x20 && code <= 0x7e) || code >= 0x80;
+}
+
+/** Spaces, tabs, newlines, and comments. A control character in a comment is an error with an empty message. */
+function scanTomlTrivia(source: string, index: number): TomlScan {
   let cursor = index;
   for (;;) {
     while (cursor < source.length && " \t\r\n".includes(source[cursor] ?? "")) {
       cursor += 1;
     }
     if (source[cursor] !== "#") {
-      return cursor;
+      return { end: cursor, hit: null, bail: false };
     }
+    cursor += 1;
     while (cursor < source.length && source[cursor] !== "\n") {
+      const char = source[cursor] ?? "";
+      if (char === "\r" && source[cursor + 1] === "\n") {
+        break;
+      }
+      if (!isTomlCommentChar(char)) {
+        return { end: cursor, hit: { index: cursor, message: "" }, bail: false };
+      }
       cursor += 1;
     }
   }
@@ -3873,11 +3907,38 @@ function isTomlHex(char: string): boolean {
   return (char >= "0" && char <= "9") || (char >= "A" && char <= "F") || (char >= "a" && char <= "f");
 }
 
+function stringLabel(multiline: boolean, literal: boolean): string {
+  if (multiline && literal) {
+    return "invalid multiline literal string";
+  }
+  if (multiline) {
+    return "invalid multiline basic string";
+  }
+  if (literal) {
+    return "invalid literal string";
+  }
+  return "invalid basic string";
+}
+
+/** Tab, printable ASCII other than the delimiter and `\`, and non-ASCII. */
+function isTomlStringChar(char: string, literal: boolean): boolean {
+  const code = char.codePointAt(0) ?? 0;
+  if (code === 0x09 || code >= 0x80) {
+    return true;
+  }
+  if (literal) {
+    return (code >= 0x20 && code <= 0x26) || (code >= 0x28 && code <= 0x7e);
+  }
+  return code === 0x20 || code === 0x21 || (code >= 0x23 && code <= 0x5b) || (code >= 0x5d && code <= 0x7e);
+}
+
 /**
  * Figment rejects `\xHH` and `\e` in a basic string, and a `\u` or `\U`
  * that is short or names a surrogate or a code point above U+10FFFF. The
  * caret is the character after the escape letter. Literal strings keep the
- * backslash. An unknown escape smol already refuses still bails.
+ * backslash. A raw control character or newline is `invalid basic string`
+ * or `invalid literal string` on that character. Multiline strings still
+ * contain newlines.
  */
 function scanTomlString(source: string, index: number): TomlScan {
   const multiline = source.startsWith('"""', index) || source.startsWith("'''", index);
@@ -3886,17 +3947,16 @@ function scanTomlString(source: string, index: number): TomlScan {
     return { end: index, hit: null, bail: true };
   }
   const literal = quote.startsWith("'");
+  const label = stringLabel(multiline, literal);
   let cursor = index + quote.length;
-  if (multiline) {
-    if (source[cursor] === "\r") {
-      cursor += 1;
-    }
-    if (source[cursor] === "\n") {
-      cursor += 1;
-    }
+  if (multiline && source[cursor] === "\r" && source[cursor + 1] === "\n") {
+    cursor += 2;
+  } else if (multiline && source[cursor] === "\n") {
+    cursor += 1;
   }
   while (cursor < source.length) {
-    if (!literal && source[cursor] === "\\") {
+    const char = source[cursor] ?? "";
+    if (!literal && char === "\\") {
       const escaped = scanBasicEscape(source, cursor + 1, multiline);
       if (escaped.hit || escaped.bail) {
         return escaped;
@@ -3907,12 +3967,20 @@ function scanTomlString(source: string, index: number): TomlScan {
     if (source.startsWith(quote, cursor)) {
       return { end: cursor + quote.length, hit: null, bail: false };
     }
-    if (!multiline && (source[cursor] === "\n" || source[cursor] === "\r")) {
-      return { end: cursor, hit: null, bail: true };
+    if (multiline && (char === "\n" || (char === "\r" && source[cursor + 1] === "\n"))) {
+      cursor += char === "\r" ? 2 : 1;
+      continue;
+    }
+    if (multiline && char === quote[0]) {
+      cursor += 1;
+      continue;
+    }
+    if (!isTomlStringChar(char, literal)) {
+      return { end: cursor, hit: { index: cursor, message: label }, bail: false };
     }
     cursor += 1;
   }
-  return { end: cursor, hit: null, bail: true };
+  return { end: cursor, hit: { index: cursor, message: label }, bail: false };
 }
 
 function scanBasicEscape(source: string, index: number, multiline: boolean): TomlScan {

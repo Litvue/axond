@@ -186,6 +186,12 @@ such as `a..b` or `a.`, is `expected `.`, `=`` on that dot, before
 extract and before a later integer. A table header uses `invalid table
 header` and `` expected `.`, `]` ``. An array-of-tables header expects
 `` `]]` ``. A key that never starts is `invalid key`. `a.b = 1` still parses.
+A raw control character or newline in a basic string is `invalid basic
+string` on that character, before extract and before a later integer. A
+literal string uses `invalid literal string`. A multiline string uses
+`invalid multiline basic string` and may still contain a newline. A control
+character in a comment is an empty message on that character. A tab and
+`\n` inside a multiline string still parse.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
