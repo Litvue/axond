@@ -625,6 +625,91 @@ test("an owner apply adds columns a Rust namespace table omitted", { skip: !dsn 
   }
 });
 
+test("a write role names namespace columns a Rust table omitted", async () => {
+  await assert.rejects(
+    () =>
+      applyPostgresSchema({
+        async query(sql, params) {
+          if (sql === POSTGRES_SCHEMA) {
+            const error = new Error("permission denied password=secret");
+            (error as { code?: string }).code = "42501";
+            throw error;
+          }
+          if (sql.includes("pg_attribute")) {
+            return { rows: [], rowCount: 0 };
+          }
+          return { rows: [{ name: String(params?.[0]) }], rowCount: 1 };
+        },
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        error.message,
+        "postgres schema is missing axond_namespace.allow_platform_fallback, axond_namespace.from_config",
+      );
+      assert.equal(error.message.includes("password=secret"), false);
+      return true;
+    },
+  );
+});
+
+test("a restricted role names columns a Rust namespace table omitted", { skip: !dsn }, async (t) => {
+  const admin = await connect();
+  const role = await admin.client.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+  if (role.rows[0]?.["rolsuper"] !== true) {
+    await admin.release();
+    t.skip("the test role cannot create a database");
+    return;
+  }
+  const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  const dbName = `axond_up_${suffix}`;
+  const roleName = `axond_upw_${suffix}`;
+  const password = `pw_${suffix}`;
+  const ownerUrl = new URL(dsn!);
+  ownerUrl.pathname = `/${dbName}`;
+  await admin.client.query(`CREATE DATABASE ${dbName}`);
+  await admin.client.query(`CREATE ROLE ${roleName} LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE`);
+  await admin.release();
+  const owner = new pg.Client({ connectionString: ownerUrl.toString() });
+  await owner.connect();
+  try {
+    await owner.query("REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+    await owner.query(`GRANT USAGE ON SCHEMA public TO ${roleName}`);
+    await owner.query(`GRANT pg_read_all_data, pg_write_all_data TO ${roleName}`);
+    await applyPostgresSchema(sqlExecutor(owner));
+    await owner.query("ALTER TABLE axond_namespace DROP COLUMN allow_platform_fallback");
+    await owner.query("ALTER TABLE axond_namespace DROP COLUMN from_config");
+    const restrictedUrl = new URL(ownerUrl.toString());
+    restrictedUrl.username = roleName;
+    restrictedUrl.password = password;
+    const restricted = new pg.Client({ connectionString: restrictedUrl.toString() });
+    await restricted.connect();
+    try {
+      await assert.rejects(() => applyPostgresSchema(sqlExecutor(restricted)), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.equal(
+          error.message,
+          "postgres schema is missing axond_namespace.allow_platform_fallback, axond_namespace.from_config",
+        );
+        assert.equal(error.message.includes(password), false);
+        return true;
+      });
+    } finally {
+      await restricted.end();
+    }
+  } finally {
+    await owner.end().catch(() => undefined);
+    const drop = await connect();
+    await drop.client.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [
+      dbName,
+    ]);
+    await drop.client.query(`DROP DATABASE ${dbName}`);
+    await drop.client.query(`REVOKE pg_read_all_data, pg_write_all_data FROM ${roleName}`);
+    await drop.client.query(`DROP ROLE ${roleName}`);
+    await drop.release();
+  }
+});
+
 test("a restricted role uses a schema an owner already applied", { skip: !dsn }, async (t) => {
   const admin = await connect();
   const role = await admin.client.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");

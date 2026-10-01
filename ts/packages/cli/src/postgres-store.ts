@@ -593,8 +593,9 @@ function namespaceFrom(row: Record<string, unknown>): NamespaceWrite {
 /**
  * Apply `POSTGRES_SCHEMA`. A role with only `pg_read_all_data` and
  * `pg_write_all_data` cannot `CREATE`, and `CREATE TABLE IF NOT EXISTS`
- * still fails when the tables are already there. In that case the existing
- * tables are enough. A missing table is named, and the driver text is not.
+ * still fails when the tables are already there. Existing tables are enough
+ * only when `axond_namespace` already has the TypeScript columns. A missing
+ * table or column is named, and the driver text is not.
  */
 export async function applyPostgresSchema(client: SqlExecutor): Promise<void> {
   try {
@@ -603,12 +604,22 @@ export async function applyPostgresSchema(client: SqlExecutor): Promise<void> {
     if (!postgresInsufficientPrivilege(error)) {
       throw error;
     }
-    const missing = await missingPostgresTables(client, postgresSchemaTables());
+    const tables = postgresSchemaTables();
+    const missingTables = await missingPostgresTables(client, tables);
+    const missingColumns = missingTables.includes("axond_namespace")
+      ? []
+      : await missingPostgresColumns(client, NAMESPACE_COLUMNS);
+    const missing = [...missingTables, ...missingColumns];
     if (missing.length > 0) {
       throw new Error(`postgres schema is missing ${missing.join(", ")}`);
     }
   }
 }
+
+const NAMESPACE_COLUMNS: readonly (readonly [string, string])[] = [
+  ["axond_namespace", "allow_platform_fallback"],
+  ["axond_namespace", "from_config"],
+];
 
 export function postgresSchemaTables(sql = POSTGRES_SCHEMA): string[] {
   return [...sql.matchAll(/CREATE TABLE IF NOT EXISTS\s+([a-zA-Z_][a-zA-Z0-9_]*)/g)].map((match) => match[1]!);
@@ -624,6 +635,24 @@ async function missingPostgresTables(client: SqlExecutor, tables: readonly strin
     const found = await client.query("SELECT to_regclass($1) AS name", [table]);
     if (found.rows[0]?.["name"] == null) {
       missing.push(table);
+    }
+  }
+  return missing;
+}
+
+async function missingPostgresColumns(
+  client: SqlExecutor,
+  columns: readonly (readonly [string, string])[],
+): Promise<string[]> {
+  const missing: string[] = [];
+  for (const [table, column] of columns) {
+    const found = await client.query(
+      `SELECT 1 AS ok FROM pg_attribute
+       WHERE attrelid = to_regclass($1) AND attname = $2 AND attnum > 0 AND NOT attisdropped`,
+      [table, column],
+    );
+    if (!found.rows[0]) {
+      missing.push(`${table}.${column}`);
     }
   }
   return missing;
