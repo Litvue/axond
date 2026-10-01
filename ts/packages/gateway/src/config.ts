@@ -3442,6 +3442,7 @@ type TomlContainer = "document" | "array" | "inline";
 
 const DOCUMENT_AFTER_VALUE = "expected newline, `#`";
 const ARRAY_AFTER_VALUE = "invalid array\nexpected `]`";
+const STRING_VALUE = "invalid string\nexpected `\"`, `'`";
 const LEADING_FLOAT = "invalid floating-point number\nexpected leading digit";
 const LEADING_INTEGER = "invalid integer\nexpected leading digit";
 
@@ -3509,9 +3510,13 @@ function scanTomlValue(source: string, index: number, container: TomlContainer, 
     return tagTomlValue(scanTomlArray(source, cursor, leaps), cursor);
   }
   const word = tomlWord(source, cursor);
-  const keyword = (["false", "true", "inf", "nan"] as const).find((name) => word.startsWith(name));
-  if (keyword) {
-    return { end: cursor + keyword.length, hit: null, bail: false, token: cursor };
+  const keywordHead = char === "t" ? "true" : char === "f" ? "false" : char === "i" ? "inf" : char === "n" ? "nan" : "";
+  if (keywordHead) {
+    if (word.startsWith(keywordHead)) {
+      return { end: cursor + keywordHead.length, hit: null, bail: false, token: cursor };
+    }
+    // A lowercase t, f, i, or n commits. Anything short of the keyword is a string.
+    return { end: cursor, hit: { index: cursor, message: STRING_VALUE }, bail: false };
   }
   if ((char === "+" || char === "-") && (source.startsWith("inf", cursor + 1) || source.startsWith("nan", cursor + 1))) {
     const end = cursor + 1 + (source.startsWith("inf", cursor + 1) ? 3 : 3);
@@ -3530,7 +3535,10 @@ function scanTomlValue(source: string, index: number, container: TomlContainer, 
       bail: false,
     };
   }
-  return { end: cursor, hit: null, bail: true };
+  if (container === "array") {
+    return { end: cursor, hit: { index: cursor, message: ARRAY_AFTER_VALUE }, bail: false };
+  }
+  return { end: cursor, hit: { index: cursor, message: STRING_VALUE }, bail: false };
 }
 
 function scanTomlArray(source: string, index: number, leaps: number[]): TomlScan {
