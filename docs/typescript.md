@@ -148,7 +148,11 @@ A TOML integer outside `i64` fails in the parser before any field is
 deserialized. `number too large to fit in target type` and `number too small
 to fit in target type` name the line and column, and they are reported before
 `[shutdown] nope`. An `AXOND_` override is not a TOML integer and may still be
-a full `u64`.
+a full `u64`. An inline table stays on one line. A trailing comma is
+`invalid inline table` and `` expected `}` `` with the caret on the comma,
+before extract and before a later integer. A newline or a `#` comment inside
+the braces is that diagram at the newline or the `#`. An array may still end
+with a comma.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

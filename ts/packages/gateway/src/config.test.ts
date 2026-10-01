@@ -230,6 +230,75 @@ test("a toml integer outside i64 is a parse error before extract", async () => {
   await reject(dated, diagram(dated, tooLarge, large));
 });
 
+test("a trailing comma in an inline table is a parse error before extract", async () => {
+  const inline = "invalid inline table\nexpected `}`";
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const comma = `failover = { overall_timeout_ms = 8, }\n[shutdown]\nnope = 1\n${BASE}`;
+  const commaMessage = diagram(comma, comma.indexOf(","), inline);
+  await reject(comma, commaMessage);
+  assert.equal(commaMessage.includes("unknown field"), false);
+  assert.equal(commaMessage.includes("number too large"), false);
+  const later = `failover = { overall_timeout_ms = 8, }\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, diagram(later, later.indexOf(","), inline));
+  const huge = `failover = { overall_timeout_ms = 9223372036854775808, }\n${BASE}`;
+  await reject(huge, diagram(huge, huge.indexOf("9223372036854775808"), "number too large to fit in target type"));
+  const pair = `n = { a = 1, b = 2, }\n${BASE}`;
+  await reject(pair, diagram(pair, pair.lastIndexOf(","), inline));
+  const array = `n = { a = [1, 2,], }\n${BASE}`;
+  await reject(array, diagram(array, array.lastIndexOf(","), inline));
+  for (const source of [
+    `n = { a = { b = 1, } }\n${BASE}`,
+    `n = { a = 1, # c\n}\n${BASE}`,
+    `n = {,}\n${BASE}`,
+    `n = { a = 1,, }\n${BASE}`,
+    `n = { a = 1 , }\n${BASE}`,
+    `n = { a = 1,}\n${BASE}`,
+    `m = [{ a = 1, }]\n${BASE}`,
+    `n = { "a" = 1, }\n${BASE}`,
+    `n = { a.b = 1, }\n${BASE}`,
+    `n = { a = 1,\n}\n${BASE}`,
+  ]) {
+    await reject(source, diagram(source, source.indexOf(","), inline));
+  }
+  const opened = `failover = {\n  overall_timeout_ms = 8\n}\n${BASE}`;
+  await reject(opened, diagram(opened, opened.indexOf("\n"), inline));
+  const broken = `n = { a = 1\n}\n${BASE}`;
+  await reject(broken, diagram(broken, broken.indexOf("\n"), inline));
+  const cr = `n = {\r\n}\n${BASE}`;
+  await reject(cr, diagram(cr, cr.indexOf("\r"), inline));
+  const comment = `n = { a = 8 # c\n}\n${BASE}`;
+  await reject(comment, diagram(comment, comment.indexOf("#"), inline));
+  const kept = await loadConfig(
+    `failover = { overall_timeout_ms = 8, max_attempts = 2 }\nblocklist = { models = ["a",] }\n${BASE}`,
+    secrets,
+  );
+  assert.equal(kept.transport.overallTimeoutMs, 8);
+  assert.equal(kept.transport.maxAttempts, 2);
+});
+
 test("storage_fields_match_the_rust_boot_refusals", async () => {
   const instead = (pathBlock: string) => BASE.replace('backend = "sqlite"\npath = "/tmp/axond.sqlite"\n', pathBlock);
   const refuse = async (toml: string, pattern: RegExp) => {

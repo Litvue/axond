@@ -3153,8 +3153,10 @@ const I64_MIN = -9223372036854775808n;
 const U64_MAX = 18446744073709551615n;
 
 /**
- * TOML integers are `i64`. Figment fails the document in the parser, before
- * extract and before a later unknown field, when a value does not fit.
+ * Figment fails the document in the parser, before extract. A file integer
+ * outside `i64` is `number too large` or `number too small`. An inline table
+ * stays on one line: a trailing comma, a newline, or a comment is
+ * `invalid inline table`.
  */
 function firstTomlIntegerOutsideI64(source: string): { index: number; message: string } | null {
   return scanTomlDocument(source, 0).hit;
@@ -3265,34 +3267,114 @@ function scanTomlArray(source: string, index: number): TomlScan {
   }
 }
 
+const INLINE_TABLE_MESSAGE = "invalid inline table\nexpected `}`";
+
+/** Inline tables take spaces and tabs. A newline or comment ends the table. */
+function skipInlineWs(source: string, index: number): number {
+  let cursor = index;
+  while (source[cursor] === " " || source[cursor] === "\t") {
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function canStartInlineKey(source: string, index: number): boolean {
+  const char = source[index] ?? "";
+  return char === '"' || char === "'" || /[A-Za-z0-9_-]/.test(char);
+}
+
+function inlineTableHit(index: number): TomlScan {
+  return { end: index, hit: { index, message: INLINE_TABLE_MESSAGE }, bail: false };
+}
+
+function isInlineBreak(source: string, index: number): boolean {
+  const char = source[index] ?? "";
+  return char === "\n" || char === "\r" || char === "#";
+}
+
+/**
+ * TOML 1.0 inline tables have no trailing comma and no newline. Figment
+ * reports `invalid inline table` at the comma, or at the newline or `#`
+ * when that token is where `}` was required. A comma followed by a key
+ * continues. Arrays keep their own trailing commas.
+ */
 function scanTomlInline(source: string, index: number): TomlScan {
   let cursor = index + 1;
   for (;;) {
-    cursor = skipTomlTrivia(source, cursor);
+    cursor = skipInlineWs(source, cursor);
     if (source[cursor] === "}") {
       return { end: cursor + 1, hit: null, bail: false };
     }
-    const key = skipTomlKey(source, cursor);
-    if (key === null) {
+    if (source[cursor] === "," || isInlineBreak(source, cursor)) {
+      return inlineTableHit(cursor);
+    }
+    if (!canStartInlineKey(source, cursor)) {
       return { end: cursor, hit: null, bail: true };
     }
-    cursor = skipTomlTrivia(source, key);
+    const keyEnd = skipInlineKey(source, cursor);
+    if (keyEnd === null) {
+      return { end: cursor, hit: null, bail: true };
+    }
+    cursor = skipInlineWs(source, keyEnd);
     if (source[cursor] !== "=") {
       return { end: cursor, hit: null, bail: true };
     }
-    const value = scanTomlValue(source, cursor + 1);
+    const value = scanInlineTableValue(source, cursor + 1);
     if (value.hit || value.bail) {
       return value;
     }
-    cursor = skipTomlTrivia(source, value.end);
+    cursor = skipInlineWs(source, value.end);
     if (source[cursor] === ",") {
-      cursor += 1;
-      continue;
+      const after = skipInlineWs(source, cursor + 1);
+      if (canStartInlineKey(source, after)) {
+        cursor = after;
+        continue;
+      }
+      return inlineTableHit(cursor);
     }
     if (source[cursor] === "}") {
       return { end: cursor + 1, hit: null, bail: false };
     }
+    if (isInlineBreak(source, cursor)) {
+      return inlineTableHit(cursor);
+    }
     return { end: cursor, hit: null, bail: true };
+  }
+}
+
+function scanInlineTableValue(source: string, index: number): TomlScan {
+  const cursor = skipInlineWs(source, index);
+  if (cursor >= source.length || isInlineBreak(source, cursor) || source[cursor] === "}" || source[cursor] === ",") {
+    return { end: cursor, hit: null, bail: true };
+  }
+  return scanTomlValue(source, cursor);
+}
+
+function skipInlineKey(source: string, index: number): number | null {
+  let cursor = index;
+  for (;;) {
+    if (source[cursor] === '"' || source[cursor] === "'") {
+      const end = skipTomlString(source, cursor);
+      if (end === null) {
+        return null;
+      }
+      cursor = end;
+    } else if (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
+      while (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
+        cursor += 1;
+      }
+    } else {
+      return null;
+    }
+    const after = skipInlineWs(source, cursor);
+    if (source[after] !== ".") {
+      return cursor;
+    }
+    const next = skipInlineWs(source, after + 1);
+    if (!canStartInlineKey(source, next)) {
+      return null;
+    }
+    cursor = next;
   }
 }
 
