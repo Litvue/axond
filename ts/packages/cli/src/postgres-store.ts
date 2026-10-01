@@ -440,6 +440,8 @@ CREATE TABLE IF NOT EXISTS axond_namespace (
     allow_platform_fallback boolean NOT NULL DEFAULT false,
     from_config boolean NOT NULL DEFAULT false
 );
+ALTER TABLE axond_namespace ADD COLUMN IF NOT EXISTS allow_platform_fallback boolean NOT NULL DEFAULT false;
+ALTER TABLE axond_namespace ADD COLUMN IF NOT EXISTS from_config boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS axond_namespace_incarnation (
     id text PRIMARY KEY NOT NULL,
     n bigint NOT NULL

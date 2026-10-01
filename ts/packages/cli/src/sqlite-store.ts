@@ -79,11 +79,24 @@ CREATE TABLE IF NOT EXISTS axond_schema_migrations (
 
 const I64_MAX = 9223372036854775807n;
 
+/** Node's SQLite rejects `ADD COLUMN IF NOT EXISTS`. A Rust file has neither column. */
+function ensureNamespaceColumns(db: DatabaseSync): void {
+  const columns = db.prepare("PRAGMA table_info(axond_namespace)").all() as { name: string }[];
+  const names = new Set(columns.map((column) => column.name));
+  if (!names.has("allow_platform_fallback")) {
+    db.exec("ALTER TABLE axond_namespace ADD COLUMN allow_platform_fallback INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!names.has("from_config")) {
+    db.exec("ALTER TABLE axond_namespace ADD COLUMN from_config INTEGER NOT NULL DEFAULT 0");
+  }
+}
+
 export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
   const db = new DatabaseSync(path);
   db.exec("PRAGMA journal_mode=WAL");
   db.exec("PRAGMA busy_timeout=5000");
   db.exec(SCHEMA);
+  ensureNamespaceColumns(db);
   let chain: Promise<unknown> = Promise.resolve();
   const lock = <T>(operation: StoreOperation | null, fn: () => T): Promise<T> => {
     const called = Date.now();
@@ -352,6 +365,7 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
 export function applyMigration(dbPath: string, id: string, sql: string): void {
   const db = new DatabaseSync(dbPath);
   db.exec(SCHEMA);
+  ensureNamespaceColumns(db);
   const existing = db.prepare("SELECT id FROM axond_schema_migrations WHERE id = ?").get(id);
   if (existing) {
     db.close();

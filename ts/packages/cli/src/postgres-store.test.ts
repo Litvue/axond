@@ -58,6 +58,14 @@ test("the postgres schema seeds a row lock and does not take an advisory lock", 
   assert.equal(POSTGRES_SCHEMA.includes("CREATE TABLE IF NOT EXISTS axond_schema_lock"), true);
   assert.equal(POSTGRES_SCHEMA.includes("INSERT INTO axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO NOTHING"), true);
   assert.equal(POSTGRES_SCHEMA.toLowerCase().includes("pg_advisory"), false);
+  assert.equal(
+    POSTGRES_SCHEMA.includes("ALTER TABLE axond_namespace ADD COLUMN IF NOT EXISTS allow_platform_fallback boolean NOT NULL DEFAULT false"),
+    true,
+  );
+  assert.equal(
+    POSTGRES_SCHEMA.includes("ALTER TABLE axond_namespace ADD COLUMN IF NOT EXISTS from_config boolean NOT NULL DEFAULT false"),
+    true,
+  );
 });
 
 test("an extension migration locks a row and skips an advisory lock", async () => {
@@ -544,6 +552,77 @@ test("a write role keeps an existing postgres schema and names a missing table",
       return true;
     },
   );
+});
+
+test("an owner apply adds columns a Rust namespace table omitted", { skip: !dsn }, async (t) => {
+  const admin = await connect();
+  const role = await admin.client.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+  if (role.rows[0]?.["rolsuper"] !== true) {
+    await admin.release();
+    t.skip("the test role cannot create a database");
+    return;
+  }
+  const name = `axond_up_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const url = new URL(dsn!);
+  url.pathname = `/${name}`;
+  const upgradeDsn = url.toString();
+  await admin.client.query(`CREATE DATABASE ${name}`);
+  await admin.release();
+  const opened = new pg.Client({ connectionString: upgradeDsn });
+  await opened.connect();
+  try {
+    await opened.query(
+      `CREATE TABLE axond_namespace (
+         id TEXT PRIMARY KEY NOT NULL,
+         attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+         blocklist JSONB
+       )`,
+    );
+    await opened.query("INSERT INTO axond_namespace (id, attrs) VALUES ('legacy', '{\"org\":\"acme\"}'::jsonb)");
+    await applyPostgresSchema({
+      query: async (sql, params) => {
+        const result = params === undefined ? await opened.query(sql) : await opened.query(sql, [...params]);
+        const row = Array.isArray(result) ? result[result.length - 1] : result;
+        return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
+      },
+    });
+    const columns = await opened.query(
+      "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'axond_namespace'",
+    );
+    const names = columns.rows.map((row) => String(row["column_name"]));
+    assert.equal(names.includes("allow_platform_fallback"), true);
+    assert.equal(names.includes("from_config"), true);
+    const lock = await opened.query("SELECT to_regclass('axond_namespace_lock') AS name");
+    assert.equal(lock.rows[0]?.["name"], "axond_namespace_lock");
+    const kept = await opened.query("SELECT attrs->>'org' AS org FROM axond_namespace WHERE id = 'legacy'");
+    assert.equal(kept.rows[0]?.["org"], "acme");
+    const store = createPostgresStore(async () => {
+      const client = new pg.Client({ connectionString: upgradeDsn });
+      await client.connect();
+      return {
+        client: {
+          query: async (sql, params) => {
+            const result = await client.query(sql, params ? [...params] : []);
+            return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+          },
+        },
+        release: () => client.end(),
+      };
+    });
+    const found = await store.getNamespace("legacy");
+    assert.equal(found?.id, "legacy");
+    assert.equal(found?.allowPlatformFallback, false);
+    assert.equal(found?.fromConfig, false);
+    assert.equal(found?.attrs["org"], "acme");
+  } finally {
+    await opened.end().catch(() => undefined);
+    const drop = await connect();
+    await drop.client.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [
+      name,
+    ]);
+    await drop.client.query(`DROP DATABASE ${name}`);
+    await drop.release();
+  }
 });
 
 test("a restricted role uses a schema an owner already applied", { skip: !dsn }, async (t) => {

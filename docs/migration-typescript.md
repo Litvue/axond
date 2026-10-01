@@ -16,9 +16,9 @@ Declare one deployment-wide `[[gateway_key]]`. A per-namespace list is withdrawn
 
 There is no usage-row migration. SQLite and Postgres keep `axond_store_usage`, and one `request_id` is still the charge key. Point `[storage] path` or `dsn_env` at the existing database.
 
-The TypeScript process adds two columns on `axond_namespace`, `allow_platform_fallback` and `from_config`, and a table `axond_catalog_streak` that holds the catalogue refusal count. Those are not in the Rust `ops/postgres` scripts. Rust does not read `axond_catalog_streak`. Opening the same SQLite file from the Rust binary leaves the table in place.
+The TypeScript process adds two columns on `axond_namespace`, `allow_platform_fallback` and `from_config`, and tables `axond_catalog_streak`, `axond_namespace_lock`, and `axond_schema_lock`. Those are not in the Rust `ops/postgres` scripts. Rust does not read `axond_catalog_streak` or the lock tables. Opening the same SQLite file from the Rust binary leaves the extra objects in place.
 
-Postgres schema application is `CREATE TABLE IF NOT EXISTS`, so a second boot does not rebuild existing rows. Extension migrations run at process start on SQLite and on Postgres. Each statement is recorded in `axond_schema_migrations` and a second boot skips that id. A failed statement is rolled back and is not recorded. The error names the migration id and omits the driver text.
+A role that can `CREATE` adds the two columns to an existing `axond_namespace` and creates the missing tables. A second boot does not rebuild existing rows. A role that cannot `CREATE` leaves an existing schema in place and names a missing table. Extension migrations run at process start on SQLite and on Postgres. Each statement is recorded in `axond_schema_migrations` and a second boot skips that id. A failed statement is rolled back and is not recorded. The error names the migration id and omits the driver text.
 
 ## What core no longer does
 

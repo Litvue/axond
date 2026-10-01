@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +11,31 @@ import { envSecretReader, loadConfig } from "../../gateway/src/config.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
 import { applyMigration, openSqliteStore } from "./sqlite-store.ts";
+
+test("sqlite open adds columns a Rust namespace table omitted", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-"));
+  const path = join(directory, "axond.sqlite");
+  try {
+    const rust = new DatabaseSync(path);
+    rust.exec(
+      `CREATE TABLE axond_namespace (
+         id TEXT PRIMARY KEY NOT NULL,
+         attrs TEXT NOT NULL DEFAULT '{}',
+         blocklist TEXT
+       )`,
+    );
+    rust.exec("INSERT INTO axond_namespace (id, attrs) VALUES ('legacy', '{\"org\":\"acme\"}')");
+    rust.close();
+    const store = openSqliteStore(path);
+    const found = await store.getNamespace("legacy");
+    assert.equal(found?.id, "legacy");
+    assert.equal(found?.allowPlatformFallback, false);
+    assert.equal(found?.fromConfig, false);
+    assert.equal(found?.attrs["org"], "acme");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("sqlite settlement is exactly once per request_id and survives reopen", async () => {
   const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-"));
