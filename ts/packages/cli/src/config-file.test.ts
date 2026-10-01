@@ -1408,6 +1408,61 @@ namespace = "platform"
   }
 });
 
+test("signed_date_is_an_integer_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-signed-date-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "plusdate.toml");
+  const line = "n = +1979-05-27";
+  await writeFile(
+    config,
+    `${line}
+[shutdown]
+nope = 1
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`,
+  );
+  const column = line.indexOf("-");
+  const pad = "  ";
+  const diagram =
+    "TOML parse error at line 1, column " +
+    (column + 1) +
+    "\n" +
+    pad +
+    "|\n" +
+    "1 | " +
+    line +
+    "\n" +
+    pad +
+    "|" +
+    " ".repeat(column + 1) +
+    "^\n" +
+    "expected newline, `#`\n" +
+    " in plusdate.toml TOML file\n";
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" + config + "`: config load: " + diagram,
+    );
+    assert.equal(result.stderr.includes("unknown field"), false);
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("sign_without_a_digit_is_a_parse_error_before_the_store_opens", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-sign-"));
   const db = join(root, "fresh.sqlite");

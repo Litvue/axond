@@ -209,7 +209,10 @@ that `_`. `n = 1 # comment` and `0x10` still parse. A `+` or `-`
 that is not followed by a digit is `invalid integer` on the missing digit,
 before extract and before a later integer. `+.5` and `+_1` use that same
 caret. Inside an array the sign is `invalid array` and `` expected `]` ``.
-`+1`, `-1`, and `+inf` still parse.
+`+1`, `-1`, and `+inf` still parse. A signed date such as `+1979-05-27`
+is that integer and `` expected newline, `#` `` on the `-`. `1-2` and
+`+07:32:00` are the same trailing character. Inside an array it is
+`` expected `]` ``. `1979-05-27`, `07:32:00`, and `0123-01-01` still parse.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

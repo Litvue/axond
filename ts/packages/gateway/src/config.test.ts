@@ -906,6 +906,66 @@ test("a sign without a digit is a parse error before extract", async () => {
   assert.equal(inf.storage.path, "/tmp/axond.sqlite");
 });
 
+test("a signed date is an integer before extract", async () => {
+  const newline = "expected newline, `#`";
+  const array = "invalid array\nexpected `]`";
+  const inline = "invalid inline table\nexpected `}`";
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index, message));
+        return true;
+      },
+    );
+  };
+  const beforeShutdown = `n = +1979-05-27\n[shutdown]\nnope = 1\n${BASE}`;
+  const mark = beforeShutdown.indexOf("-");
+  const markMessage = diagram(beforeShutdown, mark, newline);
+  await reject(beforeShutdown, mark, newline);
+  assert.equal(markMessage.includes("unknown field"), false);
+  assert.equal(markMessage.includes("number too large"), false);
+  const later = `n = +1979-05-27\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf("-"), newline);
+  const earlier = `n = 9223372036854775808\nn = +1979-05-27\n${BASE}`;
+  await reject(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type");
+  const short = `n = 1-2\n${BASE}`;
+  await reject(short, short.indexOf("-"), newline);
+  const hour = `n = +07:32:00\n${BASE}`;
+  await reject(hour, hour.indexOf("7"), newline);
+  const huge = `n = +9223372036854775808-01-01\n${BASE}`;
+  await reject(huge, huge.indexOf("+"), "number too large to fit in target type");
+  const arr = `n = [+1979-05-27]\n${BASE}`;
+  await reject(arr, arr.indexOf("-"), array);
+  const arrShort = `n = [1-2]\n${BASE}`;
+  await reject(arrShort, arrShort.indexOf("-"), array);
+  const inlineDate = `n = { a = +1979-05-27 }\n${BASE}`;
+  await reject(inlineDate, inlineDate.indexOf("-"), inline);
+  const dated = await loadConfig(`n = 1979-05-27\n${BASE}`, secrets);
+  assert.equal(dated.storage.path, "/tmp/axond.sqlite");
+  const clock = await loadConfig(`n = 07:32:00\n${BASE}`, secrets);
+  assert.equal(clock.storage.path, "/tmp/axond.sqlite");
+  const year = await loadConfig(`n = 0123-01-01\n${BASE}`, secrets);
+  assert.equal(year.storage.path, "/tmp/axond.sqlite");
+  const plusYear = await loadConfig(`n = +1979\n${BASE}`, secrets);
+  assert.equal(plusYear.storage.path, "/tmp/axond.sqlite");
+});
+
 test("a float past the finite range is a parse error before extract", async () => {
   const message = "invalid floating-point number";
   const diagram = (source: string, index: number) => {

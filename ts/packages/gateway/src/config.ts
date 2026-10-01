@@ -3753,8 +3753,10 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer,
     return { end: walked.end, hit: null, bail: false };
   }
   let cursor = index;
+  let signed = false;
   // Figment's integer label keeps the missing digit. An array backtracks to `]`.
   if (head === "+" || head === "-") {
+    signed = true;
     cursor += 1;
     if (!isTomlDigit(source[cursor] ?? "")) {
       if (container === "array") {
@@ -3763,9 +3765,12 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer,
       return { end: cursor, hit: { index: cursor, message: INTEGER_LABEL }, bail: false };
     }
   }
+  const digitsAt = cursor;
   if (source[cursor] === "0") {
     const next = source[cursor + 1] ?? "";
-    if (next !== "." && next !== "e" && next !== "E" && !isTomlDateOrTime(source, cursor)) {
+    // A sign cannot start a date. `+07:32:00` is the integer `+0`.
+    const dateLike = !signed && isTomlDateOrTime(source, cursor);
+    if (next !== "." && next !== "e" && next !== "E" && !dateLike) {
       if (isCompletedZeroBoundary(next, container)) {
         return { end: cursor + 1, hit: null, bail: false };
       }
@@ -3781,7 +3786,8 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer,
   if (next === "." || next === "e" || next === "E") {
     return scanDecimalFloat(source, index, cursor);
   }
-  if (next === "-" || next === ":") {
+  // A date is four digits then `-`. A time is two digits then `:`. A sign is an integer.
+  if (!signed && continuesTomlDateOrTime(source, digitsAt, cursor, next)) {
     const end = skipTomlDate(source, cursor);
     const date = invalidTomlDate(source, index, end);
     if (date !== null) {
@@ -3991,6 +3997,15 @@ function isTomlDateOrTime(source: string, index: number): boolean {
     return true;
   }
   return /^\d{4}-\d{2}-\d{2}/.test(source.slice(index, index + 10));
+}
+
+/** Figment tries a date only for four digits before `-`, or two digits before `:`. */
+function continuesTomlDateOrTime(source: string, digitsAt: number, cursor: number, next: string): boolean {
+  const digits = source.slice(digitsAt, cursor);
+  if (next === "-" && /^\d{4}$/.test(digits)) {
+    return true;
+  }
+  return next === ":" && /^\d{2}$/.test(digits);
 }
 
 const DATE_OUT_OF_RANGE = "invalid date-time\nvalue is out of range";
