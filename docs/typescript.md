@@ -170,7 +170,8 @@ number, before extract and before a later integer. `-1e309`, `1e308`,
 `1e-400`, and `inf` still parse. A calendar day that month does not have is
 `invalid date-time` and `value is out of range` on the day, before extract
 and before a later integer. `2024-02-29`, `1900-02-28`, and a quoted
-`2024-02-30` still parse.
+`2024-02-30` still parse. A leap second, including `23:59:60` and
+`2024-01-01T23:59:60Z`, still parses.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

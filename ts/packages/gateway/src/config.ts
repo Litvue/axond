@@ -155,13 +155,14 @@ export async function loadConfig(
   secrets: SecretReader,
   options?: { resolveSecrets?: boolean },
 ): Promise<LoadedConfig> {
-  const range = firstTomlIntegerOutsideI64(toml);
+  const leaps: number[] = [];
+  const range = scanTomlDocument(toml, 0, leaps).hit;
   if (range) {
     throw configLoad(formatTomlIntegerRange(toml, range.index, range.message));
   }
   let parsed: Record<string, unknown>;
   try {
-    parsed = parse(toml, { integersAsBigInt: "asNeeded" }) as Record<string, unknown>;
+    parsed = parse(tomlLeapSecondsAs59(toml, leaps), { integersAsBigInt: "asNeeded" }) as Record<string, unknown>;
   } catch (error) {
     throw new GatewayFailure("bad_request", 400, `config: ${error instanceof Error ? error.message : "unreadable toml"}`);
   }
@@ -3171,11 +3172,8 @@ const U64_MAX = 18446744073709551615n;
  * start of that number. `-1e309`, `1e308`, `1e-400`, and `inf` still parse.
  * A calendar day that month does not have is `invalid date-time` and
  * `value is out of range` on the day. `2024-02-29` and `1900-02-28` still parse.
+ * A time whose seconds are `60` is a leap second and still parses.
  */
-function firstTomlIntegerOutsideI64(source: string): { index: number; message: string } | null {
-  return scanTomlDocument(source, 0).hit;
-}
-
 function formatTomlIntegerRange(source: string, index: number, message: string): string {
   const line = source.slice(0, index).split("\n").length - 1;
   const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
@@ -3196,7 +3194,7 @@ function formatTomlIntegerRange(source: string, index: number, message: string):
 
 type TomlScan = { end: number; hit: { index: number; message: string } | null; bail: boolean };
 
-function scanTomlDocument(source: string, index: number): TomlScan {
+function scanTomlDocument(source: string, index: number, leaps: number[] = []): TomlScan {
   let cursor = index;
   while (cursor < source.length) {
     cursor = skipTomlTrivia(source, cursor);
@@ -3219,7 +3217,7 @@ function scanTomlDocument(source: string, index: number): TomlScan {
     if (source[cursor] !== "=") {
       return { end: cursor, hit: null, bail: true };
     }
-    const value = scanTomlValue(source, cursor + 1, "document");
+    const value = scanTomlValue(source, cursor + 1, "document", leaps);
     if (value.hit || value.bail) {
       return value;
     }
@@ -3257,7 +3255,7 @@ function isCompletedZeroBoundary(char: string, container: TomlContainer): boolea
   return false;
 }
 
-function scanTomlValue(source: string, index: number, container: TomlContainer): TomlScan {
+function scanTomlValue(source: string, index: number, container: TomlContainer, leaps: number[]): TomlScan {
   const cursor = skipTomlTrivia(source, index);
   if (cursor >= source.length) {
     return { end: cursor, hit: null, bail: true };
@@ -3267,10 +3265,10 @@ function scanTomlValue(source: string, index: number, container: TomlContainer):
     return scanTomlString(source, cursor);
   }
   if (char === "{") {
-    return scanTomlInline(source, cursor);
+    return scanTomlInline(source, cursor, leaps);
   }
   if (char === "[") {
-    return scanTomlArray(source, cursor);
+    return scanTomlArray(source, cursor, leaps);
   }
   const word = tomlWord(source, cursor);
   if (word === "true" || word === "false" || word === "inf" || word === "nan") {
@@ -3281,19 +3279,19 @@ function scanTomlValue(source: string, index: number, container: TomlContainer):
     return { end, hit: null, bail: false };
   }
   if (char === "+" || char === "-" || isTomlDigit(char)) {
-    return scanTomlNumber(source, cursor, container);
+    return scanTomlNumber(source, cursor, container, leaps);
   }
   return { end: cursor, hit: null, bail: true };
 }
 
-function scanTomlArray(source: string, index: number): TomlScan {
+function scanTomlArray(source: string, index: number, leaps: number[]): TomlScan {
   let cursor = index + 1;
   for (;;) {
     cursor = skipTomlTrivia(source, cursor);
     if (source[cursor] === "]") {
       return { end: cursor + 1, hit: null, bail: false };
     }
-    const value = scanTomlValue(source, cursor, "array");
+    const value = scanTomlValue(source, cursor, "array", leaps);
     if (value.hit || value.bail) {
       return value;
     }
@@ -3340,7 +3338,7 @@ function isInlineBreak(source: string, index: number): boolean {
  * when that token is where `}` was required. A comma followed by a key
  * continues. Arrays keep their own trailing commas.
  */
-function scanTomlInline(source: string, index: number): TomlScan {
+function scanTomlInline(source: string, index: number, leaps: number[]): TomlScan {
   let cursor = index + 1;
   for (;;) {
     cursor = skipInlineWs(source, cursor);
@@ -3361,7 +3359,7 @@ function scanTomlInline(source: string, index: number): TomlScan {
     if (source[cursor] !== "=") {
       return { end: cursor, hit: null, bail: true };
     }
-    const value = scanInlineTableValue(source, cursor + 1);
+    const value = scanInlineTableValue(source, cursor + 1, leaps);
     if (value.hit || value.bail) {
       return value;
     }
@@ -3384,12 +3382,12 @@ function scanTomlInline(source: string, index: number): TomlScan {
   }
 }
 
-function scanInlineTableValue(source: string, index: number): TomlScan {
+function scanInlineTableValue(source: string, index: number, leaps: number[]): TomlScan {
   const cursor = skipInlineWs(source, index);
   if (cursor >= source.length || isInlineBreak(source, cursor) || source[cursor] === "}" || source[cursor] === ",") {
     return { end: cursor, hit: null, bail: true };
   }
-  return scanTomlValue(source, cursor, "inline");
+  return scanTomlValue(source, cursor, "inline", leaps);
 }
 
 function scanInlineKey(source: string, index: number): TomlScan {
@@ -3420,7 +3418,7 @@ function scanInlineKey(source: string, index: number): TomlScan {
   }
 }
 
-function scanTomlNumber(source: string, index: number, container: TomlContainer): TomlScan {
+function scanTomlNumber(source: string, index: number, container: TomlContainer, leaps: number[]): TomlScan {
   const head = source[index] ?? "";
   if (source.startsWith("0x", index) || source.startsWith("0o", index) || source.startsWith("0b", index)) {
     const base = source[index + 1] === "x" ? 16 : source[index + 1] === "o" ? 8 : 2;
@@ -3468,7 +3466,14 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer)
   if (next === "-" || next === ":") {
     const end = skipTomlDate(source, cursor);
     const date = invalidTomlDate(source, index, end);
-    return date === null ? { end, hit: null, bail: false } : { end, hit: date, bail: false };
+    if (date !== null) {
+      return { end, hit: date, bail: false };
+    }
+    const leap = leapSecondAt(source, index, end);
+    if (leap !== null) {
+      leaps.push(leap);
+    }
+    return { end, hit: null, bail: false };
   }
   const raw = source.slice(index, cursor).replaceAll("_", "");
   let integer: bigint;
@@ -3559,6 +3564,39 @@ function skipTomlFloat(source: string, index: number): number | null {
     }
   }
   return cursor;
+}
+
+/**
+ * smol-toml reads a time through `Date`, which rejects second 60. Figment
+ * accepts that leap second. The two digits are read as 59 so the document
+ * parses. No config field is a date-time, so the loaded value is unused.
+ */
+function tomlLeapSecondsAs59(source: string, leaps: readonly number[]): string {
+  if (leaps.length === 0) {
+    return source;
+  }
+  let out = source;
+  for (const index of [...leaps].reverse()) {
+    if (out.slice(index, index + 2) !== "60") {
+      continue;
+    }
+    out = `${out.slice(0, index)}59${out.slice(index + 2)}`;
+  }
+  return out;
+}
+
+function leapSecondAt(source: string, index: number, end: number): number | null {
+  const token = source.slice(index, end);
+  const match = /(?:^|[Tt ])(\d{2}):(\d{2}):60/.exec(token);
+  if (match === null) {
+    return null;
+  }
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) {
+    return null;
+  }
+  return index + match.index + match[0].length - 2;
 }
 
 function isTomlDateOrTime(source: string, index: number): boolean {

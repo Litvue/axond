@@ -1518,6 +1518,40 @@ namespace = "platform"
   }
 });
 
+test("leap_second_reaches_extract_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-leap-second-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "leap.toml");
+  await writeFile(
+    config,
+    `n = 2024-01-01T23:59:60Z
+[shutdown]
+nope = 1
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`,
+  );
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /unknown field/);
+    assert.equal(result.stderr.includes("invalid date"), false);
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("usage_journal_postgres_is_refused_after_an_earlier_bound", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-journal-order-"));
   const db = join(root, "fresh.sqlite");

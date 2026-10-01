@@ -610,6 +610,30 @@ test("an impossible calendar day is a parse error before extract", async () => {
   }
 });
 
+test("a leap second is a valid time", async () => {
+  for (const line of [
+    "n = 2024-01-01T23:59:60Z",
+    "n = 09:59:60",
+    "n = 07:32:60",
+    "n = 23:59:60.5",
+    "n = 2024-01-01 23:59:60",
+    "n = 2024-01-01t23:59:60z",
+    "n = 2024-01-01T23:59:60+00:00",
+    "n = [23:59:60]",
+    "n = { a = 07:32:60 }",
+    'n = "23:59:60"',
+  ]) {
+    const loaded = await loadConfig(`${line}\n${BASE}`, secrets);
+    assert.equal(loaded.storage.path, "/tmp/axond.sqlite");
+  }
+  const shutdown = `n = 23:59:60\n[shutdown]\nnope = 1\n${BASE}`;
+  await assert.rejects(() => loadConfig(shutdown, secrets), /unknown field/);
+  const day = `n = 2024-02-30\nn = 23:59:60\n${BASE}`;
+  await assert.rejects(() => loadConfig(day, secrets), /invalid date-time/);
+  const later = `n = 23:59:60\nn = 9223372036854775808\n${BASE}`;
+  await assert.rejects(() => loadConfig(later, secrets), /number too large to fit in target type/);
+});
+
 test("storage_fields_match_the_rust_boot_refusals", async () => {
   const instead = (pathBlock: string) => BASE.replace('backend = "sqlite"\npath = "/tmp/axond.sqlite"\n', pathBlock);
   const refuse = async (toml: string, pattern: RegExp) => {
