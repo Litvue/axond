@@ -3,7 +3,7 @@ import test from "node:test";
 
 import pg from "pg";
 
-import { StoreFailure } from "../../gateway/src/errors.ts";
+import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
 import {
   applyPostgresMigration,
@@ -279,6 +279,96 @@ test("a cached namespace read serves a deleted row; the live store does not", { 
   assert.equal(await db.deleteNamespace("platform"), true);
   assert.equal((await cached.getNamespace("platform"))?.id, "platform");
   assert.equal(await db.getNamespace("platform"), null);
+});
+
+test("an unknown budget write rolls back and stays a gateway error", async () => {
+  const seen: string[] = [];
+  const db = createPostgresStore(async () => ({
+    client: {
+      async query(sql: string) {
+        seen.push(sql);
+        return { rows: [], rowCount: 0 };
+      },
+    },
+    release: async () => undefined,
+  }));
+  await assert.rejects(() => db.putBudget("missing", "compat", 1n), (error: unknown) => {
+    assert.ok(error instanceof GatewayFailure);
+    assert.equal(error.type, "unknown_namespace");
+    return true;
+  });
+  assert.deepEqual(seen, ["BEGIN", "SELECT id FROM axond_namespace WHERE id = $1", "ROLLBACK"]);
+});
+
+test("a failed namespace delete rolls the row back", async () => {
+  const seen: string[] = [];
+  const db = createPostgresStore(async () => ({
+    client: {
+      async query(sql: string) {
+        seen.push(sql);
+        if (sql.startsWith("DELETE FROM axond_namespace ")) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (sql.includes("axond_namespace_incarnation")) {
+          throw new Error("password=secret incarnation refused");
+        }
+        return { rows: [], rowCount: 0 };
+      },
+    },
+    release: async () => undefined,
+  }));
+  await assert.rejects(() => db.deleteNamespace("platform"), (error: unknown) => {
+    assert.ok(error instanceof StoreFailure);
+    assert.equal(error.message.includes("password=secret"), false);
+    return true;
+  });
+  assert.equal(seen[0], "BEGIN");
+  assert.equal(seen.at(-1), "ROLLBACK");
+  assert.equal(seen.includes("COMMIT"), false);
+});
+
+test("postgres rolls back a namespace delete when the incarnation bump fails", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  const id = "txn-rollback";
+  await db.putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  await db.putBudget(id, "compat", 5n);
+  const opened = await connect();
+  try {
+    await opened.client.query("DROP TRIGGER IF EXISTS axond_test_fail_incarnation ON axond_namespace_incarnation");
+    await opened.client.query(`
+      CREATE OR REPLACE FUNCTION axond_test_fail_incarnation() RETURNS trigger AS $$
+      BEGIN
+        IF NEW.id = 'txn-rollback' THEN
+          RAISE EXCEPTION 'incarnation refused';
+        END IF;
+        RETURN NEW;
+      END;
+      $$ LANGUAGE plpgsql
+    `);
+    await opened.client.query(`
+      CREATE TRIGGER axond_test_fail_incarnation
+      BEFORE INSERT OR UPDATE ON axond_namespace_incarnation
+      FOR EACH ROW EXECUTE FUNCTION axond_test_fail_incarnation()
+    `);
+    await assert.rejects(() => db.deleteNamespace(id), (error: unknown) => {
+      assert.ok(error instanceof StoreFailure);
+      assert.equal(error.message.includes("incarnation refused"), false);
+      return true;
+    });
+    assert.equal((await db.getNamespace(id))?.id, id);
+    assert.equal((await db.getBudget(id, "compat"))?.limit, 5n);
+  } finally {
+    await opened.client.query("DROP TRIGGER IF EXISTS axond_test_fail_incarnation ON axond_namespace_incarnation");
+    await opened.client.query("DROP FUNCTION IF EXISTS axond_test_fail_incarnation()");
+    await opened.release();
+  }
 });
 
 test("a write role keeps an existing postgres schema and names a missing table", async () => {

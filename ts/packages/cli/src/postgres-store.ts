@@ -76,7 +76,7 @@ export function createPostgresStore(
       });
     },
     async resolveNamespace(id, nowMs) {
-      return withClient("namespace_resolve", async (client) => {
+      return withClient("namespace_resolve", (client) => withTransaction(client, async (client) => {
         const found = await client.query(
           "SELECT id, attrs, blocklist, allow_platform_fallback, from_config FROM axond_namespace WHERE id = $1",
           [id],
@@ -118,7 +118,7 @@ export function createPostgresStore(
         const limit = BigInt(String(budget.rows[0]["limit_microdollars"]));
         const spent = BigInt(String(budget.rows[0]["spent_microdollars"]));
         return { record, period, limit, spent, incarnation: n, admitted: spent < limit };
-      });
+      }));
     },
     async putNamespace(record) {
       return withClient("namespace_write", async (client) => {
@@ -170,7 +170,7 @@ export function createPostgresStore(
       });
     },
     async deleteNamespace(id) {
-      return withClient("namespace_write", async (client) => {
+      return withClient("namespace_write", (client) => withTransaction(client, async (client) => {
         const deleted = await client.query("DELETE FROM axond_namespace WHERE id = $1", [id]);
         if ((deleted.rowCount ?? 0) === 0) {
           return false;
@@ -184,7 +184,7 @@ export function createPostgresStore(
           [id],
         );
         return true;
-      });
+      }));
     },
     async listNamespaces(cursor, limit) {
       return withClient("namespace_read", async (client) => {
@@ -198,7 +198,7 @@ export function createPostgresStore(
       });
     },
     async putBudget(namespace, period, limit, nowMs = Date.now()) {
-      return withClient("budget_write", async (client) => {
+      return withClient("budget_write", (client) => withTransaction(client, async (client) => {
         const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [namespace]);
         if (!known.rows[0]) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -215,7 +215,7 @@ export function createPostgresStore(
           [namespace, period],
         );
         return (await readBudget(client, namespace, period, nowMs))!;
-      });
+      }));
     },
     async getBudget(namespace, period, nowMs = Date.now()) {
       return withClient("budget_read", async (client) => {
@@ -227,7 +227,7 @@ export function createPostgresStore(
       });
     },
     async putBudgetPolicy(input: BudgetPolicyWrite) {
-      return withClient("budget_write", async (client) => {
+      return withClient("budget_write", (client) => withTransaction(client, async (client) => {
         const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [input.namespace]);
         if (!known.rows[0]) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -264,7 +264,7 @@ export function createPostgresStore(
           );
         }
         return (await readPolicy(client, input.namespace, input.nowMs))!;
-      });
+      }));
     },
     async getBudgetPolicy(namespace, nowMs = Date.now()) {
       return withClient("budget_read", async (client) => {
@@ -349,6 +349,23 @@ export function createPostgresStore(
       });
     },
   };
+}
+
+/**
+ * One origin connection for the whole body. Hyperdrive pins a connection only
+ * inside a transaction, so a namespace admit or a delete would otherwise split
+ * across pooled connections.
+ */
+async function withTransaction<T>(client: SqlExecutor, fn: (client: SqlExecutor) => Promise<T>): Promise<T> {
+  await client.query("BEGIN");
+  try {
+    const value = await fn(client);
+    await client.query("COMMIT");
+    return value;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function settlePostgres(client: SqlExecutor, input: SettleInput): Promise<{ charged: boolean }> {
