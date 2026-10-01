@@ -3161,7 +3161,11 @@ const U64_MAX = 18446744073709551615n;
  * `\u` or `\U`, or a code point that is a surrogate or above U+10FFFF, is
  * `invalid unicode 4-digit hex code` or `invalid unicode 8-digit hex code`
  * at the character after `u` or `U`. A complete hex sequence that is out of
- * range also says `value is out of range`.
+ * range also says `value is out of range`. A decimal integer that is only
+ * `0` (optional sign) stops there: a following digit, `_`, or radix letter
+ * is `expected newline, `#`` at that character. Inside an array that is
+ * `invalid array` / `expected `]``. Inside an inline table it is the inline
+ * closer. `0.5`, `0e1`, and `0x10` still parse.
  */
 function firstTomlIntegerOutsideI64(source: string): { index: number; message: string } | null {
   return scanTomlDocument(source, 0).hit;
@@ -3210,7 +3214,7 @@ function scanTomlDocument(source: string, index: number): TomlScan {
     if (source[cursor] !== "=") {
       return { end: cursor, hit: null, bail: true };
     }
-    const value = scanTomlValue(source, cursor + 1);
+    const value = scanTomlValue(source, cursor + 1, "document");
     if (value.hit || value.bail) {
       return value;
     }
@@ -3219,7 +3223,36 @@ function scanTomlDocument(source: string, index: number): TomlScan {
   return { end: cursor, hit: null, bail: false };
 }
 
-function scanTomlValue(source: string, index: number): TomlScan {
+type TomlContainer = "document" | "array" | "inline";
+
+const DOCUMENT_AFTER_VALUE = "expected newline, `#`";
+const ARRAY_AFTER_VALUE = "invalid array\nexpected `]`";
+
+function afterZeroMessage(container: TomlContainer): string {
+  if (container === "array") {
+    return ARRAY_AFTER_VALUE;
+  }
+  if (container === "inline") {
+    return INLINE_TABLE_MESSAGE;
+  }
+  return DOCUMENT_AFTER_VALUE;
+}
+
+/** A finished `0` ends before trivia, a comment, or this container's closer. */
+function isCompletedZeroBoundary(char: string, container: TomlContainer): boolean {
+  if (char === "" || char === " " || char === "\t" || char === "\n" || char === "\r" || char === "#") {
+    return true;
+  }
+  if (container === "array") {
+    return char === "," || char === "]";
+  }
+  if (container === "inline") {
+    return char === "," || char === "}";
+  }
+  return false;
+}
+
+function scanTomlValue(source: string, index: number, container: TomlContainer): TomlScan {
   const cursor = skipTomlTrivia(source, index);
   if (cursor >= source.length) {
     return { end: cursor, hit: null, bail: true };
@@ -3243,7 +3276,7 @@ function scanTomlValue(source: string, index: number): TomlScan {
     return { end, hit: null, bail: false };
   }
   if (char === "+" || char === "-" || isTomlDigit(char)) {
-    return scanTomlNumber(source, cursor);
+    return scanTomlNumber(source, cursor, container);
   }
   return { end: cursor, hit: null, bail: true };
 }
@@ -3255,7 +3288,7 @@ function scanTomlArray(source: string, index: number): TomlScan {
     if (source[cursor] === "]") {
       return { end: cursor + 1, hit: null, bail: false };
     }
-    const value = scanTomlValue(source, cursor);
+    const value = scanTomlValue(source, cursor, "array");
     if (value.hit || value.bail) {
       return value;
     }
@@ -3351,7 +3384,7 @@ function scanInlineTableValue(source: string, index: number): TomlScan {
   if (cursor >= source.length || isInlineBreak(source, cursor) || source[cursor] === "}" || source[cursor] === ",") {
     return { end: cursor, hit: null, bail: true };
   }
-  return scanTomlValue(source, cursor);
+  return scanTomlValue(source, cursor, "inline");
 }
 
 function scanInlineKey(source: string, index: number): TomlScan {
@@ -3382,11 +3415,8 @@ function scanInlineKey(source: string, index: number): TomlScan {
   }
 }
 
-function scanTomlNumber(source: string, index: number): TomlScan {
+function scanTomlNumber(source: string, index: number, container: TomlContainer): TomlScan {
   const head = source[index] ?? "";
-  if ((head === "+" || head === "-") && (source.startsWith("0x", index + 1) || source.startsWith("0o", index + 1) || source.startsWith("0b", index + 1))) {
-    return { end: index, hit: null, bail: true };
-  }
   if (source.startsWith("0x", index) || source.startsWith("0o", index) || source.startsWith("0b", index)) {
     const base = source[index + 1] === "x" ? 16 : source[index + 1] === "o" ? 8 : 2;
     const digits = readRadixDigits(source, index + 2, base);
@@ -3406,8 +3436,14 @@ function scanTomlNumber(source: string, index: number): TomlScan {
   if (!isTomlDigit(source[cursor] ?? "")) {
     return { end: index, hit: null, bail: true };
   }
-  if (source[cursor] === "0" && isTomlDigit(source[cursor + 1] ?? "")) {
-    return { end: index, hit: null, bail: true };
+  if (source[cursor] === "0") {
+    const next = source[cursor + 1] ?? "";
+    if (next !== "." && next !== "e" && next !== "E") {
+      if (isCompletedZeroBoundary(next, container)) {
+        return { end: cursor + 1, hit: null, bail: false };
+      }
+      return { end: cursor + 1, hit: { index: cursor + 1, message: afterZeroMessage(container) }, bail: false };
+    }
   }
   while (cursor < source.length && (isTomlDigit(source[cursor] ?? "") || source[cursor] === "_")) {
     cursor += 1;

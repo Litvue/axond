@@ -158,7 +158,12 @@ extract and before a later integer. A short `\u` or `\U`, or a code point
 that is a surrogate or above `U+10FFFF`, is `invalid unicode 4-digit hex code`
 or `invalid unicode 8-digit hex code` at that same character. A complete hex
 sequence that is out of range also says `value is out of range`. `\u0041` and
-`\U00000041` still decode. A literal string keeps the backslash.
+`\U00000041` still decode. A literal string keeps the backslash. A decimal
+integer that is only `0` stops there. A following digit, `_`, or a signed
+`+0x` is `expected newline, `#`` at that character, before extract and before
+a later integer. Inside an array the same spot is `invalid array` and
+`` expected `]` ``. Inside an inline table it is the inline closer. `0`,
+`0.5`, `0e1`, and `0x10` still parse.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

@@ -217,15 +217,11 @@ test("a toml integer outside i64 is a parse error before extract", async () => {
       return true;
     },
   );
-  await assert.rejects(
-    () => loadConfig(`${BASE}\n[failover]\noverall_timeout_ms = 0922\n`, secrets),
-    (error: unknown) => {
-      const message = error instanceof Error ? error.message : "";
-      assert.equal(message.includes("number too large"), false);
-      assert.match(message, /leading zero/);
-      return true;
-    },
-  );
+  const lead = `${BASE}\n[failover]\noverall_timeout_ms = 0922\n`;
+  const leadMessage = diagram(lead, "922", "expected newline, `#`");
+  await reject(lead, leadMessage);
+  assert.equal(leadMessage.includes("number too large"), false);
+  assert.equal(leadMessage.includes("leading zero"), false);
   const dated = `[failover]\noverall_timeout_ms = 1979-05-27 07:32:00Z\n${failover}\n${BASE}`;
   await reject(dated, diagram(dated, tooLarge, large));
 });
@@ -437,6 +433,67 @@ test("a short unicode escape is a parse error before extract", async () => {
   assert.equal(kept.storage.path, "hi\\u41.db");
   const commented = await loadConfig(`# \\u41\n${BASE}`, secrets);
   assert.equal(commented.storage.path, "/tmp/axond.sqlite");
+});
+
+test("a leading zero is a parse error before extract", async () => {
+  const document = "expected newline, `#`";
+  const array = "invalid array\nexpected `]`";
+  const inline = "invalid inline table\nexpected `}`";
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const beforeShutdown = `n = 0922\n[shutdown]\nnope = 1\n${BASE}`;
+  const zeroMessage = diagram(beforeShutdown, beforeShutdown.indexOf("0922") + 1, document);
+  await reject(beforeShutdown, zeroMessage);
+  assert.equal(zeroMessage.includes("unknown field"), false);
+  assert.equal(zeroMessage.includes("number too large"), false);
+  const later = `n = 0922\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, diagram(later, later.indexOf("0922") + 1, document));
+  const earlier = `n = 9223372036854775808\nn = 0922\n${BASE}`;
+  await reject(earlier, diagram(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type"));
+  const plus = `n = +08\n${BASE}`;
+  await reject(plus, diagram(plus, plus.indexOf("+08") + 2, document));
+  const radix = `n = +0x10\n${BASE}`;
+  await reject(radix, diagram(radix, radix.indexOf("+0x") + 2, document));
+  const under = `n = 0_1\n${BASE}`;
+  await reject(under, diagram(under, under.indexOf("0_1") + 1, document));
+  const models = `blocklist = { models = [0922] }\n${BASE}`;
+  await reject(models, diagram(models, models.indexOf("0922") + 1, array));
+  const table = `n = { a = 0922 }\n${BASE}`;
+  await reject(table, diagram(table, table.indexOf("0922") + 1, inline));
+  const signedInline = `n = { a = +08 }\n${BASE}`;
+  await reject(signedInline, diagram(signedInline, signedInline.indexOf("+08") + 2, inline));
+  const zero = await loadConfig(`n = 0\n${BASE}`, secrets);
+  assert.equal(zero.storage.path, "/tmp/axond.sqlite");
+  const fraction = await loadConfig(`n = 0.5\n${BASE}`, secrets);
+  assert.equal(fraction.storage.path, "/tmp/axond.sqlite");
+  const exponent = await loadConfig(`n = 0e1\n${BASE}`, secrets);
+  assert.equal(exponent.storage.path, "/tmp/axond.sqlite");
+  const hex = await loadConfig(`n = 0x10\n${BASE}`, secrets);
+  assert.equal(hex.storage.path, "/tmp/axond.sqlite");
+  const plusZero = await loadConfig(`n = +0\n${BASE}`, secrets);
+  assert.equal(plusZero.storage.path, "/tmp/axond.sqlite");
 });
 
 test("storage_fields_match_the_rust_boot_refusals", async () => {
