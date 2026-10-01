@@ -3160,8 +3160,8 @@ const U64_MAX = 18446744073709551615n;
  * `invalid inline table`. A basic string `\x` with two hex digits, or `\e`,
  * is `invalid escape sequence` at the character after the escape letter.
  * `\a`, `\q`, `\x` without two hex digits, and a backslash before a newline
- * use that diagram. A short
- * `\u` or `\U`, or a code point that is a surrogate or above U+10FFFF, is
+ * use that diagram. A short `\u` or `\U`, or a code point that is a surrogate
+ * or above U+10FFFF, is
  * `invalid unicode 4-digit hex code` or `invalid unicode 8-digit hex code`
  * at the character after `u` or `U`. A complete hex sequence that is out of
  * range also says `value is out of range`. A decimal integer that is only
