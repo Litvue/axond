@@ -152,7 +152,10 @@ a full `u64`. An inline table stays on one line. A trailing comma is
 `invalid inline table` and `` expected `}` `` with the caret on the comma,
 before extract and before a later integer. A newline or a `#` comment inside
 the braces is that diagram at the newline or the `#`. An array may still end
-with a comma.
+with a comma. A basic string `\x` with two hex digits, or `\e`, is
+`invalid escape sequence` with the caret on the next character, before
+extract and before a later integer. `\u0041` and `\U00000041` still decode.
+A literal string keeps the backslash.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

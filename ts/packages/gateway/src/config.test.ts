@@ -299,6 +299,68 @@ test("a trailing comma in an inline table is a parse error before extract", asyn
   assert.equal(kept.transport.maxAttempts, 2);
 });
 
+test("a hex escape in a string is a parse error before extract", async () => {
+  const escape = "invalid escape sequence\nexpected `b`, `f`, `n`, `r`, `t`, `u`, `U`, `\\`, `\"`";
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const hexPath = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "data\\x41.db"');
+  const beforeShutdown = `${hexPath}\n[shutdown]\nnope = 1\n`;
+  const hexMessage = diagram(beforeShutdown, beforeShutdown.indexOf("\\x") + 2, escape);
+  await reject(beforeShutdown, hexMessage);
+  assert.equal(hexMessage.includes("unknown field"), false);
+  assert.equal(hexMessage.includes("number too large"), false);
+  const later = `${hexPath}\nn = 9223372036854775808\n`;
+  await reject(later, diagram(later, later.indexOf("\\x") + 2, escape));
+  const earlier = `n = 9223372036854775808\n${hexPath}`;
+  await reject(earlier, diagram(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type"));
+  const esc = BASE.replace('id = "platform"', 'id = "plat\\eform"');
+  await reject(esc, diagram(esc, esc.indexOf("\\e") + 2, escape));
+  const multiline = `n = """hi\\\n\\x41"""\n${BASE}`;
+  await reject(multiline, diagram(multiline, multiline.indexOf("\\x") + 2, escape));
+  const header = `["hi\\x41"]\n${BASE}`;
+  await reject(header, diagram(header, header.indexOf("\\x") + 2, escape));
+  const models = `blocklist = { models = ["a\\x41"] }\n${BASE}`;
+  await reject(models, diagram(models, models.indexOf("\\x") + 2, escape));
+  const key = `"hi\\x41" = 1\n${BASE}`;
+  await reject(key, diagram(key, key.indexOf("\\x") + 2, escape));
+  const upper = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "\\x4A"');
+  await reject(upper, diagram(upper, upper.indexOf("\\x") + 2, escape));
+  const nul = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "\\x00"');
+  await reject(nul, diagram(nul, nul.indexOf("\\x") + 2, escape));
+  const decoded = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', 'path = "hi\\u0041.db"'), secrets);
+  assert.equal(decoded.storage.path, "hiA.db");
+  const wide = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', 'path = "hi\\U00000041.db"'), secrets);
+  assert.equal(wide.storage.path, "hiA.db");
+  const literal = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', "path = 'hi\\x41.db'"), secrets);
+  assert.equal(literal.storage.path, "hi\\x41.db");
+  const kept = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', 'path = "hi\\\\x41.db"'), secrets);
+  assert.equal(kept.storage.path, "hi\\x41.db");
+  const commented = await loadConfig(`# \\x41\n${BASE}`, secrets);
+  assert.equal(commented.storage.path, "/tmp/axond.sqlite");
+});
+
 test("storage_fields_match_the_rust_boot_refusals", async () => {
   const instead = (pathBlock: string) => BASE.replace('backend = "sqlite"\npath = "/tmp/axond.sqlite"\n', pathBlock);
   const refuse = async (toml: string, pattern: RegExp) => {

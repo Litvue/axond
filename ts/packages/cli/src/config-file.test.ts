@@ -1244,6 +1244,60 @@ namespace = "platform"
   }
 });
 
+test("hex_escape_in_a_string_is_a_parse_error_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-hex-escape-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "escape.toml");
+  const line = 'path = "data\\x41.db"';
+  await writeFile(
+    config,
+    `${line}
+[shutdown]
+nope = 1
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`,
+  );
+  const column = line.indexOf("\\x") + 2;
+  const pad = "  ";
+  const diagram =
+    "TOML parse error at line 1, column " +
+    (column + 1) +
+    "\n" +
+    pad +
+    "|\n" +
+    "1 | " +
+    line +
+    "\n" +
+    pad +
+    "|" +
+    " ".repeat(column + 1) +
+    "^\n" +
+    "invalid escape sequence\nexpected `b`, `f`, `n`, `r`, `t`, `u`, `U`, `\\`, `\"`\n" +
+    " in escape.toml TOML file\n";
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" + config + "`: config load: " + diagram,
+    );
+    assert.equal(result.stderr.includes("unknown field"), false);
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("usage_journal_postgres_is_refused_after_an_earlier_bound", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-journal-order-"));
   const db = join(root, "fresh.sqlite");

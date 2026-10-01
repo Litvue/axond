@@ -3156,7 +3156,8 @@ const U64_MAX = 18446744073709551615n;
  * Figment fails the document in the parser, before extract. A file integer
  * outside `i64` is `number too large` or `number too small`. An inline table
  * stays on one line: a trailing comma, a newline, or a comment is
- * `invalid inline table`.
+ * `invalid inline table`. A basic string `\x` with two hex digits, or `\e`,
+ * is `invalid escape sequence` at the character after `x` or `e`.
  */
 function firstTomlIntegerOutsideI64(source: string): { index: number; message: string } | null {
   return scanTomlDocument(source, 0).hit;
@@ -3191,17 +3192,17 @@ function scanTomlDocument(source: string, index: number): TomlScan {
     }
     if (source[cursor] === "[") {
       const header = skipTomlHeader(source, cursor);
-      if (header === null) {
-        return { end: cursor, hit: null, bail: true };
+      if (header.hit || header.bail) {
+        return header;
       }
-      cursor = header;
+      cursor = header.end;
       continue;
     }
     const key = skipTomlKey(source, cursor);
-    if (key === null) {
-      return { end: cursor, hit: null, bail: true };
+    if (key.hit || key.bail) {
+      return key;
     }
-    cursor = skipTomlTrivia(source, key);
+    cursor = skipTomlTrivia(source, key.end);
     if (source[cursor] !== "=") {
       return { end: cursor, hit: null, bail: true };
     }
@@ -3221,8 +3222,7 @@ function scanTomlValue(source: string, index: number): TomlScan {
   }
   const char = source[cursor];
   if (char === '"' || char === "'") {
-    const end = skipTomlString(source, cursor);
-    return end === null ? { end: cursor, hit: null, bail: true } : { end, hit: null, bail: false };
+    return scanTomlString(source, cursor);
   }
   if (char === "{") {
     return scanTomlInline(source, cursor);
@@ -3311,11 +3311,11 @@ function scanTomlInline(source: string, index: number): TomlScan {
     if (!canStartInlineKey(source, cursor)) {
       return { end: cursor, hit: null, bail: true };
     }
-    const keyEnd = skipInlineKey(source, cursor);
-    if (keyEnd === null) {
-      return { end: cursor, hit: null, bail: true };
+    const keyEnd = scanInlineKey(source, cursor);
+    if (keyEnd.hit || keyEnd.bail) {
+      return keyEnd;
     }
-    cursor = skipInlineWs(source, keyEnd);
+    cursor = skipInlineWs(source, keyEnd.end);
     if (source[cursor] !== "=") {
       return { end: cursor, hit: null, bail: true };
     }
@@ -3350,29 +3350,29 @@ function scanInlineTableValue(source: string, index: number): TomlScan {
   return scanTomlValue(source, cursor);
 }
 
-function skipInlineKey(source: string, index: number): number | null {
+function scanInlineKey(source: string, index: number): TomlScan {
   let cursor = index;
   for (;;) {
     if (source[cursor] === '"' || source[cursor] === "'") {
-      const end = skipTomlString(source, cursor);
-      if (end === null) {
-        return null;
+      const scanned = scanTomlString(source, cursor);
+      if (scanned.hit || scanned.bail) {
+        return scanned;
       }
-      cursor = end;
+      cursor = scanned.end;
     } else if (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
       while (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
         cursor += 1;
       }
     } else {
-      return null;
+      return { end: cursor, hit: null, bail: true };
     }
     const after = skipInlineWs(source, cursor);
     if (source[after] !== ".") {
-      return cursor;
+      return { end: cursor, hit: null, bail: false };
     }
     const next = skipInlineWs(source, after + 1);
     if (!canStartInlineKey(source, next)) {
-      return null;
+      return { end: next, hit: null, bail: true };
     }
     cursor = next;
   }
@@ -3543,105 +3543,156 @@ function skipTomlTrivia(source: string, index: number): number {
   }
 }
 
-function skipTomlHeader(source: string, index: number): number | null {
+function skipTomlHeader(source: string, index: number): TomlScan {
   let depth = 0;
   let cursor = index;
   while (source[cursor] === "[") {
     depth += 1;
     cursor += 1;
     if (depth > 2) {
-      return null;
+      return { end: cursor, hit: null, bail: true };
     }
   }
   while (cursor < source.length && source[cursor] !== "]" && source[cursor] !== "\n") {
     if (source[cursor] === '"' || source[cursor] === "'") {
-      const end = skipTomlString(source, cursor);
-      if (end === null) {
-        return null;
+      const scanned = scanTomlString(source, cursor);
+      if (scanned.hit || scanned.bail) {
+        return scanned;
       }
-      cursor = end;
+      cursor = scanned.end;
       continue;
     }
     cursor += 1;
   }
   if (source[cursor] !== "]") {
-    return null;
+    return { end: cursor, hit: null, bail: true };
   }
   cursor += 1;
   if (depth === 2) {
     if (source[cursor] !== "]") {
-      return null;
+      return { end: cursor, hit: null, bail: true };
     }
     cursor += 1;
   }
-  return cursor;
+  return { end: cursor, hit: null, bail: false };
 }
 
-function skipTomlKey(source: string, index: number): number | null {
+function skipTomlKey(source: string, index: number): TomlScan {
   let cursor = skipTomlTrivia(source, index);
   for (;;) {
     if (source[cursor] === '"' || source[cursor] === "'") {
-      const end = skipTomlString(source, cursor);
-      if (end === null) {
-        return null;
+      const scanned = scanTomlString(source, cursor);
+      if (scanned.hit || scanned.bail) {
+        return scanned;
       }
-      cursor = end;
+      cursor = scanned.end;
     } else if (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
       while (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
         cursor += 1;
       }
     } else {
-      return null;
+      return { end: cursor, hit: null, bail: true };
     }
     const after = skipTomlTrivia(source, cursor);
     if (source[after] !== ".") {
-      return after;
+      return { end: after, hit: null, bail: false };
     }
     cursor = skipTomlTrivia(source, after + 1);
   }
 }
 
-function skipTomlString(source: string, index: number): number | null {
-  if (source.startsWith('"""', index) || source.startsWith("'''", index)) {
-    const quote = source.slice(index, index + 3);
-    let cursor = index + 3;
+const ESCAPE_SEQUENCE_MESSAGE = "invalid escape sequence\nexpected `b`, `f`, `n`, `r`, `t`, `u`, `U`, `\\`, `\"`";
+
+function isTomlHex(char: string): boolean {
+  return (char >= "0" && char <= "9") || (char >= "A" && char <= "F") || (char >= "a" && char <= "f");
+}
+
+/**
+ * Figment rejects `\xHH` and `\e` in a basic string. A short `\u` or `\U`
+ * still belongs to the TOML parser, so those bail. Literal strings keep
+ * the backslash.
+ */
+function scanTomlString(source: string, index: number): TomlScan {
+  const multiline = source.startsWith('"""', index) || source.startsWith("'''", index);
+  const quote = multiline ? source.slice(index, index + 3) : (source[index] ?? "");
+  if (quote !== '"' && quote !== "'" && quote !== '"""' && quote !== "'''") {
+    return { end: index, hit: null, bail: true };
+  }
+  const literal = quote.startsWith("'");
+  let cursor = index + quote.length;
+  if (multiline) {
     if (source[cursor] === "\r") {
       cursor += 1;
     }
     if (source[cursor] === "\n") {
       cursor += 1;
     }
-    while (cursor < source.length) {
-      if (quote === '"""' && source[cursor] === "\\") {
-        cursor += 2;
-        continue;
-      }
-      if (source.startsWith(quote, cursor)) {
-        return cursor + 3;
-      }
-      cursor += 1;
-    }
-    return null;
   }
-  const quote = source[index];
-  if (quote !== '"' && quote !== "'") {
-    return null;
-  }
-  let cursor = index + 1;
   while (cursor < source.length) {
-    if (quote === '"' && source[cursor] === "\\") {
-      cursor += 2;
+    if (!literal && source[cursor] === "\\") {
+      const escaped = scanBasicEscape(source, cursor + 1, multiline);
+      if (escaped.hit || escaped.bail) {
+        return escaped;
+      }
+      cursor = escaped.end;
       continue;
     }
-    if (source[cursor] === quote) {
-      return cursor + 1;
+    if (source.startsWith(quote, cursor)) {
+      return { end: cursor + quote.length, hit: null, bail: false };
     }
-    if (source[cursor] === "\n") {
-      return null;
+    if (!multiline && (source[cursor] === "\n" || source[cursor] === "\r")) {
+      return { end: cursor, hit: null, bail: true };
     }
     cursor += 1;
   }
-  return null;
+  return { end: cursor, hit: null, bail: true };
+}
+
+function scanBasicEscape(source: string, index: number, multiline: boolean): TomlScan {
+  const char = source[index] ?? "";
+  if (char === "b" || char === "f" || char === "n" || char === "r" || char === "t" || char === '"' || char === "\\") {
+    return { end: index + 1, hit: null, bail: false };
+  }
+  if (char === "u" || char === "U") {
+    const width = char === "u" ? 4 : 8;
+    let hex = "";
+    for (let offset = 1; offset <= width; offset += 1) {
+      const digit = source[index + offset] ?? "";
+      if (!isTomlHex(digit)) {
+        return { end: index, hit: null, bail: true };
+      }
+      hex += digit;
+    }
+    const code = Number.parseInt(hex, 16);
+    if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {
+      return { end: index, hit: null, bail: true };
+    }
+    return { end: index + 1 + width, hit: null, bail: false };
+  }
+  if (char === "e" || (char === "x" && isTomlHex(source[index + 1] ?? "") && isTomlHex(source[index + 2] ?? ""))) {
+    // `dispatch` consumes the bad letter, so the caret sits on the next character.
+    return { end: index, hit: { index: index + 1, message: ESCAPE_SEQUENCE_MESSAGE }, bail: false };
+  }
+  if (multiline && (char === " " || char === "\t" || char === "\n" || char === "\r")) {
+    let cursor = index;
+    while (source[cursor] === " " || source[cursor] === "\t") {
+      cursor += 1;
+    }
+    if (source[cursor] !== "\n" && source[cursor] !== "\r") {
+      return { end: index, hit: null, bail: true };
+    }
+    if (source[cursor] === "\r") {
+      cursor += 1;
+    }
+    if (source[cursor] === "\n") {
+      cursor += 1;
+    }
+    while (source[cursor] === " " || source[cursor] === "\t" || source[cursor] === "\n" || source[cursor] === "\r") {
+      cursor += 1;
+    }
+    return { end: cursor, hit: null, bail: false };
+  }
+  return { end: index, hit: null, bail: true };
 }
 
 function tomlWord(source: string, index: number): string {
