@@ -297,7 +297,12 @@ test("an unknown budget write rolls back and stays a gateway error", async () =>
     assert.equal(error.type, "unknown_namespace");
     return true;
   });
-  assert.deepEqual(seen, ["BEGIN", "SELECT id FROM axond_namespace WHERE id = $1", "ROLLBACK"]);
+  assert.deepEqual(seen, [
+    "BEGIN",
+    "INSERT INTO axond_namespace_lock (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+    "SELECT id FROM axond_namespace WHERE id = $1",
+    "ROLLBACK",
+  ]);
 });
 
 test("a failed namespace delete rolls the row back", async () => {
@@ -371,9 +376,68 @@ test("postgres rolls back a namespace delete when the incarnation bump fails", {
   }
 });
 
+test("a budget write waits on the namespace lock and does not orphan a ledger", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  const id = "lock-race";
+  await db.putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  const holder = await connect();
+  const look = await connect();
+  try {
+    await holder.client.query("BEGIN");
+    await holder.client.query(
+      "INSERT INTO axond_namespace_lock (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+      [id],
+    );
+    const holderPid = await holder.client.query("SELECT pg_backend_pid() AS pid");
+    const pid = holderPid.rows[0]?.["pid"];
+    let failure: unknown;
+    const write = db.putBudget(id, "compat", 5n).then(
+      () => undefined,
+      (error: unknown) => {
+        failure = error;
+      },
+    );
+    const started = Date.now();
+    let waiting = false;
+    while (Date.now() - started < 2000) {
+      const locks = await look.client.query(
+        "SELECT count(*)::int AS n FROM pg_stat_activity WHERE $1::int = ANY (pg_blocking_pids(pid))",
+        [pid],
+      );
+      if (Number(locks.rows[0]?.["n"] ?? 0) > 0) {
+        waiting = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(waiting, true);
+    assert.equal(failure, undefined);
+    const mid = await look.client.query("SELECT 1 FROM axond_store_budget WHERE namespace = $1", [id]);
+    assert.equal(mid.rowCount, 0);
+    await holder.client.query("DELETE FROM axond_namespace WHERE id = $1", [id]);
+    await holder.client.query("COMMIT");
+    await write;
+    assert.ok(failure instanceof GatewayFailure);
+    const left = await look.client.query("SELECT 1 FROM axond_store_budget WHERE namespace = $1", [id]);
+    assert.equal(left.rowCount, 0);
+  } finally {
+    await holder.client.query("ROLLBACK").catch(() => undefined);
+    await holder.release();
+    await look.release();
+  }
+});
+
 test("a write role keeps an existing postgres schema and names a missing table", async () => {
   const tables = postgresSchemaTables();
   assert.equal(tables.includes("axond_namespace"), true);
+  assert.equal(tables.includes("axond_namespace_lock"), true);
   assert.equal(tables.includes("axond_schema_lock"), true);
   await applyPostgresSchema({
     async query(sql, params) {

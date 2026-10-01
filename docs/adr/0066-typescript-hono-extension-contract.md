@@ -42,7 +42,7 @@ Extension-owned Postgres or SQLite tables, reached through `Store.query`, are th
 
 ### 6. Two stores, one interface
 
-SQLite ships for Bun, Node, and the compiled binary. Postgres ships for Workers (Hyperdrive, caching disabled for namespace and budget reads) and for other highly available deployments. Both implement `Store`. The TypeScript Postgres schema adds `allow_platform_fallback` and `from_config` on `axond_namespace`; those columns are not in the shipped `ops/postgres/*.sql` files, which remain the Rust oracle's DDL.
+SQLite ships for Bun, Node, and the compiled binary. Postgres ships for Workers (Hyperdrive, caching disabled for namespace and budget reads) and for other highly available deployments. Both implement `Store`. The TypeScript Postgres schema adds `allow_platform_fallback` and `from_config` on `axond_namespace`, and `axond_namespace_lock` so create, delete, and budget writes can serialize without `pg_advisory_xact_lock` (Hyperdrive rejects advisory locks). Those objects are not in the shipped `ops/postgres/*.sql` files, which remain the Rust oracle's DDL.
 
 ### 7. Per-tenant admission is not core
 

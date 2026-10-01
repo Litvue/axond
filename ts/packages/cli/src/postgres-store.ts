@@ -93,6 +93,11 @@ export function createPostgresStore(
         let period: string | null = null;
         if (policy.rows[0]?.["cadence"] === "monthly") {
           period = monthlyPeriod(nowMs, String(policy.rows[0]["timezone"]));
+          await lockNamespace(client, id);
+          const still = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [id]);
+          if (!still.rows[0]) {
+            return null;
+          }
           await client.query(
             `INSERT INTO axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
              VALUES ($1, $2, $3, 0)
@@ -121,7 +126,8 @@ export function createPostgresStore(
       }));
     },
     async putNamespace(record) {
-      return withClient("namespace_write", async (client) => {
+      return withClient("namespace_write", (client) => withTransaction(client, async (client) => {
+        await lockNamespace(client, record.id);
         const result = await client.query(
           `INSERT INTO axond_namespace (id, attrs, blocklist, allow_platform_fallback, from_config)
            VALUES ($1, $2::jsonb, $3::jsonb, $4, $5)
@@ -135,7 +141,7 @@ export function createPostgresStore(
           ],
         );
         return (result.rowCount ?? 0) > 0 ? "created" : "exists";
-      });
+      }));
     },
     async adoptConfigNamespace(id, allowPlatformFallback) {
       await withClient("namespace_write", async (client) => {
@@ -171,6 +177,7 @@ export function createPostgresStore(
     },
     async deleteNamespace(id) {
       return withClient("namespace_write", (client) => withTransaction(client, async (client) => {
+        await lockNamespace(client, id);
         const deleted = await client.query("DELETE FROM axond_namespace WHERE id = $1", [id]);
         if ((deleted.rowCount ?? 0) === 0) {
           return false;
@@ -199,6 +206,7 @@ export function createPostgresStore(
     },
     async putBudget(namespace, period, limit, nowMs = Date.now()) {
       return withClient("budget_write", (client) => withTransaction(client, async (client) => {
+        await lockNamespace(client, namespace);
         const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [namespace]);
         if (!known.rows[0]) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -228,6 +236,7 @@ export function createPostgresStore(
     },
     async putBudgetPolicy(input: BudgetPolicyWrite) {
       return withClient("budget_write", (client) => withTransaction(client, async (client) => {
+        await lockNamespace(client, input.namespace);
         const known = await client.query("SELECT id FROM axond_namespace WHERE id = $1", [input.namespace]);
         if (!known.rows[0]) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -356,6 +365,19 @@ export function createPostgresStore(
  * inside a transaction, so a namespace admit or a delete would otherwise split
  * across pooled connections.
  */
+/**
+ * Serialize create, delete, and budget writes for one id. Hyperdrive rejects
+ * `pg_advisory_xact_lock`. The upsert locks this row until the surrounding
+ * transaction ends, including when the namespace row is already gone, so a
+ * budget write cannot insert a ledger for a namespace a delete removed.
+ */
+async function lockNamespace(client: SqlExecutor, id: string): Promise<void> {
+  await client.query(
+    "INSERT INTO axond_namespace_lock (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+    [id],
+  );
+}
+
 async function withTransaction<T>(client: SqlExecutor, fn: (client: SqlExecutor) => Promise<T>): Promise<T> {
   await client.query("BEGIN");
   try {
@@ -413,6 +435,9 @@ CREATE TABLE IF NOT EXISTS axond_namespace (
 CREATE TABLE IF NOT EXISTS axond_namespace_incarnation (
     id text PRIMARY KEY NOT NULL,
     n bigint NOT NULL
+);
+CREATE TABLE IF NOT EXISTS axond_namespace_lock (
+    id text PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS axond_store_budget (
     namespace text NOT NULL,
