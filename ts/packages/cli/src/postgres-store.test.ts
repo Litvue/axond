@@ -5,7 +5,13 @@ import pg from "pg";
 
 import { StoreFailure } from "../../gateway/src/errors.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
-import { applyPostgresMigration, applyPostgresMigrationOn, createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
+import {
+  applyPostgresMigration,
+  applyPostgresMigrationOn,
+  createPostgresStore,
+  POSTGRES_SCHEMA,
+  postgresQueryText,
+} from "./postgres-store.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
 import type { Store } from "@axond/sdk";
 
@@ -71,6 +77,39 @@ test("an extension migration locks a row and skips an advisory lock", async () =
   assert.equal(seen.some((sql) => sql.includes("INSERT INTO axond_schema_lock") && sql.includes("DO UPDATE")), true);
   assert.equal(seen.includes("CREATE TABLE axond_ext_demo (id int)"), true);
   assert.equal(seen.at(-1), "COMMIT");
+});
+
+test("postgres query text numbers question-mark binds and keeps quotes", () => {
+  assert.equal(
+    postgresQueryText(
+      "SELECT count FROM axond_ext_ratelimit_window WHERE namespace = ? AND bucket = ? AND note = '?'",
+      2,
+    ),
+    "SELECT count FROM axond_ext_ratelimit_window WHERE namespace = $1 AND bucket = $2 AND note = '?'",
+  );
+  assert.equal(postgresQueryText("SELECT $1::text -- ?\n/* ? */", 1), "SELECT $1::text -- ?\n/* ? */");
+  assert.equal(postgresQueryText("SELECT $q$?$q$", 1), "SELECT $q$?$q$");
+  assert.equal(postgresQueryText("SELECT $$ ? $$", 1), "SELECT $$ ? $$");
+  assert.throws(() => postgresQueryText("SELECT ?", 2), (error: unknown) => error instanceof StoreFailure);
+});
+
+test("postgres store query sends numbered binds to the driver", async () => {
+  let seen = "";
+  let params: readonly unknown[] = [];
+  const db = createPostgresStore(async () => ({
+    client: {
+      async query(sql, bound) {
+        seen = sql;
+        params = bound ?? [];
+        return { rows: [{ bucket: "7" }], rowCount: 1 };
+      },
+    },
+    release: async () => undefined,
+  }));
+  const rows = await db.query("SELECT bucket FROM axond_ext_bind_probe WHERE namespace = ?", ["platform"]);
+  assert.equal(seen, "SELECT bucket FROM axond_ext_bind_probe WHERE namespace = $1");
+  assert.deepEqual(params, ["platform"]);
+  assert.equal(rows.rows[0]?.["bucket"], "7");
 });
 
 test("a postgres connection error drops the driver message", async () => {
@@ -245,6 +284,26 @@ test("applying the postgres schema twice is idempotent", { skip: !dsn }, async (
   await opened.client.query(POSTGRES_SCHEMA);
   await opened.client.query(POSTGRES_SCHEMA);
   await opened.release();
+});
+
+test("postgres_extension_query_with_question_marks_reads_the_row", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  await db.query(
+    "CREATE TABLE IF NOT EXISTS axond_ext_bind_probe (namespace text NOT NULL, bucket text NOT NULL)",
+  );
+  try {
+    await db.query("INSERT INTO axond_ext_bind_probe (namespace, bucket) VALUES (?, ?)", ["platform", "7"]);
+    const found = await db.query(
+      "SELECT bucket FROM axond_ext_bind_probe WHERE namespace = ? AND '?' = '?'",
+      ["platform"],
+    );
+    assert.equal(found.rows[0]?.["bucket"], "7");
+  } finally {
+    const opened = await connect();
+    await opened.client.query("DROP TABLE IF EXISTS axond_ext_bind_probe");
+    await opened.release();
+  }
 });
 
 test("postgres_extension_migration_serializes_on_a_row_lock", { skip: !dsn }, async () => {

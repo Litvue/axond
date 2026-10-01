@@ -5,7 +5,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import pg from "pg";
+
 import { createAxond } from "@axond/gateway";
+import { applyPostgresMigration, createPostgresStore, POSTGRES_SCHEMA } from "../../cli/src/postgres-store.ts";
 import { applyMigration, openSqliteStore } from "../../cli/src/sqlite-store.ts";
 import { createMemoryStore } from "../../gateway/src/memory-store.ts";
 
@@ -37,6 +40,63 @@ test("isolate mode returns 429 after the configured limit", async () => {
   });
   assert.equal(second.status, 429);
   assert.equal((await second.json()).error.type, "rate_limited");
+});
+
+test("store mode on postgres saturates one namespace and leaves another its capacity", { skip: !process.env["AXOND_TEST_POSTGRES"] }, async () => {
+  const dsn = process.env["AXOND_TEST_POSTGRES"]!;
+  const extension = rateLimitExtension({ limit: 1, windowMs: 60_000, mode: "store" });
+  const setup = new pg.Client({ connectionString: dsn });
+  await setup.connect();
+  try {
+    await setup.query(POSTGRES_SCHEMA);
+    await setup.query("DROP TABLE IF EXISTS axond_ext_ratelimit_window");
+    await setup.query("DELETE FROM axond_schema_migrations WHERE id = 'ratelimit:0'");
+  } finally {
+    await setup.end();
+  }
+  await applyPostgresMigration(dsn, "ratelimit:0", extension.migrations![0]!);
+  const store = createPostgresStore(async () => {
+    const client = new pg.Client({ connectionString: dsn });
+    await client.connect();
+    return {
+      client: {
+        query: async (sql, params) => {
+          const result = await client.query(sql, params ? [...params] : []);
+          return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+        },
+      },
+      release: () => client.end(),
+    };
+  });
+  try {
+    for (const id of ["rl-platform", "rl-tenant"]) {
+      await store.putNamespace({
+        id,
+        attrs: {},
+        blocklist: null,
+        allowPlatformFallback: false,
+        fromConfig: true,
+      });
+    }
+    const app = createAxond({
+      store,
+      gatewayKey: "k",
+      defaultNamespace: "rl-platform",
+      providers: [],
+      extensions: [extension],
+    });
+    const call = (namespace: string) =>
+      app.request(`http://127.0.0.1/ns/${namespace}/v1/models`, { headers: { authorization: "Bearer k" } });
+    assert.equal((await call("rl-platform")).status, 200);
+    assert.equal((await call("rl-platform")).status, 429);
+    assert.equal((await call("rl-tenant")).status, 200);
+  } finally {
+    const cleanup = new pg.Client({ connectionString: dsn });
+    await cleanup.connect();
+    await cleanup.query("DROP TABLE IF EXISTS axond_ext_ratelimit_window");
+    await cleanup.query("DELETE FROM axond_namespace WHERE id IN ('rl-platform', 'rl-tenant')");
+    await cleanup.end();
+  }
 });
 
 test("store mode saturates one namespace and leaves another its capacity", async () => {

@@ -69,8 +69,9 @@ export function createPostgresStore(
 
   return {
     async query(sql, params = []) {
+      const text = postgresQueryText(sql, params.length);
       return withClient(null, async (client) => {
-        const result = await client.query(sql, params);
+        const result = await client.query(text, params);
         return { rows: result.rows };
       });
     },
@@ -583,6 +584,108 @@ export async function applyPostgresMigrationOn(client: SqlExecutor, id: string, 
     await client.query("ROLLBACK").catch(() => undefined);
     throw new Error(`extension migration ${id} failed`);
   }
+}
+
+/**
+ * Extension SQL uses `?` binds, which SQLite accepts. Postgres numbers them
+ * `$1`, `$2`. A `?` inside a quote, a comment, or a dollar quote stays. `$1`
+ * text with no `?` is already Postgres and is left as written. A `?` count
+ * that does not match the arguments is a store failure before a connection opens.
+ */
+export function postgresQueryText(sql: string, paramCount: number): string {
+  if (paramCount === 0) {
+    return sql;
+  }
+  const bound = bindPostgresPlaceholders(sql);
+  if (bound.count !== 0 && bound.count !== paramCount) {
+    throw new StoreFailure();
+  }
+  return bound.count === paramCount ? bound.sql : sql;
+}
+
+function bindPostgresPlaceholders(sql: string): { sql: string; count: number } {
+  let count = 0;
+  let out = "";
+  let i = 0;
+  while (i < sql.length) {
+    const ch = sql[i]!;
+    if (ch === "'" || ch === '"') {
+      const end = scanSqlQuote(sql, i, ch);
+      out += sql.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (ch === "-" && sql[i + 1] === "-") {
+      const newline = sql.indexOf("\n", i);
+      const end = newline === -1 ? sql.length : newline;
+      out += sql.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (ch === "/" && sql[i + 1] === "*") {
+      const close = sql.indexOf("*/", i + 2);
+      const end = close === -1 ? sql.length : close + 2;
+      out += sql.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (ch === "$") {
+      const end = scanDollarQuote(sql, i);
+      if (end > i) {
+        out += sql.slice(i, end);
+        i = end;
+        continue;
+      }
+    }
+    if (ch === "?") {
+      count += 1;
+      out += `$${count}`;
+      i += 1;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return { sql: out, count };
+}
+
+function scanSqlQuote(sql: string, start: number, quote: string): number {
+  let i = start + 1;
+  while (i < sql.length) {
+    if (sql[i] === quote) {
+      if (sql[i + 1] === quote) {
+        i += 2;
+        continue;
+      }
+      return i + 1;
+    }
+    i += 1;
+  }
+  return sql.length;
+}
+
+/** `$tag$...$tag$` or `$$...$$`. `$1` is a bind, not a quote. */
+function scanDollarQuote(sql: string, start: number): number {
+  const next = sql[start + 1];
+  if (next === undefined || /\d/.test(next)) {
+    return start;
+  }
+  let i = start + 1;
+  if (next !== "$") {
+    if (!/[A-Za-z_]/.test(next)) {
+      return start;
+    }
+    i += 1;
+    while (i < sql.length && /[A-Za-z0-9_]/.test(sql[i]!)) {
+      i += 1;
+    }
+    if (sql[i] !== "$") {
+      return start;
+    }
+  }
+  const tag = sql.slice(start, i + 1);
+  const close = sql.indexOf(tag, i + 1);
+  return close === -1 ? sql.length : close + tag.length;
 }
 
 function modelFrom(row: Record<string, unknown>): ProviderModelCache {
