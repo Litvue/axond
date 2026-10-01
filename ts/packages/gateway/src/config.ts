@@ -3788,6 +3788,9 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer,
   }
   // A date is four digits then `-`. A time is two digits then `:`. A sign is an integer.
   if (!signed && continuesTomlDateOrTime(source, digitsAt, cursor, next)) {
+    if (next === "-") {
+      return scanTomlCalendar(source, digitsAt, leaps);
+    }
     const end = skipTomlDate(source, cursor);
     const date = invalidTomlDate(source, index, end);
     if (date !== null) {
@@ -4008,7 +4011,136 @@ function continuesTomlDateOrTime(source: string, digitsAt: number, cursor: numbe
   return next === ":" && /^\d{2}$/.test(digits);
 }
 
+const DATE_LABEL = "invalid date-time";
 const DATE_OUT_OF_RANGE = "invalid date-time\nvalue is out of range";
+const OFFSET_LABEL = "invalid time offset";
+
+function tomlTwoDigits(source: string, index: number): number | null {
+  const head = source.slice(index, index + 2);
+  if (!/^\d{2}$/.test(head)) {
+    return null;
+  }
+  return Number(head);
+}
+
+/**
+ * Figment cuts a date after `YYYY-`. A missing month, dash, or day is
+ * `invalid date-time` on that character. A `T` that is not a finished time
+ * stays outside the date, so the container reports it.
+ */
+function scanTomlCalendar(source: string, yearAt: number, leaps: number[]): TomlScan {
+  const year = Number(source.slice(yearAt, yearAt + 4));
+  let cursor = yearAt + 5;
+  const monthAt = cursor;
+  const month = tomlTwoDigits(source, cursor);
+  if (month === null) {
+    return { end: cursor, hit: { index: cursor, message: DATE_LABEL }, bail: false };
+  }
+  if (month < 1 || month > 12) {
+    return { end: monthAt, hit: { index: monthAt, message: DATE_OUT_OF_RANGE }, bail: false };
+  }
+  cursor += 2;
+  if (source[cursor] !== "-") {
+    return { end: cursor, hit: { index: cursor, message: DATE_LABEL }, bail: false };
+  }
+  cursor += 1;
+  const dayAt = cursor;
+  const day = tomlTwoDigits(source, cursor);
+  if (day === null) {
+    return { end: cursor, hit: { index: cursor, message: DATE_LABEL }, bail: false };
+  }
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const shortMonth = month === 4 || month === 6 || month === 9 || month === 11;
+  const maxDay = month === 2 ? (leapYear ? 29 : 28) : shortMonth ? 30 : 31;
+  if (day < 1 || day > maxDay) {
+    return { end: dayAt, hit: { index: dayAt, message: DATE_OUT_OF_RANGE }, bail: false };
+  }
+  cursor += 2;
+  const suffix = scanTomlDateSuffix(source, cursor);
+  if (suffix.hit) {
+    return suffix;
+  }
+  const leap = leapSecondAt(source, yearAt, suffix.end);
+  if (leap !== null) {
+    leaps.push(leap);
+  }
+  return suffix;
+}
+
+/** A time attaches only after its hour and colon. Otherwise the date already ended. */
+function scanTomlDateSuffix(source: string, dateEnd: number): TomlScan {
+  const delim = source[dateEnd] ?? "";
+  if (delim !== "T" && delim !== "t" && delim !== " ") {
+    return { end: dateEnd, hit: null, bail: false };
+  }
+  const timeAt = dateEnd + 1;
+  const hour = tomlTwoDigits(source, timeAt);
+  if (hour === null || hour > 23 || source[timeAt + 2] !== ":") {
+    return { end: dateEnd, hit: null, bail: false };
+  }
+  let cursor = timeAt + 3;
+  const minuteAt = cursor;
+  const minute = tomlTwoDigits(source, cursor);
+  if (minute === null) {
+    return { end: cursor, hit: { index: cursor, message: DATE_LABEL }, bail: false };
+  }
+  if (minute > 59) {
+    return { end: minuteAt, hit: { index: minuteAt, message: DATE_OUT_OF_RANGE }, bail: false };
+  }
+  cursor += 2;
+  if (source[cursor] !== ":") {
+    return { end: cursor, hit: { index: cursor, message: DATE_LABEL }, bail: false };
+  }
+  cursor += 1;
+  const secondAt = cursor;
+  const second = tomlTwoDigits(source, cursor);
+  if (second === null) {
+    return { end: cursor, hit: { index: cursor, message: DATE_LABEL }, bail: false };
+  }
+  if (second > 60) {
+    return { end: secondAt, hit: { index: secondAt, message: DATE_OUT_OF_RANGE }, bail: false };
+  }
+  cursor += 2;
+  if (source[cursor] === "." && isTomlDigit(source[cursor + 1] ?? "")) {
+    cursor += 2;
+    while (isTomlDigit(source[cursor] ?? "")) {
+      cursor += 1;
+    }
+  }
+  const offset = source[cursor] ?? "";
+  if (offset === "Z" || offset === "z") {
+    return { end: cursor + 1, hit: null, bail: false };
+  }
+  if (offset === "+" || offset === "-") {
+    return scanTomlOffset(source, cursor);
+  }
+  return { end: cursor, hit: null, bail: false };
+}
+
+function scanTomlOffset(source: string, index: number): TomlScan {
+  const hourAt = index + 1;
+  const hour = tomlTwoDigits(source, hourAt);
+  if (hour === null) {
+    return { end: hourAt, hit: { index: hourAt, message: OFFSET_LABEL }, bail: false };
+  }
+  if (hour > 23) {
+    return { end: hourAt, hit: { index: hourAt, message: OFFSET_RANGE }, bail: false };
+  }
+  let cursor = hourAt + 2;
+  if (source[cursor] !== ":") {
+    return { end: cursor, hit: { index: cursor, message: OFFSET_LABEL }, bail: false };
+  }
+  cursor += 1;
+  const minuteAt = cursor;
+  const minute = tomlTwoDigits(source, cursor);
+  if (minute === null) {
+    return { end: cursor, hit: { index: cursor, message: OFFSET_LABEL }, bail: false };
+  }
+  if (minute > 59) {
+    return { end: minuteAt, hit: { index: minuteAt, message: OFFSET_RANGE }, bail: false };
+  }
+  return { end: cursor + 2, hit: null, bail: false };
+}
 
 function invalidTomlDate(
   source: string,

@@ -213,6 +213,10 @@ caret. Inside an array the sign is `invalid array` and `` expected `]` ``.
 is that integer and `` expected newline, `#` `` on the `-`. `1-2` and
 `+07:32:00` are the same trailing character. Inside an array it is
 `` expected `]` ``. `1979-05-27`, `07:32:00`, and `0123-01-01` still parse.
+`1979-` is `invalid date-time` on the missing month, before extract and
+before a later integer. `1979-05` and `1979-05-` use that same label. A
+finished `1979-05-27T` is `` expected newline, `#` `` on `T`.
+`1979-05-27T00:32:00Z` still parses.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
