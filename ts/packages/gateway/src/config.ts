@@ -3685,6 +3685,7 @@ function scanInlineTableValue(source: string, index: number, leaps: number[]): T
   return scanTomlValue(source, cursor, "inline", leaps);
 }
 
+const INTEGER_LABEL = "invalid integer";
 const INTEGER_DIGIT = "invalid integer\nexpected digit";
 const FLOAT_LABEL = "invalid floating-point number";
 const FLOAT_DIGIT = "invalid floating-point number\nexpected digit";
@@ -3752,11 +3753,15 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer,
     return { end: walked.end, hit: null, bail: false };
   }
   let cursor = index;
+  // Figment's integer label keeps the missing digit. An array backtracks to `]`.
   if (head === "+" || head === "-") {
     cursor += 1;
-  }
-  if (!isTomlDigit(source[cursor] ?? "")) {
-    return { end: index, hit: null, bail: true };
+    if (!isTomlDigit(source[cursor] ?? "")) {
+      if (container === "array") {
+        return { end: index, hit: { index, message: ARRAY_AFTER_VALUE }, bail: false };
+      }
+      return { end: cursor, hit: { index: cursor, message: INTEGER_LABEL }, bail: false };
+    }
   }
   if (source[cursor] === "0") {
     const next = source[cursor + 1] ?? "";

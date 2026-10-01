@@ -205,7 +205,11 @@ extract and before a later integer. A value that starts with `_` is
 `invalid integer` and `expected leading digit`. Inside an array both are
 `invalid array` and `` expected `]` ``. After a finished value, `1 _2` and
 `0x1g` are `` expected newline, `#` ``. An inline table reports its closer on
-that `_`. `n = 1 # comment` and `0x10` still parse.
+that `_`. `n = 1 # comment` and `0x10` still parse. A `+` or `-`
+that is not followed by a digit is `invalid integer` on the missing digit,
+before extract and before a later integer. `+.5` and `+_1` use that same
+caret. Inside an array the sign is `invalid array` and `` expected `]` ``.
+`+1`, `-1`, and `+inf` still parse.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

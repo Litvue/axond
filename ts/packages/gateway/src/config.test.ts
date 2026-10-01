@@ -833,6 +833,79 @@ test("a leading dot or junk after a value is a parse error before extract", asyn
   assert.equal(hexOk.storage.path, "/tmp/axond.sqlite");
 });
 
+test("a sign without a digit is a parse error before extract", async () => {
+  const label = "invalid integer";
+  const array = "invalid array\nexpected `]`";
+  const inline = "invalid inline table\nexpected `}`";
+  const newline = "expected newline, `#`";
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index, message));
+        return true;
+      },
+    );
+  };
+  const beforeShutdown = `n = +\n[shutdown]\nnope = 1\n${BASE}`;
+  const mark = beforeShutdown.indexOf("+") + 1;
+  const markMessage = diagram(beforeShutdown, mark, label);
+  await reject(beforeShutdown, mark, label);
+  assert.equal(markMessage.includes("unknown field"), false);
+  assert.equal(markMessage.includes("number too large"), false);
+  const later = `n = +\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf("+") + 1, label);
+  const earlier = `n = 9223372036854775808\nn = +\n${BASE}`;
+  await reject(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type");
+  const minus = `n = -\n${BASE}`;
+  await reject(minus, minus.indexOf("-") + 1, label);
+  const plusDot = `n = +.5\n${BASE}`;
+  await reject(plusDot, plusDot.indexOf("."), label);
+  const under = `n = +_1\n${BASE}`;
+  await reject(under, under.indexOf("_"), label);
+  const exponent = `n = +e1\n${BASE}`;
+  await reject(exponent, exponent.indexOf("e"), label);
+  const spaced = `n = + 1\n${BASE}`;
+  await reject(spaced, spaced.indexOf("+") + 1, label);
+  const arr = `n = [+]\n${BASE}`;
+  await reject(arr, arr.indexOf("+"), array);
+  const arrDot = `n = [+.5]\n${BASE}`;
+  await reject(arrDot, arrDot.indexOf("+"), array);
+  const arrComma = `n = [1, +]\n${BASE}`;
+  await reject(arrComma, arrComma.indexOf("+"), array);
+  const inlinePlus = `n = { a = + }\n${BASE}`;
+  await reject(inlinePlus, inlinePlus.indexOf("+") + 1, label);
+  const inlineDot = `n = { a = +.5 }\n${BASE}`;
+  await reject(inlineDot, inlineDot.indexOf("."), label);
+  const inlineKey = `n = { + }\n${BASE}`;
+  await reject(inlineKey, inlineKey.indexOf("+"), inline);
+  const hex = `n = +0x1\n${BASE}`;
+  await reject(hex, hex.indexOf("x"), newline);
+  const word = `n = +infinity\n${BASE}`;
+  await reject(word, word.indexOf("infinity") + 3, newline);
+  const plus = await loadConfig(`n = +1\n${BASE}`, secrets);
+  assert.equal(plus.storage.path, "/tmp/axond.sqlite");
+  const negative = await loadConfig(`n = -1\n${BASE}`, secrets);
+  assert.equal(negative.storage.path, "/tmp/axond.sqlite");
+  const inf = await loadConfig(`n = +inf\n${BASE}`, secrets);
+  assert.equal(inf.storage.path, "/tmp/axond.sqlite");
+});
+
 test("a float past the finite range is a parse error before extract", async () => {
   const message = "invalid floating-point number";
   const diagram = (source: string, index: number) => {
