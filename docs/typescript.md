@@ -154,8 +154,11 @@ before extract and before a later integer. A newline or a `#` comment inside
 the braces is that diagram at the newline or the `#`. An array may still end
 with a comma. A basic string `\x` with two hex digits, or `\e`, is
 `invalid escape sequence` with the caret on the next character, before
-extract and before a later integer. `\u0041` and `\U00000041` still decode.
-A literal string keeps the backslash.
+extract and before a later integer. A short `\u` or `\U`, or a code point
+that is a surrogate or above `U+10FFFF`, is `invalid unicode 4-digit hex code`
+or `invalid unicode 8-digit hex code` at that same character. A complete hex
+sequence that is out of range also says `value is out of range`. `\u0041` and
+`\U00000041` still decode. A literal string keeps the backslash.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

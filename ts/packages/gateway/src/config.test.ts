@@ -361,6 +361,84 @@ test("a hex escape in a string is a parse error before extract", async () => {
   assert.equal(commented.storage.path, "/tmp/axond.sqlite");
 });
 
+test("a short unicode escape is a parse error before extract", async () => {
+  const short = "invalid unicode 4-digit hex code";
+  const shortWide = "invalid unicode 8-digit hex code";
+  const ranged = (label: string) => `${label}\nvalue is out of range`;
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const shortPath = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "data\\u41.db"');
+  const beforeShutdown = `${shortPath}\n[shutdown]\nnope = 1\n`;
+  const shortMessage = diagram(beforeShutdown, beforeShutdown.indexOf("\\u") + 2, short);
+  await reject(beforeShutdown, shortMessage);
+  assert.equal(shortMessage.includes("unknown field"), false);
+  assert.equal(shortMessage.includes("number too large"), false);
+  const later = `${shortPath}\nn = 9223372036854775808\n`;
+  await reject(later, diagram(later, later.indexOf("\\u") + 2, short));
+  const earlier = `n = 9223372036854775808\n${shortPath}`;
+  await reject(earlier, diagram(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type"));
+  const surrogate = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "data\\uD800.db"');
+  await reject(surrogate, diagram(surrogate, surrogate.indexOf("\\u") + 2, ranged(short)));
+  const lower = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "data\\ud800.db"');
+  await reject(lower, diagram(lower, lower.indexOf("\\u") + 2, ranged(short)));
+  const wide = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "data\\U00110000.db"');
+  await reject(wide, diagram(wide, wide.indexOf("\\U") + 2, ranged(shortWide)));
+  const wideSurrogate = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "data\\U0000D800.db"');
+  await reject(wideSurrogate, diagram(wideSurrogate, wideSurrogate.indexOf("\\U") + 2, ranged(shortWide)));
+  const seven = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "data\\U0000004.db"');
+  await reject(seven, diagram(seven, seven.indexOf("\\U") + 2, shortWide));
+  const multiline = `n = """hi\\\n\\u41"""\n${BASE}`;
+  await reject(multiline, diagram(multiline, multiline.indexOf("\\u") + 2, short));
+  const header = `["hi\\u41"]\n${BASE}`;
+  await reject(header, diagram(header, header.indexOf("\\u") + 2, short));
+  const models = `blocklist = { models = ["a\\u41"] }\n${BASE}`;
+  await reject(models, diagram(models, models.indexOf("\\u") + 2, short));
+  const key = `"hi\\u41" = 1\n${BASE}`;
+  await reject(key, diagram(key, key.indexOf("\\u") + 2, short));
+  const brace = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "\\u{41}"');
+  await reject(brace, diagram(brace, brace.indexOf("\\u") + 2, short));
+  const spaced = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "\\u 041"');
+  await reject(spaced, diagram(spaced, spaced.indexOf("\\u") + 2, short));
+  const decoded = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', 'path = "hi\\u0041.db"'), secrets);
+  assert.equal(decoded.storage.path, "hiA.db");
+  const plane = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', 'path = "hi\\U0010FFFF.db"'), secrets);
+  assert.equal(plane.storage.path, "hi\u{10FFFF}.db");
+  const before = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', 'path = "hi\\uD7FF.db"'), secrets);
+  assert.equal(before.storage.path, "hi\u{D7FF}.db");
+  const after = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', 'path = "hi\\uE000.db"'), secrets);
+  assert.equal(after.storage.path, "hi\u{E000}.db");
+  const nul = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', 'path = "hi\\u0000.db"'), secrets);
+  assert.equal(nul.storage.path, "hi\u0000.db");
+  const literal = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', "path = 'hi\\u41.db'"), secrets);
+  assert.equal(literal.storage.path, "hi\\u41.db");
+  const kept = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', 'path = "hi\\\\u41.db"'), secrets);
+  assert.equal(kept.storage.path, "hi\\u41.db");
+  const commented = await loadConfig(`# \\u41\n${BASE}`, secrets);
+  assert.equal(commented.storage.path, "/tmp/axond.sqlite");
+});
+
 test("storage_fields_match_the_rust_boot_refusals", async () => {
   const instead = (pathBlock: string) => BASE.replace('backend = "sqlite"\npath = "/tmp/axond.sqlite"\n', pathBlock);
   const refuse = async (toml: string, pattern: RegExp) => {

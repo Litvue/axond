@@ -3157,7 +3157,11 @@ const U64_MAX = 18446744073709551615n;
  * outside `i64` is `number too large` or `number too small`. An inline table
  * stays on one line: a trailing comma, a newline, or a comment is
  * `invalid inline table`. A basic string `\x` with two hex digits, or `\e`,
- * is `invalid escape sequence` at the character after `x` or `e`.
+ * is `invalid escape sequence` at the character after `x` or `e`. A short
+ * `\u` or `\U`, or a code point that is a surrogate or above U+10FFFF, is
+ * `invalid unicode 4-digit hex code` or `invalid unicode 8-digit hex code`
+ * at the character after `u` or `U`. A complete hex sequence that is out of
+ * range also says `value is out of range`.
  */
 function firstTomlIntegerOutsideI64(source: string): { index: number; message: string } | null {
   return scanTomlDocument(source, 0).hit;
@@ -3608,9 +3612,10 @@ function isTomlHex(char: string): boolean {
 }
 
 /**
- * Figment rejects `\xHH` and `\e` in a basic string. A short `\u` or `\U`
- * still belongs to the TOML parser, so those bail. Literal strings keep
- * the backslash.
+ * Figment rejects `\xHH` and `\e` in a basic string, and a `\u` or `\U`
+ * that is short or names a surrogate or a code point above U+10FFFF. The
+ * caret is the character after the escape letter. Literal strings keep the
+ * backslash. An unknown escape smol already refuses still bails.
  */
 function scanTomlString(source: string, index: number): TomlScan {
   const multiline = source.startsWith('"""', index) || source.startsWith("'''", index);
@@ -3655,17 +3660,18 @@ function scanBasicEscape(source: string, index: number, multiline: boolean): Tom
   }
   if (char === "u" || char === "U") {
     const width = char === "u" ? 4 : 8;
+    const label = `invalid unicode ${width}-digit hex code`;
     let hex = "";
     for (let offset = 1; offset <= width; offset += 1) {
       const digit = source[index + offset] ?? "";
       if (!isTomlHex(digit)) {
-        return { end: index, hit: null, bail: true };
+        return { end: index, hit: { index: index + 1, message: label }, bail: false };
       }
       hex += digit;
     }
     const code = Number.parseInt(hex, 16);
     if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) {
-      return { end: index, hit: null, bail: true };
+      return { end: index, hit: { index: index + 1, message: `${label}\nvalue is out of range` }, bail: false };
     }
     return { end: index + 1 + width, hit: null, bail: false };
   }
