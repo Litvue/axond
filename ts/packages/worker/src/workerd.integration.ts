@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import test from "node:test";
+import { describe, test } from "node:test";
+import pg from "pg";
 import { unstable_dev } from "wrangler";
 
 const dsn = process.env.AXOND_TEST_POSTGRES;
 const key = "test-inbound-key";
 
+describe("workerd hyperdrive", { concurrency: 1 }, () => {
 test("workerd serves the gateway through a local Hyperdrive binding", { skip: !dsn }, async () => {
   process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = dsn;
   const worker = await unstable_dev(new URL("./index.ts", import.meta.url).pathname, {
@@ -144,4 +146,99 @@ test("workerd_hyperdrive_charges_one_request_id_once", { skip: !dsn }, async () 
     await worker.stop();
     await upstream.close();
   }
+});
+
+test("workerd_hyperdrive_logs_missing_namespace_columns", { skip: !dsn }, async (t) => {
+  const admin = new pg.Client({ connectionString: dsn });
+  await admin.connect();
+  const role = await admin.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+  if (role.rows[0]?.["rolsuper"] !== true) {
+    await admin.end();
+    t.skip("the test role cannot create a database");
+    return;
+  }
+  const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  const dbName = `axond_wd_${suffix}`;
+  const roleName = `axond_wdw_${suffix}`;
+  const password = `pw_${suffix}`;
+  await admin.query(`CREATE DATABASE ${dbName}`);
+  await admin.query(`CREATE ROLE ${roleName} LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE`);
+  await admin.end();
+  const ownerUrl = new URL(dsn!);
+  ownerUrl.pathname = `/${dbName}`;
+  const owner = new pg.Client({ connectionString: ownerUrl.toString() });
+  await owner.connect();
+  const restrictedUrl = new URL(ownerUrl.toString());
+  restrictedUrl.username = roleName;
+  restrictedUrl.password = password;
+  const lines: string[] = [];
+  const write = process.stdout.write;
+  const writeError = process.stderr.write;
+  process.stdout.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding, callback?: (error?: Error | null) => void) => {
+    lines.push(String(chunk));
+    return write.call(process.stdout, chunk, encoding, callback);
+  }) as typeof process.stdout.write;
+  process.stderr.write = ((chunk: string | Uint8Array, encoding?: BufferEncoding, callback?: (error?: Error | null) => void) => {
+    lines.push(String(chunk));
+    return writeError.call(process.stderr, chunk, encoding, callback);
+  }) as typeof process.stderr.write;
+  let worker: Awaited<ReturnType<typeof unstable_dev>> | undefined;
+  try {
+    await owner.query("REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+    await owner.query(`GRANT USAGE ON SCHEMA public TO ${roleName}`);
+    await owner.query(`GRANT pg_read_all_data, pg_write_all_data TO ${roleName}`);
+    await owner.query(`
+      CREATE TABLE axond_namespace (
+        id TEXT PRIMARY KEY NOT NULL,
+        attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+        blocklist JSONB
+      )
+    `);
+    const { applyPostgresSchema } = await import("../../cli/src/postgres-store.ts");
+    await applyPostgresSchema({
+      query: async (sql, params) => {
+        const result = params === undefined ? await owner.query(sql) : await owner.query(sql, [...params]);
+        const row = Array.isArray(result) ? result[result.length - 1] : result;
+        return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
+      },
+    });
+    await owner.query("ALTER TABLE axond_namespace DROP COLUMN allow_platform_fallback");
+    await owner.query("ALTER TABLE axond_namespace DROP COLUMN from_config");
+    await owner.end();
+    process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = restrictedUrl.toString();
+    worker = await unstable_dev(new URL("./index.ts", import.meta.url).pathname, {
+      config: new URL("../wrangler.toml", import.meta.url).pathname,
+      local: true,
+      ip: "127.0.0.1",
+      vars: { GATEWAY_KEY: key, PROVIDERS_JSON: "[]" },
+      logLevel: "log",
+      experimental: { disableExperimentalWarning: true, disableDevRegistry: true },
+    });
+    const response = await worker.fetch("http://127.0.0.1/api/v1/namespaces", {
+      headers: { authorization: `Bearer ${key}` },
+    });
+    const body = await response.text();
+    assert.equal(response.status, 503, body);
+    assert.equal(body.includes("store is unavailable"), true);
+    assert.equal(body.includes("allow_platform_fallback"), false);
+    assert.equal(body.includes(password), false);
+    const logs = lines.join("");
+    assert.equal(logs.includes("schema_unavailable"), true, logs);
+    assert.equal(logs.includes("axond_namespace.allow_platform_fallback"), true, logs);
+    assert.equal(logs.includes("axond_namespace.from_config"), true, logs);
+    assert.equal(logs.includes(password), false);
+  } finally {
+    process.stdout.write = write;
+    process.stderr.write = writeError;
+    await worker?.stop();
+    await owner.end().catch(() => undefined);
+    const drop = new pg.Client({ connectionString: dsn });
+    await drop.connect();
+    await drop.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [dbName]);
+    await drop.query(`DROP DATABASE IF EXISTS ${dbName}`);
+    await drop.query(`REVOKE pg_read_all_data, pg_write_all_data FROM ${roleName}`).catch(() => undefined);
+    await drop.query(`DROP ROLE IF EXISTS ${roleName}`);
+    await drop.end();
+  }
+});
 });
