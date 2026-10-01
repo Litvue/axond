@@ -1095,7 +1095,7 @@ namespace = "platform"
 kind = "postgres"
 dsn_env = "DSN"
 buffer_capacity = 1
-max_batch = 18446744073709551615
+max_batch = 9223372036854775807
 `,
   );
   try {
@@ -1106,8 +1106,76 @@ max_batch = 18446744073709551615
       result.stderr,
       "Error: failed to load config from `" +
         config +
-        "`: invalid config: usage_sink `postgres`: max_batch (18446744073709551615) must not exceed buffer_capacity (1)\n",
+        "`: invalid config: usage_sink `postgres`: max_batch (9223372036854775807) must not exceed buffer_capacity (1)\n",
     );
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("toml_integer_outside_i64_is_a_parse_error_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-toml-range-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "range.toml");
+  const line = "failover = { overall_timeout_ms = 9223372036854775808 }";
+  await writeFile(
+    config,
+    `${line}
+[shutdown]
+nope = 1
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`,
+  );
+  const column = line.indexOf("9223372036854775808");
+  const pad = "  ";
+  const diagram =
+    "TOML parse error at line 1, column " +
+    (column + 1) +
+    "\n" +
+    pad +
+    "|\n" +
+    "1 | " +
+    line +
+    "\n" +
+    pad +
+    "|" +
+    " ".repeat(column + 1) +
+    "^\n" +
+    "number too large to fit in target type\n" +
+    " in range.toml TOML file\n";
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" + config + "`: config load: " + diagram,
+    );
+    assert.equal(result.stderr.includes("unknown field"), false);
+    await assert.rejects(() => stat(db));
+
+    await writeFile(config, `n = -9223372036854775809\n[storage]\nbackend = "sqlite"\npath = "${db}"\n`);
+    const below = await run(config, root, { GW_KEY: "k" });
+    assert.equal(below.code, 1);
+    assert.equal(below.stdout, "");
+    assert.match(below.stderr, /number too small to fit in target type\n in range\.toml TOML file\n$/);
+    await assert.rejects(() => stat(db));
+
+    await writeFile(config, `n = 0x8000000000000000\n[storage]\nbackend = "sqlite"\npath = "${db}"\n`);
+    const hex = await run(config, root, { GW_KEY: "k" });
+    assert.equal(hex.code, 1);
+    assert.match(hex.stderr, /1 \| n = 0x8000000000000000\n {2}\| {5}\^\nnumber too large to fit in target type\n/);
     await assert.rejects(() => stat(db));
   } finally {
     await rm(root, { recursive: true, force: true });

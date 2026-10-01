@@ -155,6 +155,10 @@ export async function loadConfig(
   secrets: SecretReader,
   options?: { resolveSecrets?: boolean },
 ): Promise<LoadedConfig> {
+  const range = firstTomlIntegerOutsideI64(toml);
+  if (range) {
+    throw configLoad(formatTomlIntegerRange(toml, range.index, range.message));
+  }
   let parsed: Record<string, unknown>;
   try {
     parsed = parse(toml, { integersAsBigInt: "asNeeded" }) as Record<string, unknown>;
@@ -3147,6 +3151,428 @@ const BIND_ENV_LOC = " in `AXOND_` environment variable(s)";
 const I64_MAX = 9223372036854775807n;
 const I64_MIN = -9223372036854775808n;
 const U64_MAX = 18446744073709551615n;
+
+/**
+ * TOML integers are `i64`. Figment fails the document in the parser, before
+ * extract and before a later unknown field, when a value does not fit.
+ */
+function firstTomlIntegerOutsideI64(source: string): { index: number; message: string } | null {
+  return scanTomlDocument(source, 0).hit;
+}
+
+function formatTomlIntegerRange(source: string, index: number, message: string): string {
+  const line = source.slice(0, index).split("\n").length - 1;
+  const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+  const lineEnd = source.indexOf("\n", index);
+  const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+  const column = [...source.slice(lineStart, index)].length;
+  const lineNum = line + 1;
+  const gutter = String(lineNum).length;
+  const pad = " ".repeat(gutter + 1);
+  return (
+    `TOML parse error at line ${lineNum}, column ${column + 1}\n` +
+    `${pad}|\n` +
+    `${lineNum} | ${content}\n` +
+    `${pad}|${" ".repeat(column + 1)}^\n` +
+    `${message}\n`
+  );
+}
+
+type TomlScan = { end: number; hit: { index: number; message: string } | null; bail: boolean };
+
+function scanTomlDocument(source: string, index: number): TomlScan {
+  let cursor = index;
+  while (cursor < source.length) {
+    cursor = skipTomlTrivia(source, cursor);
+    if (cursor >= source.length) {
+      break;
+    }
+    if (source[cursor] === "[") {
+      const header = skipTomlHeader(source, cursor);
+      if (header === null) {
+        return { end: cursor, hit: null, bail: true };
+      }
+      cursor = header;
+      continue;
+    }
+    const key = skipTomlKey(source, cursor);
+    if (key === null) {
+      return { end: cursor, hit: null, bail: true };
+    }
+    cursor = skipTomlTrivia(source, key);
+    if (source[cursor] !== "=") {
+      return { end: cursor, hit: null, bail: true };
+    }
+    const value = scanTomlValue(source, cursor + 1);
+    if (value.hit || value.bail) {
+      return value;
+    }
+    cursor = value.end;
+  }
+  return { end: cursor, hit: null, bail: false };
+}
+
+function scanTomlValue(source: string, index: number): TomlScan {
+  const cursor = skipTomlTrivia(source, index);
+  if (cursor >= source.length) {
+    return { end: cursor, hit: null, bail: true };
+  }
+  const char = source[cursor];
+  if (char === '"' || char === "'") {
+    const end = skipTomlString(source, cursor);
+    return end === null ? { end: cursor, hit: null, bail: true } : { end, hit: null, bail: false };
+  }
+  if (char === "{") {
+    return scanTomlInline(source, cursor);
+  }
+  if (char === "[") {
+    return scanTomlArray(source, cursor);
+  }
+  const word = tomlWord(source, cursor);
+  if (word === "true" || word === "false" || word === "inf" || word === "nan") {
+    return { end: cursor + word.length, hit: null, bail: false };
+  }
+  if ((char === "+" || char === "-") && (source.startsWith("inf", cursor + 1) || source.startsWith("nan", cursor + 1))) {
+    const end = cursor + 1 + (source.startsWith("inf", cursor + 1) ? 3 : 3);
+    return { end, hit: null, bail: false };
+  }
+  if (char === "+" || char === "-" || isTomlDigit(char)) {
+    return scanTomlNumber(source, cursor);
+  }
+  return { end: cursor, hit: null, bail: true };
+}
+
+function scanTomlArray(source: string, index: number): TomlScan {
+  let cursor = index + 1;
+  for (;;) {
+    cursor = skipTomlTrivia(source, cursor);
+    if (source[cursor] === "]") {
+      return { end: cursor + 1, hit: null, bail: false };
+    }
+    const value = scanTomlValue(source, cursor);
+    if (value.hit || value.bail) {
+      return value;
+    }
+    cursor = skipTomlTrivia(source, value.end);
+    if (source[cursor] === ",") {
+      cursor += 1;
+      continue;
+    }
+    if (source[cursor] === "]") {
+      return { end: cursor + 1, hit: null, bail: false };
+    }
+    return { end: cursor, hit: null, bail: true };
+  }
+}
+
+function scanTomlInline(source: string, index: number): TomlScan {
+  let cursor = index + 1;
+  for (;;) {
+    cursor = skipTomlTrivia(source, cursor);
+    if (source[cursor] === "}") {
+      return { end: cursor + 1, hit: null, bail: false };
+    }
+    const key = skipTomlKey(source, cursor);
+    if (key === null) {
+      return { end: cursor, hit: null, bail: true };
+    }
+    cursor = skipTomlTrivia(source, key);
+    if (source[cursor] !== "=") {
+      return { end: cursor, hit: null, bail: true };
+    }
+    const value = scanTomlValue(source, cursor + 1);
+    if (value.hit || value.bail) {
+      return value;
+    }
+    cursor = skipTomlTrivia(source, value.end);
+    if (source[cursor] === ",") {
+      cursor += 1;
+      continue;
+    }
+    if (source[cursor] === "}") {
+      return { end: cursor + 1, hit: null, bail: false };
+    }
+    return { end: cursor, hit: null, bail: true };
+  }
+}
+
+function scanTomlNumber(source: string, index: number): TomlScan {
+  const head = source[index] ?? "";
+  if ((head === "+" || head === "-") && (source.startsWith("0x", index + 1) || source.startsWith("0o", index + 1) || source.startsWith("0b", index + 1))) {
+    return { end: index, hit: null, bail: true };
+  }
+  if (source.startsWith("0x", index) || source.startsWith("0o", index) || source.startsWith("0b", index)) {
+    const base = source[index + 1] === "x" ? 16 : source[index + 1] === "o" ? 8 : 2;
+    const digits = readRadixDigits(source, index + 2, base);
+    if (digits === null) {
+      return { end: index, hit: null, bail: true };
+    }
+    const integer = BigInt(base === 16 ? `0x${digits}` : base === 8 ? `0o${digits}` : `0b${digits}`);
+    if (integer > I64_MAX) {
+      return { end: digitsEnd(source, index + 2, base), hit: { index, message: "number too large to fit in target type" }, bail: false };
+    }
+    return { end: digitsEnd(source, index + 2, base), hit: null, bail: false };
+  }
+  let cursor = index;
+  if (head === "+" || head === "-") {
+    cursor += 1;
+  }
+  if (!isTomlDigit(source[cursor] ?? "")) {
+    return { end: index, hit: null, bail: true };
+  }
+  if (source[cursor] === "0" && isTomlDigit(source[cursor + 1] ?? "")) {
+    return { end: index, hit: null, bail: true };
+  }
+  while (cursor < source.length && (isTomlDigit(source[cursor] ?? "") || source[cursor] === "_")) {
+    cursor += 1;
+  }
+  const next = source[cursor] ?? "";
+  if (next === "." || next === "e" || next === "E") {
+    const end = skipTomlFloat(source, cursor);
+    return end === null ? { end: cursor, hit: null, bail: true } : { end, hit: null, bail: false };
+  }
+  if (next === "-" || next === ":") {
+    const end = skipTomlDate(source, cursor);
+    return { end, hit: null, bail: false };
+  }
+  const raw = source.slice(index, cursor).replaceAll("_", "");
+  let integer: bigint;
+  try {
+    integer = BigInt(raw);
+  } catch {
+    return { end: index, hit: null, bail: true };
+  }
+  if (integer > I64_MAX || integer < I64_MIN) {
+    return {
+      end: cursor,
+      hit: {
+        index,
+        message: integer < I64_MIN ? "number too small to fit in target type" : "number too large to fit in target type",
+      },
+      bail: false,
+    };
+  }
+  return { end: cursor, hit: null, bail: false };
+}
+
+function readRadixDigits(source: string, index: number, base: number): string | null {
+  let cursor = index;
+  let digits = "";
+  if (!isRadixDigit(source[cursor] ?? "", base)) {
+    return null;
+  }
+  while (cursor < source.length) {
+    const char = source[cursor] ?? "";
+    if (isRadixDigit(char, base)) {
+      digits += char;
+      cursor += 1;
+      continue;
+    }
+    if (char === "_" && isRadixDigit(source[cursor + 1] ?? "", base)) {
+      cursor += 1;
+      continue;
+    }
+    break;
+  }
+  return digits;
+}
+
+function digitsEnd(source: string, index: number, base: number): number {
+  let cursor = index;
+  while (cursor < source.length) {
+    const char = source[cursor] ?? "";
+    if (isRadixDigit(char, base) || (char === "_" && isRadixDigit(source[cursor + 1] ?? "", base))) {
+      cursor += char === "_" ? 2 : 1;
+      continue;
+    }
+    break;
+  }
+  return cursor;
+}
+
+function isRadixDigit(char: string, base: number): boolean {
+  if (base === 16) {
+    return /[0-9a-fA-F]/.test(char);
+  }
+  if (base === 8) {
+    return /[0-7]/.test(char);
+  }
+  return char === "0" || char === "1";
+}
+
+function skipTomlFloat(source: string, index: number): number | null {
+  let cursor = index;
+  if (source[cursor] === ".") {
+    cursor += 1;
+    if (!isTomlDigit(source[cursor] ?? "")) {
+      return null;
+    }
+    while (isTomlDigit(source[cursor] ?? "") || source[cursor] === "_") {
+      cursor += 1;
+    }
+  }
+  if (source[cursor] === "e" || source[cursor] === "E") {
+    cursor += 1;
+    if (source[cursor] === "+" || source[cursor] === "-") {
+      cursor += 1;
+    }
+    if (!isTomlDigit(source[cursor] ?? "")) {
+      return null;
+    }
+    while (isTomlDigit(source[cursor] ?? "") || source[cursor] === "_") {
+      cursor += 1;
+    }
+  }
+  return cursor;
+}
+
+function skipTomlDate(source: string, index: number): number {
+  const stop = (cursor: number) => cursor >= source.length || ` \t\n\r,]}#`.includes(source[cursor] ?? "");
+  let cursor = index;
+  while (!stop(cursor)) {
+    cursor += 1;
+  }
+  if (
+    source[cursor] === " " &&
+    isTomlDigit(source[cursor + 1] ?? "") &&
+    isTomlDigit(source[cursor + 2] ?? "") &&
+    source[cursor + 3] === ":"
+  ) {
+    cursor += 1;
+    while (!stop(cursor)) {
+      cursor += 1;
+    }
+  }
+  return cursor;
+}
+
+function skipTomlTrivia(source: string, index: number): number {
+  let cursor = index;
+  for (;;) {
+    while (cursor < source.length && " \t\r\n".includes(source[cursor] ?? "")) {
+      cursor += 1;
+    }
+    if (source[cursor] !== "#") {
+      return cursor;
+    }
+    while (cursor < source.length && source[cursor] !== "\n") {
+      cursor += 1;
+    }
+  }
+}
+
+function skipTomlHeader(source: string, index: number): number | null {
+  let depth = 0;
+  let cursor = index;
+  while (source[cursor] === "[") {
+    depth += 1;
+    cursor += 1;
+    if (depth > 2) {
+      return null;
+    }
+  }
+  while (cursor < source.length && source[cursor] !== "]" && source[cursor] !== "\n") {
+    if (source[cursor] === '"' || source[cursor] === "'") {
+      const end = skipTomlString(source, cursor);
+      if (end === null) {
+        return null;
+      }
+      cursor = end;
+      continue;
+    }
+    cursor += 1;
+  }
+  if (source[cursor] !== "]") {
+    return null;
+  }
+  cursor += 1;
+  if (depth === 2) {
+    if (source[cursor] !== "]") {
+      return null;
+    }
+    cursor += 1;
+  }
+  return cursor;
+}
+
+function skipTomlKey(source: string, index: number): number | null {
+  let cursor = skipTomlTrivia(source, index);
+  for (;;) {
+    if (source[cursor] === '"' || source[cursor] === "'") {
+      const end = skipTomlString(source, cursor);
+      if (end === null) {
+        return null;
+      }
+      cursor = end;
+    } else if (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
+      while (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
+        cursor += 1;
+      }
+    } else {
+      return null;
+    }
+    const after = skipTomlTrivia(source, cursor);
+    if (source[after] !== ".") {
+      return after;
+    }
+    cursor = skipTomlTrivia(source, after + 1);
+  }
+}
+
+function skipTomlString(source: string, index: number): number | null {
+  if (source.startsWith('"""', index) || source.startsWith("'''", index)) {
+    const quote = source.slice(index, index + 3);
+    let cursor = index + 3;
+    if (source[cursor] === "\r") {
+      cursor += 1;
+    }
+    if (source[cursor] === "\n") {
+      cursor += 1;
+    }
+    while (cursor < source.length) {
+      if (quote === '"""' && source[cursor] === "\\") {
+        cursor += 2;
+        continue;
+      }
+      if (source.startsWith(quote, cursor)) {
+        return cursor + 3;
+      }
+      cursor += 1;
+    }
+    return null;
+  }
+  const quote = source[index];
+  if (quote !== '"' && quote !== "'") {
+    return null;
+  }
+  let cursor = index + 1;
+  while (cursor < source.length) {
+    if (quote === '"' && source[cursor] === "\\") {
+      cursor += 2;
+      continue;
+    }
+    if (source[cursor] === quote) {
+      return cursor + 1;
+    }
+    if (source[cursor] === "\n") {
+      return null;
+    }
+    cursor += 1;
+  }
+  return null;
+}
+
+function tomlWord(source: string, index: number): string {
+  let cursor = index;
+  while (/[A-Za-z]/.test(source[cursor] ?? "")) {
+    cursor += 1;
+  }
+  return source.slice(index, cursor);
+}
+
+function isTomlDigit(char: string): boolean {
+  return char >= "0" && char <= "9";
+}
 
 /**
  * `server.bind` is a `SocketAddr`. Figment rejects it while extracting, before

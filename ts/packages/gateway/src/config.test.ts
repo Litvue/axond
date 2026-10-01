@@ -99,15 +99,14 @@ test("a postgres sink rejects a missing dsn, a bad table, and a batch that does 
 
 test("a postgres usage sink keeps every digit of a batch above 2^53", async () => {
   const huge = "18446744073709551615";
+  const i64Max = "9223372036854775807";
   await assert.rejects(
     () =>
       loadConfig(
         `${BASE}\n[[usage_sink]]\nkind = "postgres"\ndsn_env = "DSN"\nbuffer_capacity = 1\nmax_batch = ${huge}\n`,
         secrets,
       ),
-    new RegExp(
-      "usage_sink `postgres`: max_batch \\(" + huge + "\\) must not exceed buffer_capacity \\(1\\)",
-    ),
+    /TOML parse error at line \d+, column \d+\n[\s\S]*number too large to fit in target type/,
   );
   await assert.rejects(
     () =>
@@ -115,10 +114,10 @@ test("a postgres usage sink keeps every digit of a batch above 2^53", async () =
         `${BASE}\n[[usage_sink]]\nkind = "postgres"\nbuffer_capacity = ${huge}\n`,
         secrets,
       ),
-    /usage_sink `postgres`: `dsn_env` must name the env var holding the connection string/,
+    /number too large to fit in target type/,
   );
   const loaded = await loadConfig(
-    `${BASE}\n[[usage_sink]]\nkind = "postgres"\ndsn_env = "DSN"\nbuffer_capacity = ${huge}\nflush_interval_ms = ${huge}\n`,
+    `${BASE}\n[[usage_sink]]\nkind = "postgres"\ndsn_env = "DSN"\nbuffer_capacity = ${i64Max}\nflush_interval_ms = ${i64Max}\n`,
     secrets,
   );
   assert.equal(loaded.usageSinks[0]!.bufferCapacity, Number.MAX_SAFE_INTEGER);
@@ -139,6 +138,96 @@ test("a postgres usage sink keeps every digit of a batch above 2^53", async () =
       ),
     /max_batch \(18446744073709551615\) must not exceed buffer_capacity \(1\)/,
   );
+  await assert.rejects(
+    () =>
+      loadConfig(
+        `${BASE}\n[[usage_sink]]\nkind = "postgres"\ndsn_env = "DSN"\nbuffer_capacity = 1\nmax_batch = ${i64Max}\n`,
+        secrets,
+      ),
+    /max_batch \(9223372036854775807\) must not exceed buffer_capacity \(1\)/,
+  );
+});
+
+test("a toml integer outside i64 is a parse error before extract", async () => {
+  const diagram = (source: string, token: string, message: string) => {
+    const index = source.indexOf(token);
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", message);
+        return true;
+      },
+    );
+  };
+  const tooLarge = "9223372036854775808";
+  const tooSmall = "-9223372036854775809";
+  const large = "number too large to fit in target type";
+  const small = "number too small to fit in target type";
+  const failover = `failover = { overall_timeout_ms = ${tooLarge} }`;
+  const beforeShutdown = `${failover}\n[shutdown]\nnope = 1\n${BASE}`;
+  await reject(beforeShutdown, diagram(beforeShutdown, tooLarge, large));
+  const afterShutdown = `[shutdown]\nnope = 1\n${failover}\n${BASE}`;
+  const afterMessage = diagram(afterShutdown, tooLarge, large);
+  await reject(afterShutdown, afterMessage);
+  assert.equal(afterMessage.includes("unknown field"), false);
+  for (const [line, token, message] of [
+    [`n = ${tooSmall}`, tooSmall, small],
+    [`n = +${tooLarge}`, `+${tooLarge}`, large],
+    [`n = 9_223_372_036_854_775_808`, "9_223_372_036_854_775_808", large],
+    [`n = 0x8000000000000000`, "0x8000000000000000", large],
+    [`n = 0x8000_0000_0000_0000`, "0x8000_0000_0000_0000", large],
+    [`n = 0o1000000000000000000000`, "0o1000000000000000000000", large],
+    [`n = 0b${"1"}${"0".repeat(63)}`, `0b${"1"}${"0".repeat(63)}`, large],
+  ] as const) {
+    const source = `${line}\n${BASE}`;
+    await reject(source, diagram(source, token, message));
+  }
+  const kept = await loadConfig(
+    `# ${tooLarge}\nlabel = "${tooLarge}"\n${tooLarge} = 1\n[failover]\noverall_timeout_ms = 9223372036854775807\n${BASE}`,
+    secrets,
+  );
+  assert.equal(kept.transport.overallTimeoutMs, 9223372036854775807n);
+  const hex = await loadConfig(`${BASE}\n[failover]\noverall_timeout_ms = 0x7fffffffffffffff\n`, secrets);
+  assert.equal(hex.transport.overallTimeoutMs, 9223372036854775807n);
+  await assert.rejects(
+    () => loadConfig(`${BASE}\n[failover]\noverall_timeout_ms = -9223372036854775808\n`, secrets),
+    /invalid value signed int `-9223372036854775808`, expected u64/,
+  );
+  await assert.rejects(
+    () => loadConfig(`${BASE}\n[failover]\noverall_timeout_ms = 1e20\n`, secrets),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : "";
+      assert.equal(message.includes("TOML parse error"), false);
+      assert.match(message, /expected u64/);
+      return true;
+    },
+  );
+  await assert.rejects(
+    () => loadConfig(`${BASE}\n[failover]\noverall_timeout_ms = 0922\n`, secrets),
+    (error: unknown) => {
+      const message = error instanceof Error ? error.message : "";
+      assert.equal(message.includes("number too large"), false);
+      assert.match(message, /leading zero/);
+      return true;
+    },
+  );
+  const dated = `[failover]\noverall_timeout_ms = 1979-05-27 07:32:00Z\n${failover}\n${BASE}`;
+  await reject(dated, diagram(dated, tooLarge, large));
 });
 
 test("storage_fields_match_the_rust_boot_refusals", async () => {
@@ -219,7 +308,7 @@ test("storage_fields_match_the_rust_boot_refusals", async () => {
   );
   await refuse(
     `${BASE}\n[storage.usage_index]\nbuffer_capacity = 18446744073709551616\n`,
-    /config: number too large to fit in target type/,
+    /TOML parse error at line \d+, column \d+\n[\s\S]*number too large to fit in target type/,
   );
 
   const tuned = await loadConfig(
@@ -603,7 +692,14 @@ test("server bind matches the rust socket address refusal", async () => {
   await reject(withBind("bind = true"), typed("bool true"));
   await reject(withBind('bind = ["127.0.0.1", 8080]'), typed("sequence"));
   await reject(withBind('bind = { host = "127.0.0.1", port = 8080 }'), typed("map"));
-  await reject(withBind("bind = 9223372036854775808"), "config: number too large to fit in target type");
+  await reject(
+    withBind("bind = 9223372036854775808"),
+    "config: TOML parse error at line 3, column 8\n" +
+      "  |\n" +
+      "3 | bind = 9223372036854775808\n" +
+      "  |        ^\n" +
+      "number too large to fit in target type\n",
+  );
   await reject(
     `${withBind('bind = "localhost:8080"')}\n[budget]\nenabled = true\n`,
     syntax,

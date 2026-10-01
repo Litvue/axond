@@ -44,12 +44,13 @@ export function figmentFileSource(located: string, cwd = process.cwd()): string 
   return located;
 }
 
-/** A Figment extract failure names the file. A TOML parse error does not. */
+/** A Figment extract failure, or a TOML integer outside i64, names the file. */
 export function wantsFigmentLocation(detail: string): boolean {
   if (detail.includes(" in `AXOND_` environment variable(s)") || detail.endsWith(" TOML file")) {
     return false;
   }
   return (
+    detail.startsWith("TOML parse error") ||
     detail.startsWith("invalid type:") ||
     detail.startsWith("invalid length ") ||
     detail.startsWith("invalid value ") ||
