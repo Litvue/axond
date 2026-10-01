@@ -528,6 +528,58 @@ function namespaceFrom(row: Record<string, unknown>): NamespaceWrite {
 }
 
 /**
+ * Apply `POSTGRES_SCHEMA`. A role with only `pg_read_all_data` and
+ * `pg_write_all_data` cannot `CREATE`, and `CREATE TABLE IF NOT EXISTS`
+ * still fails when the tables are already there. In that case the existing
+ * tables are enough. A missing table is named, and the driver text is not.
+ */
+export async function applyPostgresSchema(client: SqlExecutor): Promise<void> {
+  try {
+    await client.query(POSTGRES_SCHEMA);
+  } catch (error) {
+    if (!postgresInsufficientPrivilege(error)) {
+      throw error;
+    }
+    const missing = await missingPostgresTables(client, postgresSchemaTables());
+    if (missing.length > 0) {
+      throw new Error(`postgres schema is missing ${missing.join(", ")}`);
+    }
+  }
+}
+
+export function postgresSchemaTables(sql = POSTGRES_SCHEMA): string[] {
+  return [...sql.matchAll(/CREATE TABLE IF NOT EXISTS\s+([a-zA-Z_][a-zA-Z0-9_]*)/g)].map((match) => match[1]!);
+}
+
+function postgresInsufficientPrivilege(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "42501";
+}
+
+async function missingPostgresTables(client: SqlExecutor, tables: readonly string[]): Promise<string[]> {
+  const missing: string[] = [];
+  for (const table of tables) {
+    const found = await client.query("SELECT to_regclass($1) AS name", [table]);
+    if (found.rows[0]?.["name"] == null) {
+      missing.push(table);
+    }
+  }
+  return missing;
+}
+
+function existingCreateTables(sql: string): string[] | null {
+  const parts = sql.split(";").map((part) => part.trim()).filter((part) => part.length > 0);
+  const names: string[] = [];
+  for (const part of parts) {
+    const match = /^CREATE TABLE IF NOT EXISTS\s+([a-zA-Z_][a-zA-Z0-9_]*)\b/i.exec(part);
+    if (!match?.[1]) {
+      return null;
+    }
+    names.push(match[1]);
+  }
+  return names.length > 0 ? names : null;
+}
+
+/**
  * Apply one extension migration if its id is not already recorded.
  * A second call leaves the database unchanged. A failed statement is rolled
  * back and is not recorded. The thrown error names the id and omits the
@@ -580,9 +632,38 @@ export async function applyPostgresMigrationOn(client: SqlExecutor, id: string, 
       await client.query("INSERT INTO axond_schema_migrations (id) VALUES ($1)", [id]);
     }
     await client.query("COMMIT");
-  } catch {
+  } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
+    const tables = existingCreateTables(sql);
+    if (postgresInsufficientPrivilege(error) && tables && (await missingPostgresTables(client, tables)).length === 0) {
+      try {
+        await recordPostgresMigration(client, id);
+        return;
+      } catch {
+        throw new Error(`extension migration ${id} failed`);
+      }
+    }
     throw new Error(`extension migration ${id} failed`);
+  }
+}
+
+async function recordPostgresMigration(client: SqlExecutor, id: string): Promise<void> {
+  await client.query("BEGIN");
+  try {
+    const lock = await client.query(
+      "INSERT INTO axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id RETURNING id",
+    );
+    if (lock.rows.length !== 1) {
+      throw new Error("schema lock row is missing");
+    }
+    const existing = await client.query("SELECT id FROM axond_schema_migrations WHERE id = $1", [id]);
+    if (existing.rows.length === 0) {
+      await client.query("INSERT INTO axond_schema_migrations (id) VALUES ($1)", [id]);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
   }
 }
 

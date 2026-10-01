@@ -5,7 +5,9 @@ compatibility_flags = ["nodejs_compat"]
 
 # PlanetScale Postgres is reached through Hyperdrive. Disable Hyperdrive's
 # cache for this config (`wrangler hyperdrive update <id> --caching-disabled`):
-# a cached namespace or budget read can admit a deleted namespace. Fill the id
+# a cached namespace or budget read can admit a deleted namespace. A role with
+# `pg_read_all_data` and `pg_write_all_data` cannot CREATE. Apply the schema
+# once as an owner; this Worker then skips that DDL. Fill the id
 # from `wrangler hyperdrive create`. Local `wrangler dev` reads
 # CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE and does not use
 # this id. That local path was exercised against Postgres 16; PlanetScale was not.

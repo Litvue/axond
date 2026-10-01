@@ -24,7 +24,7 @@ import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
-import { applyPostgresMigration, createPostgresStore, POSTGRES_SCHEMA } from "./postgres-store.ts";
+import { applyPostgresMigration, applyPostgresSchema, createPostgresStore } from "./postgres-store.ts";
 import { openSqliteStore } from "./sqlite-store.ts";
 
 const { Client } = pg;
@@ -351,7 +351,13 @@ function requirePostgresDsn(storage: { dsn?: string; dsnEnv?: string }): string 
 async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgresStore>[1]) {
   const setup = new Client({ connectionString: dsn });
   await setup.connect();
-  await setup.query(POSTGRES_SCHEMA);
+  await applyPostgresSchema({
+    query: async (sql, params) => {
+      const result = params === undefined ? await setup.query(sql) : await setup.query(sql, [...params]);
+      const row = Array.isArray(result) ? result[result.length - 1] : result;
+      return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
+    },
+  });
   await setup.end();
   return createPostgresStore(async () => {
     const client = new Client({ connectionString: dsn });

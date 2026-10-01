@@ -5,7 +5,7 @@ import { rateLimitExtension } from "@axond/rate-limit";
 import type { AxondExtension, CredentialConfig, PriceRule, ProviderConfig, Store } from "@axond/sdk";
 
 import { discoverOnce, type CatalogMetrics } from "../../cli/src/discovery.ts";
-import { applyPostgresMigrationOn, createPostgresStore, POSTGRES_SCHEMA } from "../../cli/src/postgres-store.ts";
+import { applyPostgresMigrationOn, applyPostgresSchema, createPostgresStore } from "../../cli/src/postgres-store.ts";
 
 export interface WorkerEnv {
   HYPERDRIVE: { connectionString: string };
@@ -31,6 +31,8 @@ interface WaitContext {
  * at startup instead. Hyperdrive supplies the Postgres connection string;
  * each call opens one client and closes it, with no session-level SET.
  * Extension migrations lock `axond_schema_lock` with a row update Hyperdrive can run.
+ * A Hyperdrive role with read and write grants and no CREATE skips DDL when
+ * the tables are already present.
  * A failed schema apply is not kept, so the next request can retry. A
  * successful apply stays for the isolate.
  * `PRICES_JSON` is the price list a chat uses when it settles.
@@ -173,7 +175,6 @@ export default {
 };
 
 async function prepareWorkerSchema(client: Client, extensions: readonly AxondExtension[]): Promise<void> {
-  await client.query(POSTGRES_SCHEMA);
   const executor = {
     query: async (sql: string, params?: readonly unknown[]) => {
       const result = params === undefined ? await client.query(sql) : await client.query(sql, [...params]);
@@ -181,6 +182,7 @@ async function prepareWorkerSchema(client: Client, extensions: readonly AxondExt
       return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
     },
   };
+  await applyPostgresSchema(executor);
   for (const extension of extensions) {
     for (const [index, sql] of (extension.migrations ?? []).entries()) {
       await applyPostgresMigrationOn(executor, `${extension.name}:${index}`, sql);

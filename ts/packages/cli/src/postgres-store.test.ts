@@ -8,9 +8,11 @@ import { createMetrics } from "../../gateway/src/metrics.ts";
 import {
   applyPostgresMigration,
   applyPostgresMigrationOn,
+  applyPostgresSchema,
   createPostgresStore,
   POSTGRES_SCHEMA,
   postgresQueryText,
+  postgresSchemaTables,
 } from "./postgres-store.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
 import type { Store } from "@axond/sdk";
@@ -278,6 +280,123 @@ test("a cached namespace read serves a deleted row; the live store does not", { 
   assert.equal((await cached.getNamespace("platform"))?.id, "platform");
   assert.equal(await db.getNamespace("platform"), null);
 });
+
+test("a write role keeps an existing postgres schema and names a missing table", async () => {
+  const tables = postgresSchemaTables();
+  assert.equal(tables.includes("axond_namespace"), true);
+  assert.equal(tables.includes("axond_schema_lock"), true);
+  await applyPostgresSchema({
+    async query(sql, params) {
+      if (sql === POSTGRES_SCHEMA) {
+        const error = new Error("permission denied for schema public password=secret");
+        (error as { code?: string }).code = "42501";
+        throw error;
+      }
+      return { rows: [{ name: String(params?.[0]) }], rowCount: 1 };
+    },
+  });
+  await assert.rejects(
+    () =>
+      applyPostgresSchema({
+        async query(sql, params) {
+          if (sql === POSTGRES_SCHEMA) {
+            const error = new Error("permission denied password=secret");
+            (error as { code?: string }).code = "42501";
+            throw error;
+          }
+          const name = String(params?.[0]);
+          return { rows: [{ name: name === "axond_schema_lock" ? null : name }], rowCount: 1 };
+        },
+      }),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "postgres schema is missing axond_schema_lock");
+      assert.equal(error.message.includes("password=secret"), false);
+      return true;
+    },
+  );
+});
+
+test("a restricted role uses a schema an owner already applied", { skip: !dsn }, async (t) => {
+  const admin = await connect();
+  const role = await admin.client.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+  if (role.rows[0]?.["rolsuper"] !== true) {
+    await admin.release();
+    t.skip("the test role cannot create a restricted role");
+    return;
+  }
+  const password = `pw_${crypto.randomUUID().replaceAll("-", "")}`;
+  await admin.client.query(`
+    DO $$ BEGIN
+      CREATE ROLE axond_rw LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE;
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END $$;
+  `);
+  await admin.client.query(`ALTER ROLE axond_rw PASSWORD '${password}'`);
+  const exists = await admin.client.query("SELECT 1 FROM pg_database WHERE datname = 'axond_rw'");
+  if (exists.rows.length === 0) {
+    await admin.client.query("CREATE DATABASE axond_rw OWNER CURRENT_USER");
+  }
+  await admin.release();
+  const ownerUrl = new URL(dsn!);
+  ownerUrl.pathname = "/axond_rw";
+  const owner = new pg.Client({ connectionString: ownerUrl.toString() });
+  await owner.connect();
+  await owner.query("REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+  await owner.query("GRANT USAGE ON SCHEMA public TO axond_rw");
+  await owner.query("GRANT pg_read_all_data, pg_write_all_data TO axond_rw");
+  await applyPostgresSchema(sqlExecutor(owner));
+  await owner.query("DROP TABLE IF EXISTS axond_ext_priv_probe");
+  await owner.query("DELETE FROM axond_schema_migrations WHERE id = 'priv:0'");
+  await owner.query("CREATE TABLE axond_ext_priv_probe (id text primary key)");
+  await owner.end();
+  const restrictedUrl = new URL(ownerUrl.toString());
+  restrictedUrl.username = "axond_rw";
+  restrictedUrl.password = password;
+  const restricted = new pg.Client({ connectionString: restrictedUrl.toString() });
+  await restricted.connect();
+  try {
+    await applyPostgresSchema(sqlExecutor(restricted));
+    await applyPostgresMigrationOn(
+      sqlExecutor(restricted),
+      "priv:0",
+      "CREATE TABLE IF NOT EXISTS axond_ext_priv_probe (id text primary key)",
+    );
+    const recorded = await restricted.query("SELECT id FROM axond_schema_migrations WHERE id = 'priv:0'");
+    assert.equal(recorded.rows.length, 1);
+    await ownerConnectDropLock(ownerUrl.toString());
+    await assert.rejects(() => applyPostgresSchema(sqlExecutor(restricted)), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message.includes("axond_schema_lock"), true);
+      assert.equal(error.message.includes(password), false);
+      return true;
+    });
+  } finally {
+    await restricted.end();
+    const restore = new pg.Client({ connectionString: ownerUrl.toString() });
+    await restore.connect();
+    await applyPostgresSchema(sqlExecutor(restore));
+    await restore.query("DROP TABLE IF EXISTS axond_ext_priv_probe");
+    await restore.end();
+  }
+});
+
+function sqlExecutor(client: pg.Client) {
+  return {
+    async query(sql: string, params?: readonly unknown[]) {
+      const result = params === undefined ? await client.query(sql) : await client.query(sql, [...params]);
+      const row = Array.isArray(result) ? result[result.length - 1] : result;
+      return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
+    },
+  };
+}
+
+async function ownerConnectDropLock(connectionString: string): Promise<void> {
+  const owner = new pg.Client({ connectionString });
+  await owner.connect();
+  await owner.query("DROP TABLE axond_schema_lock");
+  await owner.end();
+}
 
 test("applying the postgres schema twice is idempotent", { skip: !dsn }, async () => {
   const opened = await connect();
