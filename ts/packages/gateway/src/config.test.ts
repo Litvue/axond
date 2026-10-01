@@ -634,6 +634,68 @@ test("a leap second is a valid time", async () => {
   await assert.rejects(() => loadConfig(later, secrets), /number too large to fit in target type/);
 });
 
+test("an impossible clock is a parse error before extract", async () => {
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index, message));
+        return true;
+      },
+    );
+  };
+  const newline = "expected newline, `#`";
+  const time = "invalid time\nvalue is out of range";
+  const date = "invalid date-time\nvalue is out of range";
+  const offset = "invalid time offset\nvalue is out of range";
+  const hour = `n = 24:00:00\n[shutdown]\nnope = 1\n${BASE}`;
+  await reject(hour, hour.indexOf(":"), newline);
+  assert.equal(diagram(hour, hour.indexOf(":"), newline).includes("unknown field"), false);
+  const dated = `n = 2024-01-01T24:00:00\n${BASE}`;
+  await reject(dated, dated.indexOf("T"), newline);
+  const spaced = `n = 2024-01-01 24:00:00\n${BASE}`;
+  await reject(spaced, spaced.indexOf(" 24") + 1, newline);
+  const array = `n = [24:00:00]\n${BASE}`;
+  await reject(array, array.indexOf(":"), "invalid array\nexpected `]`");
+  const minute = `n = 23:60:00\n${BASE}`;
+  await reject(minute, minute.indexOf("60"), time);
+  const second = `n = 23:59:61\n${BASE}`;
+  await reject(second, second.indexOf("61"), time);
+  const dateMinute = `n = 2024-01-01T23:60:00\n${BASE}`;
+  await reject(dateMinute, dateMinute.indexOf("60"), date);
+  const dateSecond = `n = 2024-01-01T23:59:61\n${BASE}`;
+  await reject(dateSecond, dateSecond.indexOf("61"), date);
+  const off = `n = 2024-01-01T00:00:00+24:00\n${BASE}`;
+  await reject(off, off.indexOf("24:00"), offset);
+  const offMinute = `n = 2024-01-01T00:00:00+23:60\n${BASE}`;
+  await reject(offMinute, offMinute.indexOf("60"), offset);
+  const short = `n = 07:32\n${BASE}`;
+  await reject(short, short.indexOf("07:32") + "07:32".length, "invalid time");
+  const later = `n = 23:60:00\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf("60"), time);
+  const earlier = `n = 9223372036854775808\nn = 23:60:00\n${BASE}`;
+  await assert.rejects(() => loadConfig(earlier, secrets), /number too large to fit in target type/);
+  for (const line of ["n = 23:00:00", "n = 23:59:60", "n = 2024-01-01T00:00:00+23:59", "n = 07:32:00"]) {
+    const loaded = await loadConfig(`${line}\n${BASE}`, secrets);
+    assert.equal(loaded.storage.path, "/tmp/axond.sqlite");
+  }
+});
+
 test("storage_fields_match_the_rust_boot_refusals", async () => {
   const instead = (pathBlock: string) => BASE.replace('backend = "sqlite"\npath = "/tmp/axond.sqlite"\n', pathBlock);
   const refuse = async (toml: string, pattern: RegExp) => {

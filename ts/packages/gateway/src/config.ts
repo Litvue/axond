@@ -3172,7 +3172,10 @@ const U64_MAX = 18446744073709551615n;
  * start of that number. `-1e309`, `1e308`, `1e-400`, and `inf` still parse.
  * A calendar day that month does not have is `invalid date-time` and
  * `value is out of range` on the day. `2024-02-29` and `1900-02-28` still parse.
- * A time whose seconds are `60` is a leap second and still parses.
+ * A time whose seconds are `60` is a leap second and still parses. An hour
+ * past 23 is the container's newline diagram on `:` or `T`. A minute past
+ * 59 or a second past 60 is `invalid time` or `invalid date-time`, and
+ * `value is out of range`. An offset hour past 23 is `invalid time offset`.
  */
 function formatTomlIntegerRange(source: string, index: number, message: string): string {
   const line = source.slice(0, index).split("\n").length - 1;
@@ -3469,6 +3472,10 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer,
     if (date !== null) {
       return { end, hit: date, bail: false };
     }
+    const clock = invalidTomlClock(source, index, end, container);
+    if (clock !== null) {
+      return { end, hit: clock, bail: false };
+    }
     const leap = leapSecondAt(source, index, end);
     if (leap !== null) {
       leaps.push(leap);
@@ -3597,6 +3604,97 @@ function leapSecondAt(source: string, index: number, end: number): number | null
     return null;
   }
   return index + match.index + match[0].length - 2;
+}
+
+const TIME_RANGE = "invalid time\nvalue is out of range";
+const OFFSET_RANGE = "invalid time offset\nvalue is out of range";
+
+function invalidTomlClock(
+  source: string,
+  index: number,
+  end: number,
+  container: TomlContainer,
+): { index: number; message: string } | null {
+  const token = source.slice(index, end);
+  const dated = /^(\d{4}-\d{2}-\d{2})([Tt ])(.*)$/.exec(token);
+  if (dated !== null) {
+    return invalidDateTimeTail(dated[2] ?? "", dated[3] ?? "", index, container);
+  }
+  return invalidLocalTime(token, index, container);
+}
+
+function invalidLocalTime(
+  token: string,
+  index: number,
+  container: TomlContainer,
+): { index: number; message: string } | null {
+  const match = /^(\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?(.*)$/.exec(token);
+  if (match === null) {
+    return null;
+  }
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const second = match[3];
+  const rest = match[5] ?? "";
+  if (hour > 23) {
+    return { index: index + 2, message: afterZeroMessage(container) };
+  }
+  if (minute > 59) {
+    return { index: index + 3, message: TIME_RANGE };
+  }
+  if (second === undefined) {
+    return rest === "" ? { index: index + token.length, message: "invalid time" } : null;
+  }
+  if (Number(second) > 60) {
+    return { index: index + 6, message: TIME_RANGE };
+  }
+  if (rest !== "") {
+    return { index: index + token.length - rest.length, message: afterZeroMessage(container) };
+  }
+  return null;
+}
+
+function invalidDateTimeTail(
+  delim: string,
+  tail: string,
+  index: number,
+  container: TomlContainer,
+): { index: number; message: string } | null {
+  const match = /^(\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?([Zz]|[+-]\d{2}:\d{2})?(.*)$/.exec(tail);
+  if (match === null) {
+    return null;
+  }
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const second = match[3];
+  const offset = match[5] ?? "";
+  const rest = match[6] ?? "";
+  const timeStart = index + 11;
+  if (hour > 23) {
+    return { index: delim === " " ? timeStart : index + 10, message: afterZeroMessage(container) };
+  }
+  if (minute > 59) {
+    return { index: timeStart + 3, message: DATE_OUT_OF_RANGE };
+  }
+  if (second === undefined) {
+    return rest === "" ? { index: timeStart + tail.length, message: "invalid date-time" } : null;
+  }
+  if (Number(second) > 60) {
+    return { index: timeStart + 6, message: DATE_OUT_OF_RANGE };
+  }
+  if (offset.startsWith("+") || offset.startsWith("-")) {
+    const offsetAt = timeStart + tail.length - rest.length - offset.length;
+    if (Number(offset.slice(1, 3)) > 23) {
+      return { index: offsetAt + 1, message: OFFSET_RANGE };
+    }
+    if (Number(offset.slice(4, 6)) > 59) {
+      return { index: offsetAt + 4, message: OFFSET_RANGE };
+    }
+  }
+  if (rest !== "") {
+    return { index: timeStart + tail.length - rest.length, message: afterZeroMessage(container) };
+  }
+  return null;
 }
 
 function isTomlDateOrTime(source: string, index: number): boolean {
