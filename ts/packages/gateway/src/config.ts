@@ -3178,6 +3178,13 @@ const U64_MAX = 18446744073709551615n;
  * past 23 is the container's newline diagram on `:` or `T`. A minute past
  * 59 or a second past 60 is `invalid time` or `invalid date-time`, and
  * `value is out of range`. An offset hour past 23 is `invalid time offset`.
+ * An underscore in a number must sit between digits. `1_`, `1__2`, and
+ * `1_e2` are `invalid integer` and `expected digit` at the character after
+ * the underscore. `0x_1` is `invalid hexadecimal integer` on that
+ * underscore, and `0x1_` adds `expected digit`. Octal and binary use their
+ * own labels. A fraction `1.0_` is `invalid floating-point number` and
+ * `expected digit, digit`. An exponent `1e1_` is `expected digit`. `1e_`
+ * is the float label only. `1_000`, `0x1_0`, `1.0_1`, and `1e1_0` still parse.
  */
 function formatTomlIntegerRange(source: string, index: number, message: string): string {
   const line = source.slice(0, index).split("\n").length - 1;
@@ -3423,19 +3430,71 @@ function scanInlineKey(source: string, index: number): TomlScan {
   }
 }
 
+const INTEGER_DIGIT = "invalid integer\nexpected digit";
+const FLOAT_LABEL = "invalid floating-point number";
+const FLOAT_DIGIT = "invalid floating-point number\nexpected digit";
+const FLOAT_FRAC_DIGIT = "invalid floating-point number\nexpected digit, digit";
+
+function radixIntegerLabel(base: number): string {
+  if (base === 16) {
+    return "invalid hexadecimal integer";
+  }
+  if (base === 8) {
+    return "invalid octal integer";
+  }
+  return "invalid binary integer";
+}
+
+/**
+ * `index` is a digit. A later `_` must be followed by another digit.
+ * The caret sits on the character that was supposed to be that digit.
+ */
+function walkGroupedDigits(
+  source: string,
+  index: number,
+  digit: (char: string) => boolean,
+  underscoreMessage: string,
+): { end: number; hit: { index: number; message: string } | null } {
+  let cursor = index + 1;
+  while (cursor < source.length) {
+    const char = source[cursor] ?? "";
+    if (digit(char)) {
+      cursor += 1;
+      continue;
+    }
+    if (char === "_") {
+      const after = cursor + 1;
+      if (digit(source[after] ?? "")) {
+        cursor = after + 1;
+        continue;
+      }
+      return { end: after, hit: { index: after, message: underscoreMessage } };
+    }
+    break;
+  }
+  return { end: cursor, hit: null };
+}
+
 function scanTomlNumber(source: string, index: number, container: TomlContainer, leaps: number[]): TomlScan {
   const head = source[index] ?? "";
   if (source.startsWith("0x", index) || source.startsWith("0o", index) || source.startsWith("0b", index)) {
     const base = source[index + 1] === "x" ? 16 : source[index + 1] === "o" ? 8 : 2;
-    const digits = readRadixDigits(source, index + 2, base);
-    if (digits === null) {
-      return { end: index, hit: null, bail: true };
+    const label = radixIntegerLabel(base);
+    const digit = (char: string) => isRadixDigit(char, base);
+    const prefix = index + 2;
+    if (!digit(source[prefix] ?? "")) {
+      return { end: prefix, hit: { index: prefix, message: label }, bail: false };
     }
-    const integer = BigInt(base === 16 ? `0x${digits}` : base === 8 ? `0o${digits}` : `0b${digits}`);
+    const walked = walkGroupedDigits(source, prefix, digit, `${label}\nexpected digit`);
+    if (walked.hit) {
+      return { end: walked.end, hit: walked.hit, bail: false };
+    }
+    const raw = source.slice(prefix, walked.end).replaceAll("_", "");
+    const integer = BigInt(base === 16 ? `0x${raw}` : base === 8 ? `0o${raw}` : `0b${raw}`);
     if (integer > I64_MAX) {
-      return { end: digitsEnd(source, index + 2, base), hit: { index, message: "number too large to fit in target type" }, bail: false };
+      return { end: walked.end, hit: { index, message: "number too large to fit in target type" }, bail: false };
     }
-    return { end: digitsEnd(source, index + 2, base), hit: null, bail: false };
+    return { end: walked.end, hit: null, bail: false };
   }
   let cursor = index;
   if (head === "+" || head === "-") {
@@ -3453,20 +3512,14 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer,
       return { end: cursor + 1, hit: { index: cursor + 1, message: afterZeroMessage(container) }, bail: false };
     }
   }
-  while (cursor < source.length && (isTomlDigit(source[cursor] ?? "") || source[cursor] === "_")) {
-    cursor += 1;
+  const grouped = walkGroupedDigits(source, cursor, isTomlDigit, INTEGER_DIGIT);
+  if (grouped.hit) {
+    return { end: grouped.end, hit: grouped.hit, bail: false };
   }
+  cursor = grouped.end;
   const next = source[cursor] ?? "";
   if (next === "." || next === "e" || next === "E") {
-    const end = skipTomlFloat(source, cursor);
-    if (end === null) {
-      return { end: cursor, hit: null, bail: true };
-    }
-    const value = Number(source.slice(index, end).replaceAll("_", ""));
-    if (value === Number.POSITIVE_INFINITY) {
-      return { end, hit: { index, message: "invalid floating-point number" }, bail: false };
-    }
-    return { end, hit: null, bail: false };
+    return scanDecimalFloat(source, index, cursor);
   }
   if (next === "-" || next === ":") {
     const end = skipTomlDate(source, cursor);
@@ -3504,39 +3557,38 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer,
   return { end: cursor, hit: null, bail: false };
 }
 
-function readRadixDigits(source: string, index: number, base: number): string | null {
-  let cursor = index;
-  let digits = "";
-  if (!isRadixDigit(source[cursor] ?? "", base)) {
-    return null;
-  }
-  while (cursor < source.length) {
-    const char = source[cursor] ?? "";
-    if (isRadixDigit(char, base)) {
-      digits += char;
-      cursor += 1;
-      continue;
+function scanDecimalFloat(source: string, numberStart: number, cursor: number): TomlScan {
+  let at = cursor;
+  if (source[at] === ".") {
+    const first = at + 1;
+    if (!isTomlDigit(source[first] ?? "")) {
+      return { end: first, hit: { index: first, message: FLOAT_DIGIT }, bail: false };
     }
-    if (char === "_" && isRadixDigit(source[cursor + 1] ?? "", base)) {
-      cursor += 1;
-      continue;
+    const walked = walkGroupedDigits(source, first, isTomlDigit, FLOAT_FRAC_DIGIT);
+    if (walked.hit) {
+      return { end: walked.end, hit: walked.hit, bail: false };
     }
-    break;
+    at = walked.end;
   }
-  return digits;
-}
-
-function digitsEnd(source: string, index: number, base: number): number {
-  let cursor = index;
-  while (cursor < source.length) {
-    const char = source[cursor] ?? "";
-    if (isRadixDigit(char, base) || (char === "_" && isRadixDigit(source[cursor + 1] ?? "", base))) {
-      cursor += char === "_" ? 2 : 1;
-      continue;
+  if (source[at] === "e" || source[at] === "E") {
+    at += 1;
+    if (source[at] === "+" || source[at] === "-") {
+      at += 1;
     }
-    break;
+    if (!isTomlDigit(source[at] ?? "")) {
+      return { end: at, hit: { index: at, message: FLOAT_LABEL }, bail: false };
+    }
+    const walked = walkGroupedDigits(source, at, isTomlDigit, FLOAT_DIGIT);
+    if (walked.hit) {
+      return { end: walked.end, hit: walked.hit, bail: false };
+    }
+    at = walked.end;
   }
-  return cursor;
+  const value = Number(source.slice(numberStart, at).replaceAll("_", ""));
+  if (value === Number.POSITIVE_INFINITY) {
+    return { end: at, hit: { index: numberStart, message: FLOAT_LABEL }, bail: false };
+  }
+  return { end: at, hit: null, bail: false };
 }
 
 function isRadixDigit(char: string, base: number): boolean {
@@ -3547,32 +3599,6 @@ function isRadixDigit(char: string, base: number): boolean {
     return /[0-7]/.test(char);
   }
   return char === "0" || char === "1";
-}
-
-function skipTomlFloat(source: string, index: number): number | null {
-  let cursor = index;
-  if (source[cursor] === ".") {
-    cursor += 1;
-    if (!isTomlDigit(source[cursor] ?? "")) {
-      return null;
-    }
-    while (isTomlDigit(source[cursor] ?? "") || source[cursor] === "_") {
-      cursor += 1;
-    }
-  }
-  if (source[cursor] === "e" || source[cursor] === "E") {
-    cursor += 1;
-    if (source[cursor] === "+" || source[cursor] === "-") {
-      cursor += 1;
-    }
-    if (!isTomlDigit(source[cursor] ?? "")) {
-      return null;
-    }
-    while (isTomlDigit(source[cursor] ?? "") || source[cursor] === "_") {
-      cursor += 1;
-    }
-  }
-  return cursor;
 }
 
 /**

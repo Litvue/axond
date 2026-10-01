@@ -175,7 +175,13 @@ and before a later integer. `2024-02-29`, `1900-02-28`, and a quoted
 `2024-01-01T23:59:60Z`, still parses. An hour past 23 is the newline diagram
 on `:` or `T`. A minute past 59 or a second past 60 is `invalid time` or
 `invalid date-time`, and `value is out of range`. An offset of `+24:00` is
-`invalid time offset`.
+`invalid time offset`. An underscore in a number must sit between
+digits. `1__2` and `1_` are `invalid integer` and `expected digit` at the
+character after the underscore, before extract and before a later integer.
+`0x_1` is `invalid hexadecimal integer` on the underscore. `0x1_` adds
+`expected digit`. A fraction `1.0_` is `invalid floating-point number` and
+`expected digit, digit`. `1e_` is the float label only. `1_000`, `0x1_0`,
+`1.0_1`, and `1e1_0` still parse.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

@@ -510,6 +510,80 @@ test("a leading zero is a parse error before extract", async () => {
   assert.equal(plusZero.storage.path, "/tmp/axond.sqlite");
 });
 
+test("an underscore outside a digit pair is a parse error before extract", async () => {
+  const integer = "invalid integer\nexpected digit";
+  const hex = "invalid hexadecimal integer";
+  const hexDigit = "invalid hexadecimal integer\nexpected digit";
+  const octal = "invalid octal integer";
+  const binary = "invalid binary integer\nexpected digit";
+  const fraction = "invalid floating-point number\nexpected digit, digit";
+  const exponent = "invalid floating-point number\nexpected digit";
+  const floatLabel = "invalid floating-point number";
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index, message));
+        return true;
+      },
+    );
+  };
+  const beforeShutdown = `n = 1__2\n[shutdown]\nnope = 1\n${BASE}`;
+  const pair = beforeShutdown.indexOf("__") + 1;
+  const pairMessage = diagram(beforeShutdown, pair, integer);
+  await reject(beforeShutdown, pair, integer);
+  assert.equal(pairMessage.includes("unknown field"), false);
+  assert.equal(pairMessage.includes("number too large"), false);
+  const later = `n = 1_\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf("1_") + 2, integer);
+  const earlier = `n = 9223372036854775808\nn = 1__2\n${BASE}`;
+  await reject(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type");
+  const exponentDigit = `n = 1_e2\n${BASE}`;
+  await reject(exponentDigit, exponentDigit.indexOf("1_e") + 2, integer);
+  const array = `n = [1__2]\n${BASE}`;
+  await reject(array, array.indexOf("__") + 1, integer);
+  const table = `n = { a = 1_ }\n${BASE}`;
+  await reject(table, table.indexOf("1_ ") + 2, integer);
+  const hexPrefix = `n = 0x_1\n${BASE}`;
+  await reject(hexPrefix, hexPrefix.indexOf("0x_") + 2, hex);
+  const hexTail = `n = 0x1_\n${BASE}`;
+  await reject(hexTail, hexTail.indexOf("0x1_") + 4, hexDigit);
+  const octalPrefix = `n = 0o_1\n${BASE}`;
+  await reject(octalPrefix, octalPrefix.indexOf("0o_") + 2, octal);
+  const binaryTail = `n = 0b1_\n${BASE}`;
+  await reject(binaryTail, binaryTail.indexOf("0b1_") + 4, binary);
+  const badDigit = `n = 0xg\n${BASE}`;
+  await reject(badDigit, badDigit.indexOf("0xg") + 2, hex);
+  const frac = `n = 1.0_\n${BASE}`;
+  await reject(frac, frac.indexOf("1.0_") + 4, fraction);
+  const exp = `n = 1e1_\n${BASE}`;
+  await reject(exp, exp.indexOf("1e1_") + 4, exponent);
+  const expStart = `n = 1e_\n${BASE}`;
+  await reject(expStart, expStart.indexOf("1e_") + 2, floatLabel);
+  const fracStart = `n = 1._0\n${BASE}`;
+  await reject(fracStart, fracStart.indexOf("1._") + 2, exponent);
+  for (const line of ["n = 1_000", "n = 0x1_0", "n = 1.0_1", "n = 1e1_0", "n = +1_000", "n = 0o0_755", "n = 0b1_0_1"]) {
+    const loaded = await loadConfig(`${line}\n${BASE}`, secrets);
+    assert.equal(loaded.storage.path, "/tmp/axond.sqlite");
+  }
+  await assert.rejects(() => loadConfig(`n = 1_000\n[shutdown]\nnope = 1\n${BASE}`, secrets), /unknown field/);
+});
+
 test("a float past the finite range is a parse error before extract", async () => {
   const message = "invalid floating-point number";
   const diagram = (source: string, index: number) => {
