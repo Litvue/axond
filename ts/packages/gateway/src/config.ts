@@ -3361,7 +3361,7 @@ function scanTomlInline(source: string, index: number, leaps: number[]): TomlSca
       return inlineTableHit(cursor);
     }
     if (!canStartInlineKey(source, cursor)) {
-      return { end: cursor, hit: null, bail: true };
+      return inlineTableHit(cursor);
     }
     const keyEnd = scanInlineKey(source, cursor);
     if (keyEnd.hit || keyEnd.bail) {
@@ -3403,31 +3403,7 @@ function scanInlineTableValue(source: string, index: number, leaps: number[]): T
 }
 
 function scanInlineKey(source: string, index: number): TomlScan {
-  let cursor = index;
-  for (;;) {
-    if (source[cursor] === '"' || source[cursor] === "'") {
-      const scanned = scanTomlString(source, cursor);
-      if (scanned.hit || scanned.bail) {
-        return scanned;
-      }
-      cursor = scanned.end;
-    } else if (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
-      while (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
-        cursor += 1;
-      }
-    } else {
-      return { end: cursor, hit: null, bail: true };
-    }
-    const after = skipInlineWs(source, cursor);
-    if (source[after] !== ".") {
-      return { end: cursor, hit: null, bail: false };
-    }
-    const next = skipInlineWs(source, after + 1);
-    if (!canStartInlineKey(source, next)) {
-      return { end: next, hit: null, bail: true };
-    }
-    cursor = next;
-  }
+  return scanDottedKey(source, index, "equals");
 }
 
 const INTEGER_DIGIT = "invalid integer\nexpected digit";
@@ -3794,62 +3770,101 @@ function skipTomlTrivia(source: string, index: number): number {
   }
 }
 
-function skipTomlHeader(source: string, index: number): TomlScan {
-  let depth = 0;
+const KEY_EQUALS = "expected `.`, `=`";
+const INVALID_KEY = "invalid key";
+const HEADER_STD = "invalid table header\nexpected `.`, `]`";
+const HEADER_ARRAY = "invalid table header\nexpected `.`, `]]`";
+const HEADER_TRAIL = "invalid table header\nexpected newline, `#`";
+
+type KeyStop = "equals" | "header-std" | "header-array";
+
+/**
+ * A dotted key allows spaces and tabs around `.`. A `.` that is not followed
+ * by another segment is reported on that dot. A key that never starts is
+ * `invalid key`, except an inline table, which still wants `}`.
+ */
+function scanDottedKey(source: string, index: number, stop: KeyStop): TomlScan {
   let cursor = index;
-  while (source[cursor] === "[") {
-    depth += 1;
-    cursor += 1;
-    if (depth > 2) {
-      return { end: cursor, hit: null, bail: true };
-    }
-  }
-  while (cursor < source.length && source[cursor] !== "]" && source[cursor] !== "\n") {
+  for (;;) {
+    let segmentEnd: number;
     if (source[cursor] === '"' || source[cursor] === "'") {
       const scanned = scanTomlString(source, cursor);
       if (scanned.hit || scanned.bail) {
         return scanned;
       }
-      cursor = scanned.end;
-      continue;
+      segmentEnd = scanned.end;
+    } else {
+      segmentEnd = cursor;
+      while (/[A-Za-z0-9_-]/.test(source[segmentEnd] ?? "")) {
+        segmentEnd += 1;
+      }
     }
-    cursor += 1;
-  }
-  if (source[cursor] !== "]") {
-    return { end: cursor, hit: null, bail: true };
-  }
-  cursor += 1;
-  if (depth === 2) {
-    if (source[cursor] !== "]") {
-      return { end: cursor, hit: null, bail: true };
+    const after = skipInlineWs(source, segmentEnd);
+    if (source[after] === ".") {
+      const next = skipInlineWs(source, after + 1);
+      if (canStartInlineKey(source, next)) {
+        cursor = next;
+        continue;
+      }
+      return { end: after, hit: { index: after, message: keyStopMessage(stop) }, bail: false };
     }
-    cursor += 1;
+    return finishKeyStop(source, after, stop);
   }
-  return { end: cursor, hit: null, bail: false };
+}
+
+function keyStopMessage(stop: KeyStop): string {
+  if (stop === "header-std") {
+    return HEADER_STD;
+  }
+  if (stop === "header-array") {
+    return HEADER_ARRAY;
+  }
+  return KEY_EQUALS;
+}
+
+function finishKeyStop(source: string, cursor: number, stop: KeyStop): TomlScan {
+  if (stop === "equals") {
+    if (source[cursor] === "=") {
+      return { end: cursor, hit: null, bail: false };
+    }
+    return { end: cursor, hit: { index: cursor, message: KEY_EQUALS }, bail: false };
+  }
+  if (stop === "header-array") {
+    if (source.startsWith("]]", cursor)) {
+      return finishHeaderLine(source, cursor + 2);
+    }
+    return { end: cursor, hit: { index: cursor, message: HEADER_ARRAY }, bail: false };
+  }
+  if (source[cursor] === "]") {
+    return finishHeaderLine(source, cursor + 1);
+  }
+  return { end: cursor, hit: { index: cursor, message: HEADER_STD }, bail: false };
+}
+
+function finishHeaderLine(source: string, cursor: number): TomlScan {
+  const after = skipInlineWs(source, cursor);
+  const char = source[after] ?? "";
+  if (char === "" || char === "\n" || char === "\r" || char === "#") {
+    return { end: cursor, hit: null, bail: false };
+  }
+  return { end: after, hit: { index: after, message: HEADER_TRAIL }, bail: false };
+}
+
+function skipTomlHeader(source: string, index: number): TomlScan {
+  const array = source.startsWith("[[", index);
+  let cursor = skipInlineWs(source, index + (array ? 2 : 1));
+  if (!canStartInlineKey(source, cursor)) {
+    return { end: cursor, hit: { index: cursor, message: INVALID_KEY }, bail: false };
+  }
+  return scanDottedKey(source, cursor, array ? "header-array" : "header-std");
 }
 
 function skipTomlKey(source: string, index: number): TomlScan {
-  let cursor = skipTomlTrivia(source, index);
-  for (;;) {
-    if (source[cursor] === '"' || source[cursor] === "'") {
-      const scanned = scanTomlString(source, cursor);
-      if (scanned.hit || scanned.bail) {
-        return scanned;
-      }
-      cursor = scanned.end;
-    } else if (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
-      while (/[A-Za-z0-9_-]/.test(source[cursor] ?? "")) {
-        cursor += 1;
-      }
-    } else {
-      return { end: cursor, hit: null, bail: true };
-    }
-    const after = skipTomlTrivia(source, cursor);
-    if (source[after] !== ".") {
-      return { end: after, hit: null, bail: false };
-    }
-    cursor = skipTomlTrivia(source, after + 1);
+  const cursor = skipInlineWs(source, index);
+  if (!canStartInlineKey(source, cursor)) {
+    return { end: cursor, hit: { index: cursor, message: INVALID_KEY }, bail: false };
   }
+  return scanDottedKey(source, cursor, "equals");
 }
 
 const ESCAPE_SEQUENCE_MESSAGE = "invalid escape sequence\nexpected `b`, `f`, `n`, `r`, `t`, `u`, `U`, `\\`, `\"`";

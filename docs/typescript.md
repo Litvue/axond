@@ -181,7 +181,11 @@ character after the underscore, before extract and before a later integer.
 `0x_1` is `invalid hexadecimal integer` on the underscore. `0x1_` adds
 `expected digit`. A fraction `1.0_` is `invalid floating-point number` and
 `expected digit, digit`. `1e_` is the float label only. `1_000`, `0x1_0`,
-`1.0_1`, and `1e1_0` still parse.
+`1.0_1`, and `1e1_0` still parse. A dotted key with an empty segment,
+such as `a..b` or `a.`, is `expected `.`, `=`` on that dot, before
+extract and before a later integer. A table header uses `invalid table
+header` and `` expected `.`, `]` ``. An array-of-tables header expects
+`` `]]` ``. A key that never starts is `invalid key`. `a.b = 1` still parses.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
