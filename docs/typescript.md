@@ -163,7 +163,10 @@ integer that is only `0` stops there. A following digit, `_`, or a signed
 `+0x` is `expected newline, `#`` at that character, before extract and before
 a later integer. Inside an array the same spot is `invalid array` and
 `` expected `]` ``. Inside an inline table it is the inline closer. `0`,
-`0.5`, `0e1`, and `0x10` still parse.
+`0.5`, `0e1`, and `0x10` still parse. A decimal float that overflows to
+positive infinity is `invalid floating-point number` at the start of the
+number, before extract and before a later integer. `-1e309`, `1e308`,
+`1e-400`, and `inf` still parse.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

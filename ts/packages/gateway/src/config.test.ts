@@ -496,6 +496,60 @@ test("a leading zero is a parse error before extract", async () => {
   assert.equal(plusZero.storage.path, "/tmp/axond.sqlite");
 });
 
+test("a float past the finite range is a parse error before extract", async () => {
+  const message = "invalid floating-point number";
+  const diagram = (source: string, index: number) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index));
+        return true;
+      },
+    );
+  };
+  const beforeShutdown = `n = 1e309\n[shutdown]\nnope = 1\n${BASE}`;
+  const floatMessage = diagram(beforeShutdown, beforeShutdown.indexOf("1e309"));
+  await reject(beforeShutdown, beforeShutdown.indexOf("1e309"));
+  assert.equal(floatMessage.includes("unknown field"), false);
+  assert.equal(floatMessage.includes("number too large"), false);
+  const later = `n = 1e309\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf("1e309"));
+  const earlier = `n = 9223372036854775808\nn = 1e309\n${BASE}`;
+  await assert.rejects(
+    () => loadConfig(earlier, secrets),
+    /number too large to fit in target type/,
+  );
+  const plus = `n = +1e309\n${BASE}`;
+  await reject(plus, plus.indexOf("+1e309"));
+  const dotted = `n = 1.5e309\n${BASE}`;
+  await reject(dotted, dotted.indexOf("1.5e309"));
+  const underscored = `n = 1_0e309\n${BASE}`;
+  await reject(underscored, underscored.indexOf("1_0e309"));
+  const models = `blocklist = { models = [1e309] }\n${BASE}`;
+  await reject(models, models.indexOf("1e309"));
+  const table = `n = { a = 1e309 }\n${BASE}`;
+  await reject(table, table.indexOf("1e309"));
+  for (const line of ["n = -1e309", "n = 1e308", "n = 1e-400", "n = inf", "n = 1e20", "n = 0e309"]) {
+    const loaded = await loadConfig(`${line}\n${BASE}`, secrets);
+    assert.equal(loaded.storage.path, "/tmp/axond.sqlite");
+  }
+});
+
 test("storage_fields_match_the_rust_boot_refusals", async () => {
   const instead = (pathBlock: string) => BASE.replace('backend = "sqlite"\npath = "/tmp/axond.sqlite"\n', pathBlock);
   const refuse = async (toml: string, pattern: RegExp) => {

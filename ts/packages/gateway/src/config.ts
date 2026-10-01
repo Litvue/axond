@@ -3165,7 +3165,9 @@ const U64_MAX = 18446744073709551615n;
  * `0` (optional sign) stops there: a following digit, `_`, or radix letter
  * is `expected newline, `#`` at that character. Inside an array that is
  * `invalid array` / `expected `]``. Inside an inline table it is the inline
- * closer. `0.5`, `0e1`, and `0x10` still parse.
+ * closer. `0.5`, `0e1`, and `0x10` still parse. A decimal float that
+ * parses as positive infinity is `invalid floating-point number` at the
+ * start of that number. `-1e309`, `1e308`, `1e-400`, and `inf` still parse.
  */
 function firstTomlIntegerOutsideI64(source: string): { index: number; message: string } | null {
   return scanTomlDocument(source, 0).hit;
@@ -3451,7 +3453,14 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer)
   const next = source[cursor] ?? "";
   if (next === "." || next === "e" || next === "E") {
     const end = skipTomlFloat(source, cursor);
-    return end === null ? { end: cursor, hit: null, bail: true } : { end, hit: null, bail: false };
+    if (end === null) {
+      return { end: cursor, hit: null, bail: true };
+    }
+    const value = Number(source.slice(index, end).replaceAll("_", ""));
+    if (value === Number.POSITIVE_INFINITY) {
+      return { end, hit: { index, message: "invalid floating-point number" }, bail: false };
+    }
+    return { end, hit: null, bail: false };
   }
   if (next === "-" || next === ":") {
     const end = skipTomlDate(source, cursor);
