@@ -3187,11 +3187,19 @@ const U64_MAX = 18446744073709551615n;
  * is the float label only. `1_000`, `0x1_0`, `1.0_1`, and `1e1_0` still parse.
  */
 function formatTomlIntegerRange(source: string, index: number, message: string): string {
-  const line = source.slice(0, index).split("\n").length - 1;
-  const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
-  const lineEnd = source.indexOf("\n", index);
+  // toml_edit clamps an index past the last byte onto that byte and keeps the
+  // extra columns. A trailing newline stays on that line, one column past the end.
+  let at = index;
+  let columnOffset = 0;
+  if (source.length > 0 && at >= source.length) {
+    columnOffset = at - (source.length - 1);
+    at = source.length - 1;
+  }
+  const line = source.slice(0, at).split("\n").length - 1;
+  const lineStart = source.lastIndexOf("\n", Math.max(0, at - 1)) + 1;
+  const lineEnd = source.indexOf("\n", at);
   const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
-  const column = [...source.slice(lineStart, index)].length;
+  const column = [...source.slice(lineStart, at + 1)].length - 1 + columnOffset;
   const lineNum = line + 1;
   const gutter = String(lineNum).length;
   const pad = " ".repeat(gutter + 1);
@@ -3491,15 +3499,19 @@ function tagTomlValue(scan: TomlScan, token: number): TomlScan {
 }
 
 function scanTomlValue(source: string, index: number, container: TomlContainer, leaps: number[]): TomlScan {
-  const leading = scanTomlTrivia(source, index);
-  if (leading.hit) {
-    return leading;
-  }
-  const cursor = leading.end;
+  // A value may follow spaces and tabs. A newline or comment is the value in
+  // a document or inline table. An array already skipped that trivia.
+  const cursor = skipInlineWs(source, index);
   if (cursor >= source.length) {
-    return { end: cursor, hit: null, bail: true };
+    if (container === "array") {
+      return { end: cursor, hit: { index: cursor, message: ARRAY_AFTER_VALUE }, bail: false };
+    }
+    return { end: cursor, hit: { index: cursor, message: "" }, bail: false };
   }
   const char = source[cursor];
+  if (container !== "array" && (char === "\n" || char === "\r" || char === "#")) {
+    return { end: cursor, hit: { index: cursor, message: STRING_VALUE }, bail: false };
+  }
   if (char === '"' || char === "'") {
     return tagTomlValue(scanTomlString(source, cursor), cursor);
   }
@@ -3614,7 +3626,7 @@ function scanTomlInline(source: string, index: number, leaps: number[]): TomlSca
       if (pending) {
         return { end: mark, hit: { index: mark, message: pending }, bail: false };
       }
-      return { end: cursor, hit: null, bail: true };
+      return inlineTableHit(cursor);
     }
     if (source[cursor] === "}") {
       if (pending) {
@@ -3673,10 +3685,7 @@ function scanTomlInline(source: string, index: number, leaps: number[]): TomlSca
       if (pending) {
         return { end: mark, hit: { index: mark, message: pending }, bail: false };
       }
-      if (isInlineBreak(source, cursor)) {
-        return inlineTableHit(cursor);
-      }
-      return { end: cursor, hit: null, bail: true };
+      return inlineTableHit(cursor);
     }
     if (pending) {
       return { end: mark, hit: { index: mark, message: pending }, bail: false };
@@ -3687,8 +3696,11 @@ function scanTomlInline(source: string, index: number, leaps: number[]): TomlSca
 
 function scanInlineTableValue(source: string, index: number, leaps: number[]): TomlScan {
   const cursor = skipInlineWs(source, index);
-  if (cursor >= source.length || isInlineBreak(source, cursor) || source[cursor] === "}" || source[cursor] === ",") {
-    return { end: cursor, hit: null, bail: true };
+  if (cursor >= source.length) {
+    return { end: cursor, hit: { index: cursor, message: "" }, bail: false };
+  }
+  if (isInlineBreak(source, cursor) || source[cursor] === "}" || source[cursor] === ",") {
+    return { end: cursor, hit: { index: cursor, message: STRING_VALUE }, bail: false };
   }
   return scanTomlValue(source, cursor, "inline", leaps);
 }
@@ -4321,6 +4333,10 @@ function scanTomlString(source: string, index: number, allowMultiline = true): T
   while (cursor < source.length) {
     const char = source[cursor] ?? "";
     if (!literal && char === "\\") {
+      // A backslash with nothing after it never starts an escape. The string ends there.
+      if (cursor + 1 >= source.length) {
+        return { end: cursor, hit: { index: cursor, message: label }, bail: false };
+      }
       const escaped = scanBasicEscape(source, cursor + 1, multiline);
       if (escaped.hit || escaped.bail) {
         return escaped;

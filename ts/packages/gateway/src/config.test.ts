@@ -1078,6 +1078,72 @@ test("an unfinished local time is a parse error before extract", async () => {
   assert.equal(frac.storage.path, "/tmp/axond.sqlite");
 });
 
+test("a file that ends inside a value is a parse error before extract", async () => {
+  const inline = "invalid inline table\nexpected `}`";
+  const array = "invalid array\nexpected `]`";
+  const string = "invalid string\nexpected `\"`, `'`";
+  const basic = "invalid basic string";
+  const escape = "invalid escape sequence\nexpected `b`, `f`, `n`, `r`, `t`, `u`, `U`, `\\`, `\"`";
+  const diagram = (source: string, index: number, message: string) => {
+    let at = index;
+    let columnOffset = 0;
+    if (source.length > 0 && at >= source.length) {
+      columnOffset = at - (source.length - 1);
+      at = source.length - 1;
+    }
+    const line = source.slice(0, at).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, at - 1)) + 1;
+    const lineEnd = source.indexOf("\n", at);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, at + 1)].length - 1 + columnOffset;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index, message));
+        return true;
+      },
+    );
+  };
+  const open = "n = { a = 1, b = 2";
+  await reject(open, open.length, inline);
+  const brace = "n = {";
+  await reject(brace, brace.length, inline);
+  const missing = "n =";
+  await reject(missing, missing.length, "");
+  const emptyArray = "n = [";
+  await reject(emptyArray, emptyArray.length, array);
+  const slash = 'n = "foo\\';
+  await reject(slash, slash.length - 1, basic);
+  const slashNl = 'n = "foo\\\n';
+  await reject(slashNl, slashNl.length, escape);
+  const beforeShutdown = `n =\n[shutdown]\nnope = 1\n${BASE}`;
+  const newline = beforeShutdown.indexOf("\n");
+  const newlineMessage = diagram(beforeShutdown, newline, string);
+  await reject(beforeShutdown, newline, string);
+  assert.equal(newlineMessage.includes("unknown field"), false);
+  assert.equal(newlineMessage.includes("number too large"), false);
+  const later = `n =\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf("\n"), string);
+  const earlier = `n = 9223372036854775808\nn =\n${BASE}`;
+  await reject(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type");
+  const dup = "n = { a = 1, a = 2";
+  await reject(dup, dup.indexOf("{") + 1, "duplicate key `a`");
+  const closed = await loadConfig(`n = { a = 1 }\n${BASE}`, secrets);
+  assert.equal(closed.storage.path, "/tmp/axond.sqlite");
+  const text = await loadConfig(`n = "foo"\n${BASE}`, secrets);
+  assert.equal(text.storage.path, "/tmp/axond.sqlite");
+});
+
 test("a capital true is a string error before extract", async () => {
   const label = "invalid string\nexpected `\"`, `'`";
   const array = "invalid array\nexpected `]`";

@@ -1408,6 +1408,44 @@ namespace = "platform"
   }
 });
 
+test("unclosed_inline_table_is_a_parse_error_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-unclosed-inline-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "open.toml");
+  const line = "n = { a = 1, b = 2";
+  await writeFile(config, line);
+  const column = line.length;
+  const pad = "  ";
+  const diagram =
+    "TOML parse error at line 1, column " +
+    (column + 1) +
+    "\n" +
+    pad +
+    "|\n" +
+    "1 | " +
+    line +
+    "\n" +
+    pad +
+    "|" +
+    " ".repeat(column + 1) +
+    "^\n" +
+    "invalid inline table\nexpected `}`\n" +
+    " in open.toml TOML file\n";
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" + config + "`: config load: " + diagram,
+    );
+    assert.equal(result.stderr.includes("unknown field"), false);
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("capital_true_is_a_string_error_before_the_store_opens", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-capital-true-"));
   const db = join(root, "fresh.sqlite");

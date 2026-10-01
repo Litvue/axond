@@ -223,7 +223,13 @@ that same label. `07:32:00` and `24:00:00` keep their existing diagrams. `TRUE` 
 and before a later integer. `t` and `tru` use that same label on the
 first letter. Inside an array, `T` is `invalid array` and
 `` expected `]` ``, while `t` keeps the string label. `truex` is
-`` expected newline, `#` `` on `x`. `true` still parses.
+`` expected newline, `#` `` on `x`. `true` still parses. A file that ends at `n = { a = 1` is `invalid
+inline table` and `` expected `}` `` one past the last character.
+`n =` at the end of the file is an empty message on that missing
+value. `n =` followed by a newline is `invalid string` and
+`` expected `"`, `'` `` on the newline. A backslash at the end of
+`n = "foo\` is `invalid basic string`. The same text followed by a
+newline keeps the escape diagram on that line.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
