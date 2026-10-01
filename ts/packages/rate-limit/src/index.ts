@@ -12,8 +12,8 @@ const counters = new Map<string, { count: number; resetAt: number }>();
 
 /**
  * pre-dispatch limiter. Isolate mode is per process and can over-admit across
- * replicas. Store mode updates an extension-owned table and is as consistent
- * as that table's transaction.
+ * replicas. Store mode takes one slot with a single upsert, so two Postgres
+ * connections cannot both admit the last request.
  */
 export function rateLimitExtension(options: RateLimitOptions): AxondExtension {
   const mode = options.mode ?? "isolate";
@@ -66,26 +66,16 @@ async function storeAllow(
   options: RateLimitOptions,
 ): Promise<boolean> {
   const bucket = String(Math.floor(Date.now() / options.windowMs));
-  const existing = await store.query(
-    "SELECT count FROM axond_ext_ratelimit_window WHERE namespace = ? AND bucket = ?",
-    [namespace, bucket],
+  const taken = await store.query(
+    `INSERT INTO axond_ext_ratelimit_window (namespace, bucket, count)
+     VALUES (?, ?, 1)
+     ON CONFLICT (namespace, bucket) DO UPDATE
+     SET count = axond_ext_ratelimit_window.count + 1
+     WHERE axond_ext_ratelimit_window.count < ?
+     RETURNING count`,
+    [namespace, bucket, options.limit],
   );
-  const count = existing.rows[0] ? Number(existing.rows[0]["count"]) : 0;
-  if (count >= options.limit) {
-    return false;
-  }
-  if (count === 0) {
-    await store.query(
-      "INSERT INTO axond_ext_ratelimit_window (namespace, bucket, count) VALUES (?, ?, 1)",
-      [namespace, bucket],
-    );
-  } else {
-    await store.query(
-      "UPDATE axond_ext_ratelimit_window SET count = count + 1 WHERE namespace = ? AND bucket = ?",
-      [namespace, bucket],
-    );
-  }
-  return true;
+  return taken.rows.length > 0;
 }
 
 /** Test helper. Isolate counters survive the process, so tests reset them. */

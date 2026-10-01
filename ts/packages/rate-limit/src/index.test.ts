@@ -69,7 +69,7 @@ test("store mode on postgres saturates one namespace and leaves another its capa
     };
   });
   try {
-    for (const id of ["rl-platform", "rl-tenant"]) {
+    for (const id of ["rl-platform", "rl-tenant", "rl-race"]) {
       await store.putNamespace({
         id,
         attrs: {},
@@ -90,11 +90,16 @@ test("store mode on postgres saturates one namespace and leaves another its capa
     assert.equal((await call("rl-platform")).status, 200);
     assert.equal((await call("rl-platform")).status, 429);
     assert.equal((await call("rl-tenant")).status, 200);
+    const raced = await Promise.all(Array.from({ length: 8 }, () => call("rl-race")));
+    assert.equal(raced.filter((response) => response.status === 200).length, 1);
+    assert.equal(raced.filter((response) => response.status === 429).length, 7);
+    const held = await store.query("SELECT count FROM axond_ext_ratelimit_window WHERE namespace = ?", ["rl-race"]);
+    assert.equal(Number(held.rows[0]?.["count"]), 1);
   } finally {
     const cleanup = new pg.Client({ connectionString: dsn });
     await cleanup.connect();
     await cleanup.query("DROP TABLE IF EXISTS axond_ext_ratelimit_window");
-    await cleanup.query("DELETE FROM axond_namespace WHERE id IN ('rl-platform', 'rl-tenant')");
+    await cleanup.query("DELETE FROM axond_namespace WHERE id IN ('rl-platform', 'rl-tenant', 'rl-race')");
     await cleanup.end();
   }
 });
@@ -127,6 +132,8 @@ test("store mode saturates one namespace and leaves another its capacity", async
     assert.equal((await call("platform")).status, 200);
     assert.equal((await call("platform")).status, 429);
     assert.equal((await call("tenant")).status, 200);
+    const held = await store.query("SELECT count FROM axond_ext_ratelimit_window WHERE namespace = ?", ["platform"]);
+    assert.equal(Number(held.rows[0]?.["count"]), 1);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
