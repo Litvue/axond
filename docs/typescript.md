@@ -423,8 +423,10 @@ SQLite inside the container.
 
 ## Worker
 
-`ts/packages/worker` is the Hyperdrive template. Set the Hyperdrive id, keep
-caching disabled, and bundle the Worker with the extensions it imports. A
+`ts/packages/worker` is the Hyperdrive template. Create the Hyperdrive config
+against PlanetScale's direct port 5432 with `sslmode=verify-full` and
+`--caching-disabled`, then set that id. Port 6432 is PgBouncer, and Hyperdrive
+is already the transaction pooler. Bundle the Worker with the extensions it imports. A
 compiled Bun binary loads those same extensions from disk instead. A cron
 trigger (`*/5 * * * *`) runs provider discovery and catalogue import off the
 request path. The refresh walks the platform credential pool, or the lexicographically first tenant pool, and follows `has_more` for up to 20 pages. A failed fetch marks the row stale and leaves the last payload. The process writes JSON `msg` `provider_discovery` with the provider id and a bounded reason, and that line omits the credential and the base URL. A `3xx` from the provider or the catalogue is not followed, so the credential stays on the configured URL.

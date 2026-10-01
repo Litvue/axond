@@ -41,4 +41,4 @@ That switch was exercised on this host. The TypeScript process created `streak-r
 
 The root `Dockerfile`, Kubernetes, Azure, and Compose manifests stay on the Rust image. Switching a deployment to `ts/Dockerfile` or the Worker template is a separate change, and it is not what this 0.x line ships as the release artifact.
 
-A shadow compare of the fixture suite is `ts/scripts/shadow-compare.ts`. It checks status, parsed JSON, and charged `(model, status, cost)`. It is not a production traffic sample. Live Hyperdrive against PlanetScale is not part of this repository's test environment.
+A shadow compare of the fixture suite is `ts/scripts/shadow-compare.ts`. It checks status, parsed JSON, and charged `(model, status, cost)`. It is not a production traffic sample. A Worker Hyperdrive config points at PlanetScale's direct port 5432 with `sslmode=verify-full` and caching disabled. Port 6432 is PgBouncer, and Hyperdrive is already the pooler. Live Hyperdrive against PlanetScale is not part of this repository's test environment.
