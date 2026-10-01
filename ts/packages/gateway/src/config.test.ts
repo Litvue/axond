@@ -709,6 +709,64 @@ test("a control character in a string is a parse error before extract", async ()
   assert.equal(noted.storage.path, "/tmp/axond.sqlite");
 });
 
+test("a duplicate key is a parse error before extract", async () => {
+  const rootDup = "duplicate key `n` in document root";
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index, message));
+        return true;
+      },
+    );
+  };
+  const beforeShutdown = `n = 1\nn = 2\n[shutdown]\nnope = 1\n${BASE}`;
+  const mark = beforeShutdown.indexOf("\nn = 2") + 1;
+  const markMessage = diagram(beforeShutdown, mark, rootDup);
+  await reject(beforeShutdown, mark, rootDup);
+  assert.equal(markMessage.includes("unknown field"), false);
+  assert.equal(markMessage.includes("number too large"), false);
+  const later = `n = 1\nn = 2\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf("\nn = 2") + 1, rootDup);
+  const earlier = `n = 9223372036854775808\nn = 2\n${BASE}`;
+  await reject(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type");
+  const header = `[a]\n[a]\n${BASE}`;
+  await reject(header, header.indexOf("\n[a]") + 1, "invalid table header\nduplicate key `a` in document root");
+  const inline = `n = { a = 1, a = 2 }\n${BASE}`;
+  await reject(inline, inline.indexOf("{") + 1, "duplicate key `a`");
+  const trailed = `n = { a = 1, a = 2, }\n${BASE}`;
+  await reject(trailed, trailed.indexOf("{") + 1, "duplicate key `a`");
+  const nested = `[a]\nn = 1\nn = 2\n${BASE}`;
+  await reject(nested, nested.lastIndexOf("n = 2"), "duplicate key `n` in table `a`");
+  const extend = `a = 1\na.b = 2\n${BASE}`;
+  await reject(extend, extend.indexOf("a.b"), "dotted key `a` attempted to extend non-table type (integer)");
+  const sub = `[fruit.apple]\n[fruit]\napple.taste = "sweet"\n${BASE}`;
+  await reject(sub, sub.indexOf("apple.taste"), "duplicate key `apple`");
+  const headerExtend = `a = 1\n[a.b]\n${BASE}`;
+  await reject(
+    headerExtend,
+    headerExtend.indexOf("[a.b]"),
+    "invalid table header\ndotted key `a` attempted to extend non-table type (integer)",
+  );
+  const dotted = await loadConfig(`a.b = 1\na.c = 2\n${BASE}`, secrets);
+  assert.equal(dotted.storage.path, "/tmp/axond.sqlite");
+});
+
 test("a float past the finite range is a parse error before extract", async () => {
   const message = "invalid floating-point number";
   const diagram = (source: string, index: number) => {

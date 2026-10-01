@@ -191,7 +191,15 @@ string` on that character, before extract and before a later integer. A
 literal string uses `invalid literal string`. A multiline string uses
 `invalid multiline basic string` and may still contain a newline. A control
 character in a comment is an empty message on that character. A tab and
-`\n` inside a multiline string still parse.
+`\n` inside a multiline string still parse. A key defined twice is
+`duplicate key` at the later definition, before extract and before a later
+integer. The document root names `document root`, and `[a.b]` names table
+`a.b`. A repeated `[a]` is `invalid table header` plus that duplicate, with
+the caret on `[`. `a = 1` followed by `a.b = 2` is `` dotted key `a` attempted
+to extend non-table type (integer) ``. An inline `{ a = 1, a = 2 }` reports
+`` duplicate key `a` `` on the first character inside `{`, including when a
+trailing comma follows. `a.b = 1` together with `a.c = 2` still parses, and
+`[[namespace]]` may repeat.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

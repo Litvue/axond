@@ -1408,6 +1408,62 @@ namespace = "platform"
   }
 });
 
+test("duplicate_key_is_a_parse_error_before_the_store_opens", async () => {
+  const root = await mkdtemp(join(tmpdir(), "axond-duplicate-key-"));
+  const db = join(root, "fresh.sqlite");
+  const config = join(root, "dup.toml");
+  const line = "n = 2";
+  await writeFile(
+    config,
+    `n = 1
+${line}
+[shutdown]
+nope = 1
+[server]
+bind = "127.0.0.1:9"
+[storage]
+backend = "sqlite"
+path = "${db}"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`,
+  );
+  const column = 0;
+  const pad = "  ";
+  const diagram =
+    "TOML parse error at line 2, column " +
+    (column + 1) +
+    "\n" +
+    pad +
+    "|\n" +
+    "2 | " +
+    line +
+    "\n" +
+    pad +
+    "|" +
+    " ".repeat(column + 1) +
+    "^\n" +
+    "duplicate key `n` in document root\n" +
+    " in dup.toml TOML file\n";
+  try {
+    const result = await run(config, root, { GW_KEY: "k" });
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.equal(
+      result.stderr,
+      "Error: failed to load config from `" + config + "`: config load: " + diagram,
+    );
+    assert.equal(result.stderr.includes("unknown field"), false);
+    await assert.rejects(() => stat(db));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("empty_dotted_key_is_a_parse_error_before_the_store_opens", async () => {
   const root = await mkdtemp(join(tmpdir(), "axond-dotted-key-"));
   const db = join(root, "fresh.sqlite");

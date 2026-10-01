@@ -3204,9 +3204,173 @@ function formatTomlIntegerRange(source: string, index: number, message: string):
   );
 }
 
-type TomlScan = { end: number; hit: { index: number; message: string } | null; bail: boolean };
+type TomlScan = { end: number; hit: { index: number; message: string } | null; bail: boolean; token?: number };
+
+type TomlScope = "document" | "inline";
+
+interface TomlTable {
+  kind: "table";
+  implicit: boolean;
+  dotted: boolean;
+  items: Map<string, TomlNode>;
+}
+
+type TomlNode = { kind: "value"; typeName: string } | { kind: "inline" } | { kind: "aot"; last: TomlTable } | TomlTable;
+
+function newTomlTable(implicit: boolean, dotted: boolean): TomlTable {
+  return { kind: "table", implicit, dotted, items: new Map() };
+}
+
+function duplicateTomlMessage(key: string, table: readonly string[] | null): string {
+  if (table === null) {
+    return `duplicate key \`${key}\``;
+  }
+  if (table.length === 0) {
+    return `duplicate key \`${key}\` in document root`;
+  }
+  return `duplicate key \`${key}\` in table \`${table.join(".")}\``;
+}
+
+function extendTomlMessage(path: readonly string[], actual: string): string {
+  return `dotted key \`${path.join(".")}\` attempted to extend non-table type (${actual})`;
+}
+
+/** Walk a dotted prefix. An error string is Figment's message, without a header label. */
+function descendToml(
+  table: TomlTable,
+  path: readonly string[],
+  dotted: boolean,
+  scope: TomlScope,
+): TomlTable | string {
+  let current = table;
+  for (let i = 0; i < path.length; i += 1) {
+    const key = path[i] ?? "";
+    const existing = current.items.get(key);
+    if (!existing) {
+      const created = newTomlTable(true, dotted);
+      current.items.set(key, created);
+      current = created;
+      continue;
+    }
+    if (existing.kind === "aot") {
+      current = existing.last;
+      continue;
+    }
+    if (existing.kind === "value" || (existing.kind === "inline" && scope === "document")) {
+      const typeName = existing.kind === "value" ? existing.typeName : "inline table";
+      return extendTomlMessage(path.slice(0, i + 1), typeName);
+    }
+    const implicit = existing.kind === "table" ? existing.implicit : false;
+    if (dotted && !implicit) {
+      return duplicateTomlMessage(key, null);
+    }
+    if (existing.kind !== "table") {
+      return duplicateTomlMessage(key, null);
+    }
+    current = existing;
+  }
+  return current;
+}
+
+function defineTomlKey(
+  table: TomlTable,
+  tablePath: readonly string[],
+  segments: readonly string[],
+  value: TomlNode,
+  scope: TomlScope,
+): string | null {
+  if (segments.length === 0) {
+    return null;
+  }
+  const leaf = segments[segments.length - 1] ?? "";
+  const prefix = segments.slice(0, -1);
+  const landed = descendToml(table, prefix, true, scope);
+  if (typeof landed === "string") {
+    return landed;
+  }
+  if (landed.dotted === (prefix.length === 0)) {
+    return duplicateTomlMessage(leaf, null);
+  }
+  if (landed.items.has(leaf)) {
+    return duplicateTomlMessage(leaf, scope === "inline" ? null : tablePath);
+  }
+  landed.items.set(leaf, value);
+  return null;
+}
+
+function defineTomlHeader(
+  root: TomlTable,
+  segments: readonly string[],
+  array: boolean,
+): { table: TomlTable } | { message: string } {
+  const leaf = segments[segments.length - 1] ?? "";
+  const prefix = segments.slice(0, -1);
+  const parent = descendToml(root, prefix, false, "document");
+  if (typeof parent === "string") {
+    return { message: parent };
+  }
+  const existing = parent.items.get(leaf);
+  if (array) {
+    if (!existing) {
+      const last = newTomlTable(false, false);
+      parent.items.set(leaf, { kind: "aot", last });
+      return { table: last };
+    }
+    if (existing.kind === "aot") {
+      const last = newTomlTable(false, false);
+      existing.last = last;
+      return { table: last };
+    }
+    return { message: duplicateTomlMessage(leaf, prefix) };
+  }
+  if (existing?.kind === "table" && existing.implicit && !existing.dotted) {
+    existing.implicit = false;
+    existing.dotted = false;
+    return { table: existing };
+  }
+  if (existing) {
+    return { message: duplicateTomlMessage(leaf, prefix) };
+  }
+  const created = newTomlTable(false, false);
+  parent.items.set(leaf, created);
+  return { table: created };
+}
+
+function tomlDefinedValue(source: string, start: number, end: number): TomlNode {
+  const char = source[start] ?? "";
+  if (char === '"' || char === "'") {
+    return { kind: "value", typeName: "string" };
+  }
+  if (char === "{") {
+    return { kind: "inline" };
+  }
+  if (char === "[") {
+    return { kind: "value", typeName: "array" };
+  }
+  if (char === "t" || char === "f") {
+    return { kind: "value", typeName: "boolean" };
+  }
+  const slice = source.slice(start, end);
+  if (/^[+-]?(?:inf|nan)$/.test(slice)) {
+    return { kind: "value", typeName: "float" };
+  }
+  if (isTomlDateOrTime(source, start)) {
+    return { kind: "value", typeName: "datetime" };
+  }
+  const body = char === "+" || char === "-" ? start + 1 : start;
+  if (source.startsWith("0x", body) || source.startsWith("0o", body) || source.startsWith("0b", body)) {
+    return { kind: "value", typeName: "integer" };
+  }
+  if (/[.eE]/.test(slice)) {
+    return { kind: "value", typeName: "float" };
+  }
+  return { kind: "value", typeName: "integer" };
+}
 
 function scanTomlDocument(source: string, index: number, leaps: number[] = []): TomlScan {
+  const root = newTomlTable(false, false);
+  let current = root;
+  let currentPath: string[] = [];
   let cursor = index;
   while (cursor < source.length) {
     const leading = scanTomlTrivia(source, cursor);
@@ -3218,14 +3382,28 @@ function scanTomlDocument(source: string, index: number, leaps: number[] = []): 
       break;
     }
     if (source[cursor] === "[") {
-      const header = skipTomlHeader(source, cursor);
+      const at = cursor;
+      const segments: string[] = [];
+      const header = skipTomlHeader(source, cursor, segments);
       if (header.hit || header.bail) {
         return header;
       }
+      const defined = defineTomlHeader(root, segments, source.startsWith("[[", at));
+      if ("message" in defined) {
+        return {
+          end: at,
+          hit: { index: at, message: `invalid table header\n${defined.message}` },
+          bail: false,
+        };
+      }
+      current = defined.table;
+      currentPath = segments.slice();
       cursor = header.end;
       continue;
     }
-    const key = skipTomlKey(source, cursor);
+    const at = cursor;
+    const segments: string[] = [];
+    const key = skipTomlKey(source, cursor, segments);
     if (key.hit || key.bail) {
       return key;
     }
@@ -3240,6 +3418,16 @@ function scanTomlDocument(source: string, index: number, leaps: number[] = []): 
     const value = scanTomlValue(source, cursor + 1, "document", leaps);
     if (value.hit || value.bail) {
       return value;
+    }
+    const failure = defineTomlKey(
+      current,
+      currentPath,
+      segments,
+      tomlDefinedValue(source, value.token ?? cursor + 1, value.end),
+      "document",
+    );
+    if (failure) {
+      return { end: at, hit: { index: at, message: failure }, bail: false };
     }
     cursor = value.end;
   }
@@ -3275,6 +3463,13 @@ function isCompletedZeroBoundary(char: string, container: TomlContainer): boolea
   return false;
 }
 
+function tagTomlValue(scan: TomlScan, token: number): TomlScan {
+  if (scan.hit || scan.bail) {
+    return scan;
+  }
+  return { ...scan, token };
+}
+
 function scanTomlValue(source: string, index: number, container: TomlContainer, leaps: number[]): TomlScan {
   const leading = scanTomlTrivia(source, index);
   if (leading.hit) {
@@ -3286,24 +3481,24 @@ function scanTomlValue(source: string, index: number, container: TomlContainer, 
   }
   const char = source[cursor];
   if (char === '"' || char === "'") {
-    return scanTomlString(source, cursor);
+    return tagTomlValue(scanTomlString(source, cursor), cursor);
   }
   if (char === "{") {
-    return scanTomlInline(source, cursor, leaps);
+    return tagTomlValue(scanTomlInline(source, cursor, leaps), cursor);
   }
   if (char === "[") {
-    return scanTomlArray(source, cursor, leaps);
+    return tagTomlValue(scanTomlArray(source, cursor, leaps), cursor);
   }
   const word = tomlWord(source, cursor);
   if (word === "true" || word === "false" || word === "inf" || word === "nan") {
-    return { end: cursor + word.length, hit: null, bail: false };
+    return { end: cursor + word.length, hit: null, bail: false, token: cursor };
   }
   if ((char === "+" || char === "-") && (source.startsWith("inf", cursor + 1) || source.startsWith("nan", cursor + 1))) {
     const end = cursor + 1 + (source.startsWith("inf", cursor + 1) ? 3 : 3);
-    return { end, hit: null, bail: false };
+    return { end, hit: null, bail: false, token: cursor };
   }
   if (char === "+" || char === "-" || isTomlDigit(char)) {
-    return scanTomlNumber(source, cursor, container, leaps);
+    return tagTomlValue(scanTomlNumber(source, cursor, container, leaps), cursor);
   }
   return { end: cursor, hit: null, bail: true };
 }
@@ -3371,19 +3566,32 @@ function isInlineBreak(source: string, index: number): boolean {
  * continues. Arrays keep their own trailing commas.
  */
 function scanTomlInline(source: string, index: number, leaps: number[]): TomlScan {
+  const root = newTomlTable(false, false);
+  const mark = index + 1;
+  let pending: string | null = null;
   let cursor = index + 1;
   for (;;) {
     cursor = skipInlineWs(source, cursor);
+    if (cursor >= source.length) {
+      if (pending) {
+        return { end: mark, hit: { index: mark, message: pending }, bail: false };
+      }
+      return { end: cursor, hit: null, bail: true };
+    }
     if (source[cursor] === "}") {
+      if (pending) {
+        return { end: mark, hit: { index: mark, message: pending }, bail: false };
+      }
       return { end: cursor + 1, hit: null, bail: false };
     }
-    if (source[cursor] === "," || isInlineBreak(source, cursor)) {
+    if (source[cursor] === "," || isInlineBreak(source, cursor) || !canStartInlineKey(source, cursor)) {
+      if (pending) {
+        return { end: mark, hit: { index: mark, message: pending }, bail: false };
+      }
       return inlineTableHit(cursor);
     }
-    if (!canStartInlineKey(source, cursor)) {
-      return inlineTableHit(cursor);
-    }
-    const keyEnd = scanInlineKey(source, cursor);
+    const segments: string[] = [];
+    const keyEnd = scanDottedKey(source, cursor, "equals", segments);
     if (keyEnd.hit || keyEnd.bail) {
       return keyEnd;
     }
@@ -3395,6 +3603,16 @@ function scanTomlInline(source: string, index: number, leaps: number[]): TomlSca
     if (value.hit || value.bail) {
       return value;
     }
+    const failure = defineTomlKey(
+      root,
+      [],
+      segments,
+      tomlDefinedValue(source, value.token ?? keyEnd.end, value.end),
+      "inline",
+    );
+    if (failure && pending === null) {
+      pending = failure;
+    }
     cursor = skipInlineWs(source, value.end);
     if (source[cursor] === ",") {
       const after = skipInlineWs(source, cursor + 1);
@@ -3402,13 +3620,28 @@ function scanTomlInline(source: string, index: number, leaps: number[]): TomlSca
         cursor = after;
         continue;
       }
+      if (pending) {
+        return { end: mark, hit: { index: mark, message: pending }, bail: false };
+      }
       return inlineTableHit(cursor);
     }
     if (source[cursor] === "}") {
+      if (pending) {
+        return { end: mark, hit: { index: mark, message: pending }, bail: false };
+      }
       return { end: cursor + 1, hit: null, bail: false };
     }
-    if (isInlineBreak(source, cursor)) {
-      return inlineTableHit(cursor);
+    if (isInlineBreak(source, cursor) || cursor >= source.length) {
+      if (pending) {
+        return { end: mark, hit: { index: mark, message: pending }, bail: false };
+      }
+      if (isInlineBreak(source, cursor)) {
+        return inlineTableHit(cursor);
+      }
+      return { end: cursor, hit: null, bail: true };
+    }
+    if (pending) {
+      return { end: mark, hit: { index: mark, message: pending }, bail: false };
     }
     return { end: cursor, hit: null, bail: true };
   }
@@ -3420,10 +3653,6 @@ function scanInlineTableValue(source: string, index: number, leaps: number[]): T
     return { end: cursor, hit: null, bail: true };
   }
   return scanTomlValue(source, cursor, "inline", leaps);
-}
-
-function scanInlineKey(source: string, index: number): TomlScan {
-  return scanDottedKey(source, index, "equals");
 }
 
 const INTEGER_DIGIT = "invalid integer\nexpected digit";
@@ -3817,21 +4046,23 @@ type KeyStop = "equals" | "header-std" | "header-array";
  * by another segment is reported on that dot. A key that never starts is
  * `invalid key`, except an inline table, which still wants `}`.
  */
-function scanDottedKey(source: string, index: number, stop: KeyStop): TomlScan {
+function scanDottedKey(source: string, index: number, stop: KeyStop, segments: string[]): TomlScan {
   let cursor = index;
   for (;;) {
     let segmentEnd: number;
     if (source[cursor] === '"' || source[cursor] === "'") {
-      const scanned = scanTomlString(source, cursor);
+      const scanned = scanTomlString(source, cursor, false);
       if (scanned.hit || scanned.bail) {
         return scanned;
       }
       segmentEnd = scanned.end;
+      segments.push(decodeTomlKey(source, cursor, segmentEnd));
     } else {
       segmentEnd = cursor;
       while (/[A-Za-z0-9_-]/.test(source[segmentEnd] ?? "")) {
         segmentEnd += 1;
       }
+      segments.push(source.slice(cursor, segmentEnd));
     }
     const after = skipInlineWs(source, segmentEnd);
     if (source[after] === ".") {
@@ -3844,6 +4075,51 @@ function scanDottedKey(source: string, index: number, stop: KeyStop): TomlScan {
     }
     return finishKeyStop(source, after, stop);
   }
+}
+
+function decodeTomlKey(source: string, start: number, end: number): string {
+  const quote = source[start] ?? "";
+  if (quote !== '"' && quote !== "'") {
+    return source.slice(start, end);
+  }
+  if (quote === "'") {
+    return source.slice(start + 1, end - 1);
+  }
+  let cursor = start + 1;
+  const stop = end - 1;
+  let out = "";
+  while (cursor < stop) {
+    if (source[cursor] !== "\\") {
+      out += source[cursor] ?? "";
+      cursor += 1;
+      continue;
+    }
+    const esc = source[cursor + 1] ?? "";
+    const simple: Record<string, string> = {
+      b: "\b",
+      f: "\f",
+      n: "\n",
+      r: "\r",
+      t: "\t",
+      '"': '"',
+      "\\": "\\",
+    };
+    const decoded = simple[esc];
+    if (decoded !== undefined) {
+      out += decoded;
+      cursor += 2;
+      continue;
+    }
+    if (esc === "u" || esc === "U") {
+      const width = esc === "u" ? 4 : 8;
+      out += String.fromCodePoint(Number.parseInt(source.slice(cursor + 2, cursor + 2 + width), 16));
+      cursor += 2 + width;
+      continue;
+    }
+    out += source[cursor] ?? "";
+    cursor += 1;
+  }
+  return out;
 }
 
 function keyStopMessage(stop: KeyStop): string {
@@ -3884,21 +4160,21 @@ function finishHeaderLine(source: string, cursor: number): TomlScan {
   return { end: after, hit: { index: after, message: HEADER_TRAIL }, bail: false };
 }
 
-function skipTomlHeader(source: string, index: number): TomlScan {
+function skipTomlHeader(source: string, index: number, segments: string[]): TomlScan {
   const array = source.startsWith("[[", index);
   let cursor = skipInlineWs(source, index + (array ? 2 : 1));
   if (!canStartInlineKey(source, cursor)) {
     return { end: cursor, hit: { index: cursor, message: INVALID_KEY }, bail: false };
   }
-  return scanDottedKey(source, cursor, array ? "header-array" : "header-std");
+  return scanDottedKey(source, cursor, array ? "header-array" : "header-std", segments);
 }
 
-function skipTomlKey(source: string, index: number): TomlScan {
+function skipTomlKey(source: string, index: number, segments: string[]): TomlScan {
   const cursor = skipInlineWs(source, index);
   if (!canStartInlineKey(source, cursor)) {
     return { end: cursor, hit: { index: cursor, message: INVALID_KEY }, bail: false };
   }
-  return scanDottedKey(source, cursor, "equals");
+  return scanDottedKey(source, cursor, "equals", segments);
 }
 
 const ESCAPE_SEQUENCE_MESSAGE = "invalid escape sequence\nexpected `b`, `f`, `n`, `r`, `t`, `u`, `U`, `\\`, `\"`";
@@ -3940,8 +4216,8 @@ function isTomlStringChar(char: string, literal: boolean): boolean {
  * or `invalid literal string` on that character. Multiline strings still
  * contain newlines.
  */
-function scanTomlString(source: string, index: number): TomlScan {
-  const multiline = source.startsWith('"""', index) || source.startsWith("'''", index);
+function scanTomlString(source: string, index: number, allowMultiline = true): TomlScan {
+  const multiline = allowMultiline && (source.startsWith('"""', index) || source.startsWith("'''", index));
   const quote = multiline ? source.slice(index, index + 3) : (source[index] ?? "");
   if (quote !== '"' && quote !== "'" && quote !== '"""' && quote !== "'''") {
     return { end: index, hit: null, bail: true };
