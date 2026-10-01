@@ -355,6 +355,20 @@ test("a hex escape in a string is a parse error before extract", async () => {
   assert.equal(kept.storage.path, "hi\\x41.db");
   const commented = await loadConfig(`# \\x41\n${BASE}`, secrets);
   assert.equal(commented.storage.path, "/tmp/axond.sqlite");
+  const letter = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "data\\a.db"');
+  await reject(letter, diagram(letter, letter.indexOf("\\a") + 2, escape));
+  const other = BASE.replace('id = "platform"', 'id = "plat\\qform"');
+  await reject(other, diagram(other, other.indexOf("\\q") + 2, escape));
+  const shortHex = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "\\x4"');
+  await reject(shortHex, diagram(shortHex, shortHex.indexOf("\\x") + 2, escape));
+  const badHex = BASE.replace('path = "/tmp/axond.sqlite"', 'path = "\\xz1"');
+  await reject(badHex, diagram(badHex, badHex.indexOf("\\x") + 2, escape));
+  const broken = `n = "foo\\\nbar"\n${BASE}`;
+  await reject(broken, diagram(broken, broken.indexOf("bar"), escape));
+  const spaced = `n = """a\\ b"""\n${BASE}`;
+  await reject(spaced, diagram(spaced, spaced.indexOf("\\ ") + 2, escape));
+  const literalLetter = await loadConfig(BASE.replace('path = "/tmp/axond.sqlite"', "path = 'hi\\a.db'"), secrets);
+  assert.equal(literalLetter.storage.path, "hi\\a.db");
 });
 
 test("a short unicode escape is a parse error before extract", async () => {

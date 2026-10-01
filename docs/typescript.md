@@ -152,9 +152,10 @@ a full `u64`. An inline table stays on one line. A trailing comma is
 `invalid inline table` and `` expected `}` `` with the caret on the comma,
 before extract and before a later integer. A newline or a `#` comment inside
 the braces is that diagram at the newline or the `#`. An array may still end
-with a comma. A basic string `\x` with two hex digits, or `\e`, is
-`invalid escape sequence` with the caret on the next character, before
-extract and before a later integer. A short `\u` or `\U`, or a code point
+with a comma. A basic string escape other than `b`, `f`, `n`, `r`, `t`, `u`, `U`, `\`,
+and `"` is `invalid escape sequence` with the caret on the next character,
+before extract and before a later integer. That includes `\x`, `\e`, `\a`,
+`\q`, and a backslash before a newline. A short `\u` or `\U`, or a code point
 that is a surrogate or above `U+10FFFF`, is `invalid unicode 4-digit hex code`
 or `invalid unicode 8-digit hex code` at that same character. A complete hex
 sequence that is out of range also says `value is out of range`. `\u0041` and

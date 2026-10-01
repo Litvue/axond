@@ -3158,7 +3158,9 @@ const U64_MAX = 18446744073709551615n;
  * outside `i64` is `number too large` or `number too small`. An inline table
  * stays on one line: a trailing comma, a newline, or a comment is
  * `invalid inline table`. A basic string `\x` with two hex digits, or `\e`,
- * is `invalid escape sequence` at the character after `x` or `e`. A short
+ * is `invalid escape sequence` at the character after the escape letter.
+ * `\a`, `\q`, `\x` without two hex digits, and a backslash before a newline
+ * use that diagram. A short
  * `\u` or `\U`, or a code point that is a surrogate or above U+10FFFF, is
  * `invalid unicode 4-digit hex code` or `invalid unicode 8-digit hex code`
  * at the character after `u` or `U`. A complete hex sequence that is out of
@@ -3894,17 +3896,13 @@ function scanBasicEscape(source: string, index: number, multiline: boolean): Tom
     }
     return { end: index + 1 + width, hit: null, bail: false };
   }
-  if (char === "e" || (char === "x" && isTomlHex(source[index + 1] ?? "") && isTomlHex(source[index + 2] ?? ""))) {
-    // `dispatch` consumes the bad letter, so the caret sits on the next character.
-    return { end: index, hit: { index: index + 1, message: ESCAPE_SEQUENCE_MESSAGE }, bail: false };
-  }
   if (multiline && (char === " " || char === "\t" || char === "\n" || char === "\r")) {
     let cursor = index;
     while (source[cursor] === " " || source[cursor] === "\t") {
       cursor += 1;
     }
     if (source[cursor] !== "\n" && source[cursor] !== "\r") {
-      return { end: index, hit: null, bail: true };
+      return escapeSequenceHit(index);
     }
     if (source[cursor] === "\r") {
       cursor += 1;
@@ -3917,7 +3915,12 @@ function scanBasicEscape(source: string, index: number, multiline: boolean): Tom
     }
     return { end: cursor, hit: null, bail: false };
   }
-  return { end: index, hit: null, bail: true };
+  // `dispatch` consumes the bad letter, so the caret sits on the next character.
+  return escapeSequenceHit(index);
+}
+
+function escapeSequenceHit(index: number): TomlScan {
+  return { end: index, hit: { index: index + 1, message: ESCAPE_SEQUENCE_MESSAGE }, bail: false };
 }
 
 function tomlWord(source: string, index: number): string {
