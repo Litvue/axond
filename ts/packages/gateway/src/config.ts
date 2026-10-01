@@ -3791,20 +3791,10 @@ function scanTomlNumber(source: string, index: number, container: TomlContainer,
     if (next === "-") {
       return scanTomlCalendar(source, digitsAt, leaps);
     }
-    const end = skipTomlDate(source, cursor);
-    const date = invalidTomlDate(source, index, end);
-    if (date !== null) {
-      return { end, hit: date, bail: false };
+    const hour = Number(source.slice(digitsAt, cursor));
+    if (hour <= 23) {
+      return scanTomlLocalTime(source, digitsAt, leaps);
     }
-    const clock = invalidTomlClock(source, index, end, container);
-    if (clock !== null) {
-      return { end, hit: clock, bail: false };
-    }
-    const leap = leapSecondAt(source, index, end);
-    if (leap !== null) {
-      leaps.push(leap);
-    }
-    return { end, hit: null, bail: false };
   }
   const raw = source.slice(index, cursor).replaceAll("_", "");
   let integer: bigint;
@@ -3905,94 +3895,6 @@ function leapSecondAt(source: string, index: number, end: number): number | null
 
 const TIME_RANGE = "invalid time\nvalue is out of range";
 const OFFSET_RANGE = "invalid time offset\nvalue is out of range";
-
-function invalidTomlClock(
-  source: string,
-  index: number,
-  end: number,
-  container: TomlContainer,
-): { index: number; message: string } | null {
-  const token = source.slice(index, end);
-  const dated = /^(\d{4}-\d{2}-\d{2})([Tt ])(.*)$/.exec(token);
-  if (dated !== null) {
-    return invalidDateTimeTail(dated[2] ?? "", dated[3] ?? "", index, container);
-  }
-  return invalidLocalTime(token, index, container);
-}
-
-function invalidLocalTime(
-  token: string,
-  index: number,
-  container: TomlContainer,
-): { index: number; message: string } | null {
-  const match = /^(\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?(.*)$/.exec(token);
-  if (match === null) {
-    return null;
-  }
-  const hour = Number(match[1]);
-  const minute = Number(match[2]);
-  const second = match[3];
-  const rest = match[5] ?? "";
-  if (hour > 23) {
-    return { index: index + 2, message: afterZeroMessage(container) };
-  }
-  if (minute > 59) {
-    return { index: index + 3, message: TIME_RANGE };
-  }
-  if (second === undefined) {
-    return rest === "" ? { index: index + token.length, message: "invalid time" } : null;
-  }
-  if (Number(second) > 60) {
-    return { index: index + 6, message: TIME_RANGE };
-  }
-  if (rest !== "") {
-    return { index: index + token.length - rest.length, message: afterZeroMessage(container) };
-  }
-  return null;
-}
-
-function invalidDateTimeTail(
-  delim: string,
-  tail: string,
-  index: number,
-  container: TomlContainer,
-): { index: number; message: string } | null {
-  const match = /^(\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?([Zz]|[+-]\d{2}:\d{2})?(.*)$/.exec(tail);
-  if (match === null) {
-    return null;
-  }
-  const hour = Number(match[1]);
-  const minute = Number(match[2]);
-  const second = match[3];
-  const offset = match[5] ?? "";
-  const rest = match[6] ?? "";
-  const timeStart = index + 11;
-  if (hour > 23) {
-    return { index: delim === " " ? timeStart : index + 10, message: afterZeroMessage(container) };
-  }
-  if (minute > 59) {
-    return { index: timeStart + 3, message: DATE_OUT_OF_RANGE };
-  }
-  if (second === undefined) {
-    return rest === "" ? { index: timeStart + tail.length, message: "invalid date-time" } : null;
-  }
-  if (Number(second) > 60) {
-    return { index: timeStart + 6, message: DATE_OUT_OF_RANGE };
-  }
-  if (offset.startsWith("+") || offset.startsWith("-")) {
-    const offsetAt = timeStart + tail.length - rest.length - offset.length;
-    if (Number(offset.slice(1, 3)) > 23) {
-      return { index: offsetAt + 1, message: OFFSET_RANGE };
-    }
-    if (Number(offset.slice(4, 6)) > 59) {
-      return { index: offsetAt + 4, message: OFFSET_RANGE };
-    }
-  }
-  if (rest !== "") {
-    return { index: timeStart + tail.length - rest.length, message: afterZeroMessage(container) };
-  }
-  return null;
-}
 
 function isTomlDateOrTime(source: string, index: number): boolean {
   const head = source.slice(index, index + 2);
@@ -4142,48 +4044,44 @@ function scanTomlOffset(source: string, index: number): TomlScan {
   return { end: cursor + 2, hit: null, bail: false };
 }
 
-function invalidTomlDate(
-  source: string,
-  index: number,
-  end: number,
-): { index: number; message: string } | null {
-  const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(source.slice(index, end));
-  if (match === null) {
-    return null;
-  }
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  if (month < 1 || month > 12) {
-    return { index: index + 5, message: DATE_OUT_OF_RANGE };
-  }
-  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-  const shortMonth = month === 4 || month === 6 || month === 9 || month === 11;
-  const maxDay = month === 2 ? (leap ? 29 : 28) : shortMonth ? 30 : 31;
-  if (day < 1 || day > maxDay) {
-    return { index: index + 8, message: DATE_OUT_OF_RANGE };
-  }
-  return null;
-}
+const TIME_LABEL = "invalid time";
 
-function skipTomlDate(source: string, index: number): number {
-  const stop = (cursor: number) => cursor >= source.length || ` \t\n\r,]}#`.includes(source[cursor] ?? "");
-  let cursor = index;
-  while (!stop(cursor)) {
-    cursor += 1;
+/** The colon after a legal hour commits the rest of a local time. */
+function scanTomlLocalTime(source: string, hourAt: number, leaps: number[]): TomlScan {
+  let cursor = hourAt + 3;
+  const minuteAt = cursor;
+  const minute = tomlTwoDigits(source, cursor);
+  if (minute === null) {
+    return { end: cursor, hit: { index: cursor, message: TIME_LABEL }, bail: false };
   }
-  if (
-    source[cursor] === " " &&
-    isTomlDigit(source[cursor + 1] ?? "") &&
-    isTomlDigit(source[cursor + 2] ?? "") &&
-    source[cursor + 3] === ":"
-  ) {
-    cursor += 1;
-    while (!stop(cursor)) {
+  if (minute > 59) {
+    return { end: minuteAt, hit: { index: minuteAt, message: TIME_RANGE }, bail: false };
+  }
+  cursor += 2;
+  if (source[cursor] !== ":") {
+    return { end: cursor, hit: { index: cursor, message: TIME_LABEL }, bail: false };
+  }
+  cursor += 1;
+  const secondAt = cursor;
+  const second = tomlTwoDigits(source, cursor);
+  if (second === null) {
+    return { end: cursor, hit: { index: cursor, message: TIME_LABEL }, bail: false };
+  }
+  if (second > 60) {
+    return { end: secondAt, hit: { index: secondAt, message: TIME_RANGE }, bail: false };
+  }
+  cursor += 2;
+  if (source[cursor] === "." && isTomlDigit(source[cursor + 1] ?? "")) {
+    cursor += 2;
+    while (isTomlDigit(source[cursor] ?? "")) {
       cursor += 1;
     }
   }
-  return cursor;
+  const leap = leapSecondAt(source, hourAt, cursor);
+  if (leap !== null) {
+    leaps.push(leap);
+  }
+  return { end: cursor, hit: null, bail: false };
 }
 
 function isTomlCommentChar(char: string): boolean {

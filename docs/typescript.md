@@ -216,7 +216,9 @@ is that integer and `` expected newline, `#` `` on the `-`. `1-2` and
 `1979-` is `invalid date-time` on the missing month, before extract and
 before a later integer. `1979-05` and `1979-05-` use that same label. A
 finished `1979-05-27T` is `` expected newline, `#` `` on `T`.
-`1979-05-27T00:32:00Z` still parses.
+`1979-05-27T00:32:00Z` still parses. `07:` is `invalid time` on the
+missing minute, before extract and before a later integer. `07:32:` uses
+that same label. `07:32:00` and `24:00:00` keep their existing diagrams.
 
 `axond.toml` is the same file the Rust binary reads. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a

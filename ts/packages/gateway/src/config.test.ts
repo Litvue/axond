@@ -1026,6 +1026,58 @@ test("an unfinished date is a parse error before extract", async () => {
   assert.equal(spaced.storage.path, "/tmp/axond.sqlite");
 });
 
+test("an unfinished local time is a parse error before extract", async () => {
+  const label = "invalid time";
+  const diagram = (source: string, index: number, message: string) => {
+    const line = source.slice(0, index).split("\n").length;
+    const lineStart = source.lastIndexOf("\n", Math.max(0, index - 1)) + 1;
+    const lineEnd = source.indexOf("\n", index);
+    const content = source.slice(lineStart, lineEnd === -1 ? source.length : lineEnd);
+    const column = [...source.slice(lineStart, index)].length;
+    const pad = " ".repeat(String(line).length + 1);
+    return (
+      `config: TOML parse error at line ${line}, column ${column + 1}\n` +
+      `${pad}|\n` +
+      `${line} | ${content}\n` +
+      `${pad}|${" ".repeat(column + 1)}^\n` +
+      `${message}\n`
+    );
+  };
+  const reject = async (toml: string, index: number, message: string) => {
+    await assert.rejects(
+      () => loadConfig(toml, secrets),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", diagram(toml, index, message));
+        return true;
+      },
+    );
+  };
+  const beforeShutdown = `n = 07:\n[shutdown]\nnope = 1\n${BASE}`;
+  const mark = beforeShutdown.indexOf(":") + 1;
+  const markMessage = diagram(beforeShutdown, mark, label);
+  await reject(beforeShutdown, mark, label);
+  assert.equal(markMessage.includes("unknown field"), false);
+  assert.equal(markMessage.includes("number too large"), false);
+  const later = `n = 07:\nn = 9223372036854775808\n${BASE}`;
+  await reject(later, later.indexOf(":") + 1, label);
+  const earlier = `n = 9223372036854775808\nn = 07:\n${BASE}`;
+  await reject(earlier, earlier.indexOf("9223372036854775808"), "number too large to fit in target type");
+  const seconds = `n = 07:32:\n${BASE}`;
+  await reject(seconds, seconds.indexOf("32:") + 3, label);
+  const minute = `n = 07:3\n${BASE}`;
+  await reject(minute, minute.indexOf("3"), label);
+  const comment = `n = 07:# c\n${BASE}`;
+  await reject(comment, comment.indexOf("#"), label);
+  const arr = `n = [07:]\n${BASE}`;
+  await reject(arr, arr.indexOf("]"), label);
+  const inline = `n = { a = 07: }\n${BASE}`;
+  await reject(inline, inline.indexOf(":") + 1, label);
+  const clock = await loadConfig(`n = 07:32:00\n${BASE}`, secrets);
+  assert.equal(clock.storage.path, "/tmp/axond.sqlite");
+  const frac = await loadConfig(`n = 07:32:00.5\n${BASE}`, secrets);
+  assert.equal(frac.storage.path, "/tmp/axond.sqlite");
+});
+
 test("a float past the finite range is a parse error before extract", async () => {
   const message = "invalid floating-point number";
   const diagram = (source: string, index: number) => {
