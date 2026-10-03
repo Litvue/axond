@@ -443,8 +443,9 @@ SQLite is the default. Postgres uses `dsn_env` and the schema in
 `createPostgresStore`. Store statements name `public.` tables, so a role
 whose search path starts with a schema of its own name still sees them.
 A dropped socket is listened for, so it does not exit the process. A failed
-connect closes the client. A refused Workers handshake does not emit close;
-the handler finishes that close and answers 503.
+connect closes the client. A refused Workers handshake emits no close, and a
+peer that stays open after Terminate emits none either; the handler closes
+the stream itself and the request can answer.
 Extension migrations apply once on either store:
 a recorded id is skipped, and a failed statement names that id without the
 driver text. The two extra namespace columns

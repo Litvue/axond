@@ -105,7 +105,7 @@ test("the worker handler is a static bundle of the gateway and an extension", as
   const wrangler = await readFile(new URL("../wrangler.toml", import.meta.url), "utf8");
   assert.match(source, /from "@axond\/rate-limit"/);
   assert.match(source, /holdPgClient\(new Client/);
-  assert.match(source, /closeRejectedPgClient\(client\)/);
+  assert.match(source, /closePgClient\(client\)/);
   assert.match(source, /waitUntil/);
   assert.match(source, /discoverOnce/);
   assert.match(source, /scheduled/);

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { createConnection, createServer as createTcpServer } from "node:net";
 import { describe, test } from "node:test";
 import pg from "pg";
 import { unstable_dev } from "wrangler";
@@ -33,6 +34,56 @@ test("workerd_hyperdrive_refused_connect_returns_503", async () => {
     assert.equal(body.includes("would never generate a response"), false);
   } finally {
     await worker.stop();
+    if (previous === undefined) {
+      delete process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
+    } else {
+      process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = previous;
+    }
+  }
+});
+
+test("workerd_hyperdrive_open_peer_still_answers", { skip: !dsn }, async () => {
+  const upstream = new URL(dsn!);
+  const proxy = createTcpServer((client) => {
+    const remote = createConnection({ host: "127.0.0.1", port: Number(upstream.port || 5432) });
+    client.on("data", (buf) => remote.write(buf));
+    remote.on("data", (buf) => client.write(buf));
+    client.on("end", () => remote.end());
+    client.on("error", () => remote.destroy());
+    remote.on("error", () => client.destroy());
+  });
+  await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", () => resolve()));
+  const address = proxy.address();
+  if (!address || typeof address === "string") {
+    proxy.close();
+    throw new Error("no proxy port");
+  }
+  const previous = process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
+  const local = new URL(dsn!);
+  local.hostname = "127.0.0.1";
+  local.port = String(address.port);
+  process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = local.toString();
+  const worker = await unstable_dev(new URL("./index.ts", import.meta.url).pathname, {
+    config: new URL("../wrangler.toml", import.meta.url).pathname,
+    local: true,
+    ip: "127.0.0.1",
+    vars: { GATEWAY_KEY: key, PROVIDERS_JSON: "[]" },
+    logLevel: "error",
+    experimental: { disableExperimentalWarning: true, disableDevRegistry: true },
+  });
+  try {
+    const listed = await Promise.race([
+      worker.fetch("http://127.0.0.1/api/v1/namespaces", {
+        headers: { authorization: `Bearer ${key}` },
+      }).then(async (response) => ({ status: response.status, body: await response.text() })),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("open peer hung")), 4000)),
+    ]);
+    assert.equal(listed.status, 200, listed.body);
+    const parsed = JSON.parse(listed.body) as { data: unknown[] };
+    assert.equal(Array.isArray(parsed.data), true);
+  } finally {
+    await worker.stop();
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
     if (previous === undefined) {
       delete process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
     } else {

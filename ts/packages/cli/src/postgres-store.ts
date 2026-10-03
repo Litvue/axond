@@ -39,13 +39,13 @@ export function holdPgClient(client: pg.Client): pg.Client {
 }
 
 /**
- * Close a client whose connect() rejected. The Workers socket does not emit
- * close when the handshake never finishes, so end() stays pending and the
- * request never answers. Emitting close after end() starts lets that promise
- * settle. A client that connected uses end() on its own, so the backend reads
- * Terminate.
+ * Close a client. end() waits for the peer to close. A refused Workers
+ * handshake never emits close, and a peer that stays open after Terminate
+ * never does either, so the request would not answer. Destroying the stream
+ * and emitting close lets the promise settle. The listener does not record
+ * the driver text.
  */
-export async function closeRejectedPgClient(client: pg.Client): Promise<void> {
+export async function closePgClient(client: pg.Client): Promise<void> {
   let ending: Promise<void>;
   try {
     ending = Promise.resolve(client.end()).then(
@@ -55,8 +55,14 @@ export async function closeRejectedPgClient(client: pg.Client): Promise<void> {
   } catch {
     return;
   }
-  const stream = (client as pg.Client & { connection?: { stream?: { emit?: (event: string) => void } } }).connection
-    ?.stream;
+  const stream = (client as pg.Client & {
+    connection?: { stream?: { destroy?: () => void; emit?: (event: string) => void } };
+  }).connection?.stream;
+  try {
+    stream?.destroy?.();
+  } catch {
+    // A socket that never connected has nothing to destroy.
+  }
   stream?.emit?.("close");
   await ending;
 }
