@@ -39,12 +39,14 @@ export function holdPgClient(client: pg.Client): pg.Client {
 }
 
 /**
- * Close a client. end() waits for the peer to close. A refused Workers
- * handshake never emits close, and a peer that stays open after Terminate
- * never does either, so the request would not answer. Destroying the stream
- * and emitting close lets the promise settle. The listener does not record
- * the driver text.
+ * A refused handshake, and a peer that stays open after Terminate, never
+ * emits close. pg-cloudflare 1.4.1 closes the socket from the end callback
+ * and emits close when that finishes, so a normal end can write Terminate
+ * first. If that close has not arrived after this long, destroy the stream
+ * and emit close so the request still answers.
  */
+const CLOSE_FALLBACK_MS = 1_000;
+
 export async function closePgClient(client: pg.Client): Promise<void> {
   let ending: Promise<void>;
   try {
@@ -55,15 +57,28 @@ export async function closePgClient(client: pg.Client): Promise<void> {
   } catch {
     return;
   }
-  const stream = (client as pg.Client & {
-    connection?: { stream?: { destroy?: () => void; emit?: (event: string) => void } };
-  }).connection?.stream;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const fallback = new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      const stream = (client as pg.Client & {
+        connection?: { stream?: { destroy?: () => void; emit?: (event: string) => void } };
+      }).connection?.stream;
+      try {
+        stream?.destroy?.();
+      } catch {
+        // A socket that never connected has nothing to destroy.
+      }
+      stream?.emit?.("close");
+      resolve();
+    }, CLOSE_FALLBACK_MS);
+  });
   try {
-    stream?.destroy?.();
-  } catch {
-    // A socket that never connected has nothing to destroy.
+    await Promise.race([ending, fallback]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
   }
-  stream?.emit?.("close");
   await ending;
 }
 

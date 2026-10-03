@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:net";
 import test from "node:test";
 
 import pg from "pg";
@@ -9,6 +10,7 @@ import {
   applyPostgresMigration,
   applyPostgresMigrationOn,
   applyPostgresSchema,
+  closePgClient,
   createPostgresStore,
   holdPgClient,
   POSTGRES_SCHEMA,
@@ -53,6 +55,108 @@ async function reset(): Promise<void> {
       axond_store_provider_models, axond_catalog_streak, axond_schema_migrations
   `);
   await opened.release();
+}
+
+function postgresAuthReady(): Buffer {
+  const auth = Buffer.alloc(9);
+  auth.write("R", 0, "ascii");
+  auth.writeInt32BE(8, 1);
+  auth.writeInt32BE(0, 5);
+  const ready = Buffer.alloc(6);
+  ready.write("Z", 0, "ascii");
+  ready.writeInt32BE(5, 1);
+  ready.write("I", 5, "ascii");
+  return Buffer.concat([auth, ready]);
+}
+
+function postgresSelectDone(): Buffer {
+  const tag = Buffer.from("SELECT 1\0");
+  const complete = Buffer.alloc(5 + tag.length);
+  complete.write("C", 0, "ascii");
+  complete.writeInt32BE(4 + tag.length, 1);
+  tag.copy(complete, 5);
+  const ready = Buffer.alloc(6);
+  ready.write("Z", 0, "ascii");
+  ready.writeInt32BE(5, 1);
+  ready.write("I", 5, "ascii");
+  return Buffer.concat([complete, ready]);
+}
+
+test("closePgClient returns when the peer closes and when the socket stays silent", async () => {
+  const closed = await closeAgainstPeer(true);
+  assert.equal(closed.ms < 500, true, `peer close took ${closed.ms}ms`);
+  const silent = await closeAgainstPeer(false, true);
+  assert.equal(silent.ms >= 800, true, `silent socket returned in ${silent.ms}ms`);
+  assert.equal(silent.ms < 2_000, true, `silent socket took ${silent.ms}ms`);
+});
+
+function closeAgainstPeer(closeOnTerminate: boolean, silenceSocket = false): Promise<{ ms: number }> {
+  let peer: import("node:net").Socket | undefined;
+  const server = createServer((socket) => {
+    peer = socket;
+    socket.on("error", () => undefined);
+    let started = false;
+    socket.on("data", (chunk) => {
+      if (!started) {
+        started = true;
+        socket.write(postgresAuthReady());
+        return;
+      }
+      if (chunk.includes(0x58)) {
+        if (closeOnTerminate) {
+          socket.end();
+        }
+        return;
+      }
+      if (chunk.includes(0x51)) {
+        socket.write(postgresSelectDone());
+      }
+    });
+  });
+  return new Promise((resolve, reject) => {
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        reject(new Error("no port"));
+        return;
+      }
+      const client = holdPgClient(new pg.Client({
+        connectionString: `postgres://axond:socket-secret@127.0.0.1:${address.port}/axond`,
+        connectionTimeoutMillis: 2_000,
+      }));
+      void (async () => {
+        const startedAt = Date.now();
+        try {
+          await client.connect();
+          await client.query("SELECT 1");
+          const stream = (client as pg.Client & {
+            connection: { stream: NodeJS.WritableStream & { destroy: () => void } };
+          }).connection.stream;
+          const destroySocket = stream.destroy.bind(stream);
+          if (silenceSocket) {
+            stream.write = ((_data, encoding, callback) => {
+              const done = typeof encoding === "function" ? encoding : callback;
+              done?.();
+              return true;
+            }) as typeof stream.write;
+            stream.end = (() => stream) as typeof stream.end;
+            stream.destroy = (() => stream) as typeof stream.destroy;
+          }
+          await closePgClient(client);
+          if (silenceSocket) {
+            destroySocket();
+          }
+          resolve({ ms: Date.now() - startedAt });
+        } catch (error) {
+          reject(error);
+        } finally {
+          peer?.destroy();
+          server.close();
+        }
+      })();
+    });
+  });
 }
 
 test("a dropped postgres socket does not crash the process", async (t) => {
