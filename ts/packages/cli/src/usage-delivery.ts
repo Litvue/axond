@@ -6,7 +6,14 @@ import type { createMetrics } from "../../gateway/src/metrics.ts";
 import { postOtlp, resourceAttributes, usageLogPayload, type TelemetryTarget } from "../../gateway/src/otel.ts";
 import { usageLine } from "../../gateway/src/usage.ts";
 
-import { closePgClient, holdPgClient, postgresClientOptions, queryPgClient } from "./postgres-store.ts";
+import {
+  closePgClient,
+  holdPgClient,
+  POSTGRES_LOCAL_LIMITS,
+  POSTGRES_TRANSACTION_LIMITS,
+  postgresClientOptions,
+  queryPgClient,
+} from "./postgres-store.ts";
 import { usageMigrationGap, usageSchemaDdl, USAGE_NOT_NULL_COST } from "./usage-sql.ts";
 
 const { Client } = pg;
@@ -182,7 +189,9 @@ async function openPostgresSink(
   }
   try {
     if (sink.createTable) {
-      await queryPgClient(client, usageSchemaDdl(sink.table));
+      // One implicit transaction, so the limits cover a later ALTER. An explicit
+      // BEGIN would stay open into the catalog read that follows.
+      await queryPgClient(client, `${POSTGRES_LOCAL_LIMITS};\n${usageSchemaDdl(sink.table)}`);
     }
     const missing = await missingColumns(client, sink.table);
     const gap = usageMigrationGap(missing);
@@ -354,7 +363,7 @@ async function insertUsage(
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const client = holder.client;
     try {
-      await queryPgClient(client, "BEGIN");
+      await queryPgClient(client, POSTGRES_TRANSACTION_LIMITS);
       for (let index = 0; index < rows.length; index += MAX_ROWS_PER_STATEMENT) {
         const chunk = rows.slice(index, index + MAX_ROWS_PER_STATEMENT);
         await queryPgClient(client, insertSql(table, chunk.length), bindRows(chunk));

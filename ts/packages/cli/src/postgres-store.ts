@@ -515,10 +515,10 @@ async function lockNamespace(client: SqlExecutor, id: string): Promise<void> {
  * transaction. A lock waiter would otherwise hold that connection until the
  * 60s query limit.
  */
-const POSTGRES_LOCAL_LIMITS = "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'";
+export const POSTGRES_LOCAL_LIMITS = "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'";
 
 /** One simple query starts the transaction and limits it, including a charge blocked on the budget row. */
-const POSTGRES_TRANSACTION_LIMITS = `BEGIN; ${POSTGRES_LOCAL_LIMITS}`;
+export const POSTGRES_TRANSACTION_LIMITS = `BEGIN; ${POSTGRES_LOCAL_LIMITS}`;
 
 async function beginPostgresTransaction(client: SqlExecutor): Promise<void> {
   await client.query(POSTGRES_TRANSACTION_LIMITS);

@@ -350,6 +350,109 @@ test("a postgres usage sink uses the statement limit", async () => {
   assert.match(source, /application_name: "axond"/);
   assert.match(source, /queryPgClient\(/);
   assert.match(source, /closePgClient\(/);
+  assert.match(source, /POSTGRES_TRANSACTION_LIMITS/);
+  assert.match(source, /POSTGRES_LOCAL_LIMITS/);
+  assert.equal(source.includes('queryPgClient(client, "BEGIN")'), false);
   assert.equal(source.includes("client.query("), false);
   assert.equal(source.includes("client.end("), false);
+});
+
+test("a usage insert blocked on the table ends before the query limit", { skip: !dsn }, async () => {
+  const table = `usage_lock_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const logs: unknown[] = [];
+  const delivery = await openUsageDelivery({
+    sinks: [
+      {
+        kind: "postgres",
+        dsnEnv: "AXOND_TEST_POSTGRES",
+        table,
+        createTable: true,
+        bufferCapacity: 10,
+        maxBatch: 10,
+        maxBatchExplicit: true,
+        flushIntervalMs: 60_000,
+      },
+    ],
+    env: { AXOND_TEST_POSTGRES: dsn },
+    telemetry: null,
+    metrics: createMetrics([]),
+    onLog: (record) => logs.push(record),
+  });
+  const holder = new pg.Client({ connectionString: dsn });
+  await holder.connect();
+  try {
+    await holder.query("BEGIN");
+    await holder.query(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`);
+    delivery.write(sample("req_lock"));
+    const started = Date.now();
+    const flushed = await delivery.flush(12_000);
+    const elapsed = Date.now() - started;
+    assert.equal(flushed, false);
+    assert.ok(elapsed < 8_000, `usage insert still open after ${elapsed}ms`);
+    assert.equal(JSON.stringify(logs).includes("lock timeout"), false);
+  } finally {
+    await holder.query("ROLLBACK").catch(() => undefined);
+    await holder.end().catch(() => undefined);
+    const drop = new pg.Client({ connectionString: dsn });
+    await drop.connect();
+    await drop.query(
+      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query LIKE $1",
+      [`%${table}%`],
+    );
+    await drop.query(`DROP TABLE IF EXISTS ${table}`);
+    await drop.end();
+  }
+});
+
+test("a usage schema apply blocked on the table ends before the query limit", { skip: !dsn }, async () => {
+  const table = `usage_ddl_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const setup = new pg.Client({ connectionString: dsn });
+  await setup.connect();
+  await setup.query(usageSchemaDdl(table));
+  await setup.query("BEGIN");
+  await setup.query(`LOCK TABLE ${table} IN ACCESS SHARE MODE`);
+  const started = Date.now();
+  const opening = openUsageDelivery({
+    sinks: [
+      {
+        kind: "postgres",
+        dsnEnv: "AXOND_TEST_POSTGRES",
+        table,
+        createTable: true,
+        bufferCapacity: 10,
+        maxBatch: 10,
+        maxBatchExplicit: true,
+        flushIntervalMs: 60_000,
+      },
+    ],
+    env: { AXOND_TEST_POSTGRES: dsn },
+    telemetry: null,
+    metrics: createMetrics([]),
+    onLog: () => undefined,
+  });
+  const result = await Promise.race([
+    opening.then(
+      () => "ok",
+      (error: unknown) => error,
+    ),
+    new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 8_000)),
+  ]);
+  const elapsed = Date.now() - started;
+  try {
+    assert.ok(result instanceof Error, `usage schema still open after ${elapsed}ms`);
+    assert.equal((result as { code?: string }).code, "55P03");
+    assert.ok(elapsed < 8_000);
+  } finally {
+    await setup.query("ROLLBACK").catch(() => undefined);
+    await setup.end().catch(() => undefined);
+    await opening.catch(() => undefined);
+    const drop = new pg.Client({ connectionString: dsn });
+    await drop.connect();
+    await drop.query(
+      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query LIKE $1",
+      [`%${table}%`],
+    );
+    await drop.query(`DROP TABLE IF EXISTS ${table}`);
+    await drop.end();
+  }
 });
