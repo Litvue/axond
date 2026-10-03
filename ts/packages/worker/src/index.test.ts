@@ -524,6 +524,11 @@ test("worker_price_charges_one_request_id_once", async () => {
   }
 });
 
+test("worker_template_enables_request_signal", async () => {
+  const toml = await readFile(new URL("../wrangler.toml", import.meta.url), "utf8");
+  assert.match(toml, /enable_request_signal/);
+});
+
 test("worker_request_abort_settles_client_cancelled", async () => {
   const upstream = await listen((req, res) => {
     req.resume();
