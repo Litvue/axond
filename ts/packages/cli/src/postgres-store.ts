@@ -29,6 +29,16 @@ export interface SqlExecutor {
 const I64_MAX = "9223372036854775807";
 
 /**
+ * A socket reset emits `error` on the client. With no listener, Node throws
+ * that event and the process exits. The query promise still rejects, and the
+ * caller closes the client. The listener does not record the driver text.
+ */
+export function holdPgClient(client: pg.Client): pg.Client {
+  client.on("error", () => undefined);
+  return client;
+}
+
+/**
  * One connection per call. Hyperdrive pools on the far side, so Workers should
  * pass a connector that opens `pg.Client` against the Hyperdrive string and
  * closes it in `release`. Do not issue session-level SET.
@@ -679,7 +689,7 @@ function existingCreateTables(sql: string): string[] | null {
  * Hyperdrive does not support advisory locks.
  */
 export async function applyPostgresMigration(dsn: string, id: string, sql: string): Promise<void> {
-  const client = new pg.Client({ connectionString: dsn });
+  const client = holdPgClient(new pg.Client({ connectionString: dsn }));
   try {
     await client.connect();
     await applyPostgresMigrationOn(

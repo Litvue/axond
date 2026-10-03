@@ -24,7 +24,7 @@ import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
-import { applyPostgresMigration, applyPostgresSchema, createPostgresStore } from "./postgres-store.ts";
+import { applyPostgresMigration, applyPostgresSchema, createPostgresStore, holdPgClient } from "./postgres-store.ts";
 import { openSqliteStore } from "./sqlite-store.ts";
 
 const { Client } = pg;
@@ -349,19 +349,27 @@ function requirePostgresDsn(storage: { dsn?: string; dsnEnv?: string }): string 
 }
 
 async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgresStore>[1]) {
-  const setup = new Client({ connectionString: dsn });
-  await setup.connect();
-  await applyPostgresSchema({
-    query: async (sql, params) => {
-      const result = params === undefined ? await setup.query(sql) : await setup.query(sql, [...params]);
-      const row = Array.isArray(result) ? result[result.length - 1] : result;
-      return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
-    },
-  });
-  await setup.end();
+  const setup = holdPgClient(new Client({ connectionString: dsn }));
+  try {
+    await setup.connect();
+    await applyPostgresSchema({
+      query: async (sql, params) => {
+        const result = params === undefined ? await setup.query(sql) : await setup.query(sql, [...params]);
+        const row = Array.isArray(result) ? result[result.length - 1] : result;
+        return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
+      },
+    });
+  } finally {
+    await setup.end().catch(() => undefined);
+  }
   return createPostgresStore(async () => {
-    const client = new Client({ connectionString: dsn });
-    await client.connect();
+    const client = holdPgClient(new Client({ connectionString: dsn }));
+    try {
+      await client.connect();
+    } catch (error) {
+      await client.end().catch(() => undefined);
+      throw error;
+    }
     return {
       client: {
         query: async (sql, params) => {

@@ -6,6 +6,7 @@ import type { createMetrics } from "../../gateway/src/metrics.ts";
 import { postOtlp, resourceAttributes, usageLogPayload, type TelemetryTarget } from "../../gateway/src/otel.ts";
 import { usageLine } from "../../gateway/src/usage.ts";
 
+import { holdPgClient } from "./postgres-store.ts";
 import { usageMigrationGap, usageSchemaDdl, USAGE_NOT_NULL_COST } from "./usage-sql.ts";
 
 const { Client } = pg;
@@ -172,14 +173,15 @@ async function openPostgresSink(
       `usage sink configuration failed: usage sink \`postgres\`: \`${dsnEnv}\` is unset or empty in the environment`,
     );
   }
-  const client = new Client({
+  const client = holdPgClient(new Client({
     connectionString: dsn,
     connectionTimeoutMillis: 10_000,
     application_name: "axond",
-  });
+  }));
   try {
     await client.connect();
   } catch (error) {
+    await client.end().catch(() => undefined);
     throw new Error(`usage sink configuration failed: postgres usage sink: ${redact(errorText(error), dsn)}`);
   }
   try {
@@ -367,15 +369,16 @@ async function insertUsage(
       last = error;
       await client.query("ROLLBACK").catch(() => undefined);
       await client.end().catch(() => undefined);
-      const replacement = new Client({
+      const replacement = holdPgClient(new Client({
         connectionString: dsn,
         connectionTimeoutMillis: 10_000,
         application_name: "axond",
-      });
-      holder.client = replacement;
+      }));
       try {
         await replacement.connect();
+        holder.client = replacement;
       } catch (connectError) {
+        await replacement.end().catch(() => undefined);
         last = connectError;
       }
     }

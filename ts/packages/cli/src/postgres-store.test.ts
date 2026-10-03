@@ -10,6 +10,7 @@ import {
   applyPostgresMigrationOn,
   applyPostgresSchema,
   createPostgresStore,
+  holdPgClient,
   POSTGRES_SCHEMA,
   postgresQueryText,
   postgresSchemaTables,
@@ -20,7 +21,7 @@ import type { Store } from "@axond/sdk";
 const dsn = process.env["AXOND_TEST_POSTGRES"];
 
 async function connect(): Promise<{ client: pg.Client; release: () => Promise<void> }> {
-  const client = new pg.Client({ connectionString: dsn });
+  const client = holdPgClient(new pg.Client({ connectionString: dsn }));
   await client.connect();
   return {
     client,
@@ -53,6 +54,26 @@ async function reset(): Promise<void> {
   `);
   await opened.release();
 }
+
+test("a dropped postgres socket does not crash the process", async (t) => {
+  if (!dsn) {
+    t.skip("AXOND_TEST_POSTGRES is unset");
+    return;
+  }
+  const killer = holdPgClient(new pg.Client({ connectionString: dsn }));
+  const victim = holdPgClient(new pg.Client({ connectionString: dsn }));
+  await killer.connect();
+  await victim.connect();
+  try {
+    const pid = (await victim.query("SELECT pg_backend_pid() AS pid")).rows[0]?.["pid"];
+    await killer.query("SELECT pg_terminate_backend($1)", [pid]);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await assert.rejects(() => victim.query("SELECT 1"));
+  } finally {
+    await victim.end().catch(() => undefined);
+    await killer.end().catch(() => undefined);
+  }
+});
 
 test("the postgres schema seeds a row lock and does not take an advisory lock", () => {
   assert.equal(POSTGRES_SCHEMA.includes("CREATE TABLE IF NOT EXISTS public.axond_schema_lock"), true);

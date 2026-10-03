@@ -442,6 +442,8 @@ and a Cloudflare account are not part of this repository's test environment.
 SQLite is the default. Postgres uses `dsn_env` and the schema in
 `createPostgresStore`. Store statements name `public.` tables, so a role
 whose search path starts with a schema of its own name still sees them.
+A dropped socket is listened for, so it does not exit the process, and a
+failed connect closes the client.
 Extension migrations apply once on either store:
 a recorded id is skipped, and a failed statement names that id without the
 driver text. The two extra namespace columns

@@ -3,6 +3,8 @@ import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import pg from "pg";
+
 import { createMemoryStore } from "../../gateway/src/memory-store.ts";
 
 import { StoreFailure } from "../../gateway/src/errors.ts";
@@ -37,6 +39,33 @@ test("worker_schema_attempt_retries_after_rejection", async () => {
     calls += 1;
   });
   assert.equal(calls, 2);
+});
+
+test("a rejected Hyperdrive login closes the client and hides the password", async () => {
+  const original = pg.Client.prototype.end;
+  let ended = 0;
+  pg.Client.prototype.end = function (this: pg.Client, callback?: () => void) {
+    ended += 1;
+    return original.call(this, callback);
+  };
+  try {
+    const handler = createHandler({
+      HYPERDRIVE: { connectionString: "postgres://axond:socket-secret@127.0.0.1:1/axond" },
+      GATEWAY_KEY: "k",
+      PROVIDERS_JSON: "[]",
+    });
+    const response = await handler.fetch(
+      new Request("http://127.0.0.1/api/v1/namespaces", { headers: { authorization: "Bearer k" } }),
+      { waitUntil() {} },
+    );
+    const body = await response.text();
+    assert.equal(response.status, 503, body);
+    assert.equal(body.includes("socket-secret"), false);
+    assert.equal(body.includes("ECONNREFUSED"), false);
+    assert.equal(ended, 1);
+  } finally {
+    pg.Client.prototype.end = original;
+  }
 });
 
 test("worker_schema_failure_logs_a_missing_column_and_hides_the_driver", () => {
@@ -75,6 +104,7 @@ test("the worker handler is a static bundle of the gateway and an extension", as
   const source = await readFile(new URL("./index.ts", import.meta.url), "utf8");
   const wrangler = await readFile(new URL("../wrangler.toml", import.meta.url), "utf8");
   assert.match(source, /from "@axond\/rate-limit"/);
+  assert.match(source, /holdPgClient\(new Client/);
   assert.match(source, /waitUntil/);
   assert.match(source, /discoverOnce/);
   assert.match(source, /scheduled/);
