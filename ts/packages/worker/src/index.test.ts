@@ -10,7 +10,7 @@ import { createMemoryStore } from "../../gateway/src/memory-store.ts";
 
 import { StoreFailure } from "../../gateway/src/errors.ts";
 
-import { createHandler, discoverOnSchedule, handlerFor, rethrowSchemaFailure, schemaAttempt } from "./index.ts";
+import { createHandler, discoverOnSchedule, handlerFor, openSchemaClient, rethrowSchemaFailure, schemaAttempt } from "./index.ts";
 
 test("worker_schema_attempt_retries_after_rejection", async () => {
   const gate = schemaAttempt();
@@ -40,6 +40,80 @@ test("worker_schema_attempt_retries_after_rejection", async () => {
     calls += 1;
   });
   assert.equal(calls, 2);
+});
+
+test("a schema waiter opens after the first apply finishes", async () => {
+  const gate = schemaAttempt();
+  let opened = 0;
+  let closed = 0;
+  let release = (): void => {};
+  const started = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const open = async () => {
+    opened += 1;
+    return opened;
+  };
+  const first = openSchemaClient(
+    gate,
+    open,
+    async () => {
+      await started;
+    },
+    async () => {
+      closed += 1;
+    },
+  );
+  const second = openSchemaClient(
+    gate,
+    open,
+    async () => {
+      throw new Error("waiter applied");
+    },
+    async () => {
+      closed += 1;
+    },
+  );
+  assert.equal(opened, 1);
+  release();
+  const winner = await first;
+  const waiter = await second;
+  assert.equal(winner, 1);
+  assert.equal(waiter, 2);
+  assert.equal(closed, 0);
+
+  const failed = schemaAttempt();
+  await assert.rejects(
+    () =>
+      openSchemaClient(
+        failed,
+        async () => {
+          opened += 1;
+          return opened;
+        },
+        async () => {
+          throw new Error("ddl");
+        },
+        async () => {
+          closed += 1;
+        },
+      ),
+    /ddl/,
+  );
+  assert.equal(closed, 1);
+  const retried = await openSchemaClient(
+    failed,
+    async () => {
+      opened += 1;
+      return opened;
+    },
+    async () => undefined,
+    async () => {
+      closed += 1;
+    },
+  );
+  assert.equal(retried, 4);
+  assert.equal(closed, 1);
 });
 
 test("a rejected Hyperdrive login closes the client and hides the password", async () => {

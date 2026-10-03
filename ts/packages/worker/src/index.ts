@@ -54,7 +54,9 @@ interface WaitContext {
  * the schema is already present, and names a missing table or column without
  * sending the script.
  * A failed schema apply is not kept, so the next request can retry. A
- * successful apply stays for the isolate.
+ * successful apply stays for the isolate. A request that arrives while the
+ * script is running waits before it connects, so the isolate holds one
+ * Hyperdrive client until that script commits.
  * `PRICES_JSON` is the price list a chat uses when it settles.
  * One gateway lives for the isolate, so a parked credential stays parked.
  * Settlement is bound to the request that owns it.
@@ -63,10 +65,6 @@ let metrics: ReturnType<typeof createMetrics> | undefined;
 let admission = createAdmission(defaultAdmission());
 const handlers = new Map<string, ReturnType<typeof createHandler>>();
 
-/**
- * One in-flight attempt. A rejection is dropped so the next caller can try
- * again. A success stays, including for callers that arrived while it ran.
- */
 /**
  * The client response stays `store is unavailable`. A schema message we wrote
  * is logged. A driver message is not, so a DSN cannot reach the log.
@@ -79,6 +77,40 @@ export function rethrowSchemaFailure(error: unknown): never {
   throw new StoreFailure();
 }
 
+/**
+ * The caller that applies the schema already holds `open()`'s client and
+ * reuses it for the request. Anyone else waits until that apply finishes,
+ * then opens a client of their own. `open` closes a client it fails to
+ * connect and then throws. A prepare failure is closed here before it
+ * propagates, so the next attempt can connect again.
+ */
+export async function openSchemaClient<T>(
+  schema: { run(apply: () => Promise<void>): Promise<void> },
+  open: () => Promise<T>,
+  prepare: (client: T) => Promise<void>,
+  close: (client: T) => Promise<void>,
+): Promise<T> {
+  let owned: { client: T } | undefined;
+  await schema.run(async () => {
+    const client = await open();
+    try {
+      await prepare(client);
+    } catch (error) {
+      await close(client);
+      throw error;
+    }
+    owned = { client };
+  });
+  if (owned) {
+    return owned.client;
+  }
+  return open();
+}
+
+/**
+ * One in-flight attempt. A rejection is dropped so the next caller can try
+ * again. A success stays, including for callers that arrived while it ran.
+ */
 export function schemaAttempt(): { run(apply: () => Promise<void>): Promise<void> } {
   let pending: Promise<void> | null = null;
   return {
@@ -107,18 +139,26 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
   const store = storeOverride ?? createPostgresStore(async () => {
     // A silent accept and a silent statement use Hyperdrive's 15s and 60s
     // limits. Structured fields keep a password that `connectionString` cannot
-    // carry. See `hyperdriveClientOptions`.
-    const client = holdPgClient(new Client(hyperdriveClientOptions(env.HYPERDRIVE)));
+    // carry. See `hyperdriveClientOptions`. Callers that arrive during the
+    // schema script wait in `openSchemaClient` before they connect.
+    let client: Client;
     try {
-      await client.connect();
+      client = await openSchemaClient(
+        schema,
+        async () => {
+          const opened = holdPgClient(new Client(hyperdriveClientOptions(env.HYPERDRIVE)));
+          try {
+            await opened.connect();
+          } catch (error) {
+            await closePgClient(opened);
+            throw error;
+          }
+          return opened;
+        },
+        (opened) => prepareWorkerSchema(opened, extensions),
+        (opened) => closePgClient(opened),
+      );
     } catch (error) {
-      await closePgClient(client);
-      rethrowSchemaFailure(error);
-    }
-    try {
-      await schema.run(() => prepareWorkerSchema(client, extensions));
-    } catch (error) {
-      await closePgClient(client);
       rethrowSchemaFailure(error);
     }
     return {
