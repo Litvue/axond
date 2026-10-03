@@ -511,11 +511,14 @@ async function lockNamespace(client: SqlExecutor, id: string): Promise<void> {
 
 /**
  * Hyperdrive returns the origin connection when the transaction ends, so a
- * session `SET` does not stick. One simple query starts the transaction and
- * limits it. A lock waiter, including a charge blocked on the budget row,
- * would otherwise hold that connection until the 60s query limit.
+ * session `SET` does not stick. `SET LOCAL` applies to the surrounding
+ * transaction. A lock waiter would otherwise hold that connection until the
+ * 60s query limit.
  */
-const POSTGRES_TRANSACTION_LIMITS = "BEGIN; SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'";
+const POSTGRES_LOCAL_LIMITS = "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'";
+
+/** One simple query starts the transaction and limits it, including a charge blocked on the budget row. */
+const POSTGRES_TRANSACTION_LIMITS = `BEGIN; ${POSTGRES_LOCAL_LIMITS}`;
 
 async function beginPostgresTransaction(client: SqlExecutor): Promise<void> {
   await client.query(POSTGRES_TRANSACTION_LIMITS);
@@ -569,7 +572,14 @@ export async function settlePostgres(client: SqlExecutor, input: SettleInput): P
   });
 }
 
+/**
+ * One simple query, so the limits apply to a later statement. A reader holding
+ * `axond_namespace` would otherwise block `ALTER TABLE` until the 60s query
+ * limit. There is no explicit `BEGIN`: a lock timeout would leave the session
+ * aborted, and a concurrent `pg_type` race has to read the catalog on it.
+ */
 export const POSTGRES_SCHEMA = `
+${POSTGRES_LOCAL_LIMITS};
 CREATE TABLE IF NOT EXISTS public.axond_namespace (
     id TEXT PRIMARY KEY NOT NULL,
     attrs JSONB NOT NULL DEFAULT '{}'::jsonb,

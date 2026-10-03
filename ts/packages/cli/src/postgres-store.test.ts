@@ -340,6 +340,11 @@ test("a parameterized query reports a socket reset that never emits close", asyn
 });
 
 test("the postgres schema seeds a row lock and does not take an advisory lock", () => {
+  assert.equal(
+    POSTGRES_SCHEMA.trimStart().startsWith("SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s';"),
+    true,
+  );
+  assert.equal(POSTGRES_SCHEMA.includes("BEGIN"), false);
   assert.equal(POSTGRES_SCHEMA.includes("CREATE TABLE IF NOT EXISTS public.axond_schema_lock"), true);
   assert.equal(POSTGRES_SCHEMA.includes("INSERT INTO public.axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO NOTHING"), true);
   assert.equal(POSTGRES_SCHEMA.toLowerCase().includes("pg_advisory"), false);
@@ -1502,6 +1507,70 @@ async function ownerConnectDropLock(connectionString: string): Promise<void> {
   await owner.query("DROP TABLE axond_schema_lock");
   await owner.end();
 }
+
+test("a schema apply blocked on the namespace table ends before the query limit", { skip: !dsn }, async (t) => {
+  const admin = await connect();
+  const role = await admin.client.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+  if (role.rows[0]?.["rolsuper"] !== true) {
+    await admin.release();
+    t.skip("the test role cannot create a database");
+    return;
+  }
+  const name = `axond_sw_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const url = new URL(dsn!);
+  url.pathname = `/${name}`;
+  const schemaDsn = url.toString();
+  await admin.client.query(`CREATE DATABASE ${name}`);
+  await admin.release();
+  const holder = new pg.Client({ connectionString: schemaDsn });
+  const waiter = holdPgClient(new pg.Client({ connectionString: schemaDsn, query_timeout: 8_000 }));
+  await holder.connect();
+  await waiter.connect();
+  let apply: Promise<unknown> = Promise.resolve();
+  try {
+    await holder.query(
+      `CREATE TABLE public.axond_namespace (
+         id TEXT PRIMARY KEY NOT NULL,
+         attrs JSONB NOT NULL DEFAULT '{}'::jsonb,
+         blocklist JSONB
+       )`,
+    );
+    await holder.query("BEGIN");
+    await holder.query("LOCK TABLE public.axond_namespace IN ACCESS SHARE MODE");
+    const started = Date.now();
+    apply = applyPostgresSchema(sqlExecutor(waiter));
+    const result = await Promise.race([
+      apply.then(
+        () => "ok",
+        (error: unknown) => error,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 8_000)),
+    ]);
+    const elapsed = Date.now() - started;
+    assert.ok(result instanceof Error, `schema lock wait still open after ${elapsed}ms`);
+    assert.equal((result as { code?: string }).code, "55P03");
+    assert.ok(elapsed < 8_000);
+    await holder.query("ROLLBACK");
+    await applyPostgresSchema(sqlExecutor(waiter));
+    const columns = await waiter.query(
+      "SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'axond_namespace'",
+    );
+    const names = columns.rows.map((row) => String(row["column_name"]));
+    assert.equal(names.includes("allow_platform_fallback"), true);
+    assert.equal(names.includes("from_config"), true);
+  } finally {
+    await holder.query("ROLLBACK").catch(() => undefined);
+    await holder.end().catch(() => undefined);
+    await waiter.end().catch(() => undefined);
+    await apply.catch(() => undefined);
+    const drop = await connect();
+    await drop.client.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [
+      name,
+    ]);
+    await drop.client.query(`DROP DATABASE ${name}`);
+    await drop.release();
+  }
+});
 
 test("applying the postgres schema twice is idempotent", { skip: !dsn }, async () => {
   const opened = await connect();
