@@ -28,6 +28,19 @@ const catalogStreaks = new WeakMap<object, number>();
 const MAX_MODEL_PAGES = 20;
 
 /**
+ * A provider or catalogue that accepts the socket and never finishes the body
+ * would hold the Worker cron until the runtime's wall limit. 30s matches the
+ * request path's budget for provider response headers.
+ */
+const DISCOVERY_FETCH_TIMEOUT_MS = 30_000;
+
+function discoveryAbort(): { signal: AbortSignal; done: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DISCOVERY_FETCH_TIMEOUT_MS);
+  return { signal: controller.signal, done: () => clearTimeout(timer) };
+}
+
+/**
  * The first round in this process may replace a row fetched from another
  * base URL. Later rounds leave a fresh foreign row alone.
  */
@@ -182,33 +195,39 @@ async function fetchListing(
   let after: string | null = null;
   for (let page = 0; page < MAX_MODEL_PAGES; page += 1) {
     const url = after === null ? `${base}/models` : `${base}/models?after_id=${encodeQueryComponent(after)}`;
+    const deadline = discoveryAbort();
     let response: Response;
     try {
-      response = await fetchImpl(url, { headers, redirect: "manual" });
-    } catch {
-      return { ok: false, reason: "unreachable" };
+      try {
+        response = await fetchImpl(url, { headers, redirect: "manual", signal: deadline.signal });
+      } catch {
+        return { ok: false, reason: "unreachable" };
+      }
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        return { ok: false, reason: response.status === 401 || response.status === 403 ? "denied" : "unreachable" };
+      }
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch (error) {
+        return { ok: false, reason: deadline.signal.aborted || !(error instanceof SyntaxError) ? "unreachable" : "not_json" };
+      }
+      const parsed = parsePage(body);
+      if (!parsed) {
+        return { ok: false, reason: "not_json" };
+      }
+      data.push(...parsed.data);
+      if (parsed.nextAfter === null) {
+        return { ok: true, data };
+      }
+      if (page + 1 === MAX_MODEL_PAGES) {
+        return { ok: false, reason: "page_bound" };
+      }
+      after = parsed.nextAfter;
+    } finally {
+      deadline.done();
     }
-    if (!response.ok) {
-      return { ok: false, reason: response.status === 401 || response.status === 403 ? "denied" : "unreachable" };
-    }
-    let body: unknown;
-    try {
-      body = await response.json();
-    } catch {
-      return { ok: false, reason: "not_json" };
-    }
-    const parsed = parsePage(body);
-    if (!parsed) {
-      return { ok: false, reason: "not_json" };
-    }
-    data.push(...parsed.data);
-    if (parsed.nextAfter === null) {
-      return { ok: true, data };
-    }
-    if (page + 1 === MAX_MODEL_PAGES) {
-      return { ok: false, reason: "page_bound" };
-    }
-    after = parsed.nextAfter;
   }
   return { ok: false, reason: "page_bound" };
 }
@@ -273,26 +292,32 @@ async function refreshCatalog(
   fetchImpl: typeof fetch,
   sourceUrl: string,
 ): Promise<void> {
+  const deadline = discoveryAbort();
   let response: Response;
-  try {
-    response = await fetchImpl(sourceUrl, { redirect: "manual" });
-  } catch {
-    await input.store.markProviderModelsStale("catalog").catch(() => undefined);
-    await noteCatalogRefusal(input, "unreachable");
-    return;
-  }
-  if (!response.ok) {
-    await input.store.markProviderModelsStale("catalog").catch(() => undefined);
-    await noteCatalogRefusal(input, catalogStatusReason(response.status));
-    return;
-  }
   let body: unknown;
   try {
-    body = await response.json();
-  } catch {
-    await input.store.markProviderModelsStale("catalog").catch(() => undefined);
-    await noteCatalogRefusal(input, "not_json");
-    return;
+    try {
+      response = await fetchImpl(sourceUrl, { redirect: "manual", signal: deadline.signal });
+    } catch {
+      await input.store.markProviderModelsStale("catalog").catch(() => undefined);
+      await noteCatalogRefusal(input, "unreachable");
+      return;
+    }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      await input.store.markProviderModelsStale("catalog").catch(() => undefined);
+      await noteCatalogRefusal(input, catalogStatusReason(response.status));
+      return;
+    }
+    try {
+      body = await response.json();
+    } catch (error) {
+      await input.store.markProviderModelsStale("catalog").catch(() => undefined);
+      await noteCatalogRefusal(input, deadline.signal.aborted || !(error instanceof SyntaxError) ? "unreachable" : "not_json");
+      return;
+    }
+  } finally {
+    deadline.done();
   }
   const fetchedAt = new Date().toISOString();
   try {

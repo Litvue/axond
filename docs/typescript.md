@@ -430,7 +430,7 @@ Wrangler ignores `sslmode` in the connection string. The default mode is `requir
 is already the transaction pooler. Bundle the Worker with the extensions it imports. A
 compiled Bun binary loads those same extensions from disk instead. A cron
 trigger (`*/5 * * * *`) runs provider discovery and catalogue import off the
-request path. The refresh walks the platform credential pool, or the lexicographically first tenant pool, and follows `has_more` for up to 20 pages. A failed fetch marks the row stale and leaves the last payload. The process writes JSON `msg` `provider_discovery` with the provider id and a bounded reason, and that line omits the credential and the base URL. A `3xx` from the provider or the catalogue is not followed, so the credential stays on the configured URL.
+request path. The refresh walks the platform credential pool, or the lexicographically first tenant pool, and follows `has_more` for up to 20 pages. A failed fetch marks the row stale and leaves the last payload. A fetch that has not finished after 30 seconds is that failure. The process writes JSON `msg` `provider_discovery` with the provider id and a bounded reason, and that line omits the credential and the base URL. A `3xx` from the provider or the catalogue is not followed, so the credential stays on the configured URL.
 
 The template sets `enable_request_signal`. A client disconnect aborts `Request.signal`, and an open stream settles as `client_cancelled`.
 

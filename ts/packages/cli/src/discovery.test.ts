@@ -635,3 +635,45 @@ test("catalogue_and_listing_redirects_are_not_followed_and_omit_the_secret", asy
     target.close();
   }
 });
+
+test("discovery treats a provider body that never arrives as unreachable", async () => {
+  const server = createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("no discovery port");
+  }
+  const store = createMemoryStore();
+  const logs: ProviderDiscoveryLog[] = [];
+  const secret = "discovery-body-secret";
+  const started = Date.now();
+  try {
+    await Promise.race([
+      discoverOnce({
+        store,
+        providers: [{ id: "fake-openai", kind: "openai", baseUrl: `http://127.0.0.1:${address.port}` }],
+        credentials: [{ namespace: "platform", provider: "fake-openai", secret, id: "one" }],
+        catalog: { source: "none" },
+        onLog: (record) => {
+          if (record.msg === "provider_discovery") {
+            logs.push(record);
+          }
+        },
+      }),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("discovery hung")), 35_000)),
+    ]);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0]?.reason, "unreachable");
+  assert.equal(JSON.stringify(logs).includes(secret), false);
+  const elapsed = Date.now() - started;
+  assert.equal(elapsed >= 25_000, true);
+  assert.equal(elapsed < 35_000, true);
+});
