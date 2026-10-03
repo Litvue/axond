@@ -839,6 +839,51 @@ test("a write role keeps an existing postgres schema and names a missing table",
   );
 });
 
+test("a pg_type race during schema apply returns once the tables exist", async () => {
+  let scripts = 0;
+  let present = false;
+  await applyPostgresSchema({
+    async query(sql) {
+      if (sql === POSTGRES_SCHEMA) {
+        scripts += 1;
+        present = true;
+        const error = new Error('duplicate key value violates unique constraint "pg_type_typname_nsp_index"');
+        (error as { code?: string }).code = "23505";
+        throw error;
+      }
+      if (sql.startsWith("SELECT has_schema_privilege")) {
+        return { rows: [{ ok: true }], rowCount: 1 };
+      }
+      return { rows: [{ name: present ? "public.axond_namespace" : null }], rowCount: 1 };
+    },
+  });
+  assert.equal(scripts, 1);
+
+  scripts = 0;
+  await assert.rejects(
+    () =>
+      applyPostgresSchema({
+        async query(sql) {
+          if (sql === POSTGRES_SCHEMA) {
+            scripts += 1;
+            const error = new Error("syntax error");
+            (error as { code?: string }).code = "42601";
+            throw error;
+          }
+          if (sql.startsWith("SELECT has_schema_privilege")) {
+            return { rows: [{ ok: true }], rowCount: 1 };
+          }
+          return { rows: [{ name: null }], rowCount: 1 };
+        },
+      }),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "42601");
+      return true;
+    },
+  );
+  assert.equal(scripts, 1);
+});
+
 test("an owner apply adds columns a Rust namespace table omitted", { skip: !dsn }, async (t) => {
   const admin = await connect();
   const role = await admin.client.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
@@ -1376,6 +1421,44 @@ test("applying the postgres schema twice is idempotent", { skip: !dsn }, async (
   await opened.client.query(POSTGRES_SCHEMA);
   await opened.client.query(POSTGRES_SCHEMA);
   await opened.release();
+});
+
+test("concurrent schema applies survive a pg_type race", { skip: !dsn }, async (t) => {
+  const admin = await connect();
+  const role = await admin.client.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+  if (role.rows[0]?.["rolsuper"] !== true) {
+    await admin.release();
+    t.skip("the test role cannot create a database");
+    return;
+  }
+  const name = `axond_race_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const url = new URL(dsn!);
+  url.pathname = `/${name}`;
+  await admin.client.query(`CREATE DATABASE ${name}`);
+  await admin.release();
+  const clients: pg.Client[] = [];
+  try {
+    await Promise.all(
+      Array.from({ length: 8 }, async () => {
+        const client = holdPgClient(new pg.Client({ connectionString: url.toString() }));
+        clients.push(client);
+        await client.connect();
+        await applyPostgresSchema(sqlExecutor(client));
+      }),
+    );
+    const check = clients[0];
+    assert.ok(check);
+    for (const table of postgresSchemaTables()) {
+      const found = await check.query("SELECT to_regclass($1) AS name", [`public.${table}`]);
+      assert.ok(found.rows[0]?.["name"]);
+    }
+    await applyPostgresSchema(sqlExecutor(check));
+  } finally {
+    await Promise.all(clients.map((client) => closePgClient(client)));
+    const drop = await connect();
+    await drop.client.query(`DROP DATABASE ${name}`);
+    await drop.release();
+  }
 });
 
 test("postgres_extension_query_with_question_marks_reads_the_row", { skip: !dsn }, async () => {

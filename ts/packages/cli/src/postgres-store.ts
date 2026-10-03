@@ -714,6 +714,15 @@ function namespaceFrom(row: Record<string, unknown>): NamespaceWrite {
 }
 
 /**
+ * How many times a cold isolate may send `POSTGRES_SCHEMA`. Two sessions that
+ * both observe a missing table can both send the script. PostgreSQL then
+ * raises `23505` on `pg_type_typname_nsp_index`, or `40P01` when the creates
+ * deadlock. The session stays usable. The next catalog read sees the tables
+ * once the other session has committed.
+ */
+const POSTGRES_SCHEMA_ATTEMPTS = 4;
+
+/**
  * Apply `POSTGRES_SCHEMA`. A role with only `pg_read_all_data` and
  * `pg_write_all_data` cannot `CREATE`, and `CREATE TABLE IF NOT EXISTS`
  * still fails when the tables are already there. When every table and the
@@ -723,24 +732,40 @@ function namespaceFrom(row: Record<string, unknown>): NamespaceWrite {
  * objects and does not send the script, so the same peer still yields that
  * name. A role that can `CREATE` applies the script. A privilege error after
  * that names whatever is still missing, and the driver text is not included.
+ * A concurrent create that loses the `pg_type` race reads the catalog again
+ * and returns when the tables are present.
  */
 export async function applyPostgresSchema(client: SqlExecutor): Promise<void> {
-  const missing = await missingPostgresSchema(client);
-  if (missing.length === 0) {
-    return;
-  }
-  if (!(await postgresCanApplySchema(client))) {
-    throw new Error(`postgres schema is missing ${missing.join(", ")}`);
-  }
-  try {
-    await client.query(POSTGRES_SCHEMA);
-  } catch (error) {
-    if (!postgresInsufficientPrivilege(error)) {
-      throw error;
+  for (let attempt = 1; attempt <= POSTGRES_SCHEMA_ATTEMPTS; attempt += 1) {
+    const missing = await missingPostgresSchema(client);
+    if (missing.length === 0) {
+      return;
     }
-    const stillMissing = await missingPostgresSchema(client);
-    if (stillMissing.length > 0) {
-      throw new Error(`postgres schema is missing ${stillMissing.join(", ")}`);
+    if (!(await postgresCanApplySchema(client))) {
+      throw new Error(`postgres schema is missing ${missing.join(", ")}`);
+    }
+    try {
+      await client.query(POSTGRES_SCHEMA);
+      return;
+    } catch (error) {
+      if (postgresInsufficientPrivilege(error)) {
+        const stillMissing = await missingPostgresSchema(client);
+        if (stillMissing.length > 0) {
+          throw new Error(`postgres schema is missing ${stillMissing.join(", ")}`);
+        }
+        return;
+      }
+      const last = attempt === POSTGRES_SCHEMA_ATTEMPTS;
+      if (postgresSchemaRace(error) && !last) {
+        continue;
+      }
+      if (postgresSchemaRace(error)) {
+        const stillMissing = await missingPostgresSchema(client);
+        if (stillMissing.length === 0) {
+          return;
+        }
+      }
+      throw error;
     }
   }
 }
@@ -768,7 +793,20 @@ export function postgresSchemaTables(sql = POSTGRES_SCHEMA): string[] {
 }
 
 function postgresInsufficientPrivilege(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && (error as { code?: unknown }).code === "42501";
+  return postgresSqlState(error) === "42501";
+}
+
+function postgresSchemaRace(error: unknown): boolean {
+  const code = postgresSqlState(error);
+  return code === "23505" || code === "40P01";
+}
+
+function postgresSqlState(error: unknown): string {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return "";
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : "";
 }
 
 async function missingPostgresTables(client: SqlExecutor, tables: readonly string[]): Promise<string[]> {
