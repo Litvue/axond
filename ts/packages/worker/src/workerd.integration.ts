@@ -544,4 +544,59 @@ test("workerd_hyperdrive_serves_a_role_that_cannot_create", { skip: !dsn }, asyn
     await drop.end();
   }
 });
+
+test("workerd_hyperdrive_connects_when_the_password_breaks_the_url", async (t) => {
+  const adminUrl = "postgres://axond:axond@127.0.0.1:5432/axond";
+  const password = "p@ss:w/rd#x?y%zz";
+  const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  const name = `axond_hd_${suffix}`;
+  const admin = new pg.Client({ connectionString: adminUrl });
+  await admin.connect();
+  const role = await admin.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+  if (role.rows[0]?.["rolsuper"] !== true) {
+    await admin.end();
+    t.skip("the test role cannot create a database");
+    return;
+  }
+  await admin.query(`CREATE ROLE ${name} LOGIN PASSWORD '${password}'`);
+  await admin.query(`CREATE DATABASE ${name} OWNER ${name}`);
+  await admin.end();
+  const previous = process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
+  // `URL.password` leaves a `%` that is not two hex digits for Miniflare's
+  // decodeURIComponent. encodeURIComponent makes the local binding string valid.
+  process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE =
+    `postgres://${name}:${encodeURIComponent(password)}@127.0.0.1:5432/${name}`;
+  const worker = await unstable_dev(new URL("./index.ts", import.meta.url).pathname, {
+    config: new URL("../wrangler.toml", import.meta.url).pathname,
+    local: true,
+    ip: "127.0.0.1",
+    vars: { GATEWAY_KEY: key, PROVIDERS_JSON: "[]" },
+    logLevel: "error",
+    experimental: { disableExperimentalWarning: true, disableDevRegistry: true },
+  });
+  const id = `hd${suffix}`;
+  try {
+    const created = await worker.fetch("http://127.0.0.1/api/v1/namespaces", {
+      method: "POST",
+      headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    const body = await created.text();
+    assert.equal(created.status, 201, body);
+    assert.equal(body.includes(password), false);
+  } finally {
+    await worker.stop();
+    if (previous === undefined) {
+      delete process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
+    } else {
+      process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = previous;
+    }
+    const drop = new pg.Client({ connectionString: adminUrl });
+    await drop.connect();
+    await drop.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [name]);
+    await drop.query(`DROP DATABASE IF EXISTS ${name}`);
+    await drop.query(`DROP ROLE IF EXISTS ${name}`);
+    await drop.end();
+  }
+});
 });

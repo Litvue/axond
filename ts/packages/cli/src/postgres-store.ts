@@ -99,6 +99,36 @@ export function postgresClientOptions(connectionString: string) {
 }
 
 /**
+ * Hyperdrive's `connectionString` copies the password through without
+ * percent-encoding. A password that contains `@`, `:`, `/`, `#`, `?`, or `%`
+ * makes that string invalid, and `pg` throws before it connects. The binding's
+ * host, user, password, and database keep those characters. The socket from
+ * the Worker to Hyperdrive is plaintext; origin TLS stays on Hyperdrive.
+ */
+export function hyperdriveClientOptions(binding: {
+  connectionString: string;
+  host?: string;
+  port?: number;
+  user?: string;
+  password?: string;
+  database?: string;
+}) {
+  if (binding.host && binding.user && binding.database && binding.password !== undefined) {
+    return {
+      host: binding.host,
+      port: binding.port,
+      user: binding.user,
+      password: binding.password,
+      database: binding.database,
+      ssl: false as const,
+      connectionTimeoutMillis: POSTGRES_CONNECT_TIMEOUT_MS,
+      query_timeout: POSTGRES_QUERY_TIMEOUT_MS,
+    };
+  }
+  return postgresClientOptions(binding.connectionString);
+}
+
+/**
  * Run one statement. On `Query read timeout` the driver leaves the socket
  * open, so a following ROLLBACK would wait another full statement limit.
  * Drop the socket before the error returns.

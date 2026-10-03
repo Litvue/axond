@@ -12,12 +12,19 @@ import {
   closePgClient,
   createPostgresStore,
   holdPgClient,
-  postgresClientOptions,
+  hyperdriveClientOptions,
   queryPgClient,
 } from "../../cli/src/postgres-store.ts";
 
 export interface WorkerEnv {
-  HYPERDRIVE: { connectionString: string };
+  HYPERDRIVE: {
+    connectionString: string;
+    host?: string;
+    port?: number;
+    user?: string;
+    password?: string;
+    database?: string;
+  };
   GATEWAY_KEY: string;
   PROVIDERS_JSON: string;
   /** Price rules. Absent means models stay unpriced and a successful chat does not move spent. */
@@ -98,8 +105,9 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
   const extensions = [rateLimitExtension({ limit: 60, windowMs: 60_000, mode: "isolate" })];
   const store = storeOverride ?? createPostgresStore(async () => {
     // A silent accept and a silent statement use Hyperdrive's 15s and 60s
-    // limits. See `postgresClientOptions`.
-    const client = holdPgClient(new Client(postgresClientOptions(env.HYPERDRIVE.connectionString)));
+    // limits. Structured fields keep a password that `connectionString` cannot
+    // carry. See `hyperdriveClientOptions`.
+    const client = holdPgClient(new Client(hyperdriveClientOptions(env.HYPERDRIVE)));
     try {
       await client.connect();
     } catch (error) {
@@ -166,6 +174,11 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
 export function handlerFor(env: WorkerEnv) {
   const key = [
     env.HYPERDRIVE.connectionString,
+    env.HYPERDRIVE.host ?? "",
+    String(env.HYPERDRIVE.port ?? ""),
+    env.HYPERDRIVE.user ?? "",
+    env.HYPERDRIVE.password ?? "",
+    env.HYPERDRIVE.database ?? "",
     env.GATEWAY_KEY,
     env.PROVIDERS_JSON,
     env.PRICES_JSON ?? "",

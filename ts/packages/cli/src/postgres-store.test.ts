@@ -16,6 +16,7 @@ import {
   createPostgresStore,
   holdPgClient,
   POSTGRES_SCHEMA,
+  hyperdriveClientOptions,
   postgresClientOptions,
   postgresQueryText,
   postgresSchemaTables,
@@ -174,6 +175,39 @@ test("postgres clients use the connect and statement limits", async () => {
   assert.match(main, /closePgClient\(/);
   const migration = await readFile(new URL("./postgres-store.ts", import.meta.url), "utf8");
   assert.match(migration, /new pg\.Client\(postgresClientOptions\(dsn\)\)/);
+});
+
+test("hyperdrive client options keep a password the connection string cannot carry", () => {
+  const password = "p@ss:w/rd#x?y%zz";
+  const host = "example.hyperdrive.local";
+  const raw = `postgresql://postgres.branchid:${password}@${host}:5432/postgres?sslmode=disable`;
+  assert.throws(() => new URL(raw), TypeError);
+  assert.throws(() => new pg.Client({ connectionString: raw }), TypeError);
+  const options = hyperdriveClientOptions({
+    connectionString: raw,
+    host,
+    port: 5432,
+    user: "postgres.branchid",
+    password,
+    database: "postgres",
+  });
+  assert.equal(options.connectionTimeoutMillis, 15_000);
+  assert.equal(options.query_timeout, 60_000);
+  assert.equal("ssl" in options && options.ssl, false);
+  const client = new pg.Client(options);
+  const parameters = client.connectionParameters;
+  assert.equal(parameters.user, "postgres.branchid");
+  assert.equal(parameters.password, password);
+  assert.equal(parameters.host, host);
+  assert.equal(parameters.port, 5432);
+  assert.equal(parameters.database, "postgres");
+  assert.equal(parameters.ssl, false);
+  const fallback = hyperdriveClientOptions({
+    connectionString: "postgres://axond:socket-secret@127.0.0.1:1/axond",
+  });
+  assert.equal("connectionString" in fallback && fallback.connectionString.includes("socket-secret"), true);
+  assert.equal(fallback.connectionTimeoutMillis, 15_000);
+  assert.equal(fallback.query_timeout, 60_000);
 });
 
 test("queryPgClient drops the socket when a statement times out", async () => {

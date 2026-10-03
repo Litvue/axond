@@ -107,7 +107,7 @@ test("the worker handler is a static bundle of the gateway and an extension", as
   const wrangler = await readFile(new URL("../wrangler.toml", import.meta.url), "utf8");
   assert.match(source, /from "@axond\/rate-limit"/);
   assert.match(source, /holdPgClient\(new Client/);
-  assert.match(source, /postgresClientOptions\(env\.HYPERDRIVE\.connectionString\)/);
+  assert.match(source, /hyperdriveClientOptions\(env\.HYPERDRIVE\)/);
   assert.match(source, /queryPgClient\(/);
   assert.match(storeSource, /POSTGRES_CONNECT_TIMEOUT_MS = 15_000/);
   assert.match(storeSource, /POSTGRES_QUERY_TIMEOUT_MS = 60_000/);
