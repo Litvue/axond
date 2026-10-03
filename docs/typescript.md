@@ -424,10 +424,16 @@ SQLite inside the container.
 ## Worker
 
 `ts/packages/worker` is the Hyperdrive template. Create the Hyperdrive config
-against PlanetScale's direct port 5432 with `--caching-disabled`, then set that id.
-The Worker connects with the binding's host, user, password, and database. Hyperdrive's `connectionString` leaves reserved characters in the password unescaped, and `pg` rejects that string. Wrangler ignores `sslmode` in the connection string. The default mode is `require`
-(TLS, WebPKI). `--sslmode verify-full` also needs `--ca-certificate-id`. Port 6432 is PgBouncer, and Hyperdrive
-is already the transaction pooler. Bundle the Worker with the extensions it imports. A
+against PlanetScale's direct port 5432 with `--origin-host`, `--origin-port`,
+`--origin-scheme`, `--database`, `--origin-user`, `--origin-password`, and
+`--caching-disabled`, then set that id. A connection-string password that
+contains `/`, `#`, `?`, or `%` is rejected by Wrangler's URL parser.
+`--origin-password` is stored as given. The Worker connects with the binding's
+host, user, password, and database. Hyperdrive's `connectionString` leaves
+reserved characters in the password unescaped, and `pg` rejects that string.
+The default TLS mode is `require` (TLS, WebPKI). `--sslmode verify-full` also
+needs `--ca-certificate-id`. Port 6432 is PgBouncer, and Hyperdrive is already
+the transaction pooler. Bundle the Worker with the extensions it imports. A
 compiled Bun binary loads those same extensions from disk instead. A cron
 trigger (`*/5 * * * *`) runs provider discovery and catalogue import off the
 request path. The refresh walks the platform credential pool, or the lexicographically first tenant pool, and follows `has_more` for up to 20 pages. A failed fetch marks the row stale and leaves the last payload. A fetch that has not finished after 30 seconds is that failure. The process writes JSON `msg` `provider_discovery` with the provider id and a bounded reason, and that line omits the credential and the base URL. A `3xx` from the provider or the catalogue is not followed, so the credential stays on the configured URL.

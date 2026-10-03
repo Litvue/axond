@@ -537,15 +537,30 @@ test("worker_template_enables_request_signal", async () => {
   assert.match(toml, /enable_request_signal/);
 });
 
-test("worker_hyperdrive_create_comment_keeps_sslmode_out_of_the_url", async () => {
+test("worker_hyperdrive_create_comment_uses_origin_flags", async () => {
   const toml = await readFile(new URL("../wrangler.toml", import.meta.url), "utf8");
   const command = toml
     .split("\n")
-    .filter((line) => line.includes("connection-string") || line.includes("caching-disabled"))
+    .filter((line) => line.includes("wrangler hyperdrive create") || line.trimStart().startsWith("#     --"))
     .join("\n");
+  assert.match(command, /--origin-host=HOST/);
+  assert.match(command, /--origin-port=5432/);
+  assert.match(command, /--origin-scheme=postgres/);
+  assert.match(command, /--database=DB/);
+  assert.match(command, /--origin-user=USER/);
+  assert.match(command, /--origin-password=PASSWORD/);
   assert.match(command, /--caching-disabled/);
-  assert.equal(command.includes("sslmode="), false);
-  assert.match(command, /:5432\//);
+  assert.equal(command.includes("connection-string"), false);
+  assert.equal(command.includes("sslmode"), false);
+  assert.equal(command.includes("6432"), false);
+  // Wrangler 4.143.1 parses --connection-string with `new URL` and then
+  // decodeURIComponent. These two passwords never become the stored password.
+  assert.throws(
+    () => new URL("postgresql://postgres.branch:pscale_pw_ab/cd@host.example:5432/postgres"),
+    TypeError,
+  );
+  const parsed = new URL("postgresql://postgres.branch:pscale_pw_ab%cd@host.example:5432/postgres");
+  assert.throws(() => decodeURIComponent(parsed.password), URIError);
 });
 
 // pg's connection.end() writes the Terminate message as write(buffer, callback)

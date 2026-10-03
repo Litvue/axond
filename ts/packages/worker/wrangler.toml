@@ -6,14 +6,20 @@ compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat", "enable_request_signal"]
 
 # PlanetScale Postgres is reached through Hyperdrive. Create the config on
-# PlanetScale's direct port 5432 and disable caching. Wrangler keeps host,
-# port, database, user, and password from the connection string and ignores
-# its query string, so sslmode=verify-full there does not set the TLS mode.
-# The default mode is require: TLS, with the server certificate checked
-# against WebPKI. Hostname verification is --sslmode verify-full and needs
-# --ca-certificate-id for an uploaded CA.
+# PlanetScale's direct port 5432 and disable caching. Pass host, port, scheme,
+# database, user, and password as separate flags. Wrangler's URL parser rejects
+# a password that contains `/`, `#`, `?`, or `%`, and a `%` that is not two hex
+# digits parses and then fails decodeURIComponent. --origin-password stores the
+# string as given. The default TLS mode is require: TLS, with the server
+# certificate checked against WebPKI. Hostname verification is --sslmode
+# verify-full and needs --ca-certificate-id for an uploaded CA.
 #   wrangler hyperdrive create axond \
-#     --connection-string="postgresql://USER:PASSWORD@HOST:5432/DB" \
+#     --origin-host=HOST \
+#     --origin-port=5432 \
+#     --origin-scheme=postgres \
+#     --database=DB \
+#     --origin-user=USER \
+#     --origin-password=PASSWORD \
 #     --caching-disabled
 # Port 6432 is PgBouncer. Hyperdrive is already the transaction pooler, so
 # the origin should be the direct port. A cached namespace or budget read can
@@ -22,7 +28,8 @@ compatibility_flags = ["nodejs_compat", "enable_request_signal"]
 # port 5432; this Worker then skips that DDL. Fill the id from the create
 # command. Local `wrangler dev` reads
 # CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE and does not use
-# this id. That local path was exercised against Postgres 16; PlanetScale was not.
+# this id. That local path was exercised against Postgres 16, 17, and 18;
+# PlanetScale was not.
 [[hyperdrive]]
 binding = "HYPERDRIVE"
 id = "00000000000000000000000000000000"
