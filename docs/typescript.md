@@ -424,8 +424,9 @@ SQLite inside the container.
 ## Worker
 
 `ts/packages/worker` is the Hyperdrive template. Create the Hyperdrive config
-against PlanetScale's direct port 5432 with `sslmode=verify-full` and
-`--caching-disabled`, then set that id. Port 6432 is PgBouncer, and Hyperdrive
+against PlanetScale's direct port 5432 with `--caching-disabled`, then set that id.
+Wrangler ignores `sslmode` in the connection string. The default mode is `require`
+(TLS, WebPKI). `--sslmode verify-full` also needs `--ca-certificate-id`. Port 6432 is PgBouncer, and Hyperdrive
 is already the transaction pooler. Bundle the Worker with the extensions it imports. A
 compiled Bun binary loads those same extensions from disk instead. A cron
 trigger (`*/5 * * * *`) runs provider discovery and catalogue import off the

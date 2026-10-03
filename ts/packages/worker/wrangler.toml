@@ -6,9 +6,14 @@ compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat", "enable_request_signal"]
 
 # PlanetScale Postgres is reached through Hyperdrive. Create the config on
-# PlanetScale's direct port 5432, with TLS, and with caching disabled:
+# PlanetScale's direct port 5432 and disable caching. Wrangler keeps host,
+# port, database, user, and password from the connection string and ignores
+# its query string, so sslmode=verify-full there does not set the TLS mode.
+# The default mode is require: TLS, with the server certificate checked
+# against WebPKI. Hostname verification is --sslmode verify-full and needs
+# --ca-certificate-id for an uploaded CA.
 #   wrangler hyperdrive create axond \
-#     --connection-string="postgresql://USER:PASSWORD@HOST:5432/DB?sslmode=verify-full" \
+#     --connection-string="postgresql://USER:PASSWORD@HOST:5432/DB" \
 #     --caching-disabled
 # Port 6432 is PgBouncer. Hyperdrive is already the transaction pooler, so
 # the origin should be the direct port. A cached namespace or budget read can

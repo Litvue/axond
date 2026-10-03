@@ -529,6 +529,17 @@ test("worker_template_enables_request_signal", async () => {
   assert.match(toml, /enable_request_signal/);
 });
 
+test("worker_hyperdrive_create_comment_keeps_sslmode_out_of_the_url", async () => {
+  const toml = await readFile(new URL("../wrangler.toml", import.meta.url), "utf8");
+  const command = toml
+    .split("\n")
+    .filter((line) => line.includes("connection-string") || line.includes("caching-disabled"))
+    .join("\n");
+  assert.match(command, /--caching-disabled/);
+  assert.equal(command.includes("sslmode="), false);
+  assert.match(command, /:5432\//);
+});
+
 test("worker_request_abort_settles_client_cancelled", async () => {
   const upstream = await listen((req, res) => {
     req.resume();
