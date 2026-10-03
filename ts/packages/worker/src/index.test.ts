@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import pg from "pg";
 
@@ -541,6 +542,49 @@ test("worker_hyperdrive_create_comment_keeps_sslmode_out_of_the_url", async () =
   assert.equal(command.includes("sslmode="), false);
   assert.match(command, /:5432\//);
 });
+
+// pg's connection.end() writes the Terminate message as write(buffer, callback)
+// and only closes the socket from that callback. pg-cloudflare 1.4.0 stored the
+// callback as an encoding and never closed the Hyperdrive socket.
+test("worker_hyperdrive_socket_closes_from_the_end_callback", async () => {
+  const href = pathToFileURL(new URL("../../../node_modules/pg-cloudflare/dist/index.js", import.meta.url).pathname).href;
+  const loaded = await import(href) as { CloudflareSocket?: new (ssl: boolean) => HyperdriveSocket };
+  const Socket = loaded.CloudflareSocket;
+  assert.equal(typeof Socket, "function");
+  const socket = new Socket(false);
+  let written = 0;
+  socket._cfWriter = {
+    write(data) {
+      written += data.length;
+      return Promise.resolve();
+    },
+  };
+  socket._cfSocket = { close: () => Promise.resolve() };
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("end callback was dropped")), 1_000);
+    socket.write(Uint8Array.of(0x58), () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  assert.equal(written, 1);
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("socket close was not emitted")), 1_000);
+    socket.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    socket.end();
+  });
+});
+
+interface HyperdriveSocket {
+  write(data: Uint8Array, encodingOrCallback?: string | ((error?: unknown) => void), callback?: (error?: unknown) => void): void;
+  end(): void;
+  once(event: "close", listener: () => void): void;
+  _cfWriter: { write(data: Uint8Array): Promise<void> } | null;
+  _cfSocket: { close(): Promise<void> } | null;
+}
 
 test("worker_request_abort_settles_client_cancelled", async () => {
   const upstream = await listen((req, res) => {
