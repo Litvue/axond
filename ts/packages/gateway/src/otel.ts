@@ -242,18 +242,28 @@ function intAttr(key: string, value: bigint): { key: string; value: { intValue: 
   return { key, value: { intValue: clamped.toString() } };
 }
 
+/** OpenTelemetry SDK default. A collector that accepts and never answers must not hold the Worker. */
+const OTLP_EXPORT_TIMEOUT_MS = 10_000;
+
 export async function postOtlp(
   endpoint: string,
   signal: "traces" | "metrics" | "logs",
   body: unknown,
   fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
-  const response = await fetchImpl(signalUrl(endpoint, signal), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  await response.arrayBuffer();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), OTLP_EXPORT_TIMEOUT_MS);
+  try {
+    const response = await fetchImpl(signalUrl(endpoint, signal), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    await response.arrayBuffer();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function resourceAttributes(instanceId?: string): Record<string, string> {

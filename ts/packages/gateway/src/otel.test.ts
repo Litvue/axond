@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import test from "node:test";
 
-import { beginTrace, formatTraceparent, metricPayload, resolveTelemetry, signalUrl, tracePayload, usageLogPayload } from "./otel.ts";
+import { beginTrace, formatTraceparent, metricPayload, postOtlp, resolveTelemetry, signalUrl, tracePayload, usageLogPayload } from "./otel.ts";
 import type { UsageRecord } from "@axond/sdk";
 
 test("resolveTelemetry is off without an endpoint and rejects other protocols", () => {
@@ -16,6 +17,57 @@ test("resolveTelemetry is off without an endpoint and rejects other protocols", 
   assert.throws(() => resolveTelemetry({ endpoint: "http://collector:4318", protocol: "http/protobuf" }), /OTLP\/HTTP JSON/);
   assert.throws(() => resolveTelemetry({ endpoint: "collector:4318" }), /http:\/\/ or https:\/\//);
   assert.throws(() => resolveTelemetry({ instanceId: "has space" }), /ASCII letters/);
+});
+
+test("postOtlp posts a trace and reads the collector body", async () => {
+  const server = createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("no collector port");
+  }
+  try {
+    await postOtlp(`http://127.0.0.1:${address.port}`, "traces", { resourceSpans: [] });
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("postOtlp stops when the collector accepts and never finishes the body", async () => {
+  const server = createServer((req, res) => {
+    req.resume();
+    res.writeHead(200, { "content-type": "application/json" });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("no collector port");
+  }
+  const started = Date.now();
+  try {
+    await Promise.race([
+      postOtlp(`http://127.0.0.1:${address.port}`, "traces", { resourceSpans: [] }).then(
+        () => {
+          throw new Error("collector hang resolved");
+        },
+        () => undefined,
+      ),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("otlp hung")), 15_000)),
+    ]);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+  const elapsed = Date.now() - started;
+  assert.equal(elapsed >= 8_000, true);
+  assert.equal(elapsed < 15_000, true);
 });
 
 test("signalUrl appends the requested signal", () => {
