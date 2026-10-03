@@ -42,6 +42,53 @@ test("workerd_hyperdrive_refused_connect_returns_503", async () => {
   }
 });
 
+test("workerd_hyperdrive_silent_peer_returns_503", async () => {
+  const silent = createTcpServer((socket) => {
+    socket.on("error", () => undefined);
+  });
+  await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", () => resolve()));
+  const address = silent.address();
+  if (!address || typeof address === "string") {
+    silent.close();
+    throw new Error("no silent port");
+  }
+  const previous = process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
+  process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE =
+    `postgres://axond:socket-secret@127.0.0.1:${address.port}/axond`;
+  const worker = await unstable_dev(new URL("./index.ts", import.meta.url).pathname, {
+    config: new URL("../wrangler.toml", import.meta.url).pathname,
+    local: true,
+    ip: "127.0.0.1",
+    vars: { GATEWAY_KEY: key, PROVIDERS_JSON: "[]" },
+    logLevel: "error",
+    experimental: { disableExperimentalWarning: true, disableDevRegistry: true },
+  });
+  const started = Date.now();
+  try {
+    const listed = await Promise.race([
+      worker.fetch("http://127.0.0.1/api/v1/namespaces", {
+        headers: { authorization: `Bearer ${key}` },
+      }).then(async (response) => ({ status: response.status, body: await response.text(), ms: Date.now() - started })),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("silent peer hung")), 20_000)),
+    ]);
+    assert.equal(listed.status, 503, listed.body);
+    const parsed = JSON.parse(listed.body) as { error: { type: string; message: string } };
+    assert.equal(parsed.error.type, "store_unavailable");
+    assert.equal(parsed.error.message, "store is unavailable");
+    assert.equal(listed.body.includes("socket-secret"), false);
+    assert.equal(listed.body.includes("would never generate a response"), false);
+    assert.equal(listed.ms < 20_000, true);
+  } finally {
+    await worker.stop();
+    silent.close();
+    if (previous === undefined) {
+      delete process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
+    } else {
+      process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = previous;
+    }
+  }
+});
+
 test("workerd_hyperdrive_open_peer_still_answers", { skip: !dsn }, async () => {
   const upstream = new URL(dsn!);
   const proxy = createTcpServer((client) => {

@@ -89,7 +89,13 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
   const schema = schemaAttempt();
   const extensions = [rateLimitExtension({ limit: 60, windowMs: 60_000, mode: "isolate" })];
   const store = storeOverride ?? createPostgresStore(async () => {
-    const client = holdPgClient(new Client({ connectionString: env.HYPERDRIVE.connectionString }));
+    // A peer that accepts the TCP socket and never speaks Postgres leaves
+    // connect() pending, and the runtime then reports a hung Worker. 15s matches
+    // Hyperdrive's origin connection timeout.
+    const client = holdPgClient(new Client({
+      connectionString: env.HYPERDRIVE.connectionString,
+      connectionTimeoutMillis: 15_000,
+    }));
     try {
       await client.connect();
     } catch (error) {
