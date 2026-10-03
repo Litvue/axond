@@ -179,6 +179,51 @@ test("a dropped postgres socket does not crash the process", async (t) => {
   }
 });
 
+test("a parameterized query reports a socket reset that never emits close", async (t) => {
+  if (!dsn) {
+    t.skip("AXOND_TEST_POSTGRES is unset");
+    return;
+  }
+  // pg 8.23.0 set connection._ending on every extended-protocol Sync, so a
+  // later ECONNRESET was ignored. A Workers socket can report that reset
+  // without emitting close. The query then waited out query_timeout.
+  const client = holdPgClient(new pg.Client({
+    connectionString: dsn,
+    query_timeout: 2_500,
+  }));
+  await client.connect();
+  const stream = client.connection.stream as {
+    destroy: (error?: Error) => void;
+    emit: (event: string, ...args: unknown[]) => boolean;
+  };
+  const emit = stream.emit.bind(stream);
+  try {
+    await client.query("SELECT $1::int AS n", [1]);
+    stream.emit = (event: string, ...args: unknown[]) => {
+      if (event === "close" || event === "end") {
+        return false;
+      }
+      return emit(event, ...args);
+    };
+    const started = Date.now();
+    const pending = client.query("SELECT pg_sleep(8), $1::int AS n", [2]);
+    setTimeout(() => {
+      const error = new Error("reset") as Error & { code?: string };
+      error.code = "ECONNRESET";
+      stream.destroy(error);
+    }, 40);
+    await assert.rejects(pending, (error: unknown) => {
+      assert.equal(error instanceof Error ? error.message : "", "reset");
+      return true;
+    });
+    assert.equal(Date.now() - started < 1_000, true);
+  } finally {
+    stream.emit = emit;
+    stream.destroy();
+    await closePgClient(client);
+  }
+});
+
 test("the postgres schema seeds a row lock and does not take an advisory lock", () => {
   assert.equal(POSTGRES_SCHEMA.includes("CREATE TABLE IF NOT EXISTS public.axond_schema_lock"), true);
   assert.equal(POSTGRES_SCHEMA.includes("INSERT INTO public.axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO NOTHING"), true);

@@ -11,7 +11,7 @@
     "@axond/gateway": "0.0.0",
     "@axond/rate-limit": "0.0.0",
     "@axond/sdk": "0.0.0",
-    "pg": "^8.16.3"
+    "pg": "^8.23.1"
   },
   "devDependencies": {
     "wrangler": "4.143.1"
