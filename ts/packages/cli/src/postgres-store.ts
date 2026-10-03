@@ -511,14 +511,13 @@ async function lockNamespace(client: SqlExecutor, id: string): Promise<void> {
 
 /**
  * Hyperdrive returns the origin connection when the transaction ends, so a
- * session `SET` does not stick. These limits apply only to the transaction
- * that just began. A lock waiter would otherwise hold that connection until
- * the 60s query limit.
+ * session `SET` does not stick. One simple query starts the transaction and
+ * limits it. A lock waiter, including a charge blocked on the budget row,
+ * would otherwise hold that connection until the 60s query limit.
  */
-const POSTGRES_TRANSACTION_LIMITS = "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'";
+const POSTGRES_TRANSACTION_LIMITS = "BEGIN; SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'";
 
 async function beginPostgresTransaction(client: SqlExecutor): Promise<void> {
-  await client.query("BEGIN");
   await client.query(POSTGRES_TRANSACTION_LIMITS);
 }
 
@@ -535,37 +534,39 @@ async function withTransaction<T>(client: SqlExecutor, fn: (client: SqlExecutor)
 }
 
 export async function settlePostgres(client: SqlExecutor, input: SettleInput): Promise<{ charged: boolean }> {
-  if (input.cost === null || input.period === null) {
-    const inserted = await client.query(
-      `INSERT INTO public.axond_store_usage (request_id, namespace, period, model, status, cost_microdollars)
-       VALUES ($1, $2, $3, $4, $5, NULL)
-       ON CONFLICT (request_id) DO NOTHING`,
-      [input.requestId, input.namespace, input.period, input.model, input.status],
+  return withTransaction(client, async (client) => {
+    if (input.cost === null || input.period === null) {
+      const inserted = await client.query(
+        `INSERT INTO public.axond_store_usage (request_id, namespace, period, model, status, cost_microdollars)
+         VALUES ($1, $2, $3, $4, $5, NULL)
+         ON CONFLICT (request_id) DO NOTHING`,
+        [input.requestId, input.namespace, input.period, input.model, input.status],
+      );
+      return { charged: false && (inserted.rowCount ?? 0) >= 0 };
+    }
+    const result = await client.query(
+      `WITH ins AS (
+         INSERT INTO public.axond_store_usage (request_id, namespace, period, model, status, cost_microdollars, recorded_at)
+         VALUES ($1, $2, $3, $4, $5, $6::bigint, now())
+         ON CONFLICT (request_id) DO NOTHING
+         RETURNING 1
+       ),
+       upd AS (
+         UPDATE public.axond_store_budget
+         SET spent_microdollars = CASE
+           WHEN spent_microdollars >= ${I64_MAX}::bigint - $6::bigint THEN ${I64_MAX}::bigint
+           ELSE spent_microdollars + $6::bigint END
+         WHERE namespace = $2 AND period = $3
+           AND EXISTS (SELECT 1 FROM ins)
+           AND EXISTS (SELECT 1 FROM public.axond_namespace WHERE id = $2)
+           AND COALESCE((SELECT n FROM public.axond_namespace_incarnation WHERE id = $2), 1) = $7::bigint
+         RETURNING 1
+       )
+       SELECT (SELECT COUNT(*) FROM ins) AS inserted, (SELECT COUNT(*) FROM upd) AS charged`,
+      [input.requestId, input.namespace, input.period, input.model, input.status, saturateMicrodollars(input.cost).toString(), input.incarnation.toString()],
     );
-    return { charged: false && (inserted.rowCount ?? 0) >= 0 };
-  }
-  const result = await client.query(
-    `WITH ins AS (
-       INSERT INTO public.axond_store_usage (request_id, namespace, period, model, status, cost_microdollars, recorded_at)
-       VALUES ($1, $2, $3, $4, $5, $6::bigint, now())
-       ON CONFLICT (request_id) DO NOTHING
-       RETURNING 1
-     ),
-     upd AS (
-       UPDATE public.axond_store_budget
-       SET spent_microdollars = CASE
-         WHEN spent_microdollars >= ${I64_MAX}::bigint - $6::bigint THEN ${I64_MAX}::bigint
-         ELSE spent_microdollars + $6::bigint END
-       WHERE namespace = $2 AND period = $3
-         AND EXISTS (SELECT 1 FROM ins)
-         AND EXISTS (SELECT 1 FROM public.axond_namespace WHERE id = $2)
-         AND COALESCE((SELECT n FROM public.axond_namespace_incarnation WHERE id = $2), 1) = $7::bigint
-       RETURNING 1
-     )
-     SELECT (SELECT COUNT(*) FROM ins) AS inserted, (SELECT COUNT(*) FROM upd) AS charged`,
-    [input.requestId, input.namespace, input.period, input.model, input.status, saturateMicrodollars(input.cost).toString(), input.incarnation.toString()],
-  );
-  return { charged: Number(result.rows[0]?.["charged"] ?? 0) === 1 };
+    return { charged: Number(result.rows[0]?.["charged"] ?? 0) === 1 };
+  });
 }
 
 export const POSTGRES_SCHEMA = `

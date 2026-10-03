@@ -591,8 +591,7 @@ test("an unknown budget write rolls back and stays a gateway error", async () =>
     return true;
   });
   assert.deepEqual(seen, [
-    "BEGIN",
-    "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'",
+    "BEGIN; SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'",
     "INSERT INTO public.axond_namespace_lock (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
     "SELECT id FROM public.axond_namespace WHERE id = $1",
     "ROLLBACK",
@@ -621,7 +620,7 @@ test("a failed namespace delete rolls the row back", async () => {
     assert.equal(error.message.includes("password=secret"), false);
     return true;
   });
-  assert.equal(seen[0], "BEGIN");
+  assert.equal(seen[0], "BEGIN; SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'");
   assert.equal(seen.at(-1), "ROLLBACK");
   assert.equal(seen.includes("COMMIT"), false);
 });
@@ -700,6 +699,54 @@ test("a namespace lock wait ends before the query limit", { skip: !dsn }, async 
     ]);
     const elapsed = Date.now() - started;
     assert.ok(result instanceof StoreFailure, `lock wait still open after ${elapsed}ms`);
+    assert.ok(elapsed < 8_000);
+    assert.equal(result.message.includes("lock timeout"), false);
+  } finally {
+    await holder.client.query("ROLLBACK").catch(() => undefined);
+    await holder.release();
+    await write.catch(() => undefined);
+  }
+});
+
+test("a charge blocked on the budget row ends before the query limit", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  const id = "charge-lock";
+  await db.putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  await db.putBudget(id, "compat", 5n);
+  const holder = await connect();
+  let write: Promise<unknown> = Promise.resolve();
+  try {
+    await holder.client.query("BEGIN");
+    await holder.client.query("SELECT spent_microdollars FROM axond_store_budget WHERE namespace = $1 AND period = $2 FOR UPDATE", [
+      id,
+      "compat",
+    ]);
+    const started = Date.now();
+    write = db.settle({
+      requestId: "charge-lock-1",
+      namespace: id,
+      period: "compat",
+      model: "m",
+      status: "ok",
+      cost: 1n,
+      incarnation: 1n,
+    });
+    const result = await Promise.race([
+      write.then(
+        () => "ok",
+        (error: unknown) => error,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 8_000)),
+    ]);
+    const elapsed = Date.now() - started;
+    assert.ok(result instanceof StoreFailure, `charge lock wait still open after ${elapsed}ms`);
     assert.ok(elapsed < 8_000);
     assert.equal(result.message.includes("lock timeout"), false);
   } finally {
