@@ -165,10 +165,10 @@ test("a worker catalogue url other than catalog.json is not fetched", async () =
   let fetched = 0;
   const lines: string[] = [];
   const original = console.log;
+  let waited: Promise<unknown> = Promise.resolve();
   console.log = (...args: unknown[]) => {
     lines.push(args.map((part) => String(part)).join(" "));
   };
-  let waited: Promise<unknown> = Promise.resolve();
   try {
     discoverOnSchedule(
       {
@@ -189,10 +189,10 @@ test("a worker catalogue url other than catalog.json is not fetched", async () =
         return new Response(JSON.stringify({ openai: { id: "gpt-test" } }), { status: 200 });
       },
     );
-    await waited;
   } finally {
     console.log = original;
   }
+  await waited;
   assert.equal(fetched, 0);
   const body = lines.join("\n");
   assert.equal(body.includes("unsupported_endpoint"), true);
