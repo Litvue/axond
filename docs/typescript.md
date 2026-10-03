@@ -448,7 +448,12 @@ whose search path starts with a schema of its own name still sees them.
 A dropped socket is listened for, so it does not exit the process. A failed
 connect closes the client. A refused Workers handshake emits no close, and a
 peer that stays open after Terminate emits none either; the handler closes
-the stream itself and the request can answer.
+the stream itself and the request can answer. A peer that accepts the socket
+and never speaks Postgres is closed after Hyperdrive's 15-second origin
+connection timeout. A peer that finishes startup and then never answers a
+statement is closed after Hyperdrive's 60-second statement limit, and the
+socket is dropped so the next statement does not wait out that limit again.
+The request answers 503.
 Extension migrations apply once on either store:
 a recorded id is skipped, and a failed statement names that id without the
 driver text. The two extra namespace columns

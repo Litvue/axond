@@ -89,6 +89,83 @@ test("workerd_hyperdrive_silent_peer_returns_503", async () => {
   }
 });
 
+function postgresReadyPacket(): Buffer {
+  const authBody = Buffer.alloc(4);
+  authBody.writeInt32BE(0, 0);
+  const auth = Buffer.alloc(5 + authBody.length);
+  auth.write("R", 0, "ascii");
+  auth.writeInt32BE(authBody.length + 4, 1);
+  authBody.copy(auth, 5);
+  const ready = Buffer.alloc(6);
+  ready.write("Z", 0, "ascii");
+  ready.writeInt32BE(5, 1);
+  ready.write("I", 5, "ascii");
+  return Buffer.concat([auth, ready]);
+}
+
+test("workerd_hyperdrive_silent_query_returns_503", async () => {
+  const silent = createTcpServer((socket) => {
+    socket.on("error", () => undefined);
+    let buf = Buffer.alloc(0);
+    let ready = false;
+    socket.on("data", (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (ready || buf.length < 8) {
+        return;
+      }
+      const len = buf.readInt32BE(0);
+      if (buf.length < len) {
+        return;
+      }
+      ready = true;
+      socket.write(postgresReadyPacket());
+    });
+  });
+  await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", () => resolve()));
+  const address = silent.address();
+  if (!address || typeof address === "string") {
+    silent.close();
+    throw new Error("no silent query port");
+  }
+  const previous = process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
+  process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE =
+    `postgres://axond:socket-secret@127.0.0.1:${address.port}/axond`;
+  const worker = await unstable_dev(new URL("./index.ts", import.meta.url).pathname, {
+    config: new URL("../wrangler.toml", import.meta.url).pathname,
+    local: true,
+    ip: "127.0.0.1",
+    vars: { GATEWAY_KEY: key, PROVIDERS_JSON: "[]" },
+    logLevel: "error",
+    experimental: { disableExperimentalWarning: true, disableDevRegistry: true },
+  });
+  const started = Date.now();
+  try {
+    const listed = await Promise.race([
+      worker.fetch("http://127.0.0.1/api/v1/namespaces", {
+        headers: { authorization: `Bearer ${key}` },
+      }).then(async (response) => ({ status: response.status, body: await response.text(), ms: Date.now() - started })),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("silent query hung")), 70_000)),
+    ]);
+    assert.equal(listed.status, 503, listed.body);
+    const parsed = JSON.parse(listed.body) as { error: { type: string; message: string } };
+    assert.equal(parsed.error.type, "store_unavailable");
+    assert.equal(parsed.error.message, "store is unavailable");
+    assert.equal(listed.body.includes("socket-secret"), false);
+    assert.equal(listed.body.includes("would never generate a response"), false);
+    assert.equal(listed.body.includes("Query read timeout"), false);
+    assert.equal(listed.ms >= 50_000, true);
+    assert.equal(listed.ms < 70_000, true);
+  } finally {
+    await worker.stop();
+    silent.close();
+    if (previous === undefined) {
+      delete process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
+    } else {
+      process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = previous;
+    }
+  }
+});
+
 test("workerd_hyperdrive_open_peer_still_answers", { skip: !dsn }, async () => {
   const upstream = new URL(dsn!);
   const proxy = createTcpServer((client) => {

@@ -106,6 +106,7 @@ test("the worker handler is a static bundle of the gateway and an extension", as
   assert.match(source, /from "@axond\/rate-limit"/);
   assert.match(source, /holdPgClient\(new Client/);
   assert.match(source, /connectionTimeoutMillis: 15_000/);
+  assert.match(source, /query_timeout: 60_000/);
   assert.match(source, /closePgClient\(client\)/);
   assert.match(source, /waitUntil/);
   assert.match(source, /discoverOnce/);

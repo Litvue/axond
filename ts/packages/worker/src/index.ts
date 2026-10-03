@@ -91,10 +91,14 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
   const store = storeOverride ?? createPostgresStore(async () => {
     // A peer that accepts the TCP socket and never speaks Postgres leaves
     // connect() pending, and the runtime then reports a hung Worker. 15s matches
-    // Hyperdrive's origin connection timeout.
+    // Hyperdrive's origin connection timeout. A peer that finishes startup and
+    // then never answers a statement leaves the same hang. 60s matches
+    // Hyperdrive's maximum statement duration. The driver does not close the
+    // socket on that timeout, so the next statement would wait another minute.
     const client = holdPgClient(new Client({
       connectionString: env.HYPERDRIVE.connectionString,
       connectionTimeoutMillis: 15_000,
+      query_timeout: 60_000,
     }));
     try {
       await client.connect();
@@ -111,7 +115,7 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
     return {
       client: {
         query: async (sql: string, params?: readonly unknown[]) => {
-          const result = await client.query(sql, params ? [...(params as unknown[])] : []);
+          const result = await queryWorkerPg(client, sql, params ? [...params] : []);
           return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
         },
       },
@@ -193,7 +197,7 @@ export default {
 async function prepareWorkerSchema(client: Client, extensions: readonly AxondExtension[]): Promise<void> {
   const executor = {
     query: async (sql: string, params?: readonly unknown[]) => {
-      const result = params === undefined ? await client.query(sql) : await client.query(sql, [...params]);
+      const result = await queryWorkerPg(client, sql, params);
       const row = Array.isArray(result) ? result[result.length - 1] : result;
       return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
     },
@@ -203,6 +207,24 @@ async function prepareWorkerSchema(client: Client, extensions: readonly AxondExt
     for (const [index, sql] of (extension.migrations ?? []).entries()) {
       await applyPostgresMigrationOn(executor, `${extension.name}:${index}`, sql);
     }
+  }
+}
+
+async function queryWorkerPg(client: Client, sql: string, params?: readonly unknown[]) {
+  try {
+    return params === undefined ? await client.query(sql) : await client.query(sql, [...params]);
+  } catch (error) {
+    if (error instanceof Error && error.message === "Query read timeout") {
+      const stream = (client as Client & {
+        connection?: { stream?: { destroy?: () => void } };
+      }).connection?.stream;
+      try {
+        stream?.destroy?.();
+      } catch {
+        // A socket that already closed has nothing to destroy.
+      }
+    }
+    throw error;
   }
 }
 
