@@ -716,11 +716,16 @@ function namespaceFrom(row: Record<string, unknown>): NamespaceWrite {
 /**
  * Apply `POSTGRES_SCHEMA`. A role with only `pg_read_all_data` and
  * `pg_write_all_data` cannot `CREATE`, and `CREATE TABLE IF NOT EXISTS`
- * still fails when the tables are already there. Existing tables are enough
- * only when `public.axond_namespace` already has the TypeScript columns. A missing
+ * still fails when the tables are already there. The presence check runs
+ * first, so a peer that closes the socket on that privilege error still
+ * serves a schema an owner already applied. Existing tables are enough only
+ * when `public.axond_namespace` already has the TypeScript columns. A missing
  * table or column is named, and the driver text is not.
  */
 export async function applyPostgresSchema(client: SqlExecutor): Promise<void> {
+  if (await postgresSchemaReady(client)) {
+    return;
+  }
   try {
     await client.query(POSTGRES_SCHEMA);
   } catch (error) {
@@ -743,6 +748,14 @@ const NAMESPACE_COLUMNS: readonly (readonly [string, string])[] = [
   ["axond_namespace", "allow_platform_fallback"],
   ["axond_namespace", "from_config"],
 ];
+
+async function postgresSchemaReady(client: SqlExecutor): Promise<boolean> {
+  const missingTables = await missingPostgresTables(client, postgresSchemaTables());
+  if (missingTables.length > 0) {
+    return false;
+  }
+  return (await missingPostgresColumns(client, NAMESPACE_COLUMNS)).length === 0;
+}
 
 export function postgresSchemaTables(sql = POSTGRES_SCHEMA): string[] {
   return [...sql.matchAll(/CREATE TABLE IF NOT EXISTS\s+(?:public\.)?([a-zA-Z_][a-zA-Z0-9_]*)/g)].map((match) => match[1]!);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import test from "node:test";
 
 import pg from "pg";
@@ -1075,6 +1075,103 @@ test("a restricted role names columns a Rust namespace table omitted", { skip: !
     }
   } finally {
     await owner.end().catch(() => undefined);
+    const drop = await connect();
+    await drop.client.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [
+      dbName,
+    ]);
+    await drop.client.query(`DROP DATABASE ${dbName}`);
+    await drop.client.query(`REVOKE pg_read_all_data, pg_write_all_data FROM ${roleName}`);
+    await drop.client.query(`DROP ROLE ${roleName}`);
+    await drop.release();
+  }
+});
+
+test("a restricted role skips DDL when a privilege error would drop the socket", { skip: !dsn }, async (t) => {
+  const admin = await connect();
+  const role = await admin.client.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+  if (role.rows[0]?.["rolsuper"] !== true) {
+    await admin.release();
+    t.skip("the test role cannot create a database");
+    return;
+  }
+  const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  const dbName = `axond_sk_${suffix}`;
+  const roleName = `axond_skw_${suffix}`;
+  const password = `pw_${suffix}`;
+  const ownerUrl = new URL(dsn!);
+  ownerUrl.pathname = `/${dbName}`;
+  await admin.client.query(`CREATE DATABASE ${dbName}`);
+  await admin.client.query(`CREATE ROLE ${roleName} LOGIN PASSWORD '${password}' NOSUPERUSER NOCREATEDB NOCREATEROLE`);
+  await admin.release();
+  const owner = holdPgClient(new pg.Client({ connectionString: ownerUrl.toString() }));
+  let proxy: ReturnType<typeof createServer> | undefined;
+  try {
+    await owner.connect();
+    await owner.query("REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+    await owner.query(`GRANT USAGE ON SCHEMA public TO ${roleName}`);
+    await owner.query(`GRANT pg_read_all_data, pg_write_all_data TO ${roleName}`);
+    await applyPostgresSchema(sqlExecutor(owner));
+    let dropped = false;
+    proxy = createServer((socket) => {
+      const remote = createConnection({ host: "127.0.0.1", port: Number(ownerUrl.port || 5432) });
+      let pending = Buffer.alloc(0);
+      socket.on("data", (chunk) => {
+        if (!dropped) {
+          remote.write(chunk);
+        }
+      });
+      remote.on("data", (chunk) => {
+        if (dropped) {
+          return;
+        }
+        pending = Buffer.concat([pending, chunk]);
+        while (pending.length >= 5) {
+          const type = pending[0]!;
+          const length = pending.readInt32BE(1);
+          if (pending.length < 1 + length) {
+            return;
+          }
+          const message = pending.subarray(0, 1 + length);
+          pending = pending.subarray(1 + length);
+          socket.write(message);
+          if (type === 0x45) {
+            dropped = true;
+            socket.destroy();
+            remote.destroy();
+            return;
+          }
+        }
+      });
+      socket.on("error", () => remote.destroy());
+      remote.on("error", () => socket.destroy());
+      socket.on("close", () => remote.destroy());
+    });
+    await new Promise<void>((resolve) => proxy!.listen(0, "127.0.0.1", () => resolve()));
+    const address = proxy.address();
+    if (!address || typeof address === "string") {
+      throw new Error("no proxy port");
+    }
+    const client = holdPgClient(new pg.Client({
+      host: "127.0.0.1",
+      port: address.port,
+      user: roleName,
+      password,
+      database: dbName,
+      connectionTimeoutMillis: 5_000,
+      query_timeout: 5_000,
+    }));
+    await client.connect();
+    try {
+      await applyPostgresSchema(sqlExecutor(client));
+      assert.equal(dropped, false);
+    } finally {
+      await client.end().catch(() => undefined);
+    }
+  } finally {
+    await owner.end().catch(() => undefined);
+    if (proxy) {
+      await new Promise<void>((resolve) => proxy!.close(() => resolve()));
+    }
     const drop = await connect();
     await drop.client.query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()", [
       dbName,
