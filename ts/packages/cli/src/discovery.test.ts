@@ -636,7 +636,8 @@ test("catalogue_and_listing_redirects_are_not_followed_and_omit_the_secret", asy
   }
 });
 
-test("discovery treats a provider body that never arrives as unreachable", async () => {
+// The fetch abort is 30s. Bun's suite timeout has to outlast that plus the assertions.
+test("discovery treats a provider body that never arrives as unreachable", { timeout: 45_000 }, async () => {
   const server = createServer((req, res) => {
     req.resume();
     res.writeHead(200, { "content-type": "application/json" });
