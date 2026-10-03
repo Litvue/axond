@@ -194,8 +194,16 @@ export function createPostgresStore(
     async query(sql, params = []) {
       const text = postgresQueryText(sql, params.length);
       return withClient(null, async (client) => {
-        const result = await client.query(text, params);
-        return { rows: result.rows };
+        if (!postgresWrites(text)) {
+          const result = await client.query(text, params);
+          return { rows: result.rows };
+        }
+        // An extension upsert, including the store-mode rate limit, locks a row.
+        // A bare statement would hold the Hyperdrive connection until the 60s query limit.
+        return withTransaction(client, async (client) => {
+          const result = await client.query(text, params);
+          return { rows: result.rows };
+        });
       });
     },
     async resolveNamespace(id, nowMs) {
@@ -519,6 +527,12 @@ export const POSTGRES_LOCAL_LIMITS = "SET LOCAL lock_timeout = '2s'; SET LOCAL s
 
 /** One simple query starts the transaction and limits it, including a charge blocked on the budget row. */
 export const POSTGRES_TRANSACTION_LIMITS = `BEGIN; ${POSTGRES_LOCAL_LIMITS}`;
+
+/** A statement that can wait on a row lock. Reads stay one statement. */
+function postgresWrites(sql: string): boolean {
+  const head = sql.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n]*/g, " ").trim().toLowerCase();
+  return head.startsWith("insert") || head.startsWith("update") || head.startsWith("delete") || head.startsWith("merge");
+}
 
 async function beginPostgresTransaction(client: SqlExecutor): Promise<void> {
   await client.query(POSTGRES_TRANSACTION_LIMITS);

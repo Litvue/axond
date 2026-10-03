@@ -393,6 +393,31 @@ test("postgres query text numbers question-mark binds and keeps quotes", () => {
   assert.throws(() => postgresQueryText("SELECT ?", 2), (error: unknown) => error instanceof StoreFailure);
 });
 
+test("a store write limits the lock wait and a read stays one statement", async () => {
+  const seen: string[] = [];
+  const db = createPostgresStore(async () => ({
+    client: {
+      async query(sql: string) {
+        seen.push(sql);
+        return { rows: [{ count: 1 }], rowCount: 1 };
+      },
+    },
+    release: async () => undefined,
+  }));
+  await db.query("SELECT count FROM axond_ext_ratelimit_window WHERE namespace = ?", ["platform"]);
+  assert.deepEqual(seen, ["SELECT count FROM axond_ext_ratelimit_window WHERE namespace = $1"]);
+  seen.length = 0;
+  await db.query(
+    "INSERT INTO axond_ext_ratelimit_window (namespace, bucket, count) VALUES (?, ?, 1) ON CONFLICT (namespace, bucket) DO UPDATE SET count = axond_ext_ratelimit_window.count + 1",
+    ["platform", "1"],
+  );
+  assert.deepEqual(seen, [
+    "BEGIN; SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'",
+    "INSERT INTO axond_ext_ratelimit_window (namespace, bucket, count) VALUES ($1, $2, 1) ON CONFLICT (namespace, bucket) DO UPDATE SET count = axond_ext_ratelimit_window.count + 1",
+    "COMMIT",
+  ]);
+});
+
 test("postgres store query sends numbered binds to the driver", async () => {
   let seen = "";
   let params: readonly unknown[] = [];
@@ -792,6 +817,55 @@ test("a charge blocked on the budget row ends before the query limit", { skip: !
     await holder.client.query("ROLLBACK").catch(() => undefined);
     await holder.release();
     await write.catch(() => undefined);
+  }
+});
+
+test("a store write blocked on the row ends before the query limit", { skip: !dsn }, async () => {
+  const opened = await connect();
+  await opened.client.query(
+    `CREATE TABLE IF NOT EXISTS axond_ext_write_lock (
+       namespace TEXT NOT NULL,
+       bucket TEXT NOT NULL,
+       count INTEGER NOT NULL,
+       PRIMARY KEY (namespace, bucket)
+     )`,
+  );
+  await opened.client.query(
+    "INSERT INTO axond_ext_write_lock (namespace, bucket, count) VALUES ('lock-ns', 'b', 1) ON CONFLICT (namespace, bucket) DO NOTHING",
+  );
+  await opened.release();
+  const db = store();
+  const holder = await connect();
+  let write: Promise<unknown> = Promise.resolve();
+  try {
+    await holder.client.query("BEGIN");
+    await holder.client.query("SELECT count FROM axond_ext_write_lock WHERE namespace = $1 AND bucket = $2 FOR UPDATE", [
+      "lock-ns",
+      "b",
+    ]);
+    const started = Date.now();
+    write = db.query(
+      "INSERT INTO axond_ext_write_lock (namespace, bucket, count) VALUES (?, ?, 1) ON CONFLICT (namespace, bucket) DO UPDATE SET count = axond_ext_write_lock.count + 1",
+      ["lock-ns", "b"],
+    );
+    const result = await Promise.race([
+      write.then(
+        () => "ok",
+        (error: unknown) => error,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 8_000)),
+    ]);
+    const elapsed = Date.now() - started;
+    assert.ok(result instanceof StoreFailure, `store write still open after ${elapsed}ms`);
+    assert.ok(elapsed < 8_000);
+    assert.equal(result.message.includes("lock timeout"), false);
+  } finally {
+    await holder.client.query("ROLLBACK").catch(() => undefined);
+    await holder.release();
+    await write.catch(() => undefined);
+    const drop = await connect();
+    await drop.client.query("DROP TABLE IF EXISTS axond_ext_write_lock");
+    await drop.release();
   }
 });
 
