@@ -1,0 +1,21 @@
+{
+  "name": "axond-typescript",
+  "private": true,
+  "license": "Apache-2.0 OR MIT",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test $(find packages -name '*.test.ts' -print)",
+    "test:bun": "bun test --timeout 45000 $(find packages -name '*.test.ts' -print)",
+    "test:workerd": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test packages/worker/src/workerd.integration.ts",
+    "lint:web": "node --experimental-strip-types scripts/lint-no-node-imports.ts",
+    "check:alerts": "node --experimental-strip-types scripts/check-alerts.ts",
+    "check:docs": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/check-doc-samples.ts",
+    "check:npm": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/check-npm-policy.ts"
+  },
+  "engines": {
+    "node": ">=22.14"
+  }
+}

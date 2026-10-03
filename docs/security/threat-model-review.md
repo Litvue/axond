@@ -52,6 +52,7 @@ unnoticed one.
 | `backends/catalog.rs`, `aliases.rs`, `pricing.rs`, `[[price]]`, `/v1/models`, alias scope, wire families | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `store/`, `usage/`, `telemetry/` | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
 | `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
+| `ts/packages` extension loading, `AXOND_EXTENSIONS_DIR`, Worker bundling of middleware | [TypeScript extension trust](#8-typescript-extension-trust) |
 
 A change can fire more than one trigger; a credential-delivery change that also
 adds a Postgres table fires two, and owes both sets.
@@ -150,7 +151,14 @@ reference.
 `resolves_env_without_trimming`, `rejects_missing_empty_and_invalid_utf8_files`,
 and `resolves_file_bytes_without_trimming`. Outbound description:
 `a_described_failure_keeps_the_endpoint_and_drops_its_secrets`, the regression
-for the one finding of the security review. Attribution without disclosure:
+for the one finding of the security review. A provider error that echoes the
+outbound credential is returned with that value replaced by `[REDACTED]`.
+`provider_error_replaces_the_echoed_credential` covers the caller body for both
+the Bearer key and the Anthropic `x-api-key`.
+`messages_wire_headers_default_the_version_and_keep_the_caller_pin` sends
+`anthropic-version` (the caller pin, or `2023-06-01` when omitted) and
+`x-api-key`, and does not copy the gateway `Authorization` or a caller `Accept`.
+Attribution without disclosure:
 `fallback_status_hides_default_platform_label_but_keeps_explicit_id`.
 
 A new `expose_secret` call site is a review item in its own right: the security
@@ -235,13 +243,20 @@ attributes in `crates/gateway/src/telemetry/`, log call sites, and the retention
 or delivery guarantees of usage records.
 
 Provider failure diagnostics on attempt spans are bounded to 4 KiB and omit
-the known outbound API key before truncation. The gateway does not attach
+the known outbound API key before truncation. The TypeScript attempt span does
+the same, and the caller body keeps that prefix plus `… [truncated]` when the
+provider text is longer. `provider_diagnostics_keep_context_limits_and_a_bounded_message`
+covers the context-limit vocabulary, that marker, and the span bound. The gateway does not attach
 request or successful-response bodies, but provider error messages can echo
 caller input; trace access is therefore diagnostic-data access. The regression
 `provider_refusals_keep_their_class_and_export_bounded_attempt_diagnostics`
 checks actual upstream status, error classification, OpenTelemetry error
 status, the UTF-8 byte bound, and credential omission across buffered and
-streamed OpenAI and Anthropic calls.
+streamed OpenAI and Anthropic calls. The TypeScript test of that name records
+attempt `axond.status` as `error` on the same matrix.
+`malformed_responses_controls_never_reach_the_provider` refuses a non-boolean
+`stream` and a non-string `previous_response_id` before the provider is called,
+and the error omits the value.
 
 **Regression tests.** The two copies of the shipped DDL are gated by
 `every_shipped_ddl_file_exists_in_both_locations` and
@@ -370,6 +385,42 @@ stateful control plane, its principal directory, `/admin/v1`, breakglass, and
 OIDC administration no longer exist, so this trigger has no mechanism to review.
 Reintroducing an administrative surface or principal model needs a new ADR and a
 new trigger here; `admin_v1_is_unmounted` holds that the old surface stays gone.
+
+## 8. TypeScript extension trust
+
+**Fires on** a change to how `ts/` loads or trusts an extension: the stage
+order, `apiVersion`, migration prefix checks, the untrusted store scope, or
+`AXOND_EXTENSIONS_DIR`.
+
+**Regression tests.** The Rust authentication floor in section 1 still holds
+for the process operators run today. The TypeScript suite names the same
+floor: `unknown_gateway_key_is_rejected_before_namespace_lookup` rejects an
+unknown gateway key before it reads a namespace;
+`noncanonical_namespace_path_is_invalid_after_authentication` refuses a
+percent-encoded namespace segment without echoing it;
+`extension_file_loads_from_a_directory_without_a_rebuild` loads an extension
+file from a directory without rebuilding the process;
+`untrusted_extension_query_without_namespace_is_refused` refuses an untrusted
+query that omits the request namespace;
+`nested_quantifier_redaction_pattern_is_rejected` refuses a nested-quantifier
+redaction pattern; `unsupported_extension_api_version_is_refused_at_mount` and
+`unsupported_extension_api_version_is_refused_when_loaded_from_disk` refuse an
+extension whose apiVersion is not 1;
+`extension_migration_outside_its_prefix_is_refused` refuses a migration that
+creates a table outside that extension's table prefix.
+`sse_config_and_body_rewrite_are_stable_under_arbitrary_splits` holds that an
+SSE identity transform is insensitive to chunk boundaries, a model rewrite
+changes only top-level model strings, and loading one config text twice agrees
+while omitting secret values.
+
+**Threat model and ADRs.** [ADR 0066](../adr/0066-typescript-hono-extension-contract.md)
+is the decision: extensions are operator and first-party code with no
+third-party isolation boundary. Trusted extensions see the process store.
+Untrusted ones see only the request namespace. The Rust binary's static-key
+boundary is unchanged until a later minor ships the TypeScript artifact.
+
+**Release impact.** None for the Rust release binary. The TypeScript process
+is an additional artifact.
 
 ## Recording the review
 
