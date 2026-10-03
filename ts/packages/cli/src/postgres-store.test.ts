@@ -592,6 +592,7 @@ test("an unknown budget write rolls back and stays a gateway error", async () =>
   });
   assert.deepEqual(seen, [
     "BEGIN",
+    "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'",
     "INSERT INTO public.axond_namespace_lock (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
     "SELECT id FROM public.axond_namespace WHERE id = $1",
     "ROLLBACK",
@@ -666,6 +667,45 @@ test("postgres rolls back a namespace delete when the incarnation bump fails", {
     await opened.client.query("DROP TRIGGER IF EXISTS axond_test_fail_incarnation ON axond_namespace_incarnation");
     await opened.client.query("DROP FUNCTION IF EXISTS axond_test_fail_incarnation()");
     await opened.release();
+  }
+});
+
+test("a namespace lock wait ends before the query limit", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  const id = "lock-timeout";
+  await db.putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  const holder = await connect();
+  let write: Promise<unknown> = Promise.resolve();
+  try {
+    await holder.client.query("BEGIN");
+    await holder.client.query(
+      "INSERT INTO axond_namespace_lock (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+      [id],
+    );
+    const started = Date.now();
+    write = db.putBudget(id, "compat", 5n);
+    const result = await Promise.race([
+      write.then(
+        () => "ok",
+        (error: unknown) => error,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 8_000)),
+    ]);
+    const elapsed = Date.now() - started;
+    assert.ok(result instanceof StoreFailure, `lock wait still open after ${elapsed}ms`);
+    assert.ok(elapsed < 8_000);
+    assert.equal(result.message.includes("lock timeout"), false);
+  } finally {
+    await holder.client.query("ROLLBACK").catch(() => undefined);
+    await holder.release();
+    await write.catch(() => undefined);
   }
 });
 

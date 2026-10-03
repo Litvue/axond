@@ -509,8 +509,21 @@ async function lockNamespace(client: SqlExecutor, id: string): Promise<void> {
   );
 }
 
-async function withTransaction<T>(client: SqlExecutor, fn: (client: SqlExecutor) => Promise<T>): Promise<T> {
+/**
+ * Hyperdrive returns the origin connection when the transaction ends, so a
+ * session `SET` does not stick. These limits apply only to the transaction
+ * that just began. A lock waiter would otherwise hold that connection until
+ * the 60s query limit.
+ */
+const POSTGRES_TRANSACTION_LIMITS = "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'";
+
+async function beginPostgresTransaction(client: SqlExecutor): Promise<void> {
   await client.query("BEGIN");
+  await client.query(POSTGRES_TRANSACTION_LIMITS);
+}
+
+async function withTransaction<T>(client: SqlExecutor, fn: (client: SqlExecutor) => Promise<T>): Promise<T> {
+  await beginPostgresTransaction(client);
   try {
     const value = await fn(client);
     await client.query("COMMIT");
@@ -891,7 +904,7 @@ export async function applyPostgresMigration(dsn: string, id: string, sql: strin
  */
 export async function applyPostgresMigrationOn(client: SqlExecutor, id: string, sql: string): Promise<void> {
   try {
-    await client.query("BEGIN");
+    await beginPostgresTransaction(client);
     const lock = await client.query(
       "INSERT INTO public.axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id RETURNING id",
     );
@@ -920,7 +933,7 @@ export async function applyPostgresMigrationOn(client: SqlExecutor, id: string, 
 }
 
 async function recordPostgresMigration(client: SqlExecutor, id: string): Promise<void> {
-  await client.query("BEGIN");
+  await beginPostgresTransaction(client);
   try {
     const lock = await client.query(
       "INSERT INTO public.axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id RETURNING id",
