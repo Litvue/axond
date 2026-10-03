@@ -114,7 +114,6 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
   }, metrics);
   const providers = JSON.parse(env.PROVIDERS_JSON) as ProviderConfig[];
   const credentials = JSON.parse(env.CREDENTIALS_JSON ?? "[]") as CredentialConfig[];
-  const catalog = workerCatalog(env);
   const telemetry = resolveTelemetry({
     endpoint: env.OTEL_EXPORTER_OTLP_ENDPOINT,
     protocol: env.OTEL_EXPORTER_OTLP_PROTOCOL,
@@ -144,17 +143,7 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
   });
   return {
     scheduled(ctx: WaitContext, fetchImpl?: typeof fetch): void {
-      ctx.waitUntil(discoverOnce({
-        store,
-        providers,
-        credentials,
-        catalog,
-        fetchImpl,
-        metrics,
-        onLog: (record) => {
-          console.log(JSON.stringify(record));
-        },
-      }));
+      ctx.waitUntil(runScheduledDiscovery(env, store, fetchImpl, metrics));
     },
     fetch(request: Request, ctx: WaitContext): Response | Promise<Response> {
       waits.set(request, ctx);
@@ -231,6 +220,37 @@ function workerCatalog(env: WorkerEnv): { source: "none" | "models-dev" | "seed"
   return { source, sourceUrl: env.CATALOG_SOURCE_URL ?? null };
 }
 
+/**
+ * The CLI config loader admits only an `https` URL whose path ends in
+ * `/catalog.json`. `api.json` and `models.json` are different documents.
+ * A Worker env var skips that loader, so the cron checks the same shape
+ * and does not fetch a document it would store under the wrong keys.
+ */
+function supportedModelsDevCatalogUrl(sourceUrl: string): boolean {
+  const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.*)$/s.exec(sourceUrl);
+  if (!match || match[1]!.toLowerCase() !== "https") {
+    return false;
+  }
+  const rest = match[2] ?? "";
+  if (rest.length === 0) {
+    return false;
+  }
+  const authority = rest.split(/[/?#]/, 1)[0] ?? "";
+  if (authority.length === 0 || authority.includes("@")) {
+    return false;
+  }
+  const path = rest.split(/[?#]/, 1)[0] ?? rest;
+  return path.endsWith("/catalog.json");
+}
+
+function discoveryCatalog(env: WorkerEnv): { catalog: ReturnType<typeof workerCatalog>; refused: boolean } {
+  const catalog = workerCatalog(env);
+  if (catalog.source === "models-dev" && !supportedModelsDevCatalogUrl(catalog.sourceUrl ?? "")) {
+    return { catalog: { source: "none", sourceUrl: null }, refused: true };
+  }
+  return { catalog, refused: false };
+}
+
 /** Run one discovery pass against a store the caller already opened. */
 export function discoverOnSchedule(
   env: WorkerEnv,
@@ -239,19 +259,35 @@ export function discoverOnSchedule(
   fetchImpl?: typeof fetch,
   metrics?: CatalogMetrics,
 ): void {
+  ctx.waitUntil(runScheduledDiscovery(env, store, fetchImpl, metrics));
+}
+
+function runScheduledDiscovery(
+  env: WorkerEnv,
+  store: Store,
+  fetchImpl?: typeof fetch,
+  metrics?: CatalogMetrics,
+): Promise<void> {
   const providers = JSON.parse(env.PROVIDERS_JSON) as ProviderConfig[];
   const credentials = JSON.parse(env.CREDENTIALS_JSON ?? "[]") as CredentialConfig[];
-  ctx.waitUntil(
-    discoverOnce({
-      store,
-      providers,
-      credentials,
-      catalog: workerCatalog(env),
-      fetchImpl,
-      metrics,
-      onLog: (record) => {
-        console.log(JSON.stringify(record));
-      },
-    }),
-  );
+  const { catalog, refused } = discoveryCatalog(env);
+  if (refused) {
+    console.log(JSON.stringify({
+      msg: "catalogue_import",
+      outcome: "refused",
+      reason: "unsupported_endpoint",
+      consecutive_refusals: 0,
+    }));
+  }
+  return discoverOnce({
+    store,
+    providers,
+    credentials,
+    catalog,
+    fetchImpl,
+    metrics,
+    onLog: (record) => {
+      console.log(JSON.stringify(record));
+    },
+  });
 }

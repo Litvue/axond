@@ -28,7 +28,7 @@ PROVIDERS_JSON = "[]"
 # Optional. The request path and the cron both read this list.
 # CREDENTIALS_JSON = "[]"
 # CATALOG_SOURCE = "models-dev"
-# CATALOG_SOURCE_URL = "https://models.dev/api.json"
+# CATALOG_SOURCE_URL = "https://models.dev/catalog.json"
 
 # Provider model discovery and catalogue import. Same interval as the CLI default.
 [triggers]

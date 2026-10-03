@@ -110,6 +110,8 @@ test("the worker handler is a static bundle of the gateway and an extension", as
   assert.match(source, /discoverOnce/);
   assert.match(source, /scheduled/);
   assert.match(wrangler, /crons = \["\*\/5 \* \* \* \*"\]/);
+  assert.match(wrangler, /https:\/\/models\.dev\/catalog\.json/);
+  assert.equal(wrangler.includes("api.json"), false);
   assert.equal(source.includes("node:"), false);
   const handler = createHandler({
     HYPERDRIVE: { connectionString: "postgres://example" },
@@ -137,7 +139,7 @@ test("scheduled discovery keeps the last catalogue when the provider is down", a
       PROVIDERS_JSON: JSON.stringify([{ id: "fake-openai", kind: "openai", baseUrl: "http://upstream" }]),
       CREDENTIALS_JSON: JSON.stringify([{ namespace: "platform", provider: "fake-openai", secret: "s", id: "s" }]),
       CATALOG_SOURCE: "models-dev",
-      CATALOG_SOURCE_URL: "https://example.test/models.json",
+      CATALOG_SOURCE_URL: "https://example.test/catalog.json",
     },
     store,
     {
@@ -156,6 +158,47 @@ test("scheduled discovery keeps the last catalogue when the provider is down", a
   const catalog = await store.getProviderModels("catalog");
   assert.equal(catalog?.stale, true);
   assert.deepEqual(catalog?.data, []);
+});
+
+test("a worker catalogue url other than catalog.json is not fetched", async () => {
+  const store = createMemoryStore();
+  let fetched = 0;
+  const lines: string[] = [];
+  const original = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map((part) => String(part)).join(" "));
+  };
+  let waited: Promise<unknown> = Promise.resolve();
+  try {
+    discoverOnSchedule(
+      {
+        HYPERDRIVE: { connectionString: "postgres://example" },
+        GATEWAY_KEY: "k",
+        PROVIDERS_JSON: "[]",
+        CATALOG_SOURCE: "models-dev",
+        CATALOG_SOURCE_URL: "https://models.dev/api.json",
+      },
+      store,
+      {
+        waitUntil(promise) {
+          waited = promise;
+        },
+      },
+      async () => {
+        fetched += 1;
+        return new Response(JSON.stringify({ openai: { id: "gpt-test" } }), { status: 200 });
+      },
+    );
+    await waited;
+  } finally {
+    console.log = original;
+  }
+  assert.equal(fetched, 0);
+  const body = lines.join("\n");
+  assert.equal(body.includes("unsupported_endpoint"), true);
+  assert.equal(body.includes("api.json"), false);
+  assert.equal(body.includes("models.dev"), false);
+  assert.equal(await store.getProviderModels("catalog"), null);
 });
 
 test("worker_request_path_uses_credentials_json", async () => {
