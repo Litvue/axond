@@ -39,6 +39,29 @@ export function holdPgClient(client: pg.Client): pg.Client {
 }
 
 /**
+ * Close a client whose connect() rejected. The Workers socket does not emit
+ * close when the handshake never finishes, so end() stays pending and the
+ * request never answers. Emitting close after end() starts lets that promise
+ * settle. A client that connected uses end() on its own, so the backend reads
+ * Terminate.
+ */
+export async function closeRejectedPgClient(client: pg.Client): Promise<void> {
+  let ending: Promise<void>;
+  try {
+    ending = Promise.resolve(client.end()).then(
+      () => undefined,
+      () => undefined,
+    );
+  } catch {
+    return;
+  }
+  const stream = (client as pg.Client & { connection?: { stream?: { emit?: (event: string) => void } } }).connection
+    ?.stream;
+  stream?.emit?.("close");
+  await ending;
+}
+
+/**
  * One connection per call. Hyperdrive pools on the far side, so Workers should
  * pass a connector that opens `pg.Client` against the Hyperdrive string and
  * closes it in `release`. Do not issue session-level SET.

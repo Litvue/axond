@@ -8,6 +8,39 @@ const dsn = process.env.AXOND_TEST_POSTGRES;
 const key = "test-inbound-key";
 
 describe("workerd hyperdrive", { concurrency: 1 }, () => {
+test("workerd_hyperdrive_refused_connect_returns_503", async () => {
+  const previous = process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
+  process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE =
+    "postgres://axond:socket-secret@127.0.0.1:1/axond";
+  const worker = await unstable_dev(new URL("./index.ts", import.meta.url).pathname, {
+    config: new URL("../wrangler.toml", import.meta.url).pathname,
+    local: true,
+    ip: "127.0.0.1",
+    vars: { GATEWAY_KEY: key, PROVIDERS_JSON: "[]" },
+    logLevel: "error",
+    experimental: { disableExperimentalWarning: true, disableDevRegistry: true },
+  });
+  try {
+    const listed = await worker.fetch("http://127.0.0.1/api/v1/namespaces", {
+      headers: { authorization: `Bearer ${key}` },
+    });
+    const body = await listed.text();
+    assert.equal(listed.status, 503, body);
+    const parsed = JSON.parse(body) as { error: { type: string; message: string } };
+    assert.equal(parsed.error.type, "store_unavailable");
+    assert.equal(parsed.error.message, "store is unavailable");
+    assert.equal(body.includes("socket-secret"), false);
+    assert.equal(body.includes("would never generate a response"), false);
+  } finally {
+    await worker.stop();
+    if (previous === undefined) {
+      delete process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE;
+    } else {
+      process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = previous;
+    }
+  }
+});
+
 test("workerd serves the gateway through a local Hyperdrive binding", { skip: !dsn }, async () => {
   process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE = dsn;
   const worker = await unstable_dev(new URL("./index.ts", import.meta.url).pathname, {

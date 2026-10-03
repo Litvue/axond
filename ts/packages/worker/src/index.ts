@@ -6,7 +6,7 @@ import { rateLimitExtension } from "@axond/rate-limit";
 import type { AxondExtension, CredentialConfig, PriceRule, ProviderConfig, Store } from "@axond/sdk";
 
 import { discoverOnce, type CatalogMetrics } from "../../cli/src/discovery.ts";
-import { applyPostgresMigrationOn, applyPostgresSchema, createPostgresStore, holdPgClient } from "../../cli/src/postgres-store.ts";
+import { applyPostgresMigrationOn, applyPostgresSchema, closeRejectedPgClient, createPostgresStore, holdPgClient } from "../../cli/src/postgres-store.ts";
 
 export interface WorkerEnv {
   HYPERDRIVE: { connectionString: string };
@@ -31,8 +31,9 @@ interface WaitContext {
  * them. The process binary loads the same contract from `AXOND_EXTENSIONS_DIR`
  * at startup instead. Hyperdrive supplies the Postgres connection string;
  * each call opens one client and closes it, with no session-level SET.
- * A socket reset is listened for, so it cannot take down the isolate, and a
- * failed connect closes the client before the error returns.
+ * A socket reset is listened for, so it cannot take down the isolate. A
+ * failed connect closes the client before the error returns. A refused
+ * Workers handshake does not emit close, so that close is finished here.
  * Extension migrations lock `axond_schema_lock` with a row update Hyperdrive can run.
  * A Hyperdrive role with read and write grants and no CREATE skips DDL when
  * the tables are already present.
@@ -91,6 +92,11 @@ export function createHandler(env: WorkerEnv, storeOverride?: Store) {
     const client = holdPgClient(new Client({ connectionString: env.HYPERDRIVE.connectionString }));
     try {
       await client.connect();
+    } catch (error) {
+      await closeRejectedPgClient(client);
+      rethrowSchemaFailure(error);
+    }
+    try {
       await schema.run(() => prepareWorkerSchema(client, extensions));
     } catch (error) {
       await client.end().catch(() => undefined);
