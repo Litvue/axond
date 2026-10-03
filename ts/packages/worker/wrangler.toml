@@ -25,7 +25,8 @@ compatibility_flags = ["nodejs_compat", "enable_request_signal"]
 # the origin should be the direct port. A cached namespace or budget read can
 # admit a deleted namespace. A role with `pg_read_all_data` and
 # `pg_write_all_data` cannot CREATE. Apply the schema once as an owner on
-# port 5432; this Worker then skips that DDL. Fill the id from the create
+# port 5432. This Worker skips that DDL when the schema is present, and names
+# a missing table or column without sending it. Fill the id from the create
 # command. Local `wrangler dev` reads
 # CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE and does not use
 # this id. That local path was exercised against Postgres 16, 17, and 18;

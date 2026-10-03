@@ -716,15 +716,21 @@ function namespaceFrom(row: Record<string, unknown>): NamespaceWrite {
 /**
  * Apply `POSTGRES_SCHEMA`. A role with only `pg_read_all_data` and
  * `pg_write_all_data` cannot `CREATE`, and `CREATE TABLE IF NOT EXISTS`
- * still fails when the tables are already there. The presence check runs
- * first, so a peer that closes the socket on that privilege error still
- * serves a schema an owner already applied. Existing tables are enough only
- * when `public.axond_namespace` already has the TypeScript columns. A missing
- * table or column is named, and the driver text is not.
+ * still fails when the tables are already there. When every table and the
+ * TypeScript columns are present, no DDL is sent, so a peer that closes the
+ * socket on that privilege error still serves the schema. When something is
+ * missing and this role cannot `CREATE` on `public`, the error names those
+ * objects and does not send the script, so the same peer still yields that
+ * name. A role that can `CREATE` applies the script. A privilege error after
+ * that names whatever is still missing, and the driver text is not included.
  */
 export async function applyPostgresSchema(client: SqlExecutor): Promise<void> {
-  if (await postgresSchemaReady(client)) {
+  const missing = await missingPostgresSchema(client);
+  if (missing.length === 0) {
     return;
+  }
+  if (!(await postgresCanApplySchema(client))) {
+    throw new Error(`postgres schema is missing ${missing.join(", ")}`);
   }
   try {
     await client.query(POSTGRES_SCHEMA);
@@ -732,14 +738,9 @@ export async function applyPostgresSchema(client: SqlExecutor): Promise<void> {
     if (!postgresInsufficientPrivilege(error)) {
       throw error;
     }
-    const tables = postgresSchemaTables();
-    const missingTables = await missingPostgresTables(client, tables);
-    const missingColumns = missingTables.includes("axond_namespace")
-      ? []
-      : await missingPostgresColumns(client, NAMESPACE_COLUMNS);
-    const missing = [...missingTables, ...missingColumns];
-    if (missing.length > 0) {
-      throw new Error(`postgres schema is missing ${missing.join(", ")}`);
+    const stillMissing = await missingPostgresSchema(client);
+    if (stillMissing.length > 0) {
+      throw new Error(`postgres schema is missing ${stillMissing.join(", ")}`);
     }
   }
 }
@@ -749,12 +750,17 @@ const NAMESPACE_COLUMNS: readonly (readonly [string, string])[] = [
   ["axond_namespace", "from_config"],
 ];
 
-async function postgresSchemaReady(client: SqlExecutor): Promise<boolean> {
+async function missingPostgresSchema(client: SqlExecutor): Promise<string[]> {
   const missingTables = await missingPostgresTables(client, postgresSchemaTables());
-  if (missingTables.length > 0) {
-    return false;
-  }
-  return (await missingPostgresColumns(client, NAMESPACE_COLUMNS)).length === 0;
+  const missingColumns = missingTables.includes("axond_namespace")
+    ? []
+    : await missingPostgresColumns(client, NAMESPACE_COLUMNS);
+  return [...missingTables, ...missingColumns];
+}
+
+async function postgresCanApplySchema(client: SqlExecutor): Promise<boolean> {
+  const result = await client.query("SELECT has_schema_privilege(current_user, 'public', 'CREATE') AS ok");
+  return result.rows[0]?.["ok"] === true;
 }
 
 export function postgresSchemaTables(sql = POSTGRES_SCHEMA): string[] {

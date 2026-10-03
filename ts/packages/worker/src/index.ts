@@ -51,7 +51,8 @@ interface WaitContext {
  * never emits close and when the peer stays open after Terminate.
  * Extension migrations lock `axond_schema_lock` with a row update Hyperdrive can run.
  * A Hyperdrive role with read and write grants and no CREATE skips DDL when
- * the tables are already present.
+ * the schema is already present, and names a missing table or column without
+ * sending the script.
  * A failed schema apply is not kept, so the next request can retry. A
  * successful apply stays for the isolate.
  * `PRICES_JSON` is the price list a chat uses when it settles.
