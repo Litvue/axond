@@ -579,6 +579,40 @@ test("a cached namespace read serves a deleted row; the live store does not", { 
   assert.equal(await db.getNamespace("platform"), null);
 });
 
+test("a row-locking write limits the lock wait", async () => {
+  const limits = "BEGIN; SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'";
+  const seen: string[] = [];
+  const db = createPostgresStore(async () => ({
+    client: {
+      async query(sql: string) {
+        seen.push(sql);
+        if (sql.includes("RETURNING *")) {
+          return {
+            rows: [{ id: "platform", attrs: {}, blocklist: null, allow_platform_fallback: false, from_config: false }],
+            rowCount: 1,
+          };
+        }
+        if (sql.includes("consecutive_refusals")) {
+          return { rows: [{ consecutive_refusals: 1 }], rowCount: 1 };
+        }
+        return { rows: [], rowCount: 1 };
+      },
+    },
+    release: async () => undefined,
+  }));
+  await db.adoptConfigNamespace("platform", false);
+  await db.releaseConfigNamespace("platform");
+  const updated = await db.updateNamespace("platform", {}, null);
+  assert.equal(updated?.id, "platform");
+  await db.upsertProviderModels({ provider: "openai", fetchedAt: null, stale: false, data: [], source: null });
+  await db.markProviderModelsStale("openai");
+  assert.equal(await db.noteCatalogRefusal(), 1);
+  await db.resetCatalogStreak();
+  assert.equal(seen.filter((sql) => sql === limits).length, 7);
+  assert.equal(seen.filter((sql) => sql === "COMMIT").length, 7);
+  assert.equal(seen.includes("ROLLBACK"), false);
+});
+
 test("an unknown budget write rolls back and stays a gateway error", async () => {
   const seen: string[] = [];
   const db = createPostgresStore(async () => ({
@@ -752,6 +786,42 @@ test("a charge blocked on the budget row ends before the query limit", { skip: !
     ]);
     const elapsed = Date.now() - started;
     assert.ok(result instanceof StoreFailure, `charge lock wait still open after ${elapsed}ms`);
+    assert.ok(elapsed < 8_000);
+    assert.equal(result.message.includes("lock timeout"), false);
+  } finally {
+    await holder.client.query("ROLLBACK").catch(() => undefined);
+    await holder.release();
+    await write.catch(() => undefined);
+  }
+});
+
+test("a namespace update blocked on the row ends before the query limit", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  const id = "update-lock";
+  await db.putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  const holder = await connect();
+  let write: Promise<unknown> = Promise.resolve();
+  try {
+    await holder.client.query("BEGIN");
+    await holder.client.query("SELECT id FROM axond_namespace WHERE id = $1 FOR UPDATE", [id]);
+    const started = Date.now();
+    write = db.updateNamespace(id, { team: "core" }, null);
+    const result = await Promise.race([
+      write.then(
+        () => "ok",
+        (error: unknown) => error,
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve("pending"), 8_000)),
+    ]);
+    const elapsed = Date.now() - started;
+    assert.ok(result instanceof StoreFailure, `namespace update still open after ${elapsed}ms`);
     assert.ok(elapsed < 8_000);
     assert.equal(result.message.includes("lock timeout"), false);
   } finally {

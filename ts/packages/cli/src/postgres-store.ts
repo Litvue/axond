@@ -275,7 +275,7 @@ export function createPostgresStore(
       }));
     },
     async adoptConfigNamespace(id, allowPlatformFallback) {
-      await withClient("namespace_write", async (client) => {
+      await withClient("namespace_write", (client) => withTransaction(client, async (client) => {
         await client.query(
           `INSERT INTO public.axond_namespace (id, attrs, blocklist, allow_platform_fallback, from_config)
            VALUES ($1, $2::jsonb, NULL, $3, true)
@@ -284,12 +284,12 @@ export function createPostgresStore(
              from_config = true`,
           [id, encodeAttrs({}), allowPlatformFallback],
         );
-      });
+      }));
     },
     async releaseConfigNamespace(id) {
-      await withClient("namespace_write", async (client) => {
+      await withClient("namespace_write", (client) => withTransaction(client, async (client) => {
         await client.query("UPDATE public.axond_namespace SET from_config = false WHERE id = $1", [id]);
-      });
+      }));
     },
     async getNamespace(id) {
       return withClient("namespace_read", async (client) => {
@@ -298,13 +298,13 @@ export function createPostgresStore(
       });
     },
     async updateNamespace(id, attrs, blocklist) {
-      return withClient("namespace_write", async (client) => {
+      return withClient("namespace_write", (client) => withTransaction(client, async (client) => {
         const result = await client.query(
           `UPDATE public.axond_namespace SET attrs = $2::jsonb, blocklist = $3::jsonb WHERE id = $1 RETURNING *`,
           [id, encodeAttrs(attrs), blocklist === null ? null : JSON.stringify(blocklist)],
         );
         return result.rows[0] ? namespaceFrom(result.rows[0]) : null;
-      });
+      }));
     },
     async deleteNamespace(id) {
       return withClient("namespace_write", (client) => withTransaction(client, async (client) => {
@@ -447,7 +447,7 @@ export function createPostgresStore(
       });
     },
     async upsertProviderModels(row) {
-      return withClient("provider_models", async (client) => {
+      return withClient("provider_models", (client) => withTransaction(client, async (client) => {
         await client.query(
           `INSERT INTO public.axond_store_provider_models (provider, fetched_at, stale, models, source)
            VALUES ($1, $2, $3, $4::jsonb, $5)
@@ -456,20 +456,20 @@ export function createPostgresStore(
               OR public.axond_store_provider_models.stale = true`,
           [row.provider, row.fetchedAt, row.stale, JSON.stringify(row.data), row.source],
         );
-      });
+      }));
     },
     async markProviderModelsStale(provider) {
-      return withClient("provider_models", async (client) => {
+      return withClient("provider_models", (client) => withTransaction(client, async (client) => {
         await client.query(
           `INSERT INTO public.axond_store_provider_models (provider, fetched_at, stale, models, source)
            VALUES ($1, NULL, true, '[]'::jsonb, NULL)
            ON CONFLICT (provider) DO UPDATE SET stale = true`,
           [provider],
         );
-      });
+      }));
     },
     async noteCatalogRefusal() {
-      return withClient(null, async (client) => {
+      return withClient(null, (client) => withTransaction(client, async (client) => {
         const result = await client.query(
           `INSERT INTO public.axond_catalog_streak (singleton, consecutive_refusals) VALUES ('catalog', 1)
            ON CONFLICT (singleton) DO UPDATE SET consecutive_refusals = public.axond_catalog_streak.consecutive_refusals + 1
@@ -477,16 +477,16 @@ export function createPostgresStore(
           [],
         );
         return Number(result.rows[0]?.["consecutive_refusals"] ?? 1);
-      });
+      }));
     },
     async resetCatalogStreak() {
-      return withClient(null, async (client) => {
+      return withClient(null, (client) => withTransaction(client, async (client) => {
         await client.query(
           `INSERT INTO public.axond_catalog_streak (singleton, consecutive_refusals) VALUES ('catalog', 0)
            ON CONFLICT (singleton) DO UPDATE SET consecutive_refusals = 0`,
           [],
         );
-      });
+      }));
     },
   };
 }
