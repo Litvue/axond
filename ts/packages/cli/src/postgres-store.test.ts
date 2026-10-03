@@ -55,15 +55,15 @@ async function reset(): Promise<void> {
 }
 
 test("the postgres schema seeds a row lock and does not take an advisory lock", () => {
-  assert.equal(POSTGRES_SCHEMA.includes("CREATE TABLE IF NOT EXISTS axond_schema_lock"), true);
-  assert.equal(POSTGRES_SCHEMA.includes("INSERT INTO axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO NOTHING"), true);
+  assert.equal(POSTGRES_SCHEMA.includes("CREATE TABLE IF NOT EXISTS public.axond_schema_lock"), true);
+  assert.equal(POSTGRES_SCHEMA.includes("INSERT INTO public.axond_schema_lock (id) VALUES (1) ON CONFLICT (id) DO NOTHING"), true);
   assert.equal(POSTGRES_SCHEMA.toLowerCase().includes("pg_advisory"), false);
   assert.equal(
-    POSTGRES_SCHEMA.includes("ALTER TABLE axond_namespace ADD COLUMN IF NOT EXISTS allow_platform_fallback boolean NOT NULL DEFAULT false"),
+    POSTGRES_SCHEMA.includes("ALTER TABLE public.axond_namespace ADD COLUMN IF NOT EXISTS allow_platform_fallback boolean NOT NULL DEFAULT false"),
     true,
   );
   assert.equal(
-    POSTGRES_SCHEMA.includes("ALTER TABLE axond_namespace ADD COLUMN IF NOT EXISTS from_config boolean NOT NULL DEFAULT false"),
+    POSTGRES_SCHEMA.includes("ALTER TABLE public.axond_namespace ADD COLUMN IF NOT EXISTS from_config boolean NOT NULL DEFAULT false"),
     true,
   );
 });
@@ -74,7 +74,7 @@ test("an extension migration locks a row and skips an advisory lock", async () =
     {
       async query(sql) {
         seen.push(sql);
-        if (sql.includes("FROM axond_schema_migrations")) {
+        if (sql.includes("axond_schema_migrations")) {
           return { rows: [], rowCount: 0 };
         }
         return { rows: [{ id: 1 }], rowCount: 1 };
@@ -84,7 +84,7 @@ test("an extension migration locks a row and skips an advisory lock", async () =
     "CREATE TABLE axond_ext_demo (id int)",
   );
   assert.equal(seen.some((sql) => sql.toLowerCase().includes("pg_advisory")), false);
-  assert.equal(seen.some((sql) => sql.includes("INSERT INTO axond_schema_lock") && sql.includes("DO UPDATE")), true);
+  assert.equal(seen.some((sql) => sql.includes("INSERT INTO public.axond_schema_lock") && sql.includes("DO UPDATE")), true);
   assert.equal(seen.includes("CREATE TABLE axond_ext_demo (id int)"), true);
   assert.equal(seen.at(-1), "COMMIT");
 });
@@ -307,8 +307,8 @@ test("an unknown budget write rolls back and stays a gateway error", async () =>
   });
   assert.deepEqual(seen, [
     "BEGIN",
-    "INSERT INTO axond_namespace_lock (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
-    "SELECT id FROM axond_namespace WHERE id = $1",
+    "INSERT INTO public.axond_namespace_lock (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
+    "SELECT id FROM public.axond_namespace WHERE id = $1",
     "ROLLBACK",
   ]);
 });
@@ -319,7 +319,7 @@ test("a failed namespace delete rolls the row back", async () => {
     client: {
       async query(sql: string) {
         seen.push(sql);
-        if (sql.startsWith("DELETE FROM axond_namespace ")) {
+        if (sql.startsWith("DELETE FROM public.axond_namespace ")) {
           return { rows: [], rowCount: 1 };
         }
         if (sql.includes("axond_namespace_incarnation")) {
@@ -542,7 +542,7 @@ test("a write role keeps an existing postgres schema and names a missing table",
             throw error;
           }
           const name = String(params?.[0]);
-          return { rows: [{ name: name === "axond_schema_lock" ? null : name }], rowCount: 1 };
+          return { rows: [{ name: name === "public.axond_schema_lock" ? null : name }], rowCount: 1 };
         },
       }),
     (error: unknown) => {
@@ -621,6 +621,97 @@ test("an owner apply adds columns a Rust namespace table omitted", { skip: !dsn 
       name,
     ]);
     await drop.client.query(`DROP DATABASE ${name}`);
+    await drop.release();
+  }
+});
+
+test("a role schema does not hide store tables from another role", { skip: !dsn }, async (t) => {
+  const admin = await connect();
+  const role = await admin.client.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+  if (role.rows[0]?.["rolsuper"] !== true) {
+    await admin.release();
+    t.skip("the test role cannot create a database");
+    return;
+  }
+  const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  const dbName = `axond_sp_${suffix}`;
+  const ownerName = `axond_spo_${suffix}`;
+  const appName = `axond_spa_${suffix}`;
+  const ownerPassword = `pw_${suffix}`;
+  const appPassword = `pw_${suffix}a`;
+  await admin.client.query(`CREATE ROLE ${ownerName} LOGIN PASSWORD '${ownerPassword}'`);
+  await admin.client.query(
+    `CREATE ROLE ${appName} LOGIN PASSWORD '${appPassword}' NOSUPERUSER NOCREATEDB NOCREATEROLE`,
+  );
+  await admin.client.query(`CREATE DATABASE ${dbName} OWNER ${ownerName}`);
+  await admin.release();
+  const adminUrl = new URL(dsn!);
+  adminUrl.pathname = `/${dbName}`;
+  const setup = new pg.Client({ connectionString: adminUrl.toString() });
+  await setup.connect();
+  try {
+    await setup.query(`CREATE SCHEMA ${ownerName} AUTHORIZATION ${ownerName}`);
+    await setup.query(`CREATE SCHEMA ${appName} AUTHORIZATION ${appName}`);
+    await setup.query(`ALTER ROLE ${ownerName} IN DATABASE ${dbName} SET search_path TO ${ownerName}, public`);
+    await setup.query(`ALTER ROLE ${appName} IN DATABASE ${dbName} SET search_path TO ${appName}, public`);
+    await setup.query("REVOKE CREATE ON SCHEMA public FROM PUBLIC");
+    await setup.query(`GRANT USAGE ON SCHEMA public TO ${appName}`);
+    await setup.query(`GRANT pg_read_all_data, pg_write_all_data TO ${appName}`);
+  } finally {
+    await setup.end();
+  }
+  const ownerUrl = new URL(adminUrl.toString());
+  ownerUrl.username = ownerName;
+  ownerUrl.password = ownerPassword;
+  const owner = new pg.Client({ connectionString: ownerUrl.toString() });
+  await owner.connect();
+  try {
+    const path = await owner.query("SHOW search_path");
+    assert.equal(path.rows[0]?.["search_path"], `${ownerName}, public`);
+    await applyPostgresSchema(sqlExecutor(owner));
+    const placed = await owner.query(
+      "SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = 'axond_namespace'",
+    );
+    assert.deepEqual(
+      placed.rows.map((row) => row["nspname"]),
+      ["public"],
+    );
+    const appUrl = new URL(ownerUrl.toString());
+    appUrl.username = appName;
+    appUrl.password = appPassword;
+    const app = createPostgresStore(async () => {
+      const client = new pg.Client({ connectionString: appUrl.toString() });
+      await client.connect();
+      return {
+        client: {
+          query: async (sql, params) => {
+            const result = await client.query(sql, params ? [...params] : []);
+            return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+          },
+        },
+        release: () => client.end(),
+      };
+    });
+    const created = await app.putNamespace({
+      id: "visible",
+      attrs: { org: "acme" },
+      blocklist: null,
+      allowPlatformFallback: false,
+      fromConfig: false,
+    });
+    assert.equal(created, "created");
+    assert.equal((await app.getNamespace("visible"))?.attrs["org"], "acme");
+  } finally {
+    await owner.end().catch(() => undefined);
+    const drop = await connect();
+    await drop.client.query(
+      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+      [dbName],
+    );
+    await drop.client.query(`DROP DATABASE ${dbName}`);
+    await drop.client.query(`REVOKE pg_read_all_data, pg_write_all_data FROM ${appName}`);
+    await drop.client.query(`DROP ROLE ${appName}`);
+    await drop.client.query(`DROP ROLE ${ownerName}`);
     await drop.release();
   }
 });

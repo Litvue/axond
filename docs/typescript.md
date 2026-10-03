@@ -440,7 +440,9 @@ and a Cloudflare account are not part of this repository's test environment.
 ## Store
 
 SQLite is the default. Postgres uses `dsn_env` and the schema in
-`createPostgresStore`. Extension migrations apply once on either store:
+`createPostgresStore`. Store statements name `public.` tables, so a role
+whose search path starts with a schema of its own name still sees them.
+Extension migrations apply once on either store:
 a recorded id is skipped, and a failed statement names that id without the
 driver text. The two extra namespace columns
 `allow_platform_fallback` and `from_config` are applied by the TypeScript
