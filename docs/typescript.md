@@ -453,7 +453,7 @@ and never speaks Postgres is closed after Hyperdrive's 15-second origin
 connection timeout. A peer that finishes startup and then never answers a
 statement is closed after Hyperdrive's 60-second statement limit, and the
 socket is dropped so the next statement does not wait out that limit again.
-The process binary uses those same limits.
+The process binary uses those same limits for its store and for a postgres usage sink.
 A reset after a parameterized query is reported on that query, including when
 the socket does not emit close, so it does not wait out that same limit.
 The request answers 503.

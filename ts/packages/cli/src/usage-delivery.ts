@@ -6,7 +6,7 @@ import type { createMetrics } from "../../gateway/src/metrics.ts";
 import { postOtlp, resourceAttributes, usageLogPayload, type TelemetryTarget } from "../../gateway/src/otel.ts";
 import { usageLine } from "../../gateway/src/usage.ts";
 
-import { holdPgClient } from "./postgres-store.ts";
+import { closePgClient, holdPgClient, postgresClientOptions, queryPgClient } from "./postgres-store.ts";
 import { usageMigrationGap, usageSchemaDdl, USAGE_NOT_NULL_COST } from "./usage-sql.ts";
 
 const { Client } = pg;
@@ -173,20 +173,16 @@ async function openPostgresSink(
       `usage sink configuration failed: usage sink \`postgres\`: \`${dsnEnv}\` is unset or empty in the environment`,
     );
   }
-  const client = holdPgClient(new Client({
-    connectionString: dsn,
-    connectionTimeoutMillis: 10_000,
-    application_name: "axond",
-  }));
+  const client = usagePgClient(dsn);
   try {
     await client.connect();
   } catch (error) {
-    await client.end().catch(() => undefined);
+    await closePgClient(client);
     throw new Error(`usage sink configuration failed: postgres usage sink: ${redact(errorText(error), dsn)}`);
   }
   try {
     if (sink.createTable) {
-      await client.query(usageSchemaDdl(sink.table));
+      await queryPgClient(client, usageSchemaDdl(sink.table));
     }
     const missing = await missingColumns(client, sink.table);
     const gap = usageMigrationGap(missing);
@@ -197,7 +193,7 @@ async function openPostgresSink(
       throw new Error(`usage sink configuration failed: usage sink \`postgres\`: ${USAGE_NOT_NULL_COST}`);
     }
   } catch (error) {
-    await client.end().catch(() => undefined);
+    await closePgClient(client);
     throw error;
   }
   const holder = { client };
@@ -208,7 +204,7 @@ async function openPostgresSink(
     metrics,
     onLog,
     insert: (rows) => insertUsage(holder, sink.table, rows, dsn),
-    close: () => holder.client.end().then(() => undefined),
+    close: () => closePgClient(holder.client),
   });
 }
 
@@ -358,27 +354,23 @@ async function insertUsage(
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const client = holder.client;
     try {
-      await client.query("BEGIN");
+      await queryPgClient(client, "BEGIN");
       for (let index = 0; index < rows.length; index += MAX_ROWS_PER_STATEMENT) {
         const chunk = rows.slice(index, index + MAX_ROWS_PER_STATEMENT);
-        await client.query(insertSql(table, chunk.length), bindRows(chunk));
+        await queryPgClient(client, insertSql(table, chunk.length), bindRows(chunk));
       }
-      await client.query("COMMIT");
+      await queryPgClient(client, "COMMIT");
       return;
     } catch (error) {
       last = error;
-      await client.query("ROLLBACK").catch(() => undefined);
-      await client.end().catch(() => undefined);
-      const replacement = holdPgClient(new Client({
-        connectionString: dsn,
-        connectionTimeoutMillis: 10_000,
-        application_name: "axond",
-      }));
+      await queryPgClient(client, "ROLLBACK").catch(() => undefined);
+      await closePgClient(client);
+      const replacement = usagePgClient(dsn);
       try {
         await replacement.connect();
         holder.client = replacement;
       } catch (connectError) {
-        await replacement.end().catch(() => undefined);
+        await closePgClient(replacement);
         last = connectError;
       }
     }
@@ -458,8 +450,15 @@ function clamped(value: bigint): string {
   return value.toString();
 }
 
+function usagePgClient(dsn: string): pg.Client {
+  return holdPgClient(new Client({
+    ...postgresClientOptions(dsn),
+    application_name: "axond",
+  }));
+}
+
 async function missingColumns(client: pg.Client, table: string): Promise<string[]> {
-  const result = await client.query(
+  const result = await queryPgClient(client,
     "SELECT a.attname FROM pg_attribute AS a WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
     [table],
   );
@@ -471,7 +470,7 @@ async function missingColumns(client: pg.Client, table: string): Promise<string[
 }
 
 async function costIsNotNull(client: pg.Client, table: string): Promise<boolean> {
-  const result = await client.query(
+  const result = await queryPgClient(client,
     "SELECT a.attnotnull FROM pg_attribute AS a WHERE a.attrelid = to_regclass($1) AND a.attname = 'cost_microdollars' AND a.attnum > 0 AND NOT a.attisdropped",
     [table],
   );

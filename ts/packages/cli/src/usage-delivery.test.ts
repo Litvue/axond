@@ -343,3 +343,13 @@ dsn_env = "AXOND_TEST_POSTGRES"
     /AXOND_TEST_POSTGRES` is unset or empty/,
   );
 });
+
+test("a postgres usage sink uses the statement limit", async () => {
+  const source = await readFile(new URL("./usage-delivery.ts", import.meta.url), "utf8");
+  assert.match(source, /postgresClientOptions\(dsn\)/);
+  assert.match(source, /application_name: "axond"/);
+  assert.match(source, /queryPgClient\(/);
+  assert.match(source, /closePgClient\(/);
+  assert.equal(source.includes("client.query("), false);
+  assert.equal(source.includes("client.end("), false);
+});
