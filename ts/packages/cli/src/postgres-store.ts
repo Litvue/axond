@@ -83,6 +83,45 @@ export async function closePgClient(client: pg.Client): Promise<void> {
 }
 
 /**
+ * Hyperdrive's origin connection timeout and its maximum statement duration.
+ * The process binary uses the same limits, so a peer that accepts and then
+ * stays silent cannot hold a request open.
+ */
+export const POSTGRES_CONNECT_TIMEOUT_MS = 15_000;
+export const POSTGRES_QUERY_TIMEOUT_MS = 60_000;
+
+export function postgresClientOptions(connectionString: string) {
+  return {
+    connectionString,
+    connectionTimeoutMillis: POSTGRES_CONNECT_TIMEOUT_MS,
+    query_timeout: POSTGRES_QUERY_TIMEOUT_MS,
+  };
+}
+
+/**
+ * Run one statement. On `Query read timeout` the driver leaves the socket
+ * open, so a following ROLLBACK would wait another full statement limit.
+ * Drop the socket before the error returns.
+ */
+export async function queryPgClient(client: pg.Client, sql: string, params?: readonly unknown[]) {
+  try {
+    return params === undefined ? await client.query(sql) : await client.query(sql, [...params]);
+  } catch (error) {
+    if (error instanceof Error && error.message === "Query read timeout") {
+      const stream = (client as pg.Client & {
+        connection?: { stream?: { destroy?: () => void } };
+      }).connection?.stream;
+      try {
+        stream?.destroy?.();
+      } catch {
+        // A socket that already closed has nothing to destroy.
+      }
+    }
+    throw error;
+  }
+}
+
+/**
  * One connection per call. Hyperdrive pools on the far side, so Workers should
  * pass a connector that opens `pg.Client` against the Hyperdrive string and
  * closes it in `release`. Do not issue session-level SET.
@@ -733,13 +772,13 @@ function existingCreateTables(sql: string): string[] | null {
  * Hyperdrive does not support advisory locks.
  */
 export async function applyPostgresMigration(dsn: string, id: string, sql: string): Promise<void> {
-  const client = holdPgClient(new pg.Client({ connectionString: dsn }));
+  const client = holdPgClient(new pg.Client(postgresClientOptions(dsn)));
   try {
     await client.connect();
     await applyPostgresMigrationOn(
       {
         query: async (statement, params) => {
-          const result = params === undefined ? await client.query(statement) : await client.query(statement, [...params]);
+          const result = await queryPgClient(client, statement, params);
           const row = Array.isArray(result) ? result[result.length - 1] : result;
           return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
         },
@@ -753,7 +792,7 @@ export async function applyPostgresMigration(dsn: string, id: string, sql: strin
     }
     throw new Error(`extension migration ${id} failed`);
   } finally {
-    await client.end().catch(() => undefined);
+    await closePgClient(client);
   }
 }
 

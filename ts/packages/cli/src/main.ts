@@ -24,7 +24,15 @@ import type { AxondExtension, KeyMaterialLog, ShutdownLog } from "@axond/sdk";
 
 import { discoverOnce, startDiscovery } from "./discovery.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
-import { applyPostgresMigration, applyPostgresSchema, createPostgresStore, holdPgClient } from "./postgres-store.ts";
+import {
+  applyPostgresMigration,
+  applyPostgresSchema,
+  closePgClient,
+  createPostgresStore,
+  holdPgClient,
+  postgresClientOptions,
+  queryPgClient,
+} from "./postgres-store.ts";
 import { openSqliteStore } from "./sqlite-store.ts";
 
 const { Client } = pg;
@@ -349,35 +357,35 @@ function requirePostgresDsn(storage: { dsn?: string; dsnEnv?: string }): string 
 }
 
 async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgresStore>[1]) {
-  const setup = holdPgClient(new Client({ connectionString: dsn }));
+  const setup = holdPgClient(new Client(postgresClientOptions(dsn)));
   try {
     await setup.connect();
     await applyPostgresSchema({
       query: async (sql, params) => {
-        const result = params === undefined ? await setup.query(sql) : await setup.query(sql, [...params]);
+        const result = await queryPgClient(setup, sql, params);
         const row = Array.isArray(result) ? result[result.length - 1] : result;
         return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
       },
     });
   } finally {
-    await setup.end().catch(() => undefined);
+    await closePgClient(setup);
   }
   return createPostgresStore(async () => {
-    const client = holdPgClient(new Client({ connectionString: dsn }));
+    const client = holdPgClient(new Client(postgresClientOptions(dsn)));
     try {
       await client.connect();
     } catch (error) {
-      await client.end().catch(() => undefined);
+      await closePgClient(client);
       throw error;
     }
     return {
       client: {
         query: async (sql, params) => {
-          const result = await client.query(sql, params ? [...params] : []);
+          const result = await queryPgClient(client, sql, params ? [...params] : []);
           return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
         },
       },
-      release: () => client.end(),
+      release: () => closePgClient(client),
     };
   }, metrics);
 }

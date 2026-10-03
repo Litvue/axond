@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import test from "node:test";
 
@@ -6,6 +7,7 @@ import pg from "pg";
 
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
+
 import {
   applyPostgresMigration,
   applyPostgresMigrationOn,
@@ -14,8 +16,10 @@ import {
   createPostgresStore,
   holdPgClient,
   POSTGRES_SCHEMA,
+  postgresClientOptions,
   postgresQueryText,
   postgresSchemaTables,
+  queryPgClient,
 } from "./postgres-store.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
 import type { Store } from "@axond/sdk";
@@ -158,6 +162,83 @@ function closeAgainstPeer(closeOnTerminate: boolean, silenceSocket = false): Pro
     });
   });
 }
+
+test("postgres clients use the connect and statement limits", async () => {
+  const options = postgresClientOptions("postgres://axond:socket-secret@127.0.0.1:1/axond");
+  assert.equal(options.connectionTimeoutMillis, 15_000);
+  assert.equal(options.query_timeout, 60_000);
+  assert.equal(options.connectionString.includes("socket-secret"), true);
+  const main = await readFile(new URL("./main.ts", import.meta.url), "utf8");
+  assert.match(main, /new Client\(postgresClientOptions\(dsn\)\)/);
+  assert.match(main, /queryPgClient\(/);
+  assert.match(main, /closePgClient\(/);
+  const migration = await readFile(new URL("./postgres-store.ts", import.meta.url), "utf8");
+  assert.match(migration, /new pg\.Client\(postgresClientOptions\(dsn\)\)/);
+});
+
+test("queryPgClient drops the socket when a statement times out", async () => {
+  let destroyed = 0;
+  const client = {
+    connection: { stream: { destroy() { destroyed += 1; } } },
+    async query() {
+      throw new Error("Query read timeout");
+    },
+  } as unknown as pg.Client;
+  await assert.rejects(() => queryPgClient(client, "SELECT 1"), /Query read timeout/);
+  await assert.rejects(
+    () => queryPgClient(client, "SELECT $1", [1]),
+    /Query read timeout/,
+  );
+  assert.equal(destroyed, 2);
+  const other = {
+    connection: { stream: { destroy() { destroyed += 1; } } },
+    async query() {
+      throw new Error("reset");
+    },
+  } as unknown as pg.Client;
+  await assert.rejects(() => queryPgClient(other, "SELECT 1"), /reset/);
+  assert.equal(destroyed, 2);
+});
+
+test("a silent postgres accept fails at the connect limit", { timeout: 25_000 }, async () => {
+  const peers: import("node:net").Socket[] = [];
+  const server = createServer((socket) => {
+    peers.push(socket);
+    socket.on("error", () => undefined);
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    server.close();
+    throw new Error("no port");
+  }
+  const client = holdPgClient(new pg.Client(postgresClientOptions(
+    `postgres://axond:socket-secret@127.0.0.1:${address.port}/axond`,
+  )));
+  const started = Date.now();
+  try {
+    const outcome = await Promise.race([
+      client.connect().then(() => "ok" as const, (error: unknown) => error),
+      new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 20_000)),
+    ]);
+    const ms = Date.now() - started;
+    assert.notEqual(outcome, "hung");
+    assert.notEqual(outcome, "ok");
+    assert.equal(outcome instanceof Error, true);
+    assert.equal(String(outcome).includes("socket-secret"), false);
+    assert.equal(ms >= 12_000, true, `connect returned in ${ms}ms`);
+    assert.equal(ms < 20_000, true, `connect took ${ms}ms`);
+  } finally {
+    await closePgClient(client);
+    for (const peer of peers) {
+      peer.destroy();
+    }
+    server.close();
+  }
+});
 
 test("a dropped postgres socket does not crash the process", async (t) => {
   if (!dsn) {
