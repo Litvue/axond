@@ -39,7 +39,7 @@
         "docs/design/typescript-parity.md",
         "docs/design/typescript-regression-gates.md"
       ],
-      "pull_request": null
+      "pull_request": 534
     },
     {
       "order": 2,
@@ -56,7 +56,7 @@
         "ts/packages/gateway/src/request-id.ts",
         "ts/packages/gateway/src/request-id.test.ts"
       ],
-      "pull_request": null
+      "pull_request": 535
     },
     {
       "order": 3,
@@ -73,7 +73,7 @@
         "ts/packages/gateway/src/store-metrics.ts",
         "ts/packages/cli/src/sqlite-store.ts"
       ],
-      "pull_request": null
+      "pull_request": 536
     },
     {
       "order": 4,
@@ -92,7 +92,7 @@
         "ts/packages/gateway/src/pricing.ts",
         "ts/packages/gateway/src/admission.ts"
       ],
-      "pull_request": null
+      "pull_request": 537
     },
     {
       "order": 5,
@@ -104,7 +104,7 @@
         "ts/packages/gateway/src/config-toml.ts",
         "ts/packages/gateway/src/config-values.ts"
       ],
-      "pull_request": null
+      "pull_request": 538
     },
     {
       "order": 6,
@@ -115,7 +115,7 @@
       "files": [
         "ts/packages/gateway/src/config-shapes.ts"
       ],
-      "pull_request": null
+      "pull_request": 539
     },
     {
       "order": 7,
@@ -129,7 +129,7 @@
         "ts/packages/gateway/src/config-syntax-and-catalog.test.ts",
         "ts/packages/gateway/src/parsers.property.test.ts"
       ],
-      "pull_request": null
+      "pull_request": 540
     },
     {
       "order": 8,
@@ -141,7 +141,7 @@
         "ts/packages/gateway/src/config-bind-and-env.test.ts",
         "ts/packages/gateway/src/config-env-sequences.test.ts"
       ],
-      "pull_request": null
+      "pull_request": 541
     },
     {
       "order": 9,
@@ -154,7 +154,7 @@
         "ts/packages/gateway/src/native-messages.test.ts",
         "ts/packages/gateway/src/responses-sequence.test.ts"
       ],
-      "pull_request": null
+      "pull_request": 542
     },
     {
       "order": 10,
@@ -172,7 +172,7 @@
         "ts/packages/gateway/src/background.test.ts",
         "ts/packages/gateway/src/streaming.test.ts"
       ],
-      "pull_request": null
+      "pull_request": 543
     },
     {
       "order": 11,
@@ -185,7 +185,7 @@
         "ts/packages/gateway/src/app-budgets-and-accounting.test.ts",
         "ts/packages/gateway/src/app-inference-limits.test.ts"
       ],
-      "pull_request": null
+      "pull_request": 544
     },
     {
       "order": 12,
@@ -197,7 +197,7 @@
         "ts/packages/gateway/src/behavior-extensions-and-stream-limits.test.ts",
         "ts/packages/gateway/src/behavior-timing-and-credentials.test.ts"
       ],
-      "pull_request": null
+      "pull_request": 545
     },
     {
       "order": 13,
@@ -209,7 +209,7 @@
         "ts/packages/gateway/src/behavior-stream-terminals.test.ts",
         "ts/packages/gateway/src/behavior-rotation-and-admission.test.ts"
       ],
-      "pull_request": null
+      "pull_request": 546
     },
     {
       "order": 14,
@@ -221,7 +221,7 @@
         "ts/packages/gateway/src/behavior-settlement-and-redaction.test.ts",
         "ts/packages/gateway/src/behavior-provider-wire.test.ts"
       ],
-      "pull_request": null
+      "pull_request": 547
     },
     {
       "order": 15,
@@ -235,7 +235,7 @@
         "ts/packages/cli/src/sqlite-store.test.ts",
         "ts/packages/cli/src/seed-namespaces.ts"
       ],
-      "pull_request": null
+      "pull_request": 548
     },
     {
       "order": 16,
@@ -255,7 +255,7 @@
         "ts/packages/cli/src/shutdown-budget.test.ts",
         "ts/packages/cli/src/config-file.ts"
       ],
-      "pull_request": null
+      "pull_request": 549
     },
     {
       "order": 17,
@@ -272,7 +272,7 @@
         "ts/packages/cli/src/config-file-paths-and-env.test.ts",
         "ts/bin/axond"
       ],
-      "pull_request": null
+      "pull_request": 550
     },
     {
       "order": 18,
@@ -284,7 +284,7 @@
         "ts/packages/cli/src/config-file-parse-order.test.ts",
         "ts/packages/cli/src/config-file-syntax-and-admission.test.ts"
       ],
-      "pull_request": null
+      "pull_request": 551
     },
     {
       "order": 19,
@@ -303,7 +303,7 @@
         "ts/packages/tokens/src/index.test.ts",
         "ts/packages/tokens/src/index.ts"
       ],
-      "pull_request": null
+      "pull_request": 552
     },
     {
       "order": 20,
@@ -317,7 +317,7 @@
         "ts/packages/worker/src/workerd.integration.ts",
         "ts/packages/worker/wrangler.toml"
       ],
-      "pull_request": null
+      "pull_request": 553
     },
     {
       "order": 21,
@@ -356,7 +356,7 @@
         "docs/design/typescript-review-stack.md",
         "ops/typescript-review-stack.json"
       ],
-      "pull_request": null
+      "pull_request": 554
     }
   ]
 }

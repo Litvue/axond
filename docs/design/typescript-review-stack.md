@@ -1,5 +1,8 @@
 # TypeScript conversion review stack
 
+Start with [#534](https://github.com/Litvue/axond/pull/534); it is open for review.
+Later slices remain drafts until their prerequisites have been reviewed.
+
 The review stack replaces the combined diffs of PR #531 and its regression
 follow-up #533. Their branches retain the original work and validation history.
 The stack contains the conversion at `cb1ead38a4cb3a0dd04689946eda07e2cbecf255`
@@ -14,29 +17,29 @@ lock. The implementation and test files stay below 2,000 lines apiece. The
 [machine-readable map](../../ops/typescript-review-stack.json) assigns every
 changed file to a slice and records its base branch and review focus.
 
-| Order | Review slice | Changed lines before this index | PR |
+| Order | Review slice | Changed lines | PR |
 | --- | --- | ---: | --- |
-| 1 | define TypeScript SDK and review-stage CI | 3630 | Pending publication |
-| 2 | add TypeScript request and JSON parsers | 2048 | Pending publication |
-| 3 | add namespace and budget state primitives | 1754 | Pending publication |
-| 4 | add provider wire accounting and telemetry | 2429 | Pending publication |
-| 5 | add TOML scanning and Figment value primitives | 2749 | Pending publication |
-| 6 | add configuration shape and extraction validation | 1486 | Pending publication |
-| 7 | load and validate TypeScript gateway configuration | 3201 | Pending publication |
-| 8 | cover bind and environment configuration compatibility | 1430 | Pending publication |
-| 9 | add provider dispatch and credential failover | 1540 | Pending publication |
-| 10 | mount the namespaced TypeScript Hono gateway | 3131 | Pending publication |
-| 11 | qualify gateway routing and budget management | 3349 | Pending publication |
-| 12 | qualify extension ordering and streaming deadlines | 2304 | Pending publication |
-| 13 | qualify terminal streams rotation and admission | 2309 | Pending publication |
-| 14 | qualify settlement faults and provider secret omission | 1965 | Pending publication |
-| 15 | add Postgres persistence and durable-store qualification | 3391 | Pending publication |
-| 16 | add CLI discovery usage delivery and shutdown services | 2482 | Pending publication |
-| 17 | host the TypeScript gateway and operator extensions | 2768 | Pending publication |
-| 18 | qualify CLI configuration diagnostics and refusal order | 1670 | Pending publication |
-| 19 | add rate limit redaction and token extensions | 1020 | Pending publication |
-| 20 | host the TypeScript gateway on Workers Hyperdrive | 1848 | Pending publication |
-| 21 | qualify TypeScript artifacts and regression gates | 2294 | Pending publication |
+| 1 | define TypeScript SDK and review-stage CI | 3630 | [#534](https://github.com/Litvue/axond/pull/534) |
+| 2 | add TypeScript request and JSON parsers | 2048 | [#535](https://github.com/Litvue/axond/pull/535) |
+| 3 | add namespace and budget state primitives | 1754 | [#536](https://github.com/Litvue/axond/pull/536) |
+| 4 | add provider wire accounting and telemetry | 2429 | [#537](https://github.com/Litvue/axond/pull/537) |
+| 5 | add TOML scanning and Figment value primitives | 2749 | [#538](https://github.com/Litvue/axond/pull/538) |
+| 6 | add configuration shape and extraction validation | 1486 | [#539](https://github.com/Litvue/axond/pull/539) |
+| 7 | load and validate TypeScript gateway configuration | 3201 | [#540](https://github.com/Litvue/axond/pull/540) |
+| 8 | cover bind and environment configuration compatibility | 1430 | [#541](https://github.com/Litvue/axond/pull/541) |
+| 9 | add provider dispatch and credential failover | 1540 | [#542](https://github.com/Litvue/axond/pull/542) |
+| 10 | mount the namespaced TypeScript Hono gateway | 3131 | [#543](https://github.com/Litvue/axond/pull/543) |
+| 11 | qualify gateway routing and budget management | 3349 | [#544](https://github.com/Litvue/axond/pull/544) |
+| 12 | qualify extension ordering and streaming deadlines | 2304 | [#545](https://github.com/Litvue/axond/pull/545) |
+| 13 | qualify terminal streams rotation and admission | 2309 | [#546](https://github.com/Litvue/axond/pull/546) |
+| 14 | qualify settlement faults and provider secret omission | 1965 | [#547](https://github.com/Litvue/axond/pull/547) |
+| 15 | add Postgres persistence and durable-store qualification | 3391 | [#548](https://github.com/Litvue/axond/pull/548) |
+| 16 | add CLI discovery usage delivery and shutdown services | 2482 | [#549](https://github.com/Litvue/axond/pull/549) |
+| 17 | host the TypeScript gateway and operator extensions | 2768 | [#550](https://github.com/Litvue/axond/pull/550) |
+| 18 | qualify CLI configuration diagnostics and refusal order | 1670 | [#551](https://github.com/Litvue/axond/pull/551) |
+| 19 | add rate limit redaction and token extensions | 1020 | [#552](https://github.com/Litvue/axond/pull/552) |
+| 20 | host the TypeScript gateway on Workers Hyperdrive | 1848 | [#553](https://github.com/Litvue/axond/pull/553) |
+| 21 | qualify TypeScript artifacts and regression gates | 2771 | [#554](https://github.com/Litvue/axond/pull/554) |
 
 ## How to review a slice
 
