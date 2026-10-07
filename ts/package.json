@@ -18,5 +18,8 @@
   },
   "engines": {
     "node": ">=22.14"
+  },
+  "overrides": {
+    "sharp": "0.35.5"
   }
 }

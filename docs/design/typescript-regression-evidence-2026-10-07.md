@@ -20,7 +20,7 @@ checkout used to build the oracle. It is not production deployment evidence.
 | Compiled binary smoke | Health, extension load, API-version refusal, unbundled-package refusal, bundled-package load and SQLite restart passed |
 | Container, Node 22.14 image | Build, health, readiness, namespace creation and persisted restart passed |
 | Host-independent imports, alert catalogue, doc samples, OpenAPI, repository docs | Passed |
-| Dependency policy (`npm run check:npm`) | **Failed**: locked `sharp` 0.35.4 has public advisory GHSA-wq5f-xc86-pv6w; npm reports 3 high-severity affected packages through miniflare/wrangler |
+| Dependency policy (`npm run check:npm`) | Passed after a clean install: 0 vulnerabilities; 43 production packages licensed; `sharp` overridden to 0.35.5 to fix GHSA-wq5f-xc86-pv6w |
 
 The compiled binary is 82,339,296 bytes, SHA-256
 `ec6af430f63d697ff97adbd736babe79f96a505edd273bf20d503e862fc73515`.
@@ -55,9 +55,12 @@ database at another port.
 
 ## Release blockers and evidence still owed
 
-The dependency-policy failure remains visible; the lockfile is unchanged and the
-gate was not waived. Fix the affected toolchain with a compatible locked update
-and re-run workerd and the policy gate before release.
+The first CI run failed the dependency audit on Wrangler's transitive `sharp`
+0.35.4 (GHSA-wq5f-xc86-pv6w). A root override pins the patched 0.35.5 and
+regenerates only sharp and its native image-library lock entries, retaining the
+existing Wrangler/miniflare versions. The audit gate remains unchanged. A clean
+`npm ci`, dependency policy check, SVG-to-PNG native-library smoke and all nine
+workerd/Hyperdrive integration tests passed with the patched graph.
 
 This environment has no configured Cloudflare or PlanetScale credentials. Live
 Hyperdrive/PlanetScale qualification, release-tag OIDC signing, target-database
