@@ -593,6 +593,47 @@ def self_test() -> int:
     assert len(unpublished) == 1, unpublished
     assert "no private vulnerability reporting URL" in unpublished[0], unpublished
 
+    present = review_trigger_failures(
+        "`keeps_the_floor_when_the_name_stays`",
+        {"keeps_the_floor_when_the_name_stays"},
+        minimum=1,
+    )
+    assert present == [], present
+    # A rename that the page did not follow is the rot this gate exists for.
+    renamed = review_trigger_failures("`a_renamed_test_is_still_named`", set(), minimum=0)
+    assert len(renamed) == 1 and "does not exist under crates/ or ts/" in renamed[0], renamed
+    # Configuration keys stay below the three-underscore floor.
+    assert review_trigger_failures("`allow_platform_fallback`", set(), minimum=0) == []
+    thin = review_trigger_failures(
+        "`one_named_test_is_not_enough`",
+        {"one_named_test_is_not_enough"},
+    )
+    assert len(thin) == 1 and "only 1 named tests remain" in thin[0], thin
+    with tempfile.TemporaryDirectory() as raw:
+        records = Path(raw)
+        crates = records / "crates"
+        crates.mkdir()
+        (crates / "floor.rs").write_text(
+            "fn rust_only_name_is_declared() {}\n", encoding="utf-8"
+        )
+        typescript = records / "ts"
+        typescript.mkdir()
+        modules = typescript / "node_modules"
+        modules.mkdir()
+        (modules / "dep.ts").write_text(
+            'test("dependency_test_must_not_count", () => {})\n', encoding="utf-8"
+        )
+        (typescript / "app.test.ts").write_text(
+            'test("typescript_title_is_a_declared_test", () => {})\n'
+            "function helper_name_is_declared() {}\n",
+            encoding="utf-8",
+        )
+        names = declared_test_names(crates, typescript)
+        assert "rust_only_name_is_declared" in names, names
+        assert "typescript_title_is_a_declared_test" in names, names
+        assert "helper_name_is_declared" in names, names
+        assert "dependency_test_must_not_count" not in names, names
+
     named = release_script_trigger_failures(
         "run: ops/docker-smoke.sh\nrun: python ops/binary-smoke.py x\n",
         "trigger 6 fires on `ops/docker-smoke.sh` and `ops/binary-smoke.py`",
@@ -784,6 +825,45 @@ def check_front_door_size() -> list[str]:
     return failures
 
 
+def declared_test_names(crates: Path, typescript: Path | None) -> set[str]:
+    """Rust `fn` names plus TypeScript `function` and `test("snake_case")` titles."""
+    declared: set[str] = set()
+    if crates.is_dir():
+        for source in crates.rglob("*.rs"):
+            declared.update(
+                re.findall(r"\bfn\s+([a-z0-9_]+)", source.read_text(encoding="utf-8"))
+            )
+    if typescript is not None and typescript.is_dir():
+        for source in typescript.rglob("*.ts"):
+            if "node_modules" in source.parts or ".wrangler" in source.parts:
+                continue
+            text = source.read_text(encoding="utf-8")
+            declared.update(re.findall(r"\bfunction\s+([a-z0-9_]+)", text))
+            declared.update(re.findall(r"""\btest\(\s*["']([a-z0-9_]+)["']""", text))
+    return declared
+
+
+def review_trigger_failures(text: str, declared: set[str], *, minimum: int = 40) -> list[str]:
+    """Named tests on the trigger page must still be declared in Rust or TypeScript."""
+    named = {
+        candidate
+        for candidate in re.findall(r"`([a-z0-9_]+)`", text)
+        if candidate.count("_") >= 3
+    }
+    failures = [
+        "docs/security/threat-model-review.md: named test "
+        f"{name!r} does not exist under crates/ or ts/"
+        for name in sorted(named - declared)
+    ]
+    if len(named) < minimum:
+        failures.append(
+            "docs/security/threat-model-review.md: only "
+            f"{len(named)} named tests remain; the triggers are meant to name the "
+            "existing floor for each area"
+        )
+    return failures
+
+
 def check_review_trigger_tests() -> list[str]:
     """Every test the threat-model trigger page names still exists.
 
@@ -791,9 +871,10 @@ def check_review_trigger_tests() -> list[str]:
     documented test name rots silently: a rename in the crates leaves the page
     pointing at coverage nobody has. Every backticked lowercase identifier with
     three or more underscores in it is treated as a test function and must be
-    declared somewhere under `crates/`. Shorter identifiers are configuration
-    keys and field names (`allow_platform_fallback`, `credential_source`), which
-    other checks and the configuration reference already cover.
+    declared under `crates/` (`fn`) or `ts/` (`function`, or a `test("snake_case")`
+    title). Shorter identifiers are configuration keys and field names
+    (`allow_platform_fallback`, `credential_source`), which other checks and the
+    configuration reference already cover.
     """
     page = ROOT / "docs/security/threat-model-review.md"
     if not page.is_file():
@@ -801,28 +882,10 @@ def check_review_trigger_tests() -> list[str]:
             "docs/security/threat-model-review.md: the trigger page is missing; "
             "the security, deployment, contributor, and release docs link to it"
         ]
-    text = page.read_text(encoding="utf-8")
-    declared = set()
-    for source in (ROOT / "crates").rglob("*.rs"):
-        declared.update(
-            re.findall(r"\bfn\s+([a-z0-9_]+)", source.read_text(encoding="utf-8"))
-        )
-    named = {
-        candidate
-        for candidate in re.findall(r"`([a-z0-9_]+)`", text)
-        if candidate.count("_") >= 3
-    }
-    failures = [
-        f"docs/security/threat-model-review.md: named test {name!r} does not exist under crates/"
-        for name in sorted(named - declared)
-    ]
-    if len(named) < 40:
-        failures.append(
-            "docs/security/threat-model-review.md: only "
-            f"{len(named)} named tests remain; the triggers are meant to name the "
-            "existing floor for each area"
-        )
-    return failures
+    return review_trigger_failures(
+        page.read_text(encoding="utf-8"),
+        declared_test_names(ROOT / "crates", ROOT / "ts"),
+    )
 
 
 def documented_target_failures(relative: str, text: str) -> list[str]:

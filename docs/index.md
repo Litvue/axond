@@ -124,5 +124,7 @@ disk as records.
   — no pre-dispatch budget hold; `remaining = limit - spent`.
 - [ADR 0065: cadence budgets](./adr/0065-cadence-budgets.md) — `monthly`
   budgets derive `YYYY-MM` in the budget's timezone; no caller-driven period keys.
+- [ADR 0066: TypeScript gateway and extensions](./adr/0066-typescript-hono-extension-contract.md)
+  — Hono extension contract; Rust stays the conformance oracle for this line.
 - [ADR 0062](./adr/0062-blob-backed-flat-namespace-control-plane.md) and
   [ADR 0027](./adr/0027-stateless-and-stateful-operating-modes.md) — superseded.
