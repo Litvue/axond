@@ -545,8 +545,8 @@ test("workerd_hyperdrive_serves_a_role_that_cannot_create", { skip: !dsn }, asyn
   }
 });
 
-test("workerd_hyperdrive_connects_when_the_password_breaks_the_url", async (t) => {
-  const adminUrl = "postgres://axond:axond@127.0.0.1:5432/axond";
+test("workerd_hyperdrive_connects_when_the_password_breaks_the_url", { skip: !dsn }, async (t) => {
+  const adminUrl = dsn!;
   const password = "p@ss:w/rd#x?y%zz";
   const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 12);
   const name = `axond_hd_${suffix}`;
@@ -565,7 +565,7 @@ test("workerd_hyperdrive_connects_when_the_password_breaks_the_url", async (t) =
   // `URL.password` leaves a `%` that is not two hex digits for Miniflare's
   // decodeURIComponent. encodeURIComponent makes the local binding string valid.
   process.env.CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE =
-    `postgres://${name}:${encodeURIComponent(password)}@127.0.0.1:5432/${name}`;
+    `postgres://${name}:${encodeURIComponent(password)}@${new URL(adminUrl).host}/${name}`;
   const worker = await unstable_dev(new URL("./index.ts", import.meta.url).pathname, {
     config: new URL("../wrangler.toml", import.meta.url).pathname,
     local: true,

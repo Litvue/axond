@@ -63,4 +63,13 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 
 ## Shadow
 
-`ts/scripts/shadow-compare.ts` sends the fixture suite through the Rust binary and `ts/bin/axond`. Status, parsed JSON, and the charged `(model, status, cost)` rows match. Rust re-encodes some JSON objects with sorted keys. TypeScript relays the upstream bytes, which is what the streaming fixtures require. Each process mints its own `request_id`. The compare sends one `x-request-id`, which the TypeScript process keeps as its charge key.
+`ts/scripts/shadow-compare.ts` sends 49 fixture scenarios through the Rust binary
+and `ts/bin/axond` (or the binary supplied with `--ts`). Each process must return
+the expected status; matching each other's failure is insufficient. The gate
+compares contract headers, JSON without rounding large integers, SSE event order,
+and exact Responses/Messages streaming bytes. It expects seven usage rows and
+compares their namespace, period, model, status, and nullable cost, plus durable
+budget state and recovery after restart. Request IDs and timestamps are excluded:
+Rust mints an ID; TypeScript keeps the supplied `x-request-id` as its charge key.
+See [regression gates](typescript-regression-gates.md) for the feature matrix,
+permitted normalization, remaining evidence gaps, and release/canary criteria.

@@ -867,7 +867,7 @@ test("empty_model_segments_match_the_rust_split", async () => {
   const trailing = await post("fake-openai/");
   assert.equal(trailing.status, 400);
   assert.deepEqual(await trailing.json(), {
-    error: { type: "bad_request", message: "model id after `/` must not be empty" },
+    error: { type: "bad_request", message: "bad request: model id after `/` must not be empty" },
   });
   assert.equal(upstream.requests.length, 0);
   upstream.close();
@@ -884,18 +884,18 @@ test("json_null_is_missing_model_and_invalid_json_names_the_body", async () => {
     const response = await post(body);
     assert.equal(response.status, 400, body);
     assert.deepEqual(await response.json(), {
-      error: { type: "bad_request", message: "missing `model`" },
+      error: { type: "bad_request", message: "bad request: missing `model`" },
     });
   }
   const invalid = await post("{");
   assert.equal(invalid.status, 400);
   assert.deepEqual(await invalid.json(), {
-    error: { type: "bad_request", message: "request body is not valid JSON" },
+    error: { type: "bad_request", message: "bad request: request body is not valid JSON" },
   });
   const utf8 = await post(new Uint8Array([0xff, 0xfe]));
   assert.equal(utf8.status, 400);
   assert.deepEqual(await utf8.json(), {
-    error: { type: "bad_request", message: "request body is not valid JSON" },
+    error: { type: "bad_request", message: "bad request: request body is not valid JSON" },
   });
   assert.equal(upstream.requests.length, 0);
   upstream.close();
@@ -914,7 +914,7 @@ test("management_json_rejects_unknown_fields_and_out_of_range_limits", async () 
   assert.deepEqual(await typo.json(), {
     error: {
       type: "bad_request",
-      message: "Failed to deserialize the JSON body into the target type: attr: unknown field `attr`, expected `attrs` or `blocklist` at line 1 column 7",
+      message: "bad request: Failed to deserialize the JSON body into the target type: attr: unknown field `attr`, expected `attrs` or `blocklist` at line 1 column 7",
     },
   });
   const kept = await call("/api/v1/namespaces/wsp_x", "GET");
@@ -925,7 +925,7 @@ test("management_json_rejects_unknown_fields_and_out_of_range_limits", async () 
   assert.deepEqual(await extra.json(), {
     error: {
       type: "bad_request",
-      message: "Failed to deserialize the JSON body into the target type: extra: unknown field `extra`, expected one of `id`, `attrs`, `blocklist` at line 1 column 21",
+      message: "bad request: Failed to deserialize the JSON body into the target type: extra: unknown field `extra`, expected one of `id`, `attrs`, `blocklist` at line 1 column 21",
     },
   });
   const missing = await call("/api/v1/namespaces", "POST", "{}");
@@ -933,7 +933,7 @@ test("management_json_rejects_unknown_fields_and_out_of_range_limits", async () 
   assert.deepEqual(await missing.json(), {
     error: {
       type: "bad_request",
-      message: "Failed to deserialize the JSON body into the target type: missing field `id` at line 1 column 2",
+      message: "bad request: Failed to deserialize the JSON body into the target type: missing field `id` at line 1 column 2",
     },
   });
   const spaced = await call("/api/v1/namespaces/wsp_x", "PUT", "{\n  \"attr\": 1\n}");
@@ -944,7 +944,7 @@ test("management_json_rejects_unknown_fields_and_out_of_range_limits", async () 
   assert.deepEqual(await stringLimit.json(), {
     error: {
       type: "bad_request",
-      message: 'Failed to deserialize the JSON body into the target type: limit_microdollars: invalid type: string "10", expected u64 at line 1 column 26',
+      message: 'bad request: Failed to deserialize the JSON body into the target type: limit_microdollars: invalid type: string "10", expected u64 at line 1 column 26',
     },
   });
   const floatLimit = await call("/api/v1/namespaces/wsp_x/budgets/2026-09", "PUT", '{"limit_microdollars":1.5}');
@@ -952,13 +952,13 @@ test("management_json_rejects_unknown_fields_and_out_of_range_limits", async () 
   assert.deepEqual(await floatLimit.json(), {
     error: {
       type: "bad_request",
-      message: "Failed to deserialize the JSON body into the target type: limit_microdollars: invalid type: floating point `1.5`, expected u64 at line 1 column 25",
+      message: "bad request: Failed to deserialize the JSON body into the target type: limit_microdollars: invalid type: floating point `1.5`, expected u64 at line 1 column 25",
     },
   });
   const over = await call("/api/v1/namespaces/wsp_x/budgets/2026-09", "PUT", '{"limit_microdollars":9223372036854775808}');
   assert.equal(over.status, 400);
   assert.deepEqual(await over.json(), {
-    error: { type: "bad_request", message: "microdollar amount exceeds the store integer range" },
+    error: { type: "bad_request", message: "bad request: microdollar amount exceeds the store integer range" },
   });
   const exact = await call("/api/v1/namespaces/wsp_x/budgets/2026-09", "PUT", '{"limit_microdollars":9223372036854775807}');
   assert.equal(exact.status, 200);
@@ -971,7 +971,7 @@ test("management_json_rejects_unknown_fields_and_out_of_range_limits", async () 
   assert.deepEqual(await weekly.json(), {
     error: {
       type: "bad_request",
-      message: "Failed to deserialize the JSON body into the target type: cadence: unknown variant `weekly`, expected `monthly` or `fixed` at line 1 column 19",
+      message: "bad request: Failed to deserialize the JSON body into the target type: cadence: unknown variant `weekly`, expected `monthly` or `fixed` at line 1 column 19",
     },
   });
   const absent = await call("/api/v1/namespaces/not-created", "GET");
@@ -1112,7 +1112,7 @@ test("budget_policy_follows_the_cadence_period", async () => {
   const missing = await call("/api/v1/namespaces/wsp_need/budget", "PUT", '{"cadence":"fixed","limit_microdollars":1}');
   assert.equal(missing.status, 400);
   assert.deepEqual(await missing.json(), {
-    error: { type: "bad_request", message: "fixed cadence needs a period: the namespace has no active period" },
+    error: { type: "bad_request", message: "bad request: fixed cadence needs a period: the namespace has no active period" },
   });
   assert.equal((await call("/api/v1/namespaces/wsp_legacy/budgets/legacy", "PUT", '{"limit_microdollars":11}')).status, 200);
   const synthesized = await call("/api/v1/namespaces/wsp_legacy/budget", "GET");
@@ -1131,7 +1131,7 @@ test("management_query_matches_the_rust_deserializer", async () => {
     const bad = async (path: string, message: string) => {
       const response = await get(path);
       assert.equal(response.status, 400, path);
-      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message: `bad request: ${message}` } });
     };
     const digit = "Failed to deserialize query string: limit: invalid digit found in string";
     await bad("/api/v1/namespaces?limit=abc", digit);
@@ -1192,7 +1192,7 @@ test("management_json_matches_serde_syntax_and_null_attrs", async () => {
     const bad = async (path: string, method: string, body: string, message: string) => {
       const response = await call(path, method, body);
       assert.equal(response.status, 400, `${method} ${path} ${body}`);
-      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message: `bad request: ${message}` } });
     };
     const parse = "Failed to parse the request body as JSON";
     const data = "Failed to deserialize the JSON body into the target type";
@@ -1262,7 +1262,7 @@ test("management_json_rejects_duplicate_fields", async () => {
     const bad = async (path: string, method: string, body: string, message: string) => {
       const response = await call(path, method, body);
       assert.equal(response.status, 400, `${method} ${path} ${body}`);
-      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message: `bad request: ${message}` } });
     };
     const data = "Failed to deserialize the JSON body into the target type";
     const parse = "Failed to parse the request body as JSON";
@@ -1323,7 +1323,7 @@ test("management_json_string_escapes_match_serde", async () => {
     const bad = async (path: string, method: string, body: string, message: string) => {
       const response = await call(path, method, body);
       assert.equal(response.status, 400, `${method} ${path} ${JSON.stringify(body)}`);
-      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message: `bad request: ${message}` } });
     };
     const parse = "Failed to parse the request body as JSON";
     const data = "Failed to deserialize the JSON body into the target type";
@@ -1458,7 +1458,7 @@ test("management_json_cadence_unit_enum_matches_serde", async () => {
     const bad = async (body: string, message: string) => {
       const response = await call("/api/v1/namespaces/wsp_cad/budget", "PUT", body);
       assert.equal(response.status, 400);
-      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message: `bad request: ${message}` } });
     };
     const monthly = await call(
       "/api/v1/namespaces/wsp_cad/budget",
@@ -1634,7 +1634,7 @@ test("management_json_invalid_utf8_matches_serde", async () => {
     const bad = async (path: string, method: string, body: Uint8Array, message: string) => {
       const response = await call(path, method, body);
       assert.equal(response.status, 400, `${method} ${path} ${message}`);
-      assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+      assert.deepEqual(await response.json(), { error: { type: "bad_request", message: `bad request: ${message}` } });
     };
     const unicode = "invalid unicode code point";
     const control = "control character (\\u0000-\\u001F) found while parsing a string";
@@ -1812,7 +1812,7 @@ test("management_json_attrs_match_serde_reserialization", async () => {
   const bad = async (path: string, method: string, body: string, message: string) => {
     const response = await call(path, method, body);
     assert.equal(response.status, 400, body);
-    assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+    assert.deepEqual(await response.json(), { error: { type: "bad_request", message: `bad request: ${message}` } });
   };
   await bad(
     "/api/v1/namespaces",
@@ -1890,7 +1890,7 @@ test("management_json_trailing_characters_match_serde", async () => {
   const bad = async (path: string, method: string, body: Uint8Array, message: string) => {
     const response = await call(path, method, body);
     assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), { error: { type: "bad_request", message } });
+    assert.deepEqual(await response.json(), { error: { type: "bad_request", message: `bad request: ${message}` } });
   };
   await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}x'), `${parse} at line 1 column 11`);
   await bad("/api/v1/namespaces", "POST", utf8('{"id":"a"}é'), `${parse} at line 1 column 11`);
@@ -2150,7 +2150,7 @@ test("namespace_attrs_and_blocklist_match_the_rust_limits", async () => {
   const wide = await post({ id: "wide-attrs", attrs: wideAttrs });
   assert.equal(wide.status, 400);
   assert.deepEqual(await wide.json(), {
-    error: { type: "bad_request", message: "attrs exceeds 4096 byte limit" },
+    error: { type: "bad_request", message: "bad request: attrs exceeds 4096 byte limit" },
   });
   const fittingAttrs = { n: "é".repeat(2044) };
   assert.equal(utf8(fittingAttrs), 4096);
@@ -2160,21 +2160,21 @@ test("namespace_attrs_and_blocklist_match_the_rust_limits", async () => {
   const many = await post({ id: "many-globs", blocklist: Array.from({ length: 65 }, () => "foo*bar") });
   assert.equal(many.status, 400);
   assert.deepEqual(await many.json(), {
-    error: { type: "bad_request", message: "namespace blocklist exceeds 64 entries" },
+    error: { type: "bad_request", message: "bad request: namespace blocklist exceeds 64 entries" },
   });
   const hugePatterns = Array.from({ length: 64 }, () => "a".repeat(61));
   assert.ok(utf8(hugePatterns) > 4096);
   const huge = await post({ id: "huge-globs", blocklist: hugePatterns });
   assert.equal(huge.status, 400);
   assert.deepEqual(await huge.json(), {
-    error: { type: "bad_request", message: "namespace blocklist exceeds 4 KiB" },
+    error: { type: "bad_request", message: "bad request: namespace blocklist exceeds 4 KiB" },
   });
   const sizedBeforeGlob = ["a*a" + "b".repeat(4090)];
   assert.ok(utf8(sizedBeforeGlob) > 4096);
   const sized = await post({ id: "sized-glob", blocklist: sizedBeforeGlob });
   assert.equal(sized.status, 400);
   assert.deepEqual(await sized.json(), {
-    error: { type: "bad_request", message: "namespace blocklist exceeds 4 KiB" },
+    error: { type: "bad_request", message: "bad request: namespace blocklist exceeds 4 KiB" },
   });
   const atSize = Array.from({ length: 64 }, () => "a".repeat(60));
   assert.ok(utf8(atSize) <= 4096);
@@ -2186,7 +2186,7 @@ test("namespace_attrs_and_blocklist_match_the_rust_limits", async () => {
   assert.deepEqual(await middle.json(), {
     error: {
       type: "bad_request",
-      message: "blocklist glob `foo*bar` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
+      message: "bad request: blocklist glob `foo*bar` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
     },
   });
   const empty = await post({ id: "empty-glob", blocklist: [""] });
@@ -2194,7 +2194,7 @@ test("namespace_attrs_and_blocklist_match_the_rust_limits", async () => {
   assert.deepEqual(await empty.json(), {
     error: {
       type: "bad_request",
-      message: "blocklist glob `` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
+      message: "bad request: blocklist glob `` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
     },
   });
   const created = await post({ id: "ok-globs", blocklist: ["gpt-4o", "claude-*", "*-latest", "*"] });
@@ -2208,7 +2208,7 @@ test("namespace_attrs_and_blocklist_match_the_rust_limits", async () => {
   assert.deepEqual(await replaced.json(), {
     error: {
       type: "bad_request",
-      message: "blocklist glob `*middle*` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
+      message: "bad request: blocklist glob `*middle*` is invalid: use an exact id, `prefix*`, `*suffix`, or `*`",
     },
   });
   const kept = await app.request("http://127.0.0.1/api/v1/namespaces/ok-globs", {
@@ -2240,7 +2240,7 @@ test("namespace_create_uses_the_rust_identifier_messages", async () => {
     const response = await post(body);
     assert.equal(response.status, 400);
     const payload = await response.json();
-    assert.deepEqual(payload, { error: { type: "bad_request", message } });
+    assert.deepEqual(payload, { error: { type: "bad_request", message: `bad request: ${message}` } });
     assert.equal(JSON.stringify(payload).includes("é"), false);
     assert.equal(JSON.stringify(payload).includes("cafe"), false);
   };
@@ -2280,7 +2280,7 @@ test("namespace_create_uses_the_rust_identifier_messages", async () => {
   });
   assert.equal(periodFirst.status, 400);
   assert.deepEqual(await periodFirst.json(), {
-    error: { type: "bad_request", message: "`period` is required" },
+    error: { type: "bad_request", message: "bad request: `period` is required" },
   });
   const unknownUsage = await app.request("http://127.0.0.1/api/v1/namespaces/-bad/usage?period=compat", {
     headers: { authorization: `Bearer ${KEY}` },
@@ -2332,10 +2332,10 @@ test("json_content_type_matches_axum", async () => {
     };
     const suffix = await post("application/cloudevents+json", "/ns/platform/v1/chat/completions", "{}");
     assert.equal(suffix.status, 400);
-    assert.deepEqual(await suffix.json(), { error: { type: "bad_request", message: "missing `model`" } });
+    assert.deepEqual(await suffix.json(), { error: { type: "bad_request", message: "bad request: missing `model`" } });
     const charset = await post("Application/Json; Charset=UTF-8", "/ns/platform/v1/chat/completions", "{}");
     assert.equal(charset.status, 400);
-    assert.deepEqual(await charset.json(), { error: { type: "bad_request", message: "missing `model`" } });
+    assert.deepEqual(await charset.json(), { error: { type: "bad_request", message: "bad request: missing `model`" } });
     const textJson = await post("text/json", "/ns/platform/v1/chat/completions", "{}");
     assert.equal(textJson.status, 415);
     assert.deepEqual(await textJson.json(), media);
@@ -3276,7 +3276,11 @@ test("withdrawn routes stay unmounted", async () => {
         body: method === "GET" ? undefined : "{}",
       });
       assert.equal(response.status, 404, path);
-      assert.deepEqual(await response.json(), { error: { type: "not_found", message: "not found" } });
+      if (path.startsWith("/api/v1/") || path.startsWith("/ns/")) {
+        assert.deepEqual(await response.json(), { error: { type: "not_found", message: "not found" } });
+      } else {
+        assert.equal(await response.text(), "");
+      }
     }
     assert.equal(upstream.requests.length, 0);
   } finally {

@@ -2916,13 +2916,24 @@ test(
   { skip: process.versions.bun !== undefined && "Bun fetch does not enforce connect_timeout_ms" },
   async () => {
   const store = await seeded();
+  // A local peer accepts TCP but never completes the TLS handshake. This
+  // exercises the real connect timer without depending on Internet routing.
+  const sockets = new Set<import("node:net").Socket>();
+  const silent = createNetServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => undefined);
+  });
+  await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", () => resolve()));
+  const address = silent.address();
+  assert.ok(address && typeof address !== "string");
   const agent = new Agent({ connectTimeout: 50, connect: { autoSelectFamily: false } });
   const app = createAxond({
     store,
     gatewayKey: KEY,
     defaultNamespace: "platform",
     upstreamDispatcher: agent,
-    providers: [{ id: "fake-openai", kind: "openai", baseUrl: "http://192.0.2.1:81" }],
+    providers: [{ id: "fake-openai", kind: "openai", baseUrl: `https://127.0.0.1:${address.port}` }],
     credentials: [{ namespace: "platform", provider: "fake-openai", secret: "upstream", id: "one" }],
     prices: [
       {
@@ -2952,10 +2963,12 @@ test(
     const body = await response.json();
     assert.equal(body.error.type, "upstream_timeout");
     assert.match(body.error.message, /connecting to the provider exceeded its 50ms bound/);
-    assert.equal(body.error.message.includes("192.0.2.1"), false);
+    assert.equal(body.error.message.includes("127.0.0.1"), false);
     assert.ok(Date.now() - started < 3_000);
   } finally {
     await agent.close();
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => silent.close(() => resolve()));
   }
 });
 
@@ -5109,7 +5122,7 @@ test("malformed_responses_controls_never_reach_the_provider", async () => {
       assert.equal(response.status, 400, item.path);
       const body = JSON.parse(text) as { error: { type: string; message: string } };
       assert.equal(body.error.type, "bad_request", item.path);
-      assert.equal(body.error.message, item.message, item.path);
+      assert.equal(body.error.message, `bad request: ${item.message}`, item.path);
       assert.equal(text.includes(secret), false, item.path);
       assert.equal(hits, 0, item.path);
     }

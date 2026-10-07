@@ -6,6 +6,7 @@
  *     --rust ../../target/debug/axond --ts ../bin/axond
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { samePayload } from "./parity.ts";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import { createServer as createNet } from "node:net";
@@ -23,7 +24,9 @@ interface Case {
   path: string;
   body?: string;
   headers?: Record<string, string>;
-  expectStatus?: number;
+  expectStatus: number;
+  anonymous?: boolean;
+  byteFaithful?: boolean;
 }
 
 const KEY = "test-inbound-key";
@@ -60,14 +63,15 @@ function cases(): Case[] {
     messages: [{ role: "user", content: "Weather in Paris?" }],
   });
   return [
-    { name: "healthz", method: "GET", path: "/healthz", headers: {} },
-    { name: "models", method: "GET", path: "/ns/platform/v1/models" },
-    { name: "chat", method: "POST", path: "/ns/platform/v1/chat/completions", body: chat },
-    { name: "chat-stream", method: "POST", path: "/ns/platform/v1/chat/completions", body: chatStream },
-    { name: "embeddings", method: "POST", path: "/ns/platform/v1/embeddings", body: embeddings },
-    { name: "responses", method: "POST", path: "/ns/platform/v1/responses", body: responses },
-    { name: "responses-stream", method: "POST", path: "/ns/platform/v1/responses", body: responsesStream },
+    { name: "healthz", method: "GET", path: "/healthz", headers: {}, expectStatus: 200 },
+    { name: "models", method: "GET", path: "/ns/platform/v1/models", expectStatus: 200 },
+    { name: "chat", method: "POST", path: "/ns/platform/v1/chat/completions", body: chat, expectStatus: 200 },
+    { name: "chat-stream", method: "POST", path: "/ns/platform/v1/chat/completions", body: chatStream, expectStatus: 200 },
+    { name: "embeddings", method: "POST", path: "/ns/platform/v1/embeddings", body: embeddings, expectStatus: 200 },
+    { name: "responses", method: "POST", path: "/ns/platform/v1/responses", body: responses, expectStatus: 200 },
+    { byteFaithful: true, name: "responses-stream", method: "POST", path: "/ns/platform/v1/responses", body: responsesStream, expectStatus: 200 },
     {
+      expectStatus: 200,
       name: "messages",
       method: "POST",
       path: "/ns/platform/v1/messages",
@@ -75,6 +79,8 @@ function cases(): Case[] {
       headers: { "x-api-key": KEY, "anthropic-version": "2023-06-01" },
     },
     {
+      expectStatus: 200,
+      byteFaithful: true,
       name: "messages-stream",
       method: "POST",
       path: "/ns/platform/v1/messages",
@@ -90,6 +96,44 @@ function cases(): Case[] {
     },
     { name: "unknown-namespace", method: "GET", path: "/ns/ghost/v1/models", expectStatus: 404 },
     { name: "encoded-namespace", method: "GET", path: "/ns/%70latform/v1/models", expectStatus: 400 },
+    { name: "readyz", method: "GET", path: "/readyz", expectStatus: 200 },
+    { name: "unauthenticated", method: "GET", path: "/ns/platform/v1/models", anonymous: true, expectStatus: 401 },
+    { name: "auth-before-namespace", method: "GET", path: "/ns/ghost/v1/models", headers: { authorization: "Bearer wrong" }, expectStatus: 401 },
+    { name: "minted-token-refused", method: "GET", path: "/ns/platform/v1/models", headers: { authorization: "Bearer axt1.invalid" }, expectStatus: 401 },
+    { name: "management-auth", method: "GET", path: "/api/v1/namespaces", anonymous: true, expectStatus: 401 },
+    { name: "unmounted-v1", method: "GET", path: "/v1/models", expectStatus: 404 },
+    { name: "unmounted-admin", method: "GET", path: "/admin/v1/status", expectStatus: 404 },
+    { name: "credentials", method: "GET", path: "/ns/platform/v1/credentials", expectStatus: 200 },
+    { name: "credentials-duplicate-query", method: "GET", path: "/ns/platform/v1/credentials?namespaces=all&namespaces=all", expectStatus: 400 },
+    { name: "invalid-json", method: "POST", path: "/ns/platform/v1/chat/completions", body: "{", expectStatus: 400 },
+    { name: "null-model", method: "POST", path: "/ns/platform/v1/chat/completions", body: "null", expectStatus: 400 },
+    { name: "wrong-content-type", method: "POST", path: "/ns/platform/v1/chat/completions", body: chat, headers: { "content-type": "text/plain" }, expectStatus: 415 },
+    { name: "namespace-list", method: "GET", path: "/api/v1/namespaces?limit=1", expectStatus: 200 },
+    { name: "namespace-create", method: "POST", path: "/api/v1/namespaces", body: '{"id":"audit","attrs":{"owner":"regression"}}', expectStatus: 201 },
+    { name: "namespace-conflict", method: "POST", path: "/api/v1/namespaces", body: '{"id":"audit","attrs":{}}', expectStatus: 409 },
+    { name: "namespace-read", method: "GET", path: "/api/v1/namespaces/audit", expectStatus: 200 },
+    { name: "namespace-update", method: "PUT", path: "/api/v1/namespaces/audit", body: '{"attrs":{"owner":"updated"},"blocklist":["fake-openai/*"]}', expectStatus: 200 },
+    { name: "namespace-budget", method: "PUT", path: "/api/v1/namespaces/audit/budgets/compat", body: '{"limit_microdollars":1000000}', expectStatus: 200 },
+    { name: "blocked-model", method: "POST", path: "/ns/audit/v1/chat/completions", body: chat, expectStatus: 400 },
+    { name: "namespace-delete", method: "DELETE", path: "/api/v1/namespaces/audit", expectStatus: 204 },
+    { name: "namespace-delete-again", method: "DELETE", path: "/api/v1/namespaces/audit", expectStatus: 204 },
+    { name: "namespace-deleted", method: "GET", path: "/api/v1/namespaces/audit", expectStatus: 404 },
+    { name: "config-namespace-delete", method: "DELETE", path: "/api/v1/namespaces/platform", expectStatus: 409 },
+    { name: "budget-read", method: "GET", path: "/api/v1/namespaces/platform/budgets/compat", expectStatus: 200 },
+    { name: "usage-summary", method: "GET", path: "/api/v1/namespaces/platform/usage?period=compat", expectStatus: 200 },
+    { name: "usage-period-required", method: "GET", path: "/api/v1/namespaces/platform/usage", expectStatus: 400 },
+    { name: "budget-unknown-field", method: "PUT", path: "/api/v1/namespaces/platform/budgets/compat", body: '{"limit_microdollars":1,"extra":true}', expectStatus: 400 },
+    { name: "budget-exhaust", method: "PUT", path: "/api/v1/namespaces/platform/budgets/compat", body: '{"limit_microdollars":0}', expectStatus: 200 },
+    { name: "budget-denies-inference", method: "POST", path: "/ns/platform/v1/chat/completions", body: chat, expectStatus: 429 },
+    { name: "credentials-all", method: "GET", path: "/ns/platform/v1/credentials?namespaces=all", expectStatus: 200 },
+    { name: "provider-models", method: "GET", path: "/api/v1/providers/fake-openai/models", expectStatus: 200 },
+    { name: "provider-models-all", method: "GET", path: "/api/v1/providers/models", expectStatus: 200 },
+    { name: "fixed-policy-put", method: "PUT", path: "/api/v1/namespaces/tenant/budget", body: '{"cadence":"fixed","period":"compat","limit_microdollars":1000000}', expectStatus: 200 },
+    { name: "fixed-policy-get", method: "GET", path: "/api/v1/namespaces/tenant/budget", expectStatus: 200 },
+    { name: "monthly-policy-put", method: "PUT", path: "/api/v1/namespaces/tenant/budget", body: '{"cadence":"monthly","timezone":"America/New_York","limit_microdollars":1000000}', expectStatus: 200 },
+    { name: "monthly-policy-get", method: "GET", path: "/api/v1/namespaces/tenant/budget", expectStatus: 200 },
+    { name: "persistent-namespace", method: "POST", path: "/api/v1/namespaces", body: '{"id":"persist","attrs":{"owner":"restart"}}', expectStatus: 201 },
+
   ];
 }
 
@@ -159,6 +203,11 @@ function config(bind: string, sqlite: string, baseUrl: string): string {
   return `
 [server]
 bind = "${bind}"
+
+[shutdown]
+drain_grace_ms = 50
+deadline_ms = 3000
+flush_timeout_ms = 1000
 
 [storage]
 backend = "sqlite"
@@ -235,17 +284,20 @@ async function boot(program: string, directory: string, baseUrl: string): Promis
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stderr = "";
+  let spawnError: Error | undefined;
+  child.on("error", (error) => { spawnError = error; });
   child.stderr?.on("data", (chunk: Buffer) => {
     stderr += chunk.toString();
   });
   const base = `http://${bind}`;
   const deadline = Date.now() + 20_000;
   while (Date.now() < deadline) {
+    if (spawnError) throw spawnError;
     if (child.exitCode !== null) {
       throw new Error(`${program} exited ${child.exitCode}: ${stderr}`);
     }
     try {
-      const response = await fetch(`${base}/healthz`);
+      const response = await fetch(`${base}/healthz`, { signal: AbortSignal.timeout(1000) });
       if (response.ok) {
         await response.arrayBuffer();
         return { base, sqlite, child };
@@ -255,6 +307,7 @@ async function boot(program: string, directory: string, baseUrl: string): Promis
     }
     await new Promise((wake) => setTimeout(wake, 40));
   }
+  child.kill("SIGKILL");
   throw new Error(`${program} did not become healthy: ${stderr}`);
 }
 
@@ -271,95 +324,82 @@ async function putBudgets(base: string): Promise<void> {
   }
 }
 
-async function call(base: string, item: Case, requestId: string): Promise<{ status: number; body: Buffer }> {
+function normalizeContentType(value: string | null): string | null {
+  if (value === null) return null;
+  const [media, ...parameters] = value.toLowerCase().split(";").map((part) => part.trim());
+  // JSON is UTF-8 with or without an explicit charset; Bun adds that parameter.
+  const kept = parameters.filter((part) => !(media === "application/json" && part === "charset=utf-8"));
+  return [media, ...kept.sort()].join("; ");
+}
+
+async function call(base: string, item: Case, requestId: string): Promise<{ status: number; body: Buffer; headers: string }> {
   const headers: Record<string, string> = {
     "x-request-id": requestId,
     ...(item.body ? { "content-type": "application/json" } : {}),
     ...(item.headers ?? { authorization: `Bearer ${KEY}` }),
   };
-  if (item.headers && !item.headers.authorization && !item.headers["x-api-key"]) {
+  if (item.anonymous) {
+    delete headers.authorization;
+  } else if (item.headers && !item.headers.authorization && !item.headers["x-api-key"]) {
     headers.authorization = `Bearer ${KEY}`;
   }
-  const response = await fetch(`${base}${item.path}`, { method: item.method, headers, body: item.body });
-  return { status: response.status, body: Buffer.from(await response.arrayBuffer()) };
-}
-
-/**
- * Rust re-encodes some JSON (sorted object keys, compact SSE data). The
- * TypeScript gateway relays upstream bytes. Compare the parsed value.
- * Request ids differ because each process mints its own, so charges compare
- * model, status, and cost.
- */
-function samePayload(left: Buffer, right: Buffer): boolean {
-  if (left.equals(right)) {
-    return true;
-  }
-  const a = left.toString("utf8");
-  const b = right.toString("utf8");
-  if (a.startsWith("{") || a.startsWith("[")) {
-    try {
-      return canonical(JSON.parse(a)) === canonical(JSON.parse(b));
-    } catch {
-      return false;
-    }
-  }
-  return canonicalSse(a) === canonicalSse(b);
-}
-
-function canonicalSse(text: string): string {
-  return text
-    .split(/\n\n/)
-    .map((frame) =>
-      frame
-        .split("\n")
-        .map((line) => {
-          if (!line.startsWith("data:")) {
-            return line;
-          }
-          const data = line.slice(5).replace(/^ /, "");
-          if (data === "[DONE]" || data.length === 0) {
-            return line;
-          }
-          try {
-            return `data: ${canonical(JSON.parse(data))}`;
-          } catch {
-            return line;
-          }
-        })
-        .join("\n"),
-    )
-    .join("\n\n");
-}
-
-function canonical(value: unknown): string {
-  return JSON.stringify(sortKeys(value));
-}
-
-function sortKeys(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sortKeys);
-  }
-  if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
-    const sorted: Record<string, unknown> = {};
-    for (const key of Object.keys(record).sort()) {
-      sorted[key] = sortKeys(record[key]);
-    }
-    return sorted;
-  }
-  return value;
+  const response = await fetch(`${base}${item.path}`, { method: item.method, headers, body: item.body, signal: AbortSignal.timeout(10000) });
+  const body = Buffer.from(await response.arrayBuffer());
+  const contractHeaders = ["content-type", "cache-control", "retry-after", "allow"]
+    .map((name) => [name, name === "content-type"
+      ? (body.length === 0 && (response.status === 204 || response.status === 404)
+        ? null : normalizeContentType(response.headers.get(name)))
+      : response.headers.get(name)]);
+  return { status: response.status, body, headers: JSON.stringify(contractHeaders) };
 }
 
 function chargeRows(sqlite: string): string[] {
   const db = new DatabaseSync(sqlite, { readOnly: true });
   const rows = db
     .prepare(
-      `SELECT model, status, COALESCE(cost_microdollars, -1) AS cost
-       FROM axond_store_usage ORDER BY model, status, cost`,
+      `SELECT namespace, period, model, status, cost_microdollars AS cost
+       FROM axond_store_usage ORDER BY namespace, period, model, status, cost`,
     )
-    .all() as Array<{ model: string; status: string; cost: number | bigint }>;
+    .all() as Array<{ namespace: string; period: string | null; model: string; status: string; cost: number | bigint | null }>;
   db.close();
-  return rows.map((row) => `${row.model} ${row.status} ${row.cost}`);
+  return rows.map((row) => JSON.stringify([row.namespace, row.period, row.model, row.status, row.cost === null ? null : String(row.cost)]));
+}
+
+async function waitForUsage(sqlite: string, expected: number): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const count = chargeRows(sqlite).length;
+    if (count === expected) return;
+    if (count > expected) throw new Error(`unexpected usage count: ${count}, expected ${expected}`);
+    await new Promise((wake) => setTimeout(wake, 25));
+  }
+  throw new Error(`settlement did not produce ${expected} usage rows`);
+}
+
+function durableState(sqlite: string): string {
+  const db = new DatabaseSync(sqlite, { readOnly: true });
+  try {
+    const budgets = db.prepare(`SELECT namespace, period, limit_microdollars, spent_microdollars
+      FROM axond_store_budget ORDER BY namespace, period`).all();
+    const cadence = db.prepare(`SELECT namespace, cadence, limit_microdollars, timezone
+      FROM axond_store_budget_cadence ORDER BY namespace`).all();
+    const active = db.prepare(`SELECT namespace, period FROM axond_store_budget_active ORDER BY namespace`).all();
+    return JSON.stringify({ budgets, active, cadence, usage: chargeRows(sqlite) });
+  } finally {
+    db.close();
+  }
+}
+
+async function stop(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve, reject) => {
+    const deadline = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("gateway did not stop within 5 seconds"));
+    }, 5000);
+    child.once("exit", () => { clearTimeout(deadline); resolve(); });
+    child.kill("SIGTERM");
+  });
 }
 
 async function main(): Promise<void> {
@@ -373,21 +413,28 @@ async function main(): Promise<void> {
   const root = join(tmpdir(), `axond-shadow-${Date.now()}`);
   await mkdir(join(root, "rust"), { recursive: true });
   await mkdir(join(root, "ts"), { recursive: true });
-  const rustGate = await boot(rust, join(root, "rust"), fake.url);
-  const tsGate = await boot(ts, join(root, "ts"), fake.url);
+  const gates: Array<Awaited<ReturnType<typeof boot>>> = [];
   const diffs: string[] = [];
   try {
+    const rustGate = await boot(rust, join(root, "rust"), fake.url);
+    gates.push(rustGate);
+    const tsGate = await boot(ts, join(root, "ts"), fake.url);
+    gates.push(tsGate);
     await putBudgets(rustGate.base);
     await putBudgets(tsGate.base);
     let index = 0;
     for (const item of cases()) {
       index += 1;
+      if (item.name === "budget-read") {
+        await waitForUsage(rustGate.sqlite, 7);
+        await waitForUsage(tsGate.sqlite, 7);
+      }
       const requestId = `shadow-${item.name}-${index}`;
       const left = await call(rustGate.base, item, requestId);
       const right = await call(tsGate.base, item, requestId);
-      if (left.status !== right.status || !samePayload(left.body, right.body)) {
+      if (left.status !== item.expectStatus || right.status !== item.expectStatus || left.headers !== right.headers || !(item.byteFaithful ? left.body.equals(right.body) : samePayload(left.body, right.body))) {
         diffs.push(
-          `${item.name}: rust ${left.status} ${left.body.toString("utf8").slice(0, 240)} | ts ${right.status} ${right.body.toString("utf8").slice(0, 240)}`,
+          `${item.name} expected ${item.expectStatus}: headers rust ${left.headers} ts ${right.headers}; rust ${left.status} ${left.body.toString("utf8").slice(0, 240)} | ts ${right.status} ${right.body.toString("utf8").slice(0, 240)}`,
         );
       } else if (left.body.equals(right.body)) {
         process.stdout.write(`match ${item.name} ${left.status} ${left.body.length}b\n`);
@@ -395,7 +442,8 @@ async function main(): Promise<void> {
         process.stdout.write(`semantic ${item.name} ${left.status} rust ${left.body.length}b ts ${right.body.length}b\n`);
       }
     }
-    await new Promise((wake) => setTimeout(wake, 200));
+    await waitForUsage(rustGate.sqlite, 7);
+    await waitForUsage(tsGate.sqlite, 7);
     const rustUsage = chargeRows(rustGate.sqlite);
     const tsUsage = chargeRows(tsGate.sqlite);
     if (rustUsage.join("\n") !== tsUsage.join("\n")) {
@@ -403,10 +451,29 @@ async function main(): Promise<void> {
     } else {
       process.stdout.write(`match usage ${rustUsage.length} rows\n`);
     }
+
+    const before = gates.map((gate) => durableState(gate.sqlite));
+    if (before[0] !== before[1]) diffs.push(`durable state differs: rust ${before[0]} | ts ${before[1]}`);
+    await Promise.all(gates.map((gate) => stop(gate.child)));
+    for (const [program, directory] of [[rust, "rust"], [ts, "ts"]] as const) {
+      const gate = await boot(program, join(root, directory), fake.url);
+      gates.push(gate);
+      const persisted = await call(gate.base, {
+        name: "restart-namespace", method: "GET", path: "/api/v1/namespaces/persist", expectStatus: 200,
+      }, "restart-read");
+      if (persisted.status !== 200 || !samePayload(persisted.body, Buffer.from('{"id":"persist","attrs":{"owner":"restart"}}'))) {
+        diffs.push(`${directory}: namespace did not survive restart`);
+      }
+      if (durableState(gate.sqlite) !== before[directory === "rust" ? 0 : 1]) {
+        diffs.push(`${directory}: budget or usage changed across restart`);
+      }
+    }
+    process.stdout.write("checked restart: namespace, budgets, and usage\n");
   } finally {
-    rustGate.child.kill("SIGTERM");
-    tsGate.child.kill("SIGTERM");
-    await new Promise((wake) => setTimeout(wake, 300));
+    const stopped = await Promise.allSettled(gates.map((gate) => stop(gate.child)));
+    for (const result of stopped) {
+      if (result.status === "rejected") diffs.push(`cleanup: ${String(result.reason)}`);
+    }
     fake.close();
     await rm(root, { recursive: true, force: true });
   }

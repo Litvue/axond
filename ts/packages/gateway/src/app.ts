@@ -183,7 +183,7 @@ export function createAxond(opts: AxondOptions): Hono<AxondEnv> {
     }
     return gatewayError(new GatewayFailure("internal", 500, "internal error"));
   });
-  app.notFound(() => gatewayError(new GatewayFailure("not_found", 404, "not found")));
+  app.notFound(() => new Response(null, { status: 404 }));
   app.get("/healthz", (c) => c.text("ok"));
   app.get("/readyz", (c) => {
     if (opts.serving && !opts.serving()) {

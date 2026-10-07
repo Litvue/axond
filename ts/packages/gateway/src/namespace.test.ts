@@ -55,7 +55,7 @@ test("monthly_period_matches_the_bundled_tzdb", async () => {
   });
   assert.equal(refused.status, 400);
   assert.deepEqual(await refused.json(), {
-    error: { type: "bad_request", message: "unknown timezone `PST`" },
+    error: { type: "bad_request", message: "bad request: unknown timezone `PST`" },
   });
   const policy = await app.request("http://127.0.0.1/api/v1/namespaces/wsp_tz/budget", {
     method: "PUT",

@@ -90,21 +90,21 @@ test("duplicate_namespaces_query_is_rejected", async () => {
   assert.equal(repeated.status, 400);
   const repeatedBody = await repeated.json();
   assert.equal(repeatedBody.error.type, "bad_request");
-  assert.equal(repeatedBody.error.message, "duplicate query parameter `namespaces`");
+  assert.equal(repeatedBody.error.message, "bad request: duplicate query parameter `namespaces`");
   assert.equal(JSON.stringify(repeatedBody).includes("sk-platform-secret"), false);
   assert.equal(JSON.stringify(repeatedBody).includes("sk-tenant-secret"), false);
 
   const encoded = await app.request("http://127.0.0.1/ns/platform/v1/credentials?foo=%GG&namespaces=all", { headers });
   assert.equal(encoded.status, 400);
-  assert.equal((await encoded.json()).error.message, "invalid query string encoding");
+  assert.equal((await encoded.json()).error.message, "bad request: invalid query string encoding");
 
   const empty = await app.request("http://127.0.0.1/ns/platform/v1/credentials?namespaces=", { headers });
   assert.equal(empty.status, 400);
-  assert.equal((await empty.json()).error.message, "invalid `namespaces` value");
+  assert.equal((await empty.json()).error.message, "bad request: invalid `namespaces` value");
 
   const nul = await app.request("http://127.0.0.1/ns/platform/v1/credentials?namespaces=all%00", { headers });
   assert.equal(nul.status, 400);
-  assert.equal((await nul.json()).error.message, "invalid `namespaces` value");
+  assert.equal((await nul.json()).error.message, "bad request: invalid `namespaces` value");
 });
 
 test("fallback credential status hides an env-derived platform label", async () => {

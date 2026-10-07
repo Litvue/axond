@@ -33,7 +33,10 @@ export function gatewayError(error: GatewayFailure): Response {
   const retry = error.retryAfter ?? (error.type === "draining" ? "0" : null);
   const headers = retry !== null ? { "retry-after": retry } : undefined;
   return Response.json(
-    { error: { type: error.type, message: error.message } },
+    { error: {
+      type: error.type,
+      message: error.type === "bad_request" ? `bad request: ${error.message}` : error.message,
+    } },
     { status: error.status, headers },
   );
 }
