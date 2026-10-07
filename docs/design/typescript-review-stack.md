@@ -1,7 +1,7 @@
 # TypeScript conversion review stack
 
-Start with [#534](https://github.com/Litvue/axond/pull/534); it is open for review.
-Later slices remain drafts until their prerequisites have been reviewed.
+All 21 PRs are ready for review. Start with [#534](https://github.com/Litvue/axond/pull/534);
+reviews can proceed across the stack, and merges must follow dependency order.
 
 The review stack replaces the combined diffs of PR #531 and its regression
 follow-up #533. Their branches retain the original work and validation history.
