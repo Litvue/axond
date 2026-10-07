@@ -39,7 +39,7 @@ changed file to a slice and records its base branch and review focus.
 | 18 | qualify CLI configuration diagnostics and refusal order | 1670 | [#551](https://github.com/Litvue/axond/pull/551) |
 | 19 | add rate limit redaction and token extensions | 1020 | [#552](https://github.com/Litvue/axond/pull/552) |
 | 20 | host the TypeScript gateway on Workers Hyperdrive | 1848 | [#553](https://github.com/Litvue/axond/pull/553) |
-| 21 | qualify TypeScript artifacts and regression gates | 2771 | [#554](https://github.com/Litvue/axond/pull/554) |
+| 21 | qualify TypeScript artifacts and regression gates | 2774 | [#554](https://github.com/Litvue/axond/pull/554) |
 
 ## How to review a slice
 
