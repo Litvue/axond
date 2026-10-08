@@ -35,10 +35,22 @@ export function gatewayError(error: GatewayFailure): Response {
   return Response.json(
     { error: {
       type: error.type,
-      message: error.type === "bad_request" ? `bad request: ${error.message}` : error.message,
+      message: callerMessage(error),
     } },
     { status: error.status, headers },
   );
+}
+
+/** Keep provider diagnostics on attempt spans while matching Rust's public error display. */
+function callerMessage(error: GatewayFailure): string {
+  if (error.type === "bad_request") return `bad request: ${error.message}`;
+  if (error.upstreamStatus !== null) {
+    if (error.type === "invalid_request") return `invalid provider request: ${error.message}`;
+    if (error.type === "context_window_exceeded") return `context window exceeded: ${error.message}`;
+    if (error.type === "model_unavailable") return "upstream model unavailable";
+    if (error.type === "provider_dependency_failed") return "provider dependency failed";
+  }
+  return error.message;
 }
 
 export function badRequest(message: string): GatewayFailure {

@@ -136,9 +136,16 @@ test("provider_refusals_keep_their_class_and_export_bounded_attempt_diagnostics"
           assert.equal(response.status, item.http, label);
           const body = JSON.parse(text) as { error: { type: string; message: string } };
           assert.equal(body.error.type, item.type, label);
-          assert.equal(body.error.message.startsWith(item.message), true, label);
-          assert.equal(body.error.message.includes("[REDACTED]"), true, label);
-          assert.equal(body.error.message.endsWith(marker), true, label);
+          if (item.type === "model_unavailable") {
+            assert.equal(body.error.message, "upstream model unavailable", label);
+          } else if (item.type === "provider_dependency_failed") {
+            assert.equal(body.error.message, "provider dependency failed", label);
+          } else {
+            const prefix = item.type === "context_window_exceeded" ? "context window exceeded: " : "invalid provider request: ";
+            assert.equal(body.error.message.startsWith(prefix + item.message), true, label);
+            assert.equal(body.error.message.includes("[REDACTED]"), true, label);
+            assert.equal(body.error.message.endsWith(marker), true, label);
+          }
           assert.equal(text.includes(secret), false, label);
           assert.equal(hits, 1, label);
           expectedTraces += 1;

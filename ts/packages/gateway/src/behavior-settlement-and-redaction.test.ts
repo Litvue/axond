@@ -709,7 +709,7 @@ test("upstream_redirect_is_not_followed_and_omits_the_secret", async () => {
     assert.equal(response.status, 400);
     const body = JSON.parse(text) as { error: { type: string; message: string } };
     assert.equal(body.error.type, "invalid_request");
-    assert.equal(body.error.message, "upstream request failed");
+    assert.equal(body.error.message, "invalid provider request: ");
     assert.equal(targetHits, 0);
     assert.equal(text.includes(secret), false);
     assert.equal(text.includes(target.url), false);
@@ -779,7 +779,7 @@ test("provider_error_replaces_the_echoed_credential", async () => {
     assert.equal(chat.status, 502);
     const chatBody = JSON.parse(chatText) as { error: { type: string; message: string } };
     assert.equal(chatBody.error.type, "invalid_request");
-    assert.equal(chatBody.error.message, "rejected key [REDACTED]");
+    assert.equal(chatBody.error.message, "invalid provider request: rejected key [REDACTED]");
     assert.equal(chatText.includes(openaiSecret), false);
     const messages = await app.request("http://127.0.0.1/ns/platform/v1/messages", {
       method: "POST",
@@ -794,7 +794,7 @@ test("provider_error_replaces_the_echoed_credential", async () => {
     assert.equal(messages.status, 502);
     const messageBody = JSON.parse(messageText) as { error: { type: string; message: string } };
     assert.equal(messageBody.error.type, "invalid_request");
-    assert.equal(messageBody.error.message, "rejected key [REDACTED]");
+    assert.equal(messageBody.error.message, "invalid provider request: rejected key [REDACTED]");
     assert.equal(messageText.includes(anthropicSecret), false);
     const encoded = JSON.stringify(logs);
     assert.equal(encoded.includes(openaiSecret), false);
@@ -872,7 +872,7 @@ test("provider_diagnostics_keep_context_limits_and_a_bounded_message", async () 
       body: "",
       http: 400,
       type: "invalid_request",
-      message: "upstream request failed",
+      message: "",
       rateLimited: false,
     },
   ];
@@ -964,7 +964,7 @@ test("provider_diagnostics_keep_context_limits_and_a_bounded_message", async () 
     assert.equal(context.status, 400);
     const contextBody = JSON.parse(contextText) as { error: { type: string; message: string } };
     assert.equal(contextBody.error.type, "context_window_exceeded");
-    assert.equal(contextBody.error.message, "too long [REDACTED]");
+    assert.equal(contextBody.error.message, "context window exceeded: too long [REDACTED]");
     assert.equal(contextText.includes(secret), false);
 
     const refused = await chat("PROMPT_SENTINEL");
@@ -972,9 +972,9 @@ test("provider_diagnostics_keep_context_limits_and_a_bounded_message", async () 
     assert.equal(refused.status, 502);
     const refusedBody = JSON.parse(refusedText) as { error: { type: string; message: string } };
     assert.equal(refusedBody.error.type, "invalid_request");
-    assert.equal(refusedBody.error.message.startsWith("rejected key [REDACTED]"), true);
+    assert.equal(refusedBody.error.message.startsWith("invalid provider request: rejected key [REDACTED]"), true);
     assert.equal(refusedBody.error.message.endsWith(marker), true);
-    assert.ok(new TextEncoder().encode(refusedBody.error.message).length <= 4096 + markerBytes);
+    assert.ok(new TextEncoder().encode(refusedBody.error.message).length <= 4096 + markerBytes + "invalid provider request: ".length);
     assert.equal(refusedText.includes(secret), false);
     assert.equal(refusedBody.error.message.includes("y".repeat(5000)), false);
 

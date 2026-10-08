@@ -13,6 +13,7 @@ import { createServer as createNet } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import type { AddressInfo } from "node:net";
 
 const repo = resolve(new URL("../..", import.meta.url).pathname);
@@ -141,7 +142,7 @@ async function fixture(name: string): Promise<Buffer> {
   return readFile(join(fixtures, name));
 }
 
-async function upstream(): Promise<{ url: string; close: () => void }> {
+export async function upstream(): Promise<{ url: string; close: () => void }> {
   const buffered = new Map<string, Buffer>([
     ["/chat/completions", await fixture("openai/chat_completion.json")],
     ["/embeddings", await fixture("openai/embeddings.json")],
@@ -266,12 +267,12 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-async function boot(program: string, directory: string, baseUrl: string): Promise<{ base: string; sqlite: string; child: ChildProcess }> {
+export async function boot(program: string, directory: string, baseUrl: string, customize: (text: string) => string = (text) => text): Promise<{ base: string; sqlite: string; child: ChildProcess }> {
   const port = await freePort();
   const bind = `127.0.0.1:${port}`;
   const sqlite = join(directory, "axond.sqlite");
   const configPath = join(directory, "axond.toml");
-  await writeFile(configPath, config(bind, sqlite, baseUrl));
+  await writeFile(configPath, customize(config(bind, sqlite, baseUrl)));
   const child = spawn(program, {
     env: {
       ...process.env,
@@ -311,7 +312,7 @@ async function boot(program: string, directory: string, baseUrl: string): Promis
   throw new Error(`${program} did not become healthy: ${stderr}`);
 }
 
-async function putBudgets(base: string): Promise<void> {
+export async function putBudgets(base: string): Promise<void> {
   for (const namespace of ["platform", "tenant"]) {
     const response = await fetch(`${base}/api/v1/namespaces/${namespace}/budgets/compat`, {
       method: "PUT",
@@ -332,7 +333,7 @@ function normalizeContentType(value: string | null): string | null {
   return [media, ...kept.sort()].join("; ");
 }
 
-async function call(base: string, item: Case, requestId: string): Promise<{ status: number; body: Buffer; headers: string }> {
+export async function call(base: string, item: Case, requestId: string): Promise<{ status: number; body: Buffer; headers: string }> {
   const headers: Record<string, string> = {
     "x-request-id": requestId,
     ...(item.body ? { "content-type": "application/json" } : {}),
@@ -353,7 +354,7 @@ async function call(base: string, item: Case, requestId: string): Promise<{ stat
   return { status: response.status, body, headers: JSON.stringify(contractHeaders) };
 }
 
-function chargeRows(sqlite: string): string[] {
+export function chargeRows(sqlite: string): string[] {
   const db = new DatabaseSync(sqlite, { readOnly: true });
   const rows = db
     .prepare(
@@ -365,7 +366,7 @@ function chargeRows(sqlite: string): string[] {
   return rows.map((row) => JSON.stringify([row.namespace, row.period, row.model, row.status, row.cost === null ? null : String(row.cost)]));
 }
 
-async function waitForUsage(sqlite: string, expected: number): Promise<void> {
+export async function waitForUsage(sqlite: string, expected: number): Promise<void> {
   const deadline = Date.now() + 5000;
   while (Date.now() < deadline) {
     const count = chargeRows(sqlite).length;
@@ -376,7 +377,7 @@ async function waitForUsage(sqlite: string, expected: number): Promise<void> {
   throw new Error(`settlement did not produce ${expected} usage rows`);
 }
 
-function durableState(sqlite: string): string {
+export function durableState(sqlite: string): string {
   const db = new DatabaseSync(sqlite, { readOnly: true });
   try {
     const budgets = db.prepare(`SELECT namespace, period, limit_microdollars, spent_microdollars
@@ -390,7 +391,7 @@ function durableState(sqlite: string): string {
   }
 }
 
-async function stop(child: ChildProcess): Promise<void> {
+export async function stop(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return;
   await new Promise<void>((resolve, reject) => {
     const deadline = setTimeout(() => {
@@ -484,7 +485,7 @@ async function main(): Promise<void> {
   process.stdout.write("shadow compare: rust and typescript responses and charges match\n");
 }
 
-main().catch((error: unknown) => {
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main().catch((error: unknown) => {
   process.stderr.write(`${error instanceof Error ? error.stack : String(error)}\n`);
   process.exit(1);
 });

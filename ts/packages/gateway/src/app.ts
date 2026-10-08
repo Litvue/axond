@@ -215,6 +215,8 @@ function validateMigrations(extension: AxondExtension): void {
 }
 
 const admissionHolds = new WeakMap<MutableContext, AdmissionHold>();
+// Estimate the admitted caller body before provider-only model/usage rewrites.
+const admittedInputEstimates = new WeakMap<MutableContext, { callerBytes: number; routedBytes: number }>();
 
 async function pipeline(
   c: Context<AxondEnv>,
@@ -638,6 +640,10 @@ async function prepareInference(
   if (parsed["stream"] === true && axond.route === "chat") {
     (axond.body as ByteRequestBody).forceIncludeUsage();
   }
+  admittedInputEstimates.set(axond, {
+    callerBytes: serializedRequestBytes(parsed),
+    routedBytes: serializedRequestBytes(await axond.body.json<Record<string, unknown>>()),
+  });
   (axond as MutableContext & { provider?: ProviderConfig; priced?: boolean }).provider = provider;
   (axond as MutableContext & { priced?: boolean }).priced = Boolean(price);
   void record;
@@ -675,7 +681,18 @@ function ceiling(value: number | undefined, fallback: number): number | null {
 }
 
 function estimatedInputTokens(body: Record<string, unknown>): number {
-  return Math.floor(new TextEncoder().encode(JSON.stringify(body)).length / 4);
+  return Math.floor(serializedRequestBytes(body) / 4);
+}
+
+function serializedRequestBytes(body: Record<string, unknown>): number {
+  return new TextEncoder().encode(JSON.stringify(body)).length;
+}
+
+function streamInputEstimate(axond: MutableContext, payload: Record<string, unknown>): number {
+  const admitted = admittedInputEstimates.get(axond);
+  if (!admitted) return estimatedInputTokens(payload);
+  // Account for pre-dispatch extension changes, excluding the gateway's own wire rewrites.
+  return Math.floor(Math.max(0, admitted.callerBytes + serializedRequestBytes(payload) - admitted.routedBytes) / 4);
 }
 
 /** Pre-dispatch cost for a spend cap. Embeddings bill no completion. Absent output allowance uses 1024. */
@@ -965,7 +982,7 @@ async function dispatch(
             clockStartedMs,
             onBeforeContentRateLimit: () => rotateStream(index),
             onCredentialRateLimit: () => penalizeStream(nextCredential),
-            estimatedInputTokens: estimatedInputTokens(payload),
+            estimatedInputTokens: streamInputEstimate(axond, payload),
             maxStreamDurationMs,
             maxStreamBytes,
             clientSignal: c.req.raw.signal,
@@ -1011,7 +1028,7 @@ async function dispatch(
           stream && axond.route === "chat" && !pinned && planned.length > 1
             ? () => rotateStream(attempt)
             : undefined,
-        estimatedInputTokens: estimatedInputTokens(payload),
+        estimatedInputTokens: streamInputEstimate(axond, payload),
         maxStreamDurationMs,
         maxStreamBytes,
         clientSignal: stream ? c.req.raw.signal : undefined,
