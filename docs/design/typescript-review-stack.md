@@ -19,7 +19,7 @@ changed file to a slice and records its base branch and review focus.
 
 | Order | Review slice | Changed lines | PR |
 | --- | --- | ---: | --- |
-| 1 | define TypeScript SDK and review-stage CI | 3815 | [#534](https://github.com/Litvue/axond/pull/534) |
+| 1 | define TypeScript SDK and review-stage CI | 3834 | [#534](https://github.com/Litvue/axond/pull/534) |
 | 2 | add TypeScript request and JSON parsers | 2115 | [#535](https://github.com/Litvue/axond/pull/535) |
 | 3 | add namespace and budget state primitives | 1846 | [#536](https://github.com/Litvue/axond/pull/536) |
 | 4 | add provider wire accounting and telemetry | 2596 | [#537](https://github.com/Litvue/axond/pull/537) |
@@ -39,7 +39,7 @@ changed file to a slice and records its base branch and review focus.
 | 18 | qualify CLI configuration diagnostics and refusal order | 1670 | [#551](https://github.com/Litvue/axond/pull/551) |
 | 19 | add rate limit redaction and token extensions | 1101 | [#552](https://github.com/Litvue/axond/pull/552) |
 | 20 | host the TypeScript gateway on Workers Hyperdrive | 1845 | [#553](https://github.com/Litvue/axond/pull/553) |
-| 21 | qualify TypeScript artifacts and regression gates | 3115 | [#554](https://github.com/Litvue/axond/pull/554) |
+| 21 | qualify TypeScript artifacts and regression gates | 3118 | [#554](https://github.com/Litvue/axond/pull/554) |
 
 ## How to review a slice
 
@@ -104,17 +104,17 @@ Full source/runtime evidence is also recorded in the
 The [finding dispositions](typescript-review-findings.md) record all 85 original
 review findings: 79 addressed by code, tests, fixtures or gates, and six staging
 or contract clarifications. Fixes land in their owning slices and flow through
-all descendants. Fresh review added 15 threads and revised four existing
-findings; all 19 follow-up observations have owning fixes, tests or explicit
+all descendants. Fresh review added 16 threads and revised four existing
+findings; all 20 follow-up observations have owning fixes, tests or explicit
 contract evidence in the disposition report. The static import check passes at all 21 stack heads. Shared
 HTTP test fixtures are now introduced at their first caller and close servers
 after assertion failures. The required CI Success job includes TypeScript;
 merge queues also run the TypeScript workflow.
 
-Complete runtime qualification before the final two focused fixes:
+Complete CI qualification before the final delimiter-boundary fix:
 
-- Node 22.14 with Postgres 16: 414 passed, no skips.
-- Bun 1.4.2 with Postgres 16: 413 passed; its existing native connect-timeout
+- Node 22.14 with Postgres 16: 416 passed, no skips.
+- Bun 1.4.2 with Postgres 16: 415 passed; its existing native connect-timeout
   test is explicitly skipped because Bun's connector cannot simulate it.
 - workerd/Hyperdrive integration: nine passed, no skips.
 - Python vendor SDK: 13 passed; Node vendor SDK: 18 passed.
@@ -129,10 +129,12 @@ Complete runtime qualification before the final two focused fixes:
 
 The final metric-name and empty-catalogue fixes passed all 36 affected tests
 on Node and all 36 on Bun. The binary was then recompiled, signed and smoke-tested.
+The last delayed-delimiter byte-count fix then passed all 13 SDK/parser tests
+on Node and all 13 on Bun; the final binary was recompiled, signed and smoke-tested.
 CI runs the complete suite at the published heads.
 
 The corrected binary is 82,355,680 bytes, SHA-256
-`25489178d1e92889d55635628ed925499ddac3fa97e379856f4aa5693dc025a4`.
+`b6798294fa84bc12edea511c4b7b7972191b948de992ef2f1c625e3599d7c59c`.
 Local qualification does not replace CI at the pushed heads or maintainer
 approval. ADR 0067 records the authority and schema upgrade impact. Rust still
 owns the release binary/image; live deployment and release-tag OIDC evidence

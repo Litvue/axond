@@ -110,8 +110,8 @@ extension now restricts grants to inference and validates claims independently.
 
 ## Follow-up review of the corrected stack
 
-Fresh automated review raised 15 new threads and revised four existing findings.
-The 19 observations below were evaluated separately from the original 85.
+Fresh automated review raised 16 new threads and revised four existing findings.
+The 20 observations below were evaluated separately from the original 85.
 Confirmed edge cases received owning patches and regression coverage; contract
 observations are tied to explicit documentation. These dispositions do not
 constitute maintainer approval.
@@ -137,3 +137,4 @@ constitute maintainer approval.
 | [#549](https://github.com/Litvue/axond/pull/549) | [Valid models.dev catalogues are refused](https://github.com/Litvue/axond/pull/549#discussion_r4211968837) | Catalogue parser accepts the supported top-level neutral models/providers maps and retains the neutral model rows. |
 | [#537](https://github.com/Litvue/axond/pull/537) | First-token counters become histograms | Histogram inference uses the complete first-token suffix; a counter regression checks the exported Sum payload. |
 | [#549](https://github.com/Litvue/axond/pull/549) | Empty catalogue erases retained model IDs | Empty official maps, flat maps, arrays and wrapped arrays are refused; prior IDs and the refusal streak survive. |
+| [#534](https://github.com/Litvue/axond/pull/534) | [Split delimiter bypasses frame byte limit](https://github.com/Litvue/axond/pull/534#discussion_r4220247087) | Completed frame byte count includes a delayed LF; exact-boundary tests cover identity, rewrite and drop transforms with split and coalesced delimiters. |

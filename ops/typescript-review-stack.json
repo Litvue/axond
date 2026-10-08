@@ -43,7 +43,7 @@
         "docs/adr/0067-typescript-review-hardening.md"
       ],
       "pull_request": 534,
-      "changed_lines": 3815
+      "changed_lines": 3834
     },
     {
       "order": 2,
@@ -388,7 +388,7 @@
         "docs/design/typescript-review-findings.md"
       ],
       "pull_request": 554,
-      "changed_lines": 3115
+      "changed_lines": 3118
     }
   ],
   "review_hardening": {
@@ -420,9 +420,9 @@
       "codex/ts-review-20-worker": "c356f540799a40099693a3fd3c09201ebb56dea3",
       "codex/ts-review-21-release-gates": "f57a4f0d7ffcfa2508d63581b281473068353012"
     },
-    "followup_observations": 19,
-    "additional_threads": 15,
+    "followup_observations": 20,
+    "additional_threads": 16,
     "revised_existing_findings": 4,
-    "total_threads_at_this_pass": 100
+    "total_threads_at_this_pass": 101
   }
 }
