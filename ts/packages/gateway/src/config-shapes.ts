@@ -1274,7 +1274,7 @@ function scalarFromToken(value: unknown, token: string | null): FigmentScalar {
 function serverBindOverride(secrets: SecretReader): string | null {
   let found: string | null = null;
   for (const [name, value] of secrets.entries()) {
-    if (value === undefined || !name.toLowerCase().startsWith("axond_")) {
+    if (value === undefined || !name.startsWith("AXOND_")) {
       continue;
     }
     const parts = name.slice(6).toLowerCase().split("__");
@@ -1420,6 +1420,7 @@ function isIpv4(host: string): boolean {
 }
 
 function isIpv6(host: string): boolean {
+  if (host.includes(".") && (!host.slice(host.lastIndexOf(":") + 1).includes(".") || host.slice(0, host.lastIndexOf(":")).includes("."))) return false;
   if (host.length === 0 || host.includes("%")) {
     return false;
   }
