@@ -387,6 +387,7 @@ function catalogModels(body: unknown): unknown[] {
     const catalog = body as { models: unknown; providers: unknown };
     if (catalog.models === null || typeof catalog.models !== "object" || Array.isArray(catalog.models) || catalog.providers === null || typeof catalog.providers !== "object" || Array.isArray(catalog.providers)) throw new Error("invalid catalogue schema");
     const entries = Object.entries(catalog.models);
+    if (entries.length === 0) throw new Error("invalid catalogue schema");
     if (!entries.every(([id, row]) => /^[^/]+\/[^/]+$/.test(id) && row !== null && typeof row === "object" && !Array.isArray(row) && typeof (row as { id?: unknown }).id === "string" && (row as { id: string }).id === id)) throw new Error("invalid catalogue schema");
     if (!Object.values(catalog.providers).every(row => row !== null && typeof row === "object" && !Array.isArray(row))) throw new Error("invalid catalogue schema");
     return entries.map(([, row]) => row);
@@ -394,13 +395,13 @@ function catalogModels(body: unknown): unknown[] {
 
   const models = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray((body as { data?: unknown }).data) ? (body as { data: unknown[] }).data : null;
   if (models) {
-    if (models.every((row) => row !== null && typeof row === "object" && typeof (row as { id?: unknown }).id === "string")) return models;
+    if (models.length > 0 && models.every((row) => row !== null && typeof row === "object" && typeof (row as { id?: unknown }).id === "string")) return models;
     throw new Error("invalid catalogue schema");
   }
-  if (body !== null && typeof body === "object" && Object.entries(body).every(([id, row]) => /^[^/]+\/[^/]+$/.test(id) && row !== null && typeof row === "object" && !Array.isArray(row))) {
+  if (body !== null && typeof body === "object" && Object.keys(body).length > 0 && Object.entries(body).every(([id, row]) => /^[^/]+\/[^/]+$/.test(id) && row !== null && typeof row === "object" && !Array.isArray(row))) {
     return Object.keys(body).map((id) => ({ id }));
   }
-  if (body !== null && typeof body === "object" && Object.values(body).every((row) => row !== null && typeof row === "object" && !Array.isArray(row) && typeof (row as { models?: unknown }).models === "object" && (row as { models?: unknown }).models !== null)) {
+  if (body !== null && typeof body === "object" && Object.keys(body).length > 0 && Object.values(body).every((row) => row !== null && typeof row === "object" && !Array.isArray(row) && typeof (row as { models?: unknown }).models === "object" && (row as { models?: unknown }).models !== null)) {
     return Object.keys(body).map((id) => ({ id }));
   }
   throw new Error("invalid catalogue schema");

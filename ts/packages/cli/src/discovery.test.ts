@@ -707,3 +707,12 @@ test("reopening a durable store does not authorize foreign cache replacement", a
     await discoverOnce({ ...input, replaceForeignSource: true }); assert.equal(calls, 1); assert.equal((await store.getProviderModels("p"))?.source, "http://old.example");
   } finally { await store.close?.(); await rm(directory, { recursive: true, force: true }); }
 });
+
+
+test("empty catalogue successes retain prior IDs and record a refusal", async () => {
+  for (const body of [{ models: {}, providers: {} }, {}, [], { data: [] }]) {
+    const store = createMemoryStore(); const metrics = createMetrics(); await store.noteCatalogRefusal(); await store.upsertProviderModels({ provider: "catalog", fetchedAt: new Date().toISOString(), stale: false, data: [{ id: "openai/gpt-test" }] });
+    await discoverOnce({ store, metrics, providers: [], credentials: [], catalog: { source: "models-dev", sourceUrl: "https://models.dev/catalog.json" }, fetchImpl: async () => new Response(JSON.stringify(body)) });
+    const row = await store.getProviderModels("catalog"); assert.deepEqual(row?.data, [{ id: "openai/gpt-test" }]); assert.equal(row?.stale, true); assert.equal(metrics.points.find(point => point.name === "axond.catalog.consecutive_refusals")?.value, 2);
+  }
+});
