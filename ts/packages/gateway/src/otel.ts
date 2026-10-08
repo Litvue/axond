@@ -1,3 +1,4 @@
+import { INSTRUMENT_KINDS, isHistogram as histogramKind } from "./metrics.ts";
 import type { UsageRecord } from "@axond/sdk";
 
 /**
@@ -140,7 +141,7 @@ export function metricPayload(points: readonly ExportedPoint[], resource: Record
           {
             scope: { name: "axond" },
             metrics: points.map((point) =>
-              isHistogram(point.name) ? histogramMetric(point, timeMs) : sumMetric(point, timeMs),
+              isHistogram(point.name) ? histogramMetric(point, timeMs) : INSTRUMENT_KINDS[point.name] === "Gauge" ? gaugeMetric(point, timeMs) : sumMetric(point, timeMs),
             ),
           },
         ],
@@ -148,6 +149,8 @@ export function metricPayload(points: readonly ExportedPoint[], resource: Record
     ],
   };
 }
+
+const METRIC_START_MS = Date.now();
 
 const I64_MAX = 9223372036854775807n;
 
@@ -260,7 +263,8 @@ export async function postOtlp(
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    await response.arrayBuffer();
+    await response.body?.cancel().catch(() => undefined);
+    if (!response.ok) throw new Error(`OTLP export failed with HTTP ${response.status}`);
   } finally {
     clearTimeout(timer);
   }
@@ -274,8 +278,10 @@ export function resourceAttributes(instanceId?: string): Record<string, string> 
   return attributes;
 }
 
-export function isHistogram(name: string): boolean {
-  return name.endsWith(".duration") || name.includes("time_to_first_token") || name.endsWith("_wait") || name.endsWith(".wait");
+export function isHistogram(name: string): boolean { return histogramKind(name); }
+
+function gaugeMetric(point: ExportedPoint, timeMs: number): unknown {
+  return { name: point.name, gauge: { dataPoints: [{ asDouble: point.value, timeUnixNano: unixNano(timeMs), attributes: keyValues(point.attributes) }] } };
 }
 
 function sumMetric(point: ExportedPoint, timeMs: number): unknown {
@@ -283,10 +289,11 @@ function sumMetric(point: ExportedPoint, timeMs: number): unknown {
     name: point.name,
     sum: {
       aggregationTemporality: 2,
-      isMonotonic: true,
+      isMonotonic: INSTRUMENT_KINDS[point.name] !== "UpDownCounter",
       dataPoints: [
         {
           asInt: String(Math.trunc(point.value)),
+          startTimeUnixNano: unixNano(METRIC_START_MS),
           timeUnixNano: unixNano(timeMs),
           attributes: keyValues(point.attributes),
         },
@@ -309,6 +316,7 @@ function histogramMetric(point: ExportedPoint, timeMs: number): unknown {
           max: point.max ?? point.value,
           bucketCounts: [String(count)],
           explicitBounds: [],
+          startTimeUnixNano: unixNano(METRIC_START_MS),
           timeUnixNano: unixNano(timeMs),
           attributes: keyValues(point.attributes),
         },

@@ -35,6 +35,10 @@ class Sequence {
     if (this.terminal || this.failed) {
       return null;
     }
+    if (new TextEncoder().encode(this.buffer).length + new TextEncoder().encode(chunk).length > 1024 * 1024) {
+      this.failed = true; this.buffer = "";
+      return "SSE buffer exceeded 1048576 bytes";
+    }
     this.buffer += chunk;
     for (;;) {
       const end = eventEnd(this.buffer);

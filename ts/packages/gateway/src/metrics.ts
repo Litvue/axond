@@ -67,7 +67,64 @@ export interface MetricPoint {
   max?: number;
 }
 
-const HISTOGRAM = /\.duration$|time_to_first_token|_wait$|\.wait$/;
+export const INSTRUMENT_KINDS: Readonly<Record<string, string>> = {
+  "axond.http.server.requests": "Counter",
+  "axond.http.server.duration": "Histogram",
+  "axond.request.count": "Counter",
+  "axond.request.duration": "Histogram",
+  "axond.request.time_to_first_token": "Histogram",
+  "axond.tokens.input": "Counter",
+  "axond.tokens.cache_read": "Counter",
+  "axond.tokens.cache_write": "Counter",
+  "axond.tokens.output": "Counter",
+  "axond.cost.microdollars": "Counter",
+  "axond.upstream.errors": "Counter",
+  "axond.upstream.timeouts": "Counter",
+  "axond.upstream.time_to_first_token": "Histogram",
+  "axond.upstream.circuit_state": "Gauge",
+  "axond.usage.records_written": "Counter",
+  "axond.usage.records_dropped": "Counter",
+  "axond.usage.flushes": "Counter",
+  "axond.usage.journal.appends": "Counter",
+  "axond.usage.index.appends": "Counter",
+  "axond.usage.index.batches": "Counter",
+  "axond.usage.index.batch_size": "Histogram",
+  "axond.usage.index.queue_age": "Histogram",
+  "axond.usage.journal.deliveries": "Counter",
+  "axond.usage.journal.quarantined": "Counter",
+  "axond.usage.journal.undeliverable": "Counter",
+  "axond.usage.journal.lost": "Counter",
+  "axond.usage.journal.depth": "Gauge",
+  "axond.usage.journal.in_flight": "Gauge",
+  "axond.usage.journal.quarantined_events": "Gauge",
+  "axond.usage.journal.oldest_pending_age": "Gauge",
+  "axond.usage.journal.capacity": "Gauge",
+  "axond.shutdown.phase": "Gauge",
+  "axond.shutdown.rejected_requests": "Counter",
+  "axond.shutdown.abandoned_requests": "Counter",
+  "axond.shutdown.abandoned_settlements": "Counter",
+  "axond.shutdown.abandoned_index": "Counter",
+  "axond.settlement.in_flight": "UpDownCounter",
+  "axond.settlement.queue_wait": "Histogram",
+  "axond.settlement.oldest_pending_age": "Gauge",
+  "axond.settlement.failures": "Counter",
+  "axond.admission.queue.depth": "Histogram",
+  "axond.store.acquire_wait": "Histogram",
+  "axond.store.query_duration": "Histogram",
+  "axond.store.operations": "Counter",
+  "axond.store.connections_opened": "Counter",
+  "axond.store.connections_reused": "Counter",
+  "axond.store.connections_discarded": "Counter",
+  "axond.store.pool.sessions": "Gauge",
+  "axond.usage.index.queue.depth": "Histogram",
+  "axond.usage.index.queue.wait": "Histogram",
+  "axond.admission.in_flight": "UpDownCounter",
+  "axond.admission.rejections": "Counter",
+  "axond.catalog.refusals": "Counter",
+  "axond.catalog.active_age": "Gauge",
+  "axond.catalog.consecutive_refusals": "Gauge"
+};
+export function isHistogram(name: string): boolean { return INSTRUMENT_KINDS[name] === "Histogram" || name.startsWith("axond.ext.") && /\.duration$|\.wait$/.test(name); }
 
 export function sanitizeAttributes(
   attributes: Record<string, string>,
@@ -75,7 +132,7 @@ export function sanitizeAttributes(
 ): Record<string, string> {
   const safe: Record<string, string> = {};
   for (const [key, raw] of Object.entries(attributes)) {
-    if (raw.length > MAX_LABEL) {
+    if (/(?:^|[._-])(?:prompt|content|authorization|api[_-]?key|secret|access[_-]?token|token)(?:$|[._-])/i.test(key) || raw.length > MAX_LABEL) {
       continue;
     }
     if (secrets.some((secret) => secret.length > 0 && raw.includes(secret))) {
@@ -111,7 +168,7 @@ export function createMetrics(secrets: readonly string[] = []) {
       }
       const safe = sanitizeAttributes(attributes, secrets);
       const signature = `${name}\0${JSON.stringify(safe)}`;
-      const histogram = HISTOGRAM.test(name);
+      const histogram = isHistogram(name);
       const existing = series.get(signature);
       if (existing) {
         if (histogram) {
