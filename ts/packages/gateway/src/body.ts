@@ -13,14 +13,17 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
  */
 export class ByteRequestBody implements RequestBody {
   private loaded: Uint8Array | null = null;
+  private loading: Promise<Uint8Array> | null = null;
   private model: string | null = null;
   private forceUsage = false;
   private replacement: unknown | undefined;
   private replaced = false;
   private readonly source: Request;
+  private readonly limit: number;
 
-  constructor(source: Request) {
+  constructor(source: Request, limit = Infinity) {
     this.source = source;
+    this.limit = limit;
   }
 
   async raw(): Promise<Uint8Array> {
@@ -28,7 +31,7 @@ export class ByteRequestBody implements RequestBody {
   }
 
   async json<T = unknown>(): Promise<T> {
-    if (this.replaced && !this.forceUsage) {
+    if (this.replaced && !this.forceUsage && this.model === null) {
       return this.replacement as T;
     }
     if (this.replaced || this.model !== null || this.forceUsage) {
@@ -66,7 +69,11 @@ export class ByteRequestBody implements RequestBody {
   /** Bytes to send upstream. */
   outgoing(): Uint8Array {
     if (this.replaced) {
-      const value = this.forceUsage ? withIncludeUsage(this.replacement) : this.replacement;
+      let value = this.replacement;
+      if (this.model !== null && value !== null && typeof value === "object" && !Array.isArray(value)) {
+        value = { ...(value as Record<string, unknown>), model: this.model };
+      }
+      if (this.forceUsage) value = withIncludeUsage(value);
       return encoder.encode(JSON.stringify(value));
     }
     if (this.loaded === null) {
@@ -81,7 +88,8 @@ export class ByteRequestBody implements RequestBody {
 
   private async bytes(): Promise<Uint8Array> {
     if (this.loaded === null) {
-      this.loaded = new Uint8Array(await this.source.arrayBuffer());
+      this.loading ??= readBoundedBody(this.source, this.limit);
+      this.loaded = await this.loading;
     }
     return this.loaded;
   }
@@ -376,4 +384,30 @@ function setIncludeUsage(text: string, start: number, end: number): string {
   }
   const next = inner.slice(0, usage.value.start) + "true" + inner.slice(usage.value.end);
   return text.slice(0, start) + next + text.slice(end);
+}
+
+/** Read and cancel at the byte limit, including chunked requests without Content-Length. */
+export async function readBoundedBody(source: Request, limit: number): Promise<Uint8Array> {
+  const reader = source.body?.getReader();
+  if (!reader) return new Uint8Array(0);
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      length += chunk.value.byteLength;
+      if (length > limit) {
+        void reader.cancel().catch(() => undefined);
+        throw new GatewayFailure("request_too_large", 413, "request body exceeds the configured inbound limit");
+      }
+      chunks.push(chunk.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(length);
+  let at = 0;
+  for (const chunk of chunks) { bytes.set(chunk, at); at += chunk.length; }
+  return bytes;
 }

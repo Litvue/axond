@@ -271,6 +271,7 @@ function readPositional(cur: Cursor, fields: readonly StrictField[], structName:
     if (cur.peek() === ",") {
       cur.bump();
       cur.skipWs();
+      if (cur.peek() === "]") parseFail("trailing comma", peekLoc(cur));
       continue;
     }
     if (cur.peek() !== "]" && cur.peek() !== "") {
@@ -797,7 +798,8 @@ function readNumber(cur: Cursor): string {
   return asciiSlice(cur, start, cur.i);
 }
 
-function skipValue(cur: Cursor, path = ""): Loc {
+function skipValue(cur: Cursor, path = "", depth = 0): Loc {
+  if (depth >= 128) parseFail("recursion limit exceeded", peekLoc(cur));
   const peek = cur.peek();
   if (peek === '"') {
     readString(cur, path.length === 0 ? undefined : path);
@@ -836,7 +838,7 @@ function skipValue(cur: Cursor, path = ""): Loc {
         syntax(cur);
       }
       cur.skipWs();
-      skipValue(cur, path.length === 0 ? "" : `${path}.${key}`);
+      skipValue(cur, path.length === 0 ? "" : `${path}.${key}`, depth + 1);
       cur.skipWs();
       if (cur.peek() === ",") {
         cur.bump();
@@ -861,7 +863,7 @@ function skipValue(cur: Cursor, path = ""): Loc {
     }
     let index = 0;
     while (cur.peek() !== "") {
-      skipValue(cur, path.length === 0 ? "" : `${path}[${index}]`);
+      skipValue(cur, path.length === 0 ? "" : `${path}[${index}]`, depth + 1);
       index += 1;
       cur.skipWs();
       if (cur.peek() === ",") {
@@ -913,6 +915,7 @@ export function serdeCanonical(value: unknown): string | null {
 /** Parse `canonical` for field access and keep those bytes for the wire. */
 export function serdeValue(canonical: string): unknown {
   const parsed = JSON.parse(canonical) as unknown;
+  if (parsed === null) return null;
   if (parsed !== null && typeof parsed === "object") {
     Object.defineProperty(parsed, CANONICAL, { value: canonical, enumerable: false });
     return parsed;
@@ -928,13 +931,14 @@ export function encodeAttrs(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function canonicalJson(bytes: Uint8Array): string {
+export function canonicalJson(bytes: Uint8Array): string {
   const cur = new Cursor(bytes);
   cur.skipWs();
   return canonicalValue(cur);
 }
 
-function canonicalValue(cur: Cursor): string {
+function canonicalValue(cur: Cursor, depth = 0): string {
+  if (depth >= 128) parseFail("recursion limit exceeded", peekLoc(cur));
   const peek = cur.peek();
   if (peek === '"') {
     return JSON.stringify(readString(cur));
@@ -966,7 +970,7 @@ function canonicalValue(cur: Cursor): string {
           syntax(cur);
         }
         cur.skipWs();
-        entries.set(key, canonicalValue(cur));
+        entries.set(key, canonicalValue(cur, depth + 1));
         cur.skipWs();
         if (cur.peek() === ",") {
           cur.bump();
@@ -988,7 +992,7 @@ function canonicalValue(cur: Cursor): string {
     const items: string[] = [];
     if (cur.peek() !== "]") {
       while (cur.peek() !== "") {
-        items.push(canonicalValue(cur));
+        items.push(canonicalValue(cur, depth + 1));
         cur.skipWs();
         if (cur.peek() === ",") {
           cur.bump();
