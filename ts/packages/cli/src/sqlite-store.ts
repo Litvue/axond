@@ -60,6 +60,8 @@ CREATE TABLE IF NOT EXISTS axond_store_usage (
 );
 CREATE INDEX IF NOT EXISTS axond_store_usage_ns_period
     ON axond_store_usage (namespace, period);
+CREATE INDEX IF NOT EXISTS axond_store_usage_ns_period_request
+    ON axond_store_usage (namespace, period, request_id);
 CREATE TABLE IF NOT EXISTS axond_store_provider_models (
     provider TEXT PRIMARY KEY NOT NULL,
     fetched_at TEXT,
@@ -93,10 +95,16 @@ function ensureNamespaceColumns(db: DatabaseSync): void {
 
 export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
   const db = new DatabaseSync(path);
+  const prepare = db.prepare.bind(db);
+  db.prepare = (sql: string) => { const statement = prepare(sql); statement.setReadBigInts(true); return statement; };
   db.exec("PRAGMA journal_mode=WAL");
   db.exec("PRAGMA busy_timeout=5000");
   db.exec(SCHEMA);
   ensureNamespaceColumns(db);
+  for (const [table, column] of [["axond_store_budget_cadence", "period"], ["axond_store_provider_models", "source"]]) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!columns.some((row) => row.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+  }
   let chain: Promise<unknown> = Promise.resolve();
   const lock = <T>(operation: StoreOperation | null, fn: () => T): Promise<T> => {
     const called = Date.now();
@@ -219,8 +227,11 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
     },
     deleteNamespace(id) {
       return lock("namespace_write", () => {
+        db.exec("BEGIN IMMEDIATE");
+        try {
         const result = db.prepare("DELETE FROM axond_namespace WHERE id = ?").run(id);
         if (Number(result.changes) === 0) {
+          db.exec("COMMIT");
           return false;
         }
         db.prepare("DELETE FROM axond_store_budget WHERE namespace = ?").run(id);
@@ -230,7 +241,9 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
           `INSERT INTO axond_namespace_incarnation (id, n) VALUES (?, 2)
            ON CONFLICT(id) DO UPDATE SET n = n + 1`,
         ).run(id);
+        db.exec("COMMIT");
         return true;
+        } catch (error) { db.exec("ROLLBACK"); throw error; }
       });
     },
     listNamespaces(cursor, limit) {
@@ -287,7 +300,11 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
     settle(input) {
       return lock("budget_charge", () => settleSqlite(db, input));
     },
-    summarizeUsage(namespace, period) {
+    async summarizeUsage(namespace, period) {
+      if (path !== ":memory:") {
+        await lock("namespace_read", () => { if (!readNamespace(db, namespace)) throw new GatewayFailure("unknown_namespace", 404, "unknown namespace"); });
+        return pagedSummary(path, namespace, period);
+      }
       return lock("usage_summary", () => {
         if (!readNamespace(db, namespace)) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
@@ -366,6 +383,10 @@ export function applyMigration(dbPath: string, id: string, sql: string): void {
   const db = new DatabaseSync(dbPath);
   db.exec(SCHEMA);
   ensureNamespaceColumns(db);
+  for (const [table, column] of [["axond_store_budget_cadence", "period"], ["axond_store_provider_models", "source"]]) {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!columns.some((row) => row.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+  }
   const existing = db.prepare("SELECT id FROM axond_schema_migrations WHERE id = ?").get(id);
   if (existing) {
     db.close();
@@ -577,3 +598,33 @@ function bind(value: SqlValue): string | number | bigint | null {
 }
 
 export type { QueryResult };
+
+
+async function pagedSummary(path: string, namespace: string, period: string) {
+  const reader = new DatabaseSync(path, { readOnly: true });
+  const grouped = new Map<string, { model: string; status: string; count: bigint; cost: bigint }>();
+  try {
+    reader.exec("PRAGMA busy_timeout=5000; BEGIN");
+    const statement = reader.prepare(`SELECT request_id, model, status, CAST(cost_microdollars AS TEXT) AS cost
+      FROM axond_store_usage WHERE namespace = ? AND period = ? AND request_id > ?
+      ORDER BY request_id LIMIT 1024`);
+    const firstPage = reader.prepare(`SELECT request_id, model, status, CAST(cost_microdollars AS TEXT) AS cost FROM axond_store_usage WHERE namespace = ? AND period = ? ORDER BY request_id LIMIT 1024`);
+    let cursor: string | null = null;
+    for (;;) {
+      const rows = cursor === null ? firstPage.all(namespace, period) : statement.all(namespace, period, cursor);
+      for (const row of rows) {
+        const model = String(row.model), status = String(row.status);
+        const key = JSON.stringify([model, status]);
+        const group = grouped.get(key) ?? { model, status, count: 0n, cost: 0n };
+        group.count++;
+        group.cost = saturateMicrodollars(group.cost + (row.cost === null ? 0n : BigInt(String(row.cost))));
+        grouped.set(key, group);
+      }
+      if (rows.length < 1024) break;
+      cursor = String(rows[rows.length - 1]!.request_id);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    return foldUsageSummary(grouped.values());
+  } catch { throw new StoreFailure(); }
+  finally { reader.close(); }
+}

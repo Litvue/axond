@@ -42,6 +42,10 @@ function copyAttrs(attrs: NamespaceWrite["attrs"]): NamespaceWrite["attrs"] {
   return attrs;
 }
 
+function copyNamespace(record: NamespaceWrite): NamespaceWrite {
+  return { ...record, attrs: copyAttrs(record.attrs), blocklist: record.blocklist === null ? null : [...record.blocklist] };
+}
+
 interface UsageRow {
   requestId: string;
   namespace: string;
@@ -130,7 +134,8 @@ export function createMemoryStore(): Store {
     },
     resolveNamespace(id, nowMs) {
       return lock(() => {
-        const record = namespaces.get(id);
+        const stored = namespaces.get(id);
+        const record = stored ? copyNamespace(stored) : undefined;
         if (!record) {
           return null;
         }
@@ -158,7 +163,7 @@ export function createMemoryStore(): Store {
         if (namespaces.has(record.id)) {
           return "exists" as const;
         }
-        namespaces.set(record.id, { ...record, attrs: copyAttrs(record.attrs) });
+        namespaces.set(record.id, copyNamespace(record));
         return "created" as const;
       });
     },
@@ -182,7 +187,7 @@ export function createMemoryStore(): Store {
       });
     },
     getNamespace(id) {
-      return lock(() => namespaces.get(id) ?? null);
+      return lock(() => { const record = namespaces.get(id); return record ? copyNamespace(record) : null; });
     },
     updateNamespace(id, attrs, blocklist) {
       return lock(() => {
@@ -190,9 +195,9 @@ export function createMemoryStore(): Store {
         if (!current) {
           return null;
         }
-        const next = { ...current, attrs: copyAttrs(attrs), blocklist };
+        const next = { ...current, attrs: copyAttrs(attrs), blocklist: blocklist === null ? null : [...blocklist] };
         namespaces.set(id, next);
-        return next;
+        return copyNamespace(next);
       });
     },
     deleteNamespace(id) {
@@ -217,7 +222,7 @@ export function createMemoryStore(): Store {
         const ids = [...namespaces.keys()].filter((id) => cursor === null || id > cursor).sort();
         const page = ids.slice(0, limit);
         const nextCursor = ids.length > limit ? page[page.length - 1]! : null;
-        return { data: page.map((id) => namespaces.get(id)!), nextCursor };
+        return { data: page.map((id) => copyNamespace(namespaces.get(id)!)), nextCursor };
       });
     },
     putBudget(namespace, period, limit, nowMs = Date.now()) {
@@ -411,7 +416,7 @@ function addMicrodollars(total: bigint, next: bigint): bigint {
  * cost at `i64::MAX`.
  */
 export function foldUsageSummary(
-  rows: Iterable<{ model: string; status: string; cost: bigint | null }>,
+  rows: Iterable<{ model: string; status: string; cost: bigint | null; count?: bigint }>,
 ): UsageSummaryRow[] {
   const grouped = new Map<string, Map<string, { count: bigint; cost: bigint }>>();
   for (const row of rows) {
@@ -421,7 +426,8 @@ export function foldUsageSummary(
       grouped.set(row.model, statuses);
     }
     const current = statuses.get(row.status) ?? { count: 0n, cost: 0n };
-    current.count = current.count >= U64_MAX ? U64_MAX : current.count + 1n;
+    current.count += row.count ?? 1n;
+    if (current.count > U64_MAX) current.count = U64_MAX;
     current.cost = addMicrodollars(current.cost, row.cost ?? 0n);
     statuses.set(row.status, current);
   }
