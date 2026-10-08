@@ -156,3 +156,26 @@ test("an oversized unterminated event cancels its source", async () => {
   await assert.rejects(new Response(transformSseEvents(source, (event) => event)).arrayBuffer(), /byte limit/);
   assert.equal(cancelled, true);
 });
+
+
+test("a live CR-terminated event is delivered without another upstream byte", async () => {
+  for (const terminal of ["\r\r", "\r\n\r"]) {
+    let source!: ReadableStreamDefaultController<Uint8Array>;
+    const input = new ReadableStream<Uint8Array>({ start(c) { source = c; c.enqueue(encoder.encode("data: secret" + terminal)); } });
+    const reader = transformSseEvents(input, event => ({ ...event, data: "hidden" })).getReader();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const value = await Promise.race([reader.read(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("completed CR event stalled")), 250); })]);
+      assert.equal(decoder.decode(value.value), "data: hidden\n\n");
+      source.enqueue(encoder.encode("\ndata: next\n\n"));
+      assert.equal(decoder.decode((await reader.read()).value), "data: hidden\n\n");
+    } finally { clearTimeout(timer); await reader.cancel(); }
+  }
+});
+
+test("an identity transform preserves a delayed optional delimiter LF", async () => {
+  const seen: string[] = [];
+  const wire = "data: one\r\n\r\ndata: two\r\r";
+  const result = await readAll(transformSseEvents(chunks(["data: one\r\n\r", "\n", "data: two\r\r"]), event => { seen.push(event.data); return event; }));
+  assert.equal(result.text, wire); assert.deepEqual(seen, ["one", "two"]);
+});

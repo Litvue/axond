@@ -8,7 +8,9 @@ export interface SseEvent {
   /**
    * The frame exactly as it arrived, delimiter included.
    * An identity transform emits this so chunk boundaries of the payload stay
-   * intact when the whole frame fits in one chunk.
+   * intact when the whole frame fits in one chunk. If a completed CR delimiter
+   * ends a chunk, its optional LF is forwarded separately for an identity
+   * transform when it arrives.
    */
   raw: Uint8Array;
 }
@@ -39,6 +41,8 @@ export function transformSseEvents(
   let lineLength = 0;
   let afterCr = false;
   let delimiterCr = false;
+  let swallowDelimiterLf = false;
+  let forwardDelimiterLf = false;
   let ended = false;
   function append(byte: number): void {
     if (used >= maxFrameBytes) throw new Error("SSE event exceeds the byte limit");
@@ -52,6 +56,7 @@ export function transformSseEvents(
     const parsed = parseFrame(buffer.slice(0, used));
     used = 0; lineLength = 0; afterCr = false; delimiterCr = false;
     const next = transform(parsed);
+    if (swallowDelimiterLf) forwardDelimiterLf = next === parsed;
     if (next === null) return false;
     controller.enqueue(next === parsed ? parsed.raw : encodeFrame(next));
     return true;
@@ -60,17 +65,31 @@ export function transformSseEvents(
     async pull(controller) {
       try {
         for (;;) {
+          if (delimiterCr) {
+            if (at < chunk.length) {
+              if (chunk[at] === 10) { append(10); at++; }
+            } else {
+              // CR already completes the blank line. Do not wait for a live
+              // provider to send the optional LF before delivering the event.
+              swallowDelimiterLf = true;
+            }
+            if (emit(controller)) return;
+            continue;
+          }
           if (at === chunk.length && !ended) {
             const next = await reader.read();
             ended = next.done;
             chunk = next.value ?? new Uint8Array(0); at = 0;
             if (!ended && chunk.length === 0) continue;
           }
-          if (delimiterCr) {
-            if (!ended && chunk[at] === 10) { append(10); at++; }
-            if (emit(controller)) return;
-            continue;
+          if (swallowDelimiterLf) {
+            swallowDelimiterLf = false;
+            if (!ended && chunk[at] === 10) {
+              at++;
+              if (forwardDelimiterLf) { controller.enqueue(new Uint8Array([10])); return; }
+            }
           }
+          if (at === chunk.length && !ended) continue;
           if (ended) {
             if (used > 0) controller.enqueue(buffer.slice(0, used));
             controller.close(); return;

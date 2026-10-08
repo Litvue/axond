@@ -9,7 +9,7 @@ and [the operator compatibility contract](../compatibility.md).
 This guide describes qualification of the complete review stack. Early slices
 contain only their focused unit checks; the loader, gateway callers, Worker,
 shadow runner, and binary gates arrive in later slices. Merge the stack only
-after qualifying its final head, as described in [the stack guide](https://github.com/Litvue/axond/blob/codex/ts-review-21-release-gates/docs/design/typescript-review-stack.md).
+after qualifying its final head, as described in [the stack guide](https://github.com/Litvue/axond/blob/1bd572d8ab4f2e0333b3ccc5f350d2c080d5d6d7/docs/design/typescript-review-stack.md).
 
 ## Feature coverage matrix
 

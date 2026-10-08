@@ -35,12 +35,16 @@ bounds connection cleanup with the same deadline.
 
 File-backed SQLite summaries use a separate read-only WAL snapshot and indexed
 pages of at most 1024 rows, yielding between pages. Settlement uses the existing
-connection and serialization. An in-memory SQLite store retains synchronous
+connection and serialization. An independent summary queue permits only one
+reader per store, records summary wait/duration/outcome, and preserves first
+reader snapshot ordering. An in-memory SQLite store retains synchronous
 reads. PostgreSQL aggregates summaries in SQL. Integer charges and JSON numeric
 tokens retain their exact values; the established ledger saturation remains.
 
 Metric exports are cumulative snapshots with a stable start timestamp, emitted
-at most once per 30 seconds per recorder on request completion. Traces remain
+at most once per 30 seconds per gateway on request completion. Successful
+delivery advances the timestamp; failures clear in-flight state for retry.
+Separate gateways/collectors sharing a recorder retain independent state. Traces remain
 per request. Exporter HTTP refusals are failures, not successful deliveries.
 
 An existing extension table is insufficient evidence of an applied migration.
@@ -48,6 +52,12 @@ An owner must run and register the migration before a restricted role starts.
 `storage.create_table = false` probes the schema and refuses missing objects
 without issuing gateway DDL. Existing databases also need the usage index and
 the cadence `period` and provider-model `source` columns.
+
+Provider discovery replaces a fresh foreign-source cache only when explicitly
+authorized. The CLI discovery loop grants that authority on its initial
+configuration round; reopening a Store object alone grants none. The model-ID
+cache accepts the supported models.dev neutral `models` and `providers` maps;
+it still does not provide Rust catalogue pricing/offerings.
 
 ### State tier
 
