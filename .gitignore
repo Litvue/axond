@@ -15,6 +15,10 @@ __pycache__/
 /tests/compat-ts/node_modules/
 /tests/compat-ts/build/
 
+# TypeScript gateway workspace
+/ts/node_modules/
+/ts/packages/worker/.wrangler/
+
 # OpenAPI smoke: installed tools and generated client types
 /tests/openapi-smoke/node_modules/
 /tests/openapi-smoke/generated/

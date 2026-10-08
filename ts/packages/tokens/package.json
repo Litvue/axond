@@ -1,0 +1,14 @@
+{
+  "name": "@axond/tokens",
+  "version": "0.0.0",
+  "license": "Apache-2.0 OR MIT",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@axond/sdk": "0.0.0",
+    "hono": "^4.9.8"
+  }
+}
