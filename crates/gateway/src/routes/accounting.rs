@@ -1,12 +1,10 @@
 //! Response accounting: budget holds, buffered-response settlement, and usage
 //! records.
 //!
-//! Permit and reservation ownership is here. A [`BudgetReservation`] drop
-//! releases a hold that the handler never settled. [`BufferedResponseAccounting`]
+//! Permit and settlement ownership is here. [`BufferedResponseAccounting`]
 //! finishes one durable `ok` / `rejected` / `client_cancelled` decision.
 //! Streaming relay accounting stays in [`crate::streaming`]. Settlement
-//! capacity is [`crate::settlement`]; this module only spends a reservation
-//! taken at admission.
+//! capacity is [`crate::settlement`].
 
 use gateway_core::Usage;
 use serde_json::Value;

@@ -13,9 +13,8 @@
 //!   socket for as long as the model talks, taken last so a request still
 //!   waiting for global capacity does not occupy a stream slot.
 //!
-//! This is a separate layer from [`crate::rate_limit`], which bounds one
-//! authenticated *subject*. Admission bounds the process and the tenant; the
-//! per-subject limiter still runs, and both must admit a request.
+//! Admission bounds the process and the tenant. The former per-subject rate
+//! limiter was withdrawn by ADR 0063.
 //!
 //! Permits are owned values released in `Drop`, so every exit path — success,
 //! upstream failure, client cancellation, timeout, and process teardown —

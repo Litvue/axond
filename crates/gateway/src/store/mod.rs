@@ -498,12 +498,12 @@ pub trait Store: Send + Sync {
     /// does, so a repeated batch after a failure inserts each `request_id`
     /// exactly once. Duplicate `request_id`s are skipped, never rewritten, with
     /// the same null `cost_microdollars` / `period` semantics as
-    /// [`Self::append_usage`]. There is no sequential-walk default: a per-row
+    /// the test-only single-row `append_usage` helper. There is no sequential-walk default: a per-row
     /// walk that returns on the first error would leave a committed prefix.
     /// Callers bound `events.len()` by [`MAX_USAGE_INDEX_BATCH`].
     async fn append_usage_batch(&self, events: Vec<UsageAppend>) -> Result<(), StoreError>;
 
-    /// When true, [`Self::append_usage`] runs blocking I/O inside `spawn_blocking`
+    /// When true, usage writes run blocking I/O inside `spawn_blocking`
     /// and dropping its future cannot cancel the work. The usage-index worker
     /// then calls [`Self::append_usage_batch_sync`] on one OS thread instead.
     fn blocking_usage_index(&self) -> bool {
