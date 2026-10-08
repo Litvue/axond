@@ -1,13 +1,8 @@
-//! Resource envelopes: what a revision is made of.
+//! Content-addressed blob references for retained catalogue snapshots.
 //!
-//! A resource version is an *envelope*, not a schema. It carries identity, the
-//! scope it belongs to, its readable name, the versioned resources it depends
-//! on, and a body that is either an inline canonical value or a
-//! content-addressed [`BlobRef`]. What is inside the body — the catalogue,
-//! tenancy, secret, pricing, and policy schemas — is deliberately not fixed
-//! here: those land as later slices, and each is a body shape plus its own
-//! validation, with no change to this envelope, to the canonical serializer, or
-//! to #165's tables.
+//! A [`BlobRef`] records a payload's kind, checksum, and byte length without
+//! embedding the payload. Verification checks both length and content, so a
+//! stored catalogue cannot hydrate from truncated or substituted bytes.
 //!
 //! ADR 0063 withdrew resource identities, versions, and dependency envelopes.
 //! This module retains the content-addressed blob primitives used by catalogue
