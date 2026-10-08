@@ -378,6 +378,9 @@ export async function loadConfig(
       provider: stringField(row, "provider"),
       model,
       inputMicrodollarsPerMillion: bigField(row, "input_microdollars_per_million"),
+      ...(row["reasoning_microdollars_per_million"] == null ? {} : { reasoningMicrodollarsPerMillion: bigField(row, "reasoning_microdollars_per_million") }),
+      ...(row["cache_read_microdollars_per_million"] == null ? {} : { cacheReadMicrodollarsPerMillion: bigField(row, "cache_read_microdollars_per_million") }),
+      ...(row["cache_write_microdollars_per_million"] == null ? {} : { cacheWriteMicrodollarsPerMillion: bigField(row, "cache_write_microdollars_per_million") }),
       outputMicrodollarsPerMillion: bigField(row, "output_microdollars_per_million"),
     };
   });
@@ -825,6 +828,13 @@ function rustUrl(value: string): { error: string | null; scheme: string; hasAuth
       password = true;
     }
   }
+  if (scheme === "http" || scheme === "https") {
+    try { new URL(value); } catch {
+      const host = authority.slice(authority.lastIndexOf("@") + 1);
+      const error = host.startsWith("[") ? "invalid IPv6 address" : /:\d+$/u.test(host) || /:[^:]*$/u.test(host) ? "invalid port number" : "invalid international domain name";
+      return { error, scheme, hasAuthority, username, password };
+    }
+  }
   return { error: null, scheme, hasAuthority, username, password };
 }
 
@@ -1005,11 +1015,7 @@ function runtimeCount(value: number | bigint): number {
  * largest delay those timers accept, so the wait does not collapse to 1ms.
  */
 function timerCount(value: number | bigint, scale = 1): number {
-  const max = BigInt(Math.floor(2_147_483_647 / scale));
-  if (typeof value === "bigint" && value > BigInt(Number.MAX_SAFE_INTEGER)) {
-    return Number(value > max ? max : value);
-  }
-  return runtimeCount(value);
+  return Math.min(Number(value), Math.floor(2147483647 / scale));
 }
 
 function numberField(row: Record<string, unknown>, key: string, fallback: number): number {
