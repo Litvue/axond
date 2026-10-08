@@ -5,7 +5,7 @@ import { StoreFailure } from "../../gateway/src/errors.ts";
 import { rateLimitExtension } from "@axond/rate-limit";
 import type { AxondExtension, CredentialConfig, PriceRule, ProviderConfig, Store } from "@axond/sdk";
 
-import { discoverOnce, type CatalogMetrics } from "../../cli/src/discovery.ts";
+import { discoverOnce, noteCatalogRefusal, type CatalogMetrics } from "../../cli/src/discovery.ts";
 import {
   applyPostgresMigrationOn,
   applyPostgresSchema,
@@ -281,7 +281,7 @@ function workerPrices(raw: string | undefined): PriceRule[] {
 
 function workerCatalog(env: WorkerEnv): { source: "none" | "models-dev" | "seed"; sourceUrl: string | null } {
   const source = env.CATALOG_SOURCE === "models-dev" || env.CATALOG_SOURCE === "seed" ? env.CATALOG_SOURCE : "none";
-  return { source, sourceUrl: env.CATALOG_SOURCE_URL ?? null };
+  return { source, sourceUrl: env.CATALOG_SOURCE_URL ?? (source === "models-dev" ? "https://models.dev/catalog.json" : null) };
 }
 
 /**
@@ -291,6 +291,7 @@ function workerCatalog(env: WorkerEnv): { source: "none" | "models-dev" | "seed"
  * and does not fetch a document it would store under the wrong keys.
  */
 function supportedModelsDevCatalogUrl(sourceUrl: string): boolean {
+  try { const url = new URL(sourceUrl); if (!url.hostname || url.username || url.password) return false; } catch { return false; }
   const match = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.*)$/s.exec(sourceUrl);
   if (!match || match[1]!.toLowerCase() !== "https") {
     return false;
@@ -326,7 +327,7 @@ export function discoverOnSchedule(
   ctx.waitUntil(runScheduledDiscovery(env, store, fetchImpl, metrics));
 }
 
-function runScheduledDiscovery(
+async function runScheduledDiscovery(
   env: WorkerEnv,
   store: Store,
   fetchImpl?: typeof fetch,
@@ -336,12 +337,7 @@ function runScheduledDiscovery(
   const credentials = JSON.parse(env.CREDENTIALS_JSON ?? "[]") as CredentialConfig[];
   const { catalog, refused } = discoveryCatalog(env);
   if (refused) {
-    console.log(JSON.stringify({
-      msg: "catalogue_import",
-      outcome: "refused",
-      reason: "unsupported_endpoint",
-      consecutive_refusals: 0,
-    }));
+    await noteCatalogRefusal({ store, metrics, onLog: (record) => console.log(JSON.stringify(record)) }, "unsupported_endpoint");
   }
   return discoverOnce({
     store,

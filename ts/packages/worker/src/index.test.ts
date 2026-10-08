@@ -271,16 +271,17 @@ test("a worker catalogue url other than catalog.json is not fetched", async () =
         return new Response(JSON.stringify({ openai: { id: "gpt-test" } }), { status: 200 });
       },
     );
+    await waited;
   } finally {
     console.log = original;
   }
-  await waited;
   assert.equal(fetched, 0);
   const body = lines.join("\n");
   assert.equal(body.includes("unsupported_endpoint"), true);
   assert.equal(body.includes("api.json"), false);
   assert.equal(body.includes("models.dev"), false);
-  assert.equal(await store.getProviderModels("catalog"), null);
+  assert.equal((await store.getProviderModels("catalog"))?.stale, true);
+  assert.ok(body.includes('"consecutive_refusals":1'));
 });
 
 test("worker_request_path_uses_credentials_json", async () => {
