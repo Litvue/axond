@@ -98,7 +98,7 @@ test("server bind matches the rust socket address refusal", async () => {
     `config: invalid type: found ${found}, expected socket address for key "SERVER.BIND" in \`AXOND_\` environment variable(s)`;
   await reject(BASE, envSyntax, { AXOND_SERVER__BIND: "localhost:8080" });
   await reject(BASE, envSyntax, { AXOND_SERVER__BIND: "" });
-  await reject(BASE, envSyntax, { axond_server__bind: "not-a-socket" });
+  assert.equal((await loadConfig(BASE, envSecretReader({ GW_KEY: "k", axond_server__bind: "not-a-socket" }, async () => ""))).bind, "127.0.0.1:9");
   await reject(BASE, envTyped("unsigned int `8080`"), { AXOND_SERVER__BIND: "8080" });
   await reject(BASE, envTyped("unsigned int `8`"), { AXOND_SERVER__BIND: "+8" });
   await reject(BASE, envTyped("signed int `-1`"), { AXOND_SERVER__BIND: "-1" });
@@ -998,4 +998,16 @@ test("axond env overrides are figment values and cite the environment", async ()
     envSecretReader({ GW_KEY: "k", AXOND_USAGE_SINK: '[{kind="stdout"}]' }, async () => ""),
   );
   assert.equal(sink.usageSinks[0]?.kind, "stdout");
+});
+
+test("review regressions preserve multiline numeric types, bind validity, price rates and timer ranges", async () => {
+  const secrets = envSecretReader({ GW_KEY: "k", axond_server__bind: "127.0.0.1:81" }, async () => "");
+  assert.equal((await loadConfig(BASE, secrets)).bind, "127.0.0.1:9");
+  await assert.rejects(loadConfig('failover = [\n  1.0 # integral float\n]\n' + BASE, secrets), /expected u32/);
+  await assert.rejects(loadConfig(BASE.replace('127.0.0.1:9', '[192.0.2.1::]:8080'), secrets), /socket address/);
+  const cfg = await loadConfig(BASE + '\n[[provider]]\nid="p"\nkind="openai"\nbase_url="https://example.test"\n[transport]\nstream_idle_timeout_ms = 2147483648\n[[price]]\nprovider="p"\nmodel="*"\ninput_microdollars_per_million=1\noutput_microdollars_per_million=2\nreasoning_microdollars_per_million=3\ncache_read_microdollars_per_million=4\ncache_write_microdollars_per_million=5\n', secrets);
+  assert.equal(cfg.transport.streamIdleTimeoutMs, 2147483647);
+  assert.equal(cfg.prices[0]?.reasoningMicrodollarsPerMillion, 3n);
+  assert.equal(cfg.prices[0]?.cacheReadMicrodollarsPerMillion, 4n);
+  assert.equal(cfg.prices[0]?.cacheWriteMicrodollarsPerMillion, 5n);
 });
