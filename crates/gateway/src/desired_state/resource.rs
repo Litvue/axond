@@ -9,18 +9,9 @@
 //! validation, with no change to this envelope, to the canonical serializer, or
 //! to #165's tables.
 //!
-//! The envelope is what the revision machinery needs, and it is all it needs:
-//!
-//! - identity that never changes ([`ResourceId`]) versus a name that may
-//!   ([`Slug`]), so a rename is not a re-creation;
-//! - a monotonic [`ResourceVersionNumber`], so a manifest pins the exact bytes a
-//!   revision was compiled against and an older revision keeps pinning the older
-//!   ones;
-//! - explicit [`ResourceVersion::depends_on`] edges, so "this alias points at a
-//!   credential that no longer exists in this revision" is a domain-level
-//!   dangling reference rather than something only a schema-aware validator could
-//!   notice;
-//! - a scope, so a cross-tenant reference is detectable without reading any body.
+//! ADR 0063 withdrew resource identities, versions, and dependency envelopes.
+//! This module retains the content-addressed blob primitives used by catalogue
+//! snapshots.
 
 use super::canonical::{Canonical, CanonicalValue, Checksum};
 

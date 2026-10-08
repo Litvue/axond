@@ -314,7 +314,7 @@ pub fn relay_opened(
     )
 }
 
-/// Variant of [`relay_opened`] that carries the request's core accounting
+/// Variant of `relay_opened` that carries the request's core accounting
 /// owner. It is moved into `Accounting`, which is owned by the response body and
 /// therefore survives the handler and drops on normal completion, client hangup,
 /// or cancellation.

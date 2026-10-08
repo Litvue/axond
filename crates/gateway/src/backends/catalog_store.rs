@@ -18,7 +18,7 @@
 //!   catalogue therefore stores nothing new
 //!   ([`Retention::AlreadyRetained`]) — idempotence is the table's shape, not a
 //!   check someone remembered to write — and a
-//!   [`CatalogOffering`](crate::desired_state::models::CatalogOffering) that
+//!   `CatalogOffering` that
 //!   pinned an older snapshot keeps resolving the content it was published
 //!   against.
 //! - **What is active is a pointer, not a copy.** Activation moves one
