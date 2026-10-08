@@ -43,7 +43,7 @@
         "docs/adr/0067-typescript-review-hardening.md"
       ],
       "pull_request": 534,
-      "changed_lines": 3763
+      "changed_lines": 3815
     },
     {
       "order": 2,
@@ -81,7 +81,7 @@
         "ts/packages/gateway/src/state-review-regressions.test.ts"
       ],
       "pull_request": 536,
-      "changed_lines": 1830
+      "changed_lines": 1846
     },
     {
       "order": 4,
@@ -102,7 +102,7 @@
         "ts/packages/gateway/src/wire-review-regressions.test.ts"
       ],
       "pull_request": 537,
-      "changed_lines": 2544
+      "changed_lines": 2587
     },
     {
       "order": 5,
@@ -155,7 +155,7 @@
         "ts/packages/gateway/src/config-env-sequences.test.ts"
       ],
       "pull_request": 541,
-      "changed_lines": 1442
+      "changed_lines": 1447
     },
     {
       "order": 9,
@@ -190,7 +190,7 @@
         "ts/packages/gateway/src/app-test-fixtures.ts"
       ],
       "pull_request": 543,
-      "changed_lines": 3188
+      "changed_lines": 3190
     },
     {
       "order": 11,
@@ -204,7 +204,7 @@
         "ts/packages/gateway/src/app-inference-limits.test.ts"
       ],
       "pull_request": 544,
-      "changed_lines": 3045
+      "changed_lines": 3057
     },
     {
       "order": 12,
@@ -218,7 +218,7 @@
         "ts/packages/gateway/src/behavior-test-fixtures.ts"
       ],
       "pull_request": 545,
-      "changed_lines": 2201
+      "changed_lines": 2217
     },
     {
       "order": 13,
@@ -231,7 +231,7 @@
         "ts/packages/gateway/src/behavior-rotation-and-admission.test.ts"
       ],
       "pull_request": 546,
-      "changed_lines": 1980
+      "changed_lines": 1989
     },
     {
       "order": 14,
@@ -259,7 +259,7 @@
         "ts/packages/cli/src/seed-namespaces.ts"
       ],
       "pull_request": 548,
-      "changed_lines": 3455
+      "changed_lines": 3503
     },
     {
       "order": 16,
@@ -280,7 +280,7 @@
         "ts/packages/cli/src/config-file.ts"
       ],
       "pull_request": 549,
-      "changed_lines": 2542
+      "changed_lines": 2567
     },
     {
       "order": 17,
@@ -388,7 +388,7 @@
         "docs/design/typescript-review-findings.md"
       ],
       "pull_request": 554,
-      "changed_lines": 3074
+      "changed_lines": 3108
     }
   ],
   "review_hardening": {
@@ -419,6 +419,9 @@
       "codex/ts-review-19-extensions": "4ed2f251ad252b75f673fb3775f7ce923ad7b1cf",
       "codex/ts-review-20-worker": "c356f540799a40099693a3fd3c09201ebb56dea3",
       "codex/ts-review-21-release-gates": "f57a4f0d7ffcfa2508d63581b281473068353012"
-    }
+    },
+    "followup_observations": 17,
+    "additional_threads": 13,
+    "revised_existing_findings": 4
   }
 }
