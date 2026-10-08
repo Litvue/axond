@@ -21,7 +21,7 @@ import { API_VERSION } from "@axond/sdk";
 
 import { admissionFromOptions, createAdmission, type AdmissionHold } from "./admission.ts";
 import { assertGatewayKey, presentedCredential } from "./auth.ts";
-import { ByteRequestBody } from "./body.ts";
+import { ByteRequestBody, readBoundedBody } from "./body.ts";
 import {
   callUpstream,
   credentialPolicy,
@@ -255,6 +255,7 @@ async function pipeline(
         return;
       }
       if (axond.route === "models" || axond.route === "credentials") {
+        if (c.req.method !== "GET") throw new GatewayFailure("not_found", 404, "not found");
         await runStage(c, "pre-dispatch", extensions, opts.store, async () => {
           if (axond.route === "models") {
             await listModels(c, opts, axond);
@@ -380,7 +381,7 @@ function createContext(c: Context<AxondEnv>, opts: AxondOptions): MutableContext
     requestId,
     startedMs: Date.now(),
     route: "other",
-    body: new ByteRequestBody(c.req.raw),
+    body: new ByteRequestBody(c.req.raw, opts.maxRequestBytes ?? DEFAULT_MAX_REQUEST),
     authenticated: false,
     hooks: [],
     resolvedIncarnation: 1n,
@@ -486,22 +487,24 @@ async function bindNamespace(
 }
 
 function routeOf(path: string): InferenceRoute {
-  if (path.endsWith("/chat/completions")) {
+  const match = /^\/ns\/[^/]+\/v1(\/.*)$/.exec(path);
+  const suffix = match?.[1];
+  if (suffix === "/chat/completions") {
     return "chat";
   }
-  if (path.endsWith("/messages")) {
+  if (suffix === "/messages") {
     return "messages";
   }
-  if (path.endsWith("/embeddings")) {
+  if (suffix === "/embeddings") {
     return "embeddings";
   }
-  if (path.endsWith("/responses")) {
+  if (suffix === "/responses") {
     return "responses";
   }
-  if (path.endsWith("/models")) {
+  if (suffix === "/models") {
     return "models";
   }
-  if (path.endsWith("/credentials")) {
+  if (suffix === "/credentials") {
     return "credentials";
   }
   throw new GatewayFailure("not_found", 404, "not found");
@@ -858,12 +861,12 @@ async function dispatch(
     let streamServed = true;
     const penalizeStream = (served: CredentialConfig) => {
       streamServed = false;
-      noteCredentialFailure(pools, record.id, provider.id, served.id, now, policy.failureThreshold);
+      noteCredentialFailure(pools, served.namespace, provider.id, served.id, now, policy.failureThreshold);
     };
     const finishStream = (served: CredentialConfig, reason: "end" | "cancel" | "fail") => {
       admissionHolds.get(axond)?.claimSettlement();
       if (reason === "end" && streamServed) {
-        noteCredentialSuccess(pools, record.id, provider.id, served.id);
+        noteCredentialSuccess(pools, served.namespace, provider.id, served.id);
       }
       noteServed(axond, opts, served);
       streamStatus = reason === "cancel" ? "client_cancelled" : reason === "fail" ? "upstream_error" : "ok";
@@ -935,11 +938,12 @@ async function dispatch(
     };
     const rotateStream = async (failedIndex: number): Promise<Response | null> => {
       const failed = planned[failedIndex]!;
-      noteCredentialFailure(pools, record.id, provider.id, failed.id, now, policy.failureThreshold);
+      noteCredentialFailure(pools, failed.namespace, provider.id, failed.id, now, policy.failureThreshold);
       noteRateLimit(opts, axond, provider.id, failed.id);
       for (let index = failedIndex + 1; index < planned.length; index += 1) {
         const nextCredential = planned[index]!;
         try {
+          axond.upstreamAttempts += 1;
           const opened = await callUpstream({
             url,
             headers: headersFor(nextCredential),
@@ -969,7 +973,7 @@ async function dispatch(
           return opened.response;
         } catch (error) {
           if (error instanceof GatewayFailure && error.rateLimited) {
-            noteCredentialFailure(pools, record.id, provider.id, nextCredential.id, now, policy.failureThreshold);
+            noteCredentialFailure(pools, nextCredential.namespace, provider.id, nextCredential.id, now, policy.failureThreshold);
             if (index + 1 < planned.length) {
               noteRateLimit(opts, axond, provider.id, nextCredential.id);
             }
@@ -982,6 +986,7 @@ async function dispatch(
       return null;
     };
     try {
+      axond.upstreamAttempts += 1;
       upstream = await callUpstream({
         url,
         headers,
@@ -1019,7 +1024,7 @@ async function dispatch(
         noteServed(axond, opts, credential);
       }
       if (!stream) {
-        noteCredentialSuccess(pools, record.id, provider.id, credential.id);
+        noteCredentialSuccess(pools, credential.namespace, provider.id, credential.id);
       }
       noteAttempt(c, opts, axond, credential, attempt, attemptStarted, "ok", false, walk.parked, "served", null, !stream);
       break;
@@ -1046,7 +1051,7 @@ async function dispatch(
         false,
       );
       if (rateLimited) {
-        noteCredentialFailure(pools, record.id, provider.id, credential.id, now, policy.failureThreshold);
+        noteCredentialFailure(pools, credential.namespace, provider.id, credential.id, now, policy.failureThreshold);
         if (!pinned && attempt + 1 < planned.length) {
           noteRateLimit(opts, axond, provider.id, credential.id);
         }
@@ -1208,6 +1213,9 @@ function noteLease(
   });
 }
 
+const metricExportTimes = new WeakMap<object, number>();
+const METRIC_EXPORT_INTERVAL_MS = 30_000;
+
 async function publishTelemetry(opts: AxondOptions, spans: readonly ExportedSpan[]): Promise<void> {
   const target = opts.telemetry;
   if (!target || spans.length === 0) {
@@ -1218,7 +1226,10 @@ async function publishTelemetry(opts: AxondOptions, spans: readonly ExportedSpan
   try {
     await postOtlp(target.endpoint, "traces", tracePayload(spans, resource), fetchImpl);
     const points = opts.metrics?.points;
-    if (points && points.length > 0) {
+    const now = Date.now();
+    const previous = opts.metrics ? metricExportTimes.get(opts.metrics) : undefined;
+    if (opts.metrics && points && points.length > 0 && (previous === undefined || now - previous >= METRIC_EXPORT_INTERVAL_MS)) {
+      metricExportTimes.set(opts.metrics, now);
       await postOtlp(target.endpoint, "metrics", metricPayload(points, resource, spans[0]!.endMs), fetchImpl);
     }
   } catch {
@@ -1293,7 +1304,6 @@ function copyUsage(target: UsageTokens, next: UsageTokens): void {
 function noteServed(axond: MutableContext, opts: AxondOptions, credential: CredentialConfig): void {
   axond.servedCredentialId = credential.id;
   axond.servedCredentialSource = credential.namespace === opts.defaultNamespace ? "platform" : "byok";
-  axond.upstreamAttempts = 1;
 }
 
 function settlementCost(opts: AxondOptions, axond: MutableContext, usage: UsageTokens, status: string): bigint | null {
@@ -1895,7 +1905,7 @@ async function readJson(c: Context<AxondEnv>, fields: readonly StrictField[], st
   if (!isJsonContentType(contentType)) {
     throw new GatewayFailure("unsupported_media_type", 415, "expected a `content-type: application/json` request");
   }
-  const bytes = new Uint8Array(await c.req.arrayBuffer());
+  const bytes = await readBoundedBody(c.req.raw, 64 * 1024);
   return readStrictObject(bytes, fields, structName);
 }
 

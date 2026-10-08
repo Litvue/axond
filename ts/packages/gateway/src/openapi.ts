@@ -18,25 +18,30 @@ export const OPENAPI = {
       post: { responses: { "201": { description: "Created" } } },
     },
     "/api/v1/namespaces/{ns}": {
+      parameters: [{ name: "ns", in: "path", required: true, schema: { type: "string" } }],
       get: { responses: { "200": { description: "Read namespace" } } },
       put: { responses: { "200": { description: "Replace attrs" } } },
       delete: { responses: { "204": { description: "Deleted" } } },
     },
     "/api/v1/namespaces/{ns}/budgets/{period}": {
+      parameters: [{ name: "ns", in: "path", required: true, schema: { type: "string" } }, { name: "period", in: "path", required: true, schema: { type: "string" } }],
       get: { responses: { "200": { description: "Read budget" } } },
       put: { responses: { "200": { description: "Set budget" } } },
     },
     "/api/v1/namespaces/{ns}/budget": {
+      parameters: [{ name: "ns", in: "path", required: true, schema: { type: "string" } }],
       get: { responses: { "200": { description: "Read policy" } } },
       put: { responses: { "200": { description: "Set policy" } } },
     },
     "/api/v1/namespaces/{ns}/usage": {
+      parameters: [{ name: "ns", in: "path", required: true, schema: { type: "string" } }],
       get: {
         parameters: [{ name: "period", in: "query", required: true, schema: { type: "string" } }],
         responses: { "200": { description: "Usage summary" } },
       },
     },
     "/api/v1/providers/{id}/models": {
+      parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
       get: { responses: { "200": { description: "Cached provider models" } } },
     },
     "/api/v1/providers/models": {
