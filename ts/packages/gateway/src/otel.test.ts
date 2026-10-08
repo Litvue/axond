@@ -19,7 +19,7 @@ test("resolveTelemetry is off without an endpoint and rejects other protocols", 
   assert.throws(() => resolveTelemetry({ instanceId: "has space" }), /ASCII letters/);
 });
 
-test("postOtlp posts a trace and reads the collector body", async () => {
+test("postOtlp posts a trace and accepts successful collector headers", async () => {
   const server = createServer((req, res) => {
     req.resume();
     res.writeHead(200, { "content-type": "application/json" });
@@ -39,7 +39,7 @@ test("postOtlp posts a trace and reads the collector body", async () => {
   }
 });
 
-test("postOtlp stops when the collector accepts and never finishes the body", async () => {
+test("postOtlp times out when the collector never sends response headers", async () => {
   const server = createServer((req, res) => {
     req.resume();
     res.writeHead(200, { "content-type": "application/json" });
@@ -164,3 +164,10 @@ function sampleUsage(): UsageRecord {
     attempts: 1,
   };
 }
+
+
+test("a successful collector with an unfinished response body completes immediately", async () => {
+  let cancelled = false;
+  await postOtlp("http://collector", "metrics", {}, async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 200 }));
+  assert.equal(cancelled, true);
+});

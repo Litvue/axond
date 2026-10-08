@@ -32,19 +32,27 @@ class Sequence {
   }
 
   push(chunk: string): string | null {
+    for (let offset = 0; offset < chunk.length; offset += 64 * 1024) {
+      const error = this.pushPart(chunk.slice(offset, offset + 64 * 1024));
+      if (error !== null) return error;
+      if (this.terminal || this.failed) break;
+    }
+    return null;
+  }
+
+  private pushPart(chunk: string): string | null {
     if (this.terminal || this.failed) {
       return null;
-    }
-    if (new TextEncoder().encode(this.buffer).length + new TextEncoder().encode(chunk).length > 1024 * 1024) {
-      this.failed = true; this.buffer = "";
-      return "SSE buffer exceeded 1048576 bytes";
     }
     this.buffer += chunk;
     for (;;) {
       const end = eventEnd(this.buffer);
-      if (end === null) {
-        return null;
+      const retained = end === null ? this.buffer : this.buffer.slice(0, end.index + end.delimiter);
+      if (new TextEncoder().encode(retained).length > 1024 * 1024) {
+        this.failed = true; this.buffer = "";
+        return "SSE buffer exceeded 1048576 bytes";
       }
+      if (end === null) return null;
       const block = this.buffer.slice(0, end.index).replaceAll("\r", "");
       this.buffer = this.buffer.slice(end.index + end.delimiter);
       const event = parseEvent(block);

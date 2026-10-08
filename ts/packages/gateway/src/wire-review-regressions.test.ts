@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createResponsesSequence } from "./responses-sequence.ts";
+import { createNativeMessagesSequence } from "./native-messages.ts";
 import { costMicrodollars } from "./pricing.ts";
 import { createMetrics } from "./metrics.ts";
 import { metricPayload, postOtlp } from "./otel.ts";
@@ -37,4 +39,22 @@ test("scoped SQL refuses projected leaks and writes before contacting the backen
   assert.equal(calls, 0);
   await scoped.query("SELECT attrs FROM axond_namespace WHERE id = ?", ["one"]);
   assert.equal(calls, 1);
+});
+
+
+test("complete coalesced SSE frames do not consume the incomplete-event limit", () => {
+  const wire = (": " + "x".repeat(1024) + "\n\n").repeat(1100);
+  for (const decoder of [createResponsesSequence(() => false), createNativeMessagesSequence(() => false)]) {
+    assert.equal(decoder.push(wire), null); assert.equal(decoder.finish(), null);
+    assert.match(decoder.push("data: " + "x".repeat(1024 * 1024)), /exceeded/);
+  }
+});
+
+test("extension wait and first-token observations retain histograms", () => {
+  const metrics = createMetrics();
+  for (const name of ["axond.ext.queue_wait", "axond.ext.time_to_first_token"]) {
+    metrics.record(name, 1); metrics.record(name, 4);
+    const point = metrics.points.find(row => row.name === name)!;
+    assert.equal(point.observations, 2); assert.equal(point.min, 1); assert.equal(point.max, 4);
+  }
 });
