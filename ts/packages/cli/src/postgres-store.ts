@@ -546,10 +546,38 @@ export const POSTGRES_LOCAL_LIMITS = "SET LOCAL lock_timeout = '2s'; SET LOCAL s
 export const POSTGRES_TRANSACTION_LIMITS = `BEGIN; ${POSTGRES_LOCAL_LIMITS}`;
 
 /** A statement that can wait on a row lock. Reads stay one statement. */
-function postgresWrites(sql: string): boolean {
-  if (/\b(?:INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE)\b/i.test(sql)) return true;
-  const head = sql.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n]*/g, " ").trim().toLowerCase();
-  return head.startsWith("insert") || head.startsWith("update") || head.startsWith("delete") || head.startsWith("merge");
+export function postgresWrites(sql: string): boolean {
+  const tokens: string[] = [];
+  for (let at = 0; at < sql.length;) {
+    if (sql.startsWith("--", at)) {
+      const end = sql.indexOf("\n", at + 2); at = end < 0 ? sql.length : end + 1;
+    } else if (sql.startsWith("/*", at)) {
+      at += 2; let depth = 1;
+      while (at < sql.length && depth) {
+        if (sql.startsWith("/*", at)) { depth++; at += 2; }
+        else if (sql.startsWith("*/", at)) { depth--; at += 2; }
+        else at++;
+      }
+    } else if (sql[at] === "'" || sql[at] === '"') {
+      const quoteAt = at;
+      const quote = sql[at++]!;
+      const escapes = quote === "'" && quoteAt > 0 && /[eE]/.test(sql[quoteAt - 1]!) && (quoteAt < 2 || !/[A-Za-z_0-9$]/.test(sql[quoteAt - 2]!));
+      while (at < sql.length) {
+        if (sql[at] === quote) {
+          at++; if (sql[at] !== quote) break; at++;
+        } else if (escapes && sql[at] === "\\") at += 2;
+        else at++;
+      }
+    } else if (sql[at] === "$" && /^\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$/.test(sql.slice(at))) {
+      const tag = sql.slice(at).match(/^\$(?:[A-Za-z_][A-Za-z_0-9]*)?\$/)![0];
+      const end = sql.indexOf(tag, at + tag.length); at = end < 0 ? sql.length : end + tag.length;
+    } else if (/[A-Za-z_]/.test(sql[at]!)) {
+      const start = at++;
+      while (at < sql.length && /[A-Za-z_0-9$]/.test(sql[at]!)) at++;
+      tokens.push(sql.slice(start, at).toUpperCase());
+    } else at++;
+  }
+  return tokens.some(token => /^(INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|DO|CALL)$/.test(token)) || (tokens.includes("FOR") && tokens.includes("SHARE"));
 }
 
 async function beginPostgresTransaction(client: SqlExecutor): Promise<void> {

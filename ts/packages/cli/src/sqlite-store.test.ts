@@ -406,3 +406,16 @@ test("paged SQLite summaries keep a snapshot and yield to settlement", async () 
     assert.equal(rows[0]?.count, 4096); assert.equal(rows[0]?.cost_microdollars, 4096);
   } finally { await store.close?.(); await rm(directory, { recursive: true, force: true }); }
 });
+
+
+test("file-backed summaries retain success/failure metrics and isolate concurrent readers", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "axond-summary-metrics-")); const metrics = createMetrics(); const store = openSqliteStore(join(directory, "db.sqlite"), metrics);
+  try {
+    await store.putNamespace({ id: "n", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: false });
+    const results = await Promise.allSettled([store.summarizeUsage("missing", "p"), store.summarizeUsage("n", "p"), store.summarizeUsage("n", "p")]);
+    assert.equal(results[0]?.status, "rejected"); assert.equal(results[1]?.status, "fulfilled"); assert.equal(results[2]?.status, "fulfilled");
+    const points = metrics.points.filter(row => row.name === "axond.store.operations" && row.attributes["axond.store.operation"] === "usage_summary");
+    assert.equal(points.find(row => row.attributes["axond.store.outcome"] === "ok")?.value, 2);
+    assert.equal(points.find(row => row.attributes["axond.store.outcome"] === "error")?.value, 1);
+  } finally { await store.close?.(); await rm(directory, { recursive: true, force: true }); }
+});

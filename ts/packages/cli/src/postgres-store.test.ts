@@ -9,6 +9,7 @@ import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
 
 import {
+  postgresWrites,
   applyPostgresMigration,
   applyPostgresMigrationOn,
   applyPostgresSchema,
@@ -1908,4 +1909,10 @@ test("incompatible pre-existing extension tables cannot be declared migrated by 
     return { rows: sql.includes("RETURNING id") ? [{ id: 1 }] : [], rowCount: 0 };
   } }, "review-incompatible", "CREATE TABLE IF NOT EXISTS axond_ext_incompatible (namespace text, count int)"));
   assert.equal(calls.some((sql) => sql.startsWith("INSERT INTO public.axond_schema_migrations")), false);
+});
+
+
+test("SQL limits classify actual writes and locking reads outside quoted text", () => {
+  for (const sql of ["SELECT 'UPDATE'", 'SELECT 1 AS "INSERT"', "/* UPDATE /* DELETE */ */ SELECT 1 -- INSERT", "SELECT $$DELETE$$", "SELECT $tag$UPDATE$tag$", "WITH x AS (SELECT 'INSERT') SELECT * FROM x"]) assert.equal(postgresWrites(sql), false, sql);
+  for (const sql of ["/* fixture */ UPDATE t SET a=1", "WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x", "SELECT * FROM t FOR UPDATE", "SELECT * FROM t FOR KEY SHARE"]) assert.equal(postgresWrites(sql), true, sql);
 });
