@@ -42,7 +42,8 @@ Rust's gateway status 502; status remains an explicit assertion.
 | PostgreSQL store qualification | 46 tests, including concurrent settlement, schema migration ownership, absent columns, non-owner access, lossless attributes, and bounded socket cleanup |
 | Runtime suites | Node and Bun workspace suites; local workerd/Hyperdrive; vendor Python and Node SDKs; compiled artifact sign/verify, extension loading, and SQLite restart |
 
-The fault comparator is part of the required Rust-shadow CI job and retains its
+The fault comparator is part of the required Rust-shadow CI job. That job builds
+a Bun compiled candidate, runs both comparisons against it, and retains its
 JSON report as an Actions artifact. It records executable hashes, full bounded
 fault responses, settlement state, and every assertion. For a launcher script,
 its hash identifies the launcher; the checked-out source commit identifies the

@@ -87,12 +87,19 @@ jobs:
       - name: Install the TypeScript gateway
         working-directory: ts
         run: npm ci
+      - name: Install Bun 1.4.2
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.2
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+      - name: Compile the TypeScript candidate
+        working-directory: ts
+        run: bun build packages/cli/src/main.ts --compile --outfile "$RUNNER_TEMP/axond-typescript"
       - name: Compare fixture responses and charges
         working-directory: ts
-        run: node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/shadow-compare.ts --rust "${{ github.workspace }}/target/debug/axond" --ts "${{ github.workspace }}/ts/bin/axond"
+        run: node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/shadow-compare.ts --rust "${{ github.workspace }}/target/debug/axond" --ts "${{ runner.temp }}/axond-typescript"
       - name: Compare fault settlement, crash recovery, and database rollback
         working-directory: ts
-        run: node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/release-conformance.ts --rust "${{ github.workspace }}/target/debug/axond" --ts "${{ github.workspace }}/ts/bin/axond" --report "${{ runner.temp }}/conformance.json"
+        run: node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/release-conformance.ts --rust "${{ github.workspace }}/target/debug/axond" --ts "${{ runner.temp }}/axond-typescript" --report "${{ runner.temp }}/conformance.json"
       - name: Retain fault conformance evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

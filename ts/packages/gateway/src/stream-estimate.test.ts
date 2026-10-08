@@ -4,7 +4,7 @@ import { createAxond } from "./app.ts";
 import { KEY, seeded, listen } from "./behavior-test-fixtures.ts";
 import type { UsageRecord } from "@axond/sdk";
 
-for (const [extra, expectedInput] of [[false, 14n], [true, 25n]] as const) {
+for (const [extra, expectedInput] of [[false, 14n], [true, 29n]] as const) {
   test(`partial stream estimates exclude provider rewrites and retain extension changes: extra=${extra}`, async () => {
     const records: UsageRecord[] = [];
     const background: Promise<unknown>[] = [];
@@ -23,7 +23,7 @@ for (const [extra, expectedInput] of [[false, 14n], [true, 25n]] as const) {
       onUsage: (record) => { records.push(record); }, onBackground: (task) => { background.push(task); },
       extensions: extra ? [{ name: "extra", apiVersion: 1, stage: "pre-dispatch", async middleware(c, next) {
         const body = c.get("axond").body;
-        body.setJson({ ...await body.json<Record<string, unknown>>(), extra: "x".repeat(32) });
+        body.setJson({ ...await body.json<Record<string, unknown>>(), messages: [{ role: "user", content: "x".repeat(32) }] });
         await next();
       } }] : [],
     });
@@ -36,6 +36,7 @@ for (const [extra, expectedInput] of [[false, 14n], [true, 25n]] as const) {
       await Promise.all(background);
       assert.equal(sent?.model, "fixture");
       assert.deepEqual(sent?.stream_options, { include_usage: true });
+      assert.deepEqual(sent?.messages, extra ? [{ role: "user", content: "x".repeat(32) }] : []);
       assert.equal(records.length, 1);
       assert.equal(records[0]!.inputTokens, expectedInput);
     } finally { upstream.close(); }
