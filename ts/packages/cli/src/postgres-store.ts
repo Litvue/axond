@@ -11,7 +11,7 @@ import type {
 } from "@axond/sdk";
 
 import { FIXED_CADENCE_NEEDS_PERIOD, GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
-import { encodeAttrs } from "../../gateway/src/strict-json.ts";
+import { encodeAttrs, serdeValue, canonicalJson } from "../../gateway/src/strict-json.ts";
 import { budgetPolicyFromLedger, foldUsageSummary, saturateMicrodollars } from "../../gateway/src/memory-store.ts";
 import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 import {
@@ -79,8 +79,8 @@ export async function closePgClient(client: pg.Client): Promise<void> {
       clearTimeout(timer);
     }
   }
-  await ending;
 }
+
 
 /**
  * Hyperdrive's origin connection timeout and its maximum statement duration.
@@ -209,7 +209,7 @@ export function createPostgresStore(
     async resolveNamespace(id, nowMs) {
       return withClient("namespace_resolve", async (client) => {
         const found = await client.query(
-          `SELECT n.id, n.attrs, n.blocklist, n.allow_platform_fallback, n.from_config,
+          `SELECT n.id, n.attrs::text AS attrs_text, n.blocklist, n.allow_platform_fallback, n.from_config,
                   c.cadence, c.limit_microdollars AS cadence_limit, c.timezone,
                   a.period AS active_period, b.limit_microdollars, b.spent_microdollars, i.n
            FROM public.axond_namespace n
@@ -237,15 +237,31 @@ export function createPostgresStore(
           }
           return withTransaction(client, async (client) => {
             await lockNamespace(client, id);
-            const still = await client.query("SELECT id FROM public.axond_namespace WHERE id = $1", [id]);
-            if (!still.rows[0]) {
-              return null;
+            const still = await client.query(`SELECT n.id, n.attrs::text AS attrs_text, n.blocklist, n.allow_platform_fallback, n.from_config,
+                  c.cadence, c.limit_microdollars AS cadence_limit, c.timezone,
+                  a.period AS active_period, b.limit_microdollars, b.spent_microdollars, i.n
+           FROM public.axond_namespace n
+           LEFT JOIN public.axond_store_budget_cadence c ON c.namespace = n.id
+           LEFT JOIN public.axond_store_budget_active a ON a.namespace = n.id
+           LEFT JOIN public.axond_store_budget b ON b.namespace = a.namespace AND b.period = a.period
+           LEFT JOIN public.axond_namespace_incarnation i ON i.id = n.id
+           WHERE n.id = $1`, [id]);
+            const current = still.rows[0];
+            if (!current) return null;
+            const record = namespaceFrom(current);
+            const incarnation = current["n"] == null ? 1n : BigInt(String(current["n"]));
+            if (current["cadence"] !== "monthly") {
+              const active = current["active_period"] == null ? null : String(current["active_period"]);
+              return active === null || current["limit_microdollars"] == null
+                ? { record, period: active, limit: null, spent: null, incarnation, admitted: false }
+                : admittedBudget(record, active, current, incarnation);
             }
+            const period = monthlyPeriod(nowMs, String(current["timezone"]));
             await client.query(
               `INSERT INTO public.axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
                VALUES ($1, $2, $3, 0)
                ON CONFLICT (namespace, period) DO NOTHING`,
-              [id, period, row["cadence_limit"]],
+              [id, period, current["cadence_limit"]],
             );
             const created = await client.query(
               "SELECT limit_microdollars, spent_microdollars FROM public.axond_store_budget WHERE namespace = $1 AND period = $2",
@@ -301,14 +317,14 @@ export function createPostgresStore(
     },
     async getNamespace(id) {
       return withClient("namespace_read", async (client) => {
-        const result = await client.query("SELECT * FROM public.axond_namespace WHERE id = $1", [id]);
+        const result = await client.query("SELECT *, attrs::text AS attrs_text FROM public.axond_namespace WHERE id = $1", [id]);
         return result.rows[0] ? namespaceFrom(result.rows[0]) : null;
       });
     },
     async updateNamespace(id, attrs, blocklist) {
       return withClient("namespace_write", (client) => withTransaction(client, async (client) => {
         const result = await client.query(
-          `UPDATE public.axond_namespace SET attrs = $2::jsonb, blocklist = $3::jsonb WHERE id = $1 RETURNING *`,
+          `UPDATE public.axond_namespace SET attrs = $2::jsonb, blocklist = $3::jsonb WHERE id = $1 RETURNING *, attrs::text AS attrs_text`,
           [id, encodeAttrs(attrs), blocklist === null ? null : JSON.stringify(blocklist)],
         );
         return result.rows[0] ? namespaceFrom(result.rows[0]) : null;
@@ -335,7 +351,7 @@ export function createPostgresStore(
     async listNamespaces(cursor, limit) {
       return withClient("namespace_read", async (client) => {
         const result = await client.query(
-          "SELECT * FROM public.axond_namespace WHERE ($1::text IS NULL OR id > $1) ORDER BY id LIMIT $2",
+          "SELECT *, attrs::text AS attrs_text FROM public.axond_namespace WHERE ($1::text IS NULL OR id > $1) ORDER BY id LIMIT $2",
           [cursor, limit + 1],
         );
         const page = result.rows.slice(0, limit).map(namespaceFrom);
@@ -429,13 +445,14 @@ export function createPostgresStore(
     async summarizeUsage(namespace, period) {
       return withClient("usage_summary", async (client) => {
         const result = await client.query(
-          `SELECT model, status, cost_microdollars::text AS cost
-           FROM public.axond_store_usage WHERE namespace = $1 AND period = $2`,
+          `SELECT model, status, COUNT(*)::text AS count, SUM(cost_microdollars)::text AS cost
+           FROM public.axond_store_usage WHERE namespace = $1 AND period = $2 GROUP BY model, status`,
           [namespace, period],
         );
         return foldUsageSummary(
           result.rows.map((row) => ({
             model: String(row["model"]),
+            count: BigInt(String(row["count"] ?? 1)),
             status: String(row["status"]),
             cost: row["cost"] === null ? null : BigInt(String(row["cost"])),
           })),
@@ -530,6 +547,7 @@ export const POSTGRES_TRANSACTION_LIMITS = `BEGIN; ${POSTGRES_LOCAL_LIMITS}`;
 
 /** A statement that can wait on a row lock. Reads stay one statement. */
 function postgresWrites(sql: string): boolean {
+  if (/\b(?:INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE)\b/i.test(sql)) return true;
   const head = sql.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/--[^\n]*/g, " ").trim().toLowerCase();
   return head.startsWith("insert") || head.startsWith("update") || head.startsWith("delete") || head.startsWith("merge");
 }
@@ -637,6 +655,7 @@ CREATE TABLE IF NOT EXISTS public.axond_store_usage (
     cost_microdollars bigint,
     recorded_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX IF NOT EXISTS axond_store_usage_ns_period ON public.axond_store_usage(namespace, period);
 CREATE TABLE IF NOT EXISTS public.axond_store_provider_models (
     provider text PRIMARY KEY NOT NULL,
     fetched_at text,
@@ -644,6 +663,8 @@ CREATE TABLE IF NOT EXISTS public.axond_store_provider_models (
     models jsonb NOT NULL,
     source text
 );
+ALTER TABLE public.axond_store_provider_models ADD COLUMN IF NOT EXISTS source text;
+ALTER TABLE public.axond_store_budget_cadence ADD COLUMN IF NOT EXISTS period text;
 CREATE TABLE IF NOT EXISTS public.axond_catalog_streak (
     singleton text PRIMARY KEY NOT NULL,
     consecutive_refusals integer NOT NULL
@@ -744,7 +765,7 @@ function admittedBudget(
 function namespaceFrom(row: Record<string, unknown>): NamespaceWrite {
   return {
     id: String(row["id"]),
-    attrs: (row["attrs"] ?? {}) as Record<string, unknown>,
+    attrs: (typeof row["attrs_text"] === "string" ? serdeValue(canonicalJson(new TextEncoder().encode(row["attrs_text"]))) : row["attrs"] ?? {}) as Record<string, unknown>,
     blocklist: (row["blocklist"] as string[] | null) ?? null,
     allowPlatformFallback: Boolean(row["allow_platform_fallback"]),
     fromConfig: Boolean(row["from_config"]),
@@ -773,13 +794,13 @@ const POSTGRES_SCHEMA_ATTEMPTS = 4;
  * A concurrent create that loses the `pg_type` race reads the catalog again
  * and returns when the tables are present.
  */
-export async function applyPostgresSchema(client: SqlExecutor): Promise<void> {
+export async function applyPostgresSchema(client: SqlExecutor, createTable = true): Promise<void> {
   for (let attempt = 1; attempt <= POSTGRES_SCHEMA_ATTEMPTS; attempt += 1) {
     const missing = await missingPostgresSchema(client);
     if (missing.length === 0) {
       return;
     }
-    if (!(await postgresCanApplySchema(client))) {
+    if (!createTable || !(await postgresCanApplySchema(client))) {
       throw new Error(`postgres schema is missing ${missing.join(", ")}`);
     }
     try {
@@ -811,14 +832,15 @@ export async function applyPostgresSchema(client: SqlExecutor): Promise<void> {
 const NAMESPACE_COLUMNS: readonly (readonly [string, string])[] = [
   ["axond_namespace", "allow_platform_fallback"],
   ["axond_namespace", "from_config"],
+  ["axond_store_budget_cadence", "period"],
+  ["axond_store_provider_models", "source"],
 ];
 
 async function missingPostgresSchema(client: SqlExecutor): Promise<string[]> {
   const missingTables = await missingPostgresTables(client, postgresSchemaTables());
-  const missingColumns = missingTables.includes("axond_namespace")
-    ? []
-    : await missingPostgresColumns(client, NAMESPACE_COLUMNS);
-  return [...missingTables, ...missingColumns];
+  const missingColumns = await missingPostgresColumns(client, NAMESPACE_COLUMNS.filter(([table]) => !missingTables.includes(table)));
+  const index = await client.query("SELECT to_regclass($1) AS name", ["public.axond_store_usage_ns_period"]);
+  return [...missingTables, ...missingColumns, ...(index.rows[0]?.["name"] == null ? ["axond_store_usage_ns_period"] : [])];
 }
 
 async function postgresCanApplySchema(client: SqlExecutor): Promise<boolean> {
@@ -944,15 +966,6 @@ export async function applyPostgresMigrationOn(client: SqlExecutor, id: string, 
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK").catch(() => undefined);
-    const tables = existingCreateTables(sql);
-    if (postgresInsufficientPrivilege(error) && tables && (await missingPostgresTables(client, tables)).length === 0) {
-      try {
-        await recordPostgresMigration(client, id);
-        return;
-      } catch {
-        throw new Error(`extension migration ${id} failed`);
-      }
-    }
     throw new Error(`extension migration ${id} failed`);
   }
 }

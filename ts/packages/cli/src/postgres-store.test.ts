@@ -1289,7 +1289,7 @@ test("a write role names namespace columns a Rust table omitted", async () => {
       assert.ok(error instanceof Error);
       assert.equal(
         error.message,
-        "postgres schema is missing axond_namespace.allow_platform_fallback, axond_namespace.from_config",
+        "postgres schema is missing axond_namespace.allow_platform_fallback, axond_namespace.from_config, axond_store_budget_cadence.period, axond_store_provider_models.source",
       );
       assert.equal(error.message.includes("password=secret"), false);
       return true;
@@ -1590,6 +1590,7 @@ test("a restricted role uses a schema an owner already applied", { skip: !dsn },
   await owner.query("DROP TABLE IF EXISTS axond_ext_priv_probe");
   await owner.query("DELETE FROM axond_schema_migrations WHERE id = 'priv:0'");
   await owner.query("CREATE TABLE axond_ext_priv_probe (id text primary key)");
+  await applyPostgresMigrationOn(sqlExecutor(owner), "priv:0", "CREATE TABLE IF NOT EXISTS axond_ext_priv_probe (id text primary key)");
   await owner.end();
   const restrictedUrl = new URL(ownerUrl.toString());
   restrictedUrl.username = "axond_rw";
@@ -1887,4 +1888,24 @@ test("a catalogue refusal streak survives a new postgres store", { skip: !dsn },
   assert.equal(await store().noteCatalogRefusal(), 2);
   await store().resetCatalogStreak();
   assert.equal(await store().noteCatalogRefusal(), 1);
+});
+
+test("Postgres attributes retain large JSON integers across all namespace reads", { skip: !dsn }, async () => {
+  const { serdeValue, encodeAttrs } = await import("../../gateway/src/strict-json.ts");
+  await reset(); const db = store(); const attrs = serdeValue('{"account":9007199254740993}') as Record<string, unknown>;
+  await db.putNamespace({ id: "precision", attrs, blocklist: null, allowPlatformFallback: false, fromConfig: false });
+  assert.equal(encodeAttrs((await db.getNamespace("precision"))!.attrs), '{"account":9007199254740993}');
+  const changed = await db.updateNamespace("precision", attrs, null);
+  assert.equal(encodeAttrs(changed!.attrs).replaceAll(" ", ""), '{"account":9007199254740993}');
+  assert.equal(encodeAttrs((await db.listNamespaces(null, 10)).data[0]!.attrs).replaceAll(" ", ""), '{"account":9007199254740993}');
+});
+
+test("incompatible pre-existing extension tables cannot be declared migrated by a restricted role", async () => {
+  const calls: string[] = [];
+  await assert.rejects(applyPostgresMigrationOn({ async query(sql) {
+    calls.push(sql);
+    if (sql.startsWith("CREATE TABLE")) { const error = Object.assign(new Error("restricted"), { code: "42501" }); throw error; }
+    return { rows: sql.includes("RETURNING id") ? [{ id: 1 }] : [], rowCount: 0 };
+  } }, "review-incompatible", "CREATE TABLE IF NOT EXISTS axond_ext_incompatible (namespace text, count int)"));
+  assert.equal(calls.some((sql) => sql.startsWith("INSERT INTO public.axond_schema_migrations")), false);
 });

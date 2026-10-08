@@ -376,3 +376,33 @@ test("config_seed_tracks_file_fallback", async () => {
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+
+test("SQLite preserves adjacent integers above 2^53 and rolls back partial namespace deletion", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-review-"));
+  const path = join(directory, "store.sqlite");
+  const store = openSqliteStore(path);
+  try {
+    await store.putNamespace({ id: "large", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: false });
+    await store.putBudget("large", "fixed", 9007199254740993n);
+    assert.equal((await store.getBudget("large", "fixed"))?.limit, 9007199254740993n);
+    const db = new DatabaseSync(path);
+    db.exec("CREATE TRIGGER reject_budget_delete BEFORE DELETE ON axond_store_budget BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
+    db.close();
+    await assert.rejects(store.deleteNamespace("large"));
+    assert.ok(await store.getNamespace("large"));
+    assert.equal((await store.getBudget("large", "fixed"))?.limit, 9007199254740993n);
+  } finally { await store.close?.(); await rm(directory, { recursive: true, force: true }); }
+});
+
+test("paged SQLite summaries keep a snapshot and yield to settlement", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "axond-summary-review-")); const path = join(directory, "store.sqlite"); const store = openSqliteStore(path);
+  try {
+    await store.putNamespace({ id: "paged", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: false }); await store.putBudget("paged", "p", 100000n);
+    await store.query(`WITH RECURSIVE ids(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM ids WHERE n < 4095) INSERT INTO axond_store_usage(request_id,namespace,period,model,status,cost_microdollars) SELECT printf('%08d',n), 'paged','p','m','ok',1 FROM ids`);
+    const summary = store.summarizeUsage("paged", "p");
+    await store.settle({ requestId: "new", namespace: "paged", incarnation: 1n, period: "p", model: "m", status: "ok", cost: 1n });
+    const rows = await summary;
+    assert.equal(rows[0]?.count, 4096); assert.equal(rows[0]?.cost_microdollars, 4096);
+  } finally { await store.close?.(); await rm(directory, { recursive: true, force: true }); }
+});
