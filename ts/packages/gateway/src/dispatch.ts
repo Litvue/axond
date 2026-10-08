@@ -66,7 +66,7 @@ export interface CredentialWalk {
 /**
  * One request's credential walk. A pinned route returns the first credential
  * and does not read or advance health. Otherwise the rotation cursor moves
- * once, a cooldown-elapsed credential is taken as the single half-open probe,
+ * once, each cooldown-elapsed credential is taken once as a half-open probe,
  * and parked credentials are skipped unless every key is parked. A key forced
  * through because the whole pool is parked is an attempt, not a skip.
  */
@@ -556,8 +556,8 @@ function relayStream(
   let pending = "";
   let openBytes = 0;
   let inflight: Promise<ReadableStreamReadResult<Uint8Array>> | null = null;
-  let sawChunkAt = Date.now();
-  let keepaliveAt = sawChunkAt;
+  let readStartedAt = Date.now();
+  let keepaliveAt = readStartedAt;
   let terminalAt: number | null = null;
   let done = false;
   let committed = onBeforeContentRateLimit === undefined;
@@ -733,9 +733,10 @@ function relayStream(
       }
       let value: Uint8Array | null | "keepalive" | "duration";
       try {
+        if (inflight === null) readStartedAt = Date.now();
         value = await readWithIdle(reader, () => inflight, (next) => {
           inflight = next;
-        }, transport.streamIdleTimeoutMs, sawChunkAt, keepaliveAt, (at) => { keepaliveAt = at; }, controller, () => (
+        }, transport.streamIdleTimeoutMs, readStartedAt, keepaliveAt, (at) => { keepaliveAt = at; }, controller, () => (
           terminalAt === null ? null : terminalAt + transport.streamTerminalGraceMs
         ), durationAt, onTimeout, onTerminalRemain);
       } catch (error) {
@@ -802,8 +803,7 @@ function relayStream(
         failBound(controller, "stream exceeded the gateway's maximum stream size");
         return;
       }
-      sawChunkAt = Date.now();
-      keepaliveAt = sawChunkAt;
+      keepaliveAt = Date.now();
       if (!committed && onBeforeContentRateLimit) {
         held.push(value);
         heldBytes += value.length;
@@ -1067,7 +1067,7 @@ async function readWithIdle(
   current: () => Promise<ReadableStreamReadResult<Uint8Array>> | null,
   setCurrent: (next: Promise<ReadableStreamReadResult<Uint8Array>> | null) => void,
   idleMs: number,
-  sawChunkAt: number,
+  readStartedAt: number,
   keepaliveAt: number,
   onKeepalive: (at: number) => void,
   controller: ReadableStreamDefaultController<Uint8Array>,
@@ -1082,7 +1082,7 @@ async function readWithIdle(
     read.catch(() => undefined);
     setCurrent(read);
   }
-  const started = sawChunkAt;
+  const started = readStartedAt;
   let lastKeepalive = keepaliveAt;
   for (;;) {
     const now = Date.now();
