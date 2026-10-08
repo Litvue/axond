@@ -28,113 +28,7 @@ import { costMicrodollars } from "./pricing.ts";
 import type { Store } from "@axond/sdk";
 
 
-const KEY = "test-inbound-key";
-
-
-async function gateway(
-  metrics?: ReturnType<typeof createMetrics>,
-  telemetry?: { endpoint: string; instanceId?: string },
-  responseBody?: string,
-  onLog?: (record: {
-    msg: "request";
-    status?: string;
-    input_tokens?: string;
-    [key: string]: unknown;
-  }) => void,
-) {
-  const store = createMemoryStore();
-  await store.putNamespace({
-    id: "platform",
-    attrs: {},
-    blocklist: null,
-    allowPlatformFallback: false,
-    fromConfig: true,
-  });
-  await store.putNamespace({
-    id: "tenant",
-    attrs: {},
-    blocklist: null,
-    allowPlatformFallback: false,
-    fromConfig: true,
-  });
-  await store.putBudget("platform", "compat", 1_000_000_000_000n);
-  await store.putBudget("tenant", "compat", 1_000_000_000_000n);
-  const upstream = await listenUpstream(responseBody);
-  const app = createAxond({
-    store,
-    gatewayKey: KEY,
-    defaultNamespace: "platform",
-    configNamespaces: ["platform", "tenant"],
-    providers: [
-      { id: "fake-openai", kind: "openai", baseUrl: upstream.url },
-      { id: "fake-anthropic", kind: "anthropic", baseUrl: upstream.url },
-    ],
-    credentials: [
-      { namespace: "platform", provider: "fake-openai", secret: "upstream-openai", id: "openai" },
-      { namespace: "platform", provider: "fake-anthropic", secret: "upstream-anthropic", id: "anthropic" },
-    ],
-    prices: [
-      {
-        provider: "fake-openai",
-        model: "*",
-        inputMicrodollarsPerMillion: 2_500_000n,
-        outputMicrodollarsPerMillion: 10_000_000n,
-      },
-      {
-        provider: "fake-anthropic",
-        model: "*",
-        inputMicrodollarsPerMillion: 2_500_000n,
-        outputMicrodollarsPerMillion: 10_000_000n,
-      },
-    ],
-    rawPath: (c) => c.req.header("x-axond-raw-path") ?? new URL(c.req.url).pathname,
-    metrics,
-    telemetry,
-    onLog,
-  });
-  return { app, store, upstream };
-}
-
-
-async function listenUpstream(responseBody?: string): Promise<{
-  url: string;
-  requests: { path: string; authorization: string; body: string; traceparent: string }[];
-  close: () => void;
-}> {
-  const requests: { path: string; authorization: string; body: string; traceparent: string }[] = [];
-  const server = createServer(async (req, res) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) {
-      chunks.push(chunk as Buffer);
-    }
-    const body = Buffer.concat(chunks).toString("utf8");
-    requests.push({
-      path: req.url ?? "",
-      authorization: req.headers.authorization ?? req.headers["x-api-key"]?.toString() ?? "",
-      body,
-      traceparent: req.headers.traceparent?.toString() ?? "",
-    });
-    const payload = {
-      id: "chatcmpl-test",
-      choices: [{ message: { role: "assistant", content: "The capital of France is Paris." } }],
-      usage: { prompt_tokens: 12, completion_tokens: 7 },
-    };
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(responseBody ?? JSON.stringify(payload));
-  });
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("no port");
-  }
-  return {
-    url: `http://127.0.0.1:${address.port}`,
-    requests,
-    close: () => server.close(),
-  };
-}
-
+import { KEY, gateway, listenUpstream } from "./app-test-fixtures.ts";
 
 test("a host Hono app mounts the gateway and keeps its own route", async () => {
   const store = createMemoryStore();
@@ -276,8 +170,12 @@ test("a buffered chat completion rewrites the model and forwards the provider cr
   assert.equal(sent.path, "/chat/completions");
   assert.equal(sent.authorization, "Bearer upstream-openai");
   assert.equal(JSON.parse(sent.body).model, "gpt-test");
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  const summary = await store.summarizeUsage("platform", "compat");
+  const deadline = Date.now() + 2000;
+  let summary = await store.summarizeUsage("platform", "compat");
+  while (summary.length === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    summary = await store.summarizeUsage("platform", "compat");
+  }
   assert.equal(summary.length, 1);
   assert.equal(summary[0]!.count, 1);
   assert.equal(summary[0]!.cost_microdollars, 100);
@@ -1093,4 +991,14 @@ test("budget_amounts_match_serde_numbers", async () => {
   } finally {
     upstream.close();
   }
+});
+
+test("cumulative metric snapshots are bounded per recorder while traces remain per request", async () => {
+  const tasks: Promise<void>[] = []; const signals: string[] = []; const metrics = createMetrics();
+  const app = createAxond({ store: createMemoryStore(), gatewayKey: KEY, defaultNamespace: "platform", providers: [], metrics,
+    telemetry: { endpoint: "http://collector", fetch: async (url) => { signals.push(String(url)); return new Response(null, { status: 200 }); } },
+    onBackground: (task) => { tasks.push(task); } });
+  for (let i = 0; i < 3; i++) { assert.equal((await app.request("http://localhost/healthz")).status, 200); await Promise.all(tasks); }
+  assert.equal(signals.filter((url) => url.endsWith("/v1/traces")).length, 3);
+  assert.equal(signals.filter((url) => url.endsWith("/v1/metrics")).length, 1);
 });
