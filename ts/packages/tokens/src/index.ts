@@ -14,26 +14,31 @@ export interface TokenClaims {
 }
 
 /**
- * pre-auth verification of `axt1.` tokens, a static-key mint route, and a
+ * pre-auth verification of `axt1.` tokens, an opt-in administrative-key mint route, and a
  * post-auth revocation lookup. Tokens are HMAC-SHA256 over the JSON claims.
  */
-const claimsByRequest = new Map<string, TokenClaims>();
+const claimsByRequest = new WeakMap<object, TokenClaims>();
+let heldClaims = 0;
 
 /** How many verified tokens are still held after their request finished. */
 export function heldTokenClaims(): number {
-  return claimsByRequest.size;
+  return heldClaims;
 }
 
-export function tokensExtension(signingKey: string): AxondExtension[] {
+export function tokensExtension(signingKey: string, options: { mintKey?: string; maxLifetimeSeconds?: number } = {}): AxondExtension[] {
+  if (options.mintKey === signingKey) throw new Error("token mint key must differ from the signing key");
+  const maxLifetime = options.maxLifetimeSeconds ?? 3600;
+  if (!Number.isSafeInteger(maxLifetime) || maxLifetime <= 0) throw new Error("invalid token maximum lifetime");
   const routes = new Hono<AxondEnv>();
   routes.post("/api/v1/tokens", async (c) => {
     const authorization = c.req.header("authorization") ?? "";
     const presented = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : "";
-    if (presented.length === 0 || !timingSafe(presented, signingKey)) {
+    if (!options.mintKey || presented.length === 0 || !timingSafe(presented, options.mintKey)) {
       return c.json({ error: { type: "unauthorized", message: "unauthorized" } }, 401);
     }
-    const body = await c.req.json<Partial<TokenClaims>>();
-    if (!body.sub || !body.namespace || !body.exp) {
+    let body: Partial<TokenClaims>;
+    try { body = await c.req.json<Partial<TokenClaims>>(); } catch { return c.json({ error: { type: "bad_request", message: "invalid token claims" } }, 400); }
+    if (!body || !body.sub || !body.namespace || !body.exp) {
       return c.json({ error: { type: "bad_request", message: "missing token claims" } }, 400);
     }
     const claims: TokenClaims = {
@@ -46,6 +51,9 @@ export function tokensExtension(signingKey: string): AxondExtension[] {
       epoch: body.epoch ?? 1,
       jti: body.jti ?? crypto.randomUUID(),
     };
+    if (!validClaims(claims) || (claims.exp * 1000 <= Date.now() || claims.exp > Math.floor(Date.now() / 1000) + maxLifetime)) {
+      return c.json({ error: { type: "bad_request", message: "invalid token claims" } }, 400);
+    }
     const token = await signToken(signingKey, claims);
     return c.json({ token, claims }, 201);
   });
@@ -81,7 +89,11 @@ export function tokensExtension(signingKey: string): AxondExtension[] {
         return c.json({ error: { type: "token_expired", message: "token expired" } }, 401);
       }
       const axond = c.get("axond");
-      claimsByRequest.set(axond.requestId, claims);
+      if (!/^\/ns\/[^/]+\/v1\/(?:chat\/completions|messages|embeddings|responses|models|credentials)$/.test(c.req.path)) {
+        return c.json({ error: { type: "token_scope_insufficient", message: "tokens cannot authorize management APIs" } }, 403);
+      }
+      claimsByRequest.set(axond, claims);
+      heldClaims += 1;
       axond.authenticated = true;
       axond.subject = claims.sub;
       axond.aliasGlobs = claims.globs;
@@ -91,7 +103,8 @@ export function tokensExtension(signingKey: string): AxondExtension[] {
       try {
         await next();
       } finally {
-        claimsByRequest.delete(axond.requestId);
+        claimsByRequest.delete(axond);
+        heldClaims -= 1;
       }
     },
   };
@@ -102,7 +115,7 @@ export function tokensExtension(signingKey: string): AxondExtension[] {
     trusted: true,
     async middleware(c, next) {
       const axond = c.get("axond");
-      const claims = claimsByRequest.get(axond.requestId);
+      const claims = claimsByRequest.get(axond);
       if (!claims) {
         await next();
         return;
@@ -158,7 +171,8 @@ export async function verifyToken(key: string, token: string): Promise<TokenClai
     return null;
   }
   try {
-    return JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[1]))) as TokenClaims;
+    const claims: unknown = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[1])));
+    return validClaims(claims) ? claims : null;
   } catch {
     return null;
   }
@@ -203,4 +217,15 @@ function timingSafe(left: string, right: string): boolean {
     diff |= (a[index] ?? 0) ^ (b[index] ?? 0);
   }
   return diff === 0;
+}
+
+function validClaims(value: unknown): value is TokenClaims {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const c = value as Record<string, unknown>;
+  const strings = (x: unknown): x is string[] => Array.isArray(x) && x.every((s) => typeof s === "string" && s.length > 0);
+  return typeof c.sub === "string" && c.sub.length > 0 && typeof c.namespace === "string" && c.namespace.length > 0 &&
+    strings(c.scope) && c.scope.every((s) => ["chat", "messages", "embeddings", "responses", "models", "credentials"].includes(s)) &&
+    strings(c.globs) && (c.cap === null || typeof c.cap === "string" && /^\d+$/.test(c.cap) && BigInt(c.cap) <= 18446744073709551615n) &&
+    Number.isSafeInteger(c.exp) && (c.exp as number) > 0 && Number.isSafeInteger(c.epoch) && (c.epoch as number) >= 0 &&
+    typeof c.jti === "string" && c.jti.length > 0;
 }

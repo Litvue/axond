@@ -81,3 +81,12 @@ test("a rule redacts across an SSE split and a miss keeps the upstream bytes", a
   server.closeAllConnections();
   server.close();
 });
+test("redaction escapes replacements and retains the prepared model and field names", async () => {
+  const { ByteRequestBody } = await import("../../gateway/src/body.ts");
+  const body = new ByteRequestBody(new Request("http://localhost", { method: "POST", body: JSON.stringify({ model: "p/m", secret: "secret" }) }));
+  await body.raw(); body.setModel("m");
+  const extension = redactExtension([{ pattern: "secret", replacement: '"hidden"\n' }]);
+  const context = { get: () => ({ route: "chat", body }), res: new Response(null) };
+  await extension.middleware!(context as any, async () => {});
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(body.outgoing())), { model: "m", secret: '"hidden"\n' });
+});

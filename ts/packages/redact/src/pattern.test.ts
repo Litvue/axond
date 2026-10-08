@@ -15,3 +15,9 @@ test("a literal is replaced by the caller", () => {
   const match = compilePattern("sk-test");
   assert.deepEqual(match("key sk-test end"), [{ start: 4, end: 11 }]);
 });
+
+test("accepted ambiguous quantifiers remain bounded on a repetitive miss", () => {
+  assert.deepEqual(compilePattern("a+a+b")("a".repeat(10000)), []);
+  assert.throws(() => compilePattern("(ab)+"), /grouping/);
+  assert.throws(() => compilePattern("a{100}"), /quantifier/);
+});

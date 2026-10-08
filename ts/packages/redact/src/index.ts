@@ -29,11 +29,8 @@ export function redactExtension(rules: readonly RedactRule[]): AxondExtension {
       const axond = c.get("axond");
       if (axond.route === "chat" || axond.route === "messages" || axond.route === "embeddings" || axond.route === "responses") {
         const current = await axond.body.json<Record<string, unknown>>();
-        const encoded = JSON.stringify(current);
-        const redacted = apply(encoded, compiled);
-        if (redacted !== encoded) {
-          axond.body.setJson(JSON.parse(redacted) as unknown);
-        }
+        const redacted = redactValue(current, compiled);
+        if (JSON.stringify(redacted) !== JSON.stringify(current)) axond.body.setJson(redacted);
       }
       await next();
       if (!c.res.body) {
@@ -44,7 +41,13 @@ export function redactExtension(rules: readonly RedactRule[]): AxondExtension {
         return;
       }
       const stream = transformSseEvents(c.res.body, (event) => {
-        const data = apply(event.data, compiled);
+        let data: string;
+        try {
+          data = JSON.stringify(redactValue(JSON.parse(event.data), compiled));
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+          data = apply(event.data, compiled);
+        }
         if (data === event.data) {
           return event;
         }
@@ -72,4 +75,13 @@ function apply(text: string, rules: { replace: (input: string) => Array<{ start:
     out = next;
   }
   return out;
+}
+
+function redactValue(value: unknown, rules: Parameters<typeof apply>[1]): unknown {
+  if (typeof value === "string") return apply(value, rules);
+  if (Array.isArray(value)) return value.map((item) => redactValue(item, rules));
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactValue(item, rules)]));
+  }
+  return value;
 }

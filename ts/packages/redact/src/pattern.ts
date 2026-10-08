@@ -6,7 +6,6 @@ interface Atom {
   max: number;
 }
 
-const BUDGET_FACTOR = 8;
 
 /** Compile an operator pattern. Nested quantifiers and empty matches are refused. */
 export function compilePattern(source: string): (input: string) => Array<{ start: number; end: number }> {
@@ -54,10 +53,7 @@ function parse(source: string): Atom[] {
   let index = 0;
   while (index < source.length) {
     const char = source[index]!;
-    if (char === "(" || char === ")") {
-      index += 1;
-      continue;
-    }
+    if ("()|^$".includes(char)) throw new Error("pattern rejected: grouping, alternation, and anchors are unsupported");
     let atom: Atom;
     if (char === "\\") {
       atom = { kind: "lit", value: source[index + 1] ?? "", min: 1, max: 1 };
@@ -112,7 +108,7 @@ function readQuantifier(source: string, index: number): { min: number; max: numb
   const [minText, maxText] = body.split(",");
   const min = Number(minText);
   const max = maxText === undefined ? min : maxText.length === 0 ? 64 : Number(maxText);
-  if (!Number.isInteger(min) || !Number.isInteger(max) || min < 0 || max < min) {
+  if (!Number.isInteger(min) || !Number.isInteger(max) || min < 0 || max < min || max > 64) {
     throw new Error("pattern rejected: bad quantifier");
   }
   return { min, max, end: end + 1 };
@@ -123,53 +119,29 @@ function matchesEmpty(atoms: Atom[]): boolean {
 }
 
 function matchAll(atoms: Atom[], input: string): Array<{ start: number; end: number }> {
+  // Each (atom, input offset) is evaluated once. Quantifiers have a fixed 64
+  // character bound, so accepted patterns cannot trigger exponential retries.
+  let next = new Int32Array(input.length + 1);
+  for (let i = 0; i <= input.length; i++) next[i] = i;
+  for (let atomAt = atoms.length - 1; atomAt >= 0; atomAt--) {
+    const atom = atoms[atomAt]!;
+    const current = new Int32Array(input.length + 1).fill(-1);
+    for (let offset = input.length; offset >= 0; offset--) {
+      let maximum = 0;
+      while (maximum < atom.max && offset + maximum < input.length && accepts(atom, input[offset + maximum]!)) maximum++;
+      for (let count = maximum; count >= atom.min; count--) {
+        if (next[offset + count]! >= 0) { current[offset] = next[offset + count]!; break; }
+      }
+    }
+    next = current;
+  }
   const found: Array<{ start: number; end: number }> = [];
-  let index = 0;
-  const budget = input.length * Math.max(atoms.length, 1) * BUDGET_FACTOR + 32;
-  let steps = 0;
-  const tick = () => {
-    steps += 1;
-    if (steps > budget) {
-      throw new Error("pattern exceeded its linear step budget");
-    }
-  };
-  while (index <= input.length) {
-    const hit = matchAt(atoms, input, index, 0, tick);
-    if (hit !== null && hit > index) {
-      found.push({ start: index, end: hit });
-      index = hit;
-      continue;
-    }
-    index += 1;
+  for (let offset = 0; offset < input.length;) {
+    const end = next[offset]!;
+    if (end > offset) { found.push({ start: offset, end }); offset = end; }
+    else offset++;
   }
   return found;
-}
-
-function matchAt(atoms: Atom[], input: string, inputAt: number, atomAt: number, tick: () => void): number | null {
-  tick();
-  if (atomAt === atoms.length) {
-    return inputAt;
-  }
-  const atom = atoms[atomAt]!;
-  for (let count = atom.max; count >= atom.min; count -= 1) {
-    let cursor = inputAt;
-    let ok = true;
-    for (let taken = 0; taken < count; taken += 1) {
-      if (cursor >= input.length || !accepts(atom, input[cursor]!)) {
-        ok = false;
-        break;
-      }
-      cursor += 1;
-    }
-    if (!ok) {
-      continue;
-    }
-    const rest = matchAt(atoms, input, cursor, atomAt + 1, tick);
-    if (rest !== null) {
-      return rest;
-    }
-  }
-  return null;
 }
 
 function accepts(atom: Atom, char: string): boolean {

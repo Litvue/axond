@@ -8,7 +8,8 @@ export interface RateLimitOptions {
   mode?: "isolate" | "store";
 }
 
-const counters = new Map<string, { count: number; resetAt: number }>();
+type Counters = Map<string, { count: number; resetAt: number }>;
+let resetGeneration = 0;
 
 /**
  * pre-dispatch limiter. Isolate mode is per process and can over-admit across
@@ -16,6 +17,11 @@ const counters = new Map<string, { count: number; resetAt: number }>();
  * connections cannot both admit the last request.
  */
 export function rateLimitExtension(options: RateLimitOptions): AxondExtension {
+  if (!Number.isSafeInteger(options.limit) || options.limit < 0 || !Number.isSafeInteger(options.windowMs) || options.windowMs <= 0) {
+    throw new Error("rate limit requires a nonnegative integer limit and positive integer windowMs");
+  }
+  const counters: Counters = new Map();
+  let generation = resetGeneration;
   const mode = options.mode ?? "isolate";
   return {
     name: "ratelimit",
@@ -34,10 +40,11 @@ export function rateLimitExtension(options: RateLimitOptions): AxondExtension {
           ]
         : [],
     async middleware(c, next) {
+      if (generation !== resetGeneration) { counters.clear(); generation = resetGeneration; }
       const axond = c.get("axond");
       const namespace = axond.namespace?.id ?? "anonymous";
       const allowed =
-        mode === "store" ? await storeAllow(axond.store, namespace, options) : isolateAllow(namespace, options);
+        options.limit > 0 && (mode === "store" ? await storeAllow(axond.store, namespace, options) : isolateAllow(counters, namespace, options));
       if (!allowed) {
         return c.json({ error: { type: "rate_limited", message: "rate limit exceeded" } }, 429);
       }
@@ -46,7 +53,7 @@ export function rateLimitExtension(options: RateLimitOptions): AxondExtension {
   };
 }
 
-function isolateAllow(namespace: string, options: RateLimitOptions): boolean {
+function isolateAllow(counters: Counters, namespace: string, options: RateLimitOptions): boolean {
   const now = Date.now();
   const slot = counters.get(namespace);
   if (!slot || slot.resetAt <= now) {
@@ -66,6 +73,7 @@ async function storeAllow(
   options: RateLimitOptions,
 ): Promise<boolean> {
   const bucket = String(Math.floor(Date.now() / options.windowMs));
+  await store.query("DELETE FROM axond_ext_ratelimit_window WHERE namespace = ? AND CAST(bucket AS BIGINT) < CAST(? AS BIGINT)", [namespace, bucket]);
   const taken = await store.query(
     `INSERT INTO axond_ext_ratelimit_window (namespace, bucket, count)
      VALUES (?, ?, 1)
@@ -80,5 +88,5 @@ async function storeAllow(
 
 /** Test helper. Isolate counters survive the process, so tests reset them. */
 export function resetIsolateCounters(): void {
-  counters.clear();
+  resetGeneration += 1;
 }

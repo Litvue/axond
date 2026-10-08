@@ -205,3 +205,40 @@ test("a minted token revokes on postgres and drops its claims", { skip: !process
     await cleanup.end();
   }
 });
+
+
+test("signed malformed claims are rejected and valid inference grants cannot administer", async () => {
+  const { verifyToken } = await import("./index.ts");
+  for (const invalid of [{}, { exp: "tomorrow" }, { cap: "NaN" }]) {
+    const token = await signToken(KEY, invalid as any);
+    assert.equal(await verifyToken(KEY, token), null);
+  }
+  const { createMemoryStore } = await import("../../gateway/src/memory-store.ts");
+  const store = createMemoryStore();
+  const app = createAxond({ store, gatewayKey: "admin-key", defaultNamespace: "platform", providers: [], extensions: tokensExtension(KEY) });
+  const token = await signToken(KEY, { sub: "user", namespace: "platform", scope: ["models"], globs: ["*"], cap: null, exp: Math.floor(Date.now()/1000)+60, epoch: 1, jti: "review" });
+  const response = await app.request("http://localhost/api/v1/namespaces", { headers: { authorization: `Bearer ${token}` } });
+  assert.equal(response.status, 403);
+  assert.equal(heldTokenClaims(), 0);
+  const mint = await app.request("http://localhost/api/v1/tokens", { method: "POST", headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" }, body: "{}" });
+  assert.equal(mint.status, 401);
+  assert.throws(() => tokensExtension(KEY, { mintKey: KEY }), /must differ/);
+});
+
+test("concurrent requests with one client request ID keep distinct token authority", async () => {
+  const { createMemoryStore } = await import("../../gateway/src/memory-store.ts");
+  const store = createMemoryStore(); store.query = async () => ({ rows: [] });
+  for (const id of ["one", "two"]) await store.putNamespace({ id, attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: false });
+  const [verify, revoke] = tokensExtension(KEY);
+  let entered = 0; let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const app = createAxond({ store, gatewayKey: "admin", defaultNamespace: "one", providers: [], extensions: [verify!, {
+    name: "review-barrier", apiVersion: 1, stage: "pre-auth", trusted: true,
+    async middleware(_c, next) { if (++entered === 2) release(); await barrier; await next(); },
+  }, revoke!] });
+  const requests = await Promise.all(["one", "two"].map(async (namespace) => {
+    const token = await signToken(KEY, { sub: namespace, namespace, scope: ["models"], globs: ["*"], cap: null, exp: Math.floor(Date.now()/1000)+60, epoch: 1, jti: namespace });
+    return app.request(`http://localhost/ns/${namespace}/v1/models`, { headers: { authorization: `Bearer ${token}`, "x-request-id": "shared" } });
+  }));
+  assert.deepEqual(requests.map((r) => r.status), [200, 200]); assert.equal(heldTokenClaims(), 0);
+});

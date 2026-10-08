@@ -138,3 +138,15 @@ test("store mode saturates one namespace and leaves another its capacity", async
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("independent limiter instances and zero allowances remain independent", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({ id: "platform", attrs: {}, blocklist: null, allowPlatformFallback: false, fromConfig: false });
+  const build = (limit: number) => createAxond({ store, gatewayKey: "k", defaultNamespace: "platform", providers: [], extensions: [rateLimitExtension({ limit, windowMs: 60000 })] });
+  const get = (app: ReturnType<typeof build>) => app.request("http://localhost/ns/platform/v1/models", { headers: { authorization: "Bearer k" } });
+  const one = build(1); const another = build(1);
+  assert.equal((await get(one)).status, 200); assert.equal((await get(another)).status, 200);
+  assert.equal((await get(build(0))).status, 429);
+  assert.throws(() => rateLimitExtension({ limit: -1, windowMs: 10 }));
+  assert.throws(() => rateLimitExtension({ limit: 1, windowMs: 0 }));
+});
