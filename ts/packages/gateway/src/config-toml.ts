@@ -1248,7 +1248,9 @@ function scanTomlString(source: string, index: number, allowMultiline = true): T
       continue;
     }
     if (source.startsWith(quote, cursor)) {
-      return { end: cursor + quote.length, hit: null, bail: false };
+      let end = cursor + quote.length;
+      if (multiline) { while (end < cursor + 5 && source[end] === quote[0]) end++; }
+      return { end, hit: null, bail: false };
     }
     if (multiline && (char === "\n" || (char === "\r" && source[cursor + 1] === "\n"))) {
       cursor += char === "\r" ? 2 : 1;

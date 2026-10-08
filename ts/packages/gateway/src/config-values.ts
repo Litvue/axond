@@ -294,7 +294,7 @@ function assignEnvLeaf(
  */
 export function applyEnvOverrides(parsed: Record<string, unknown>, secrets: SecretReader): void {
   for (const [name, value] of secrets.entries()) {
-    if (value === undefined || !name.toLowerCase().startsWith("axond_")) {
+    if (value === undefined || !name.startsWith("AXOND_")) {
       continue;
     }
     const parts = name.slice(6).toLowerCase().split("__").filter((part) => part.length > 0);
@@ -1050,14 +1050,15 @@ export function configLoad(message: string): GatewayFailure {
 
 export function topLevelAssignment(toml: string, key: string): string | null {
   let found: string | null = null;
-  for (const line of toml.split(/\r?\n/)) {
-    if (/^\s*\[/.test(line)) {
-      break;
-    }
+  let offset = 0;
+  for (const line of toml.split("\n")) {
+    if (/^\s*\[/.test(line)) break;
     const assigned = assignmentValue(line, key);
     if (assigned !== null) {
-      found = assigned;
+      const suffix = toml.slice(offset + line.indexOf("=") + 1).trimStart();
+      found = suffix.slice(0, skipTomlValue(suffix, 0)).trim();
     }
+    offset += line.length + 1;
   }
   return found;
 }
@@ -1076,6 +1077,7 @@ export function arrayElements(rhs: string): string[] {
     if (index >= text.length || text[index] === "]") {
       break;
     }
+    if (text[index] === "#") { while (index < text.length && text[index] !== "\n") index++; continue; }
     const start = index;
     index = skipTomlValue(text, index);
     elements.push(text.slice(start, index).trim());
@@ -1086,15 +1088,17 @@ export function arrayElements(rhs: string): string[] {
 function skipTomlValue(text: string, index: number): number {
   const opener = text[index];
   if (opener === '"' || opener === "'") {
-    const quote = opener;
-    index += 1;
+    const quote = text.startsWith(opener.repeat(3), index) ? opener.repeat(3) : opener;
+    index += quote.length;
     while (index < text.length) {
       if (text[index] === "\\") {
         index += 2;
         continue;
       }
-      if (text[index] === quote) {
-        return index + 1;
+      if (text.startsWith(quote, index)) {
+        let end = index + quote.length;
+        if (quote.length === 3) while (end < index + 5 && text[end] === opener) end++;
+        return end;
       }
       index += 1;
     }
@@ -1104,6 +1108,7 @@ function skipTomlValue(text: string, index: number): number {
     let depth = 0;
     while (index < text.length) {
       const char = text[index];
+      if (char === "#") { while (index < text.length && text[index] !== "\n") index++; continue; }
       if (char === '"' || char === "'") {
         index = skipTomlValue(text, index);
         continue;
@@ -1122,7 +1127,7 @@ function skipTomlValue(text: string, index: number): number {
     }
     return index;
   }
-  while (index < text.length && text[index] !== "," && text[index] !== "]" && text[index] !== "}") {
+  while (index < text.length && text[index] !== "," && text[index] !== "]" && text[index] !== "}" && text[index] !== "\n" && text[index] !== "\r" && text[index] !== "#") {
     index += 1;
   }
   return index;
