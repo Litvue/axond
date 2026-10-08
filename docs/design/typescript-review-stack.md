@@ -19,27 +19,27 @@ changed file to a slice and records its base branch and review focus.
 
 | Order | Review slice | Changed lines | PR |
 | --- | --- | ---: | --- |
-| 1 | define TypeScript SDK and review-stage CI | 3630 | [#534](https://github.com/Litvue/axond/pull/534) |
-| 2 | add TypeScript request and JSON parsers | 2048 | [#535](https://github.com/Litvue/axond/pull/535) |
-| 3 | add namespace and budget state primitives | 1754 | [#536](https://github.com/Litvue/axond/pull/536) |
-| 4 | add provider wire accounting and telemetry | 2429 | [#537](https://github.com/Litvue/axond/pull/537) |
-| 5 | add TOML scanning and Figment value primitives | 2749 | [#538](https://github.com/Litvue/axond/pull/538) |
-| 6 | add configuration shape and extraction validation | 1486 | [#539](https://github.com/Litvue/axond/pull/539) |
-| 7 | load and validate TypeScript gateway configuration | 3201 | [#540](https://github.com/Litvue/axond/pull/540) |
-| 8 | cover bind and environment configuration compatibility | 1430 | [#541](https://github.com/Litvue/axond/pull/541) |
-| 9 | add provider dispatch and credential failover | 1540 | [#542](https://github.com/Litvue/axond/pull/542) |
-| 10 | mount the namespaced TypeScript Hono gateway | 3131 | [#543](https://github.com/Litvue/axond/pull/543) |
-| 11 | qualify gateway routing and budget management | 3349 | [#544](https://github.com/Litvue/axond/pull/544) |
-| 12 | qualify extension ordering and streaming deadlines | 2304 | [#545](https://github.com/Litvue/axond/pull/545) |
-| 13 | qualify terminal streams rotation and admission | 2309 | [#546](https://github.com/Litvue/axond/pull/546) |
-| 14 | qualify settlement faults and provider secret omission | 1965 | [#547](https://github.com/Litvue/axond/pull/547) |
-| 15 | add Postgres persistence and durable-store qualification | 3391 | [#548](https://github.com/Litvue/axond/pull/548) |
-| 16 | add CLI discovery usage delivery and shutdown services | 2482 | [#549](https://github.com/Litvue/axond/pull/549) |
-| 17 | host the TypeScript gateway and operator extensions | 2768 | [#550](https://github.com/Litvue/axond/pull/550) |
+| 1 | define TypeScript SDK and review-stage CI | 3763 | [#534](https://github.com/Litvue/axond/pull/534) |
+| 2 | add TypeScript request and JSON parsers | 2115 | [#535](https://github.com/Litvue/axond/pull/535) |
+| 3 | add namespace and budget state primitives | 1830 | [#536](https://github.com/Litvue/axond/pull/536) |
+| 4 | add provider wire accounting and telemetry | 2544 | [#537](https://github.com/Litvue/axond/pull/537) |
+| 5 | add TOML scanning and Figment value primitives | 2756 | [#538](https://github.com/Litvue/axond/pull/538) |
+| 6 | add configuration shape and extraction validation | 1487 | [#539](https://github.com/Litvue/axond/pull/539) |
+| 7 | load and validate TypeScript gateway configuration | 3207 | [#540](https://github.com/Litvue/axond/pull/540) |
+| 8 | cover bind and environment configuration compatibility | 1442 | [#541](https://github.com/Litvue/axond/pull/541) |
+| 9 | add provider dispatch and credential failover | 1560 | [#542](https://github.com/Litvue/axond/pull/542) |
+| 10 | mount the namespaced TypeScript Hono gateway | 3188 | [#543](https://github.com/Litvue/axond/pull/543) |
+| 11 | qualify gateway routing and budget management | 3045 | [#544](https://github.com/Litvue/axond/pull/544) |
+| 12 | qualify extension ordering and streaming deadlines | 2201 | [#545](https://github.com/Litvue/axond/pull/545) |
+| 13 | qualify terminal streams rotation and admission | 1980 | [#546](https://github.com/Litvue/axond/pull/546) |
+| 14 | qualify settlement faults and provider secret omission | 1633 | [#547](https://github.com/Litvue/axond/pull/547) |
+| 15 | add Postgres persistence and durable-store qualification | 3455 | [#548](https://github.com/Litvue/axond/pull/548) |
+| 16 | add CLI discovery usage delivery and shutdown services | 2542 | [#549](https://github.com/Litvue/axond/pull/549) |
+| 17 | host the TypeScript gateway and operator extensions | 2759 | [#550](https://github.com/Litvue/axond/pull/550) |
 | 18 | qualify CLI configuration diagnostics and refusal order | 1670 | [#551](https://github.com/Litvue/axond/pull/551) |
-| 19 | add rate limit redaction and token extensions | 1020 | [#552](https://github.com/Litvue/axond/pull/552) |
-| 20 | host the TypeScript gateway on Workers Hyperdrive | 1848 | [#553](https://github.com/Litvue/axond/pull/553) |
-| 21 | qualify TypeScript artifacts and regression gates | 2774 | [#554](https://github.com/Litvue/axond/pull/554) |
+| 19 | add rate limit redaction and token extensions | 1101 | [#552](https://github.com/Litvue/axond/pull/552) |
+| 20 | host the TypeScript gateway on Workers Hyperdrive | 1845 | [#553](https://github.com/Litvue/axond/pull/553) |
+| 21 | qualify TypeScript artifacts and regression gates | 3074 | [#554](https://github.com/Litvue/axond/pull/554) |
 
 ## How to review a slice
 
@@ -51,7 +51,7 @@ changed file to a slice and records its base branch and review focus.
 3. Inspect the relevant tests for plausible failure cases. Gateway-level tests
    land once the factory exists; executable tests land once the CLI exists.
    The configuration helper slices are exercised by the loader/property suites
-   in slices 7–8. Their declarations are unchanged from the source conversion.
+   in slices 7–8. Their original split retained the source declarations; the review hardening now adds explicit parser and configuration fixes.
 4. Record remaining concerns in the appropriate PR. Authentication/extension
    authority, durable budgets/migrations, settlement and release workflows need
    a human reviewer in addition to automated review.
@@ -74,12 +74,12 @@ exports, declaration placement and surrounding whitespace changed.
 The large app, behavior, configuration and CLI config-file test files were split
 at complete top-level test declarations. A syntax-tree comparison confirmed all
 223 test bodies, with their order within each original suite, remained intact.
-Shared fixtures were copied without changing their bodies. One store test that
+Shared fixtures were initially copied without changing their bodies. The review hardening consolidates them and adds cleanup after failed assertions. One store test that
 reads the CLI host source moved unchanged to `postgres-host.test.ts`. An extra
 blank line at the end of `app.ts` was removed. No runtime behavior was added by
 this restructuring; the earlier regression fixes remain included.
 
-Local qualification after the split:
+Initial qualification after the original split (2026-10-07):
 
 - Node 22.14 with Postgres 16: 376 passed, no skips.
 - Bun 1.4.2 with Postgres 16: 375 passed, one declared connect-timeout skip.
@@ -93,11 +93,44 @@ Local qualification after the split:
   are checked at the stage that introduces them; database tests use an isolated
   Postgres fixture. The foundation and complete tree pass docs/workflow policy.
 
-The compiled review binary is 82,339,296 bytes, SHA-256
+The original compiled review binary is 82,339,296 bytes, SHA-256
 `6874c7d1fa7cb8f7ab376cf9e8a1405fde358474f4d6c6f9f9f810128fa65371`.
 
 Full source/runtime evidence is also recorded in the
 [regression evidence](typescript-regression-evidence-2026-10-07.md).
+
+## Review hardening (2026-10-08)
+
+The [finding dispositions](typescript-review-findings.md) record all 85 original
+review findings: 79 addressed by code, tests, fixtures or gates, and six staging
+or contract clarifications. Fixes land in their owning slices and flow through
+all descendants. The static import check passes at all 21 stack heads. Shared
+HTTP test fixtures are now introduced at their first caller and close servers
+after assertion failures. The required CI Success job includes TypeScript;
+merge queues also run the TypeScript workflow.
+
+Qualification of the complete corrected source:
+
+- Node 22.14 with Postgres 16: 402 passed, no skips.
+- Bun 1.4.2 with Postgres 16: 401 passed; its existing native connect-timeout
+  test is explicitly skipped because Bun's connector cannot simulate it.
+- workerd/Hyperdrive integration: nine passed, no skips.
+- Python vendor SDK: 13 passed; Node vendor SDK: 18 passed.
+- Rust differential replay: all fixture responses, seven usage rows, durable
+  budgets/cadence and restart recovery matched the Rust oracle.
+- Compiled binary: health, extension loading/version refusal, package bundling
+  and SQLite restart smoke passed. cosign 2.5.2 signed and verified with an
+  ephemeral key; private signing material was deleted.
+- Web imports, alert catalogue, documentation samples, OpenAPI and workflow
+  policies passed. npm audit: zero vulnerabilities; 43 licensed production
+  packages.
+
+The corrected binary is 82,351,584 bytes, SHA-256
+`40dabd9fceae76f9f19bc5c9f5fac133cc9a3663c7351faccdab4319971f9815`.
+Local qualification does not replace CI at the pushed heads or maintainer
+approval. ADR 0067 records the authority and schema upgrade impact. Rust still
+owns the release binary/image; live deployment and release-tag OIDC evidence
+remain part of a separately authorized cutover.
 
 ## Merge and integration review
 

@@ -37,9 +37,13 @@
         ".github/workflows/typescript.yml",
         "docs/adr/0066-typescript-hono-extension-contract.md",
         "docs/design/typescript-parity.md",
-        "docs/design/typescript-regression-gates.md"
+        "docs/design/typescript-regression-gates.md",
+        ".github/workflows/ci.yml",
+        "ops/ci-success.py",
+        "docs/adr/0067-typescript-review-hardening.md"
       ],
-      "pull_request": 534
+      "pull_request": 534,
+      "changed_lines": 3763
     },
     {
       "order": 2,
@@ -54,9 +58,11 @@
         "ts/packages/gateway/src/content-type.ts",
         "ts/packages/gateway/src/content-type.test.ts",
         "ts/packages/gateway/src/request-id.ts",
-        "ts/packages/gateway/src/request-id.test.ts"
+        "ts/packages/gateway/src/request-id.test.ts",
+        "ts/packages/gateway/src/request-review-regressions.test.ts"
       ],
-      "pull_request": 535
+      "pull_request": 535,
+      "changed_lines": 2115
     },
     {
       "order": 3,
@@ -71,9 +77,11 @@
         "ts/packages/gateway/src/memory-store.ts",
         "ts/packages/gateway/src/scoped-store.ts",
         "ts/packages/gateway/src/store-metrics.ts",
-        "ts/packages/cli/src/sqlite-store.ts"
+        "ts/packages/cli/src/sqlite-store.ts",
+        "ts/packages/gateway/src/state-review-regressions.test.ts"
       ],
-      "pull_request": 536
+      "pull_request": 536,
+      "changed_lines": 1830
     },
     {
       "order": 4,
@@ -90,9 +98,11 @@
         "ts/packages/gateway/src/otel.test.ts",
         "ts/packages/gateway/src/metrics.ts",
         "ts/packages/gateway/src/pricing.ts",
-        "ts/packages/gateway/src/admission.ts"
+        "ts/packages/gateway/src/admission.ts",
+        "ts/packages/gateway/src/wire-review-regressions.test.ts"
       ],
-      "pull_request": 537
+      "pull_request": 537,
+      "changed_lines": 2544
     },
     {
       "order": 5,
@@ -104,7 +114,8 @@
         "ts/packages/gateway/src/config-toml.ts",
         "ts/packages/gateway/src/config-values.ts"
       ],
-      "pull_request": 538
+      "pull_request": 538,
+      "changed_lines": 2756
     },
     {
       "order": 6,
@@ -115,7 +126,8 @@
       "files": [
         "ts/packages/gateway/src/config-shapes.ts"
       ],
-      "pull_request": 539
+      "pull_request": 539,
+      "changed_lines": 1487
     },
     {
       "order": 7,
@@ -129,7 +141,8 @@
         "ts/packages/gateway/src/config-syntax-and-catalog.test.ts",
         "ts/packages/gateway/src/parsers.property.test.ts"
       ],
-      "pull_request": 540
+      "pull_request": 540,
+      "changed_lines": 3207
     },
     {
       "order": 8,
@@ -141,7 +154,8 @@
         "ts/packages/gateway/src/config-bind-and-env.test.ts",
         "ts/packages/gateway/src/config-env-sequences.test.ts"
       ],
-      "pull_request": 541
+      "pull_request": 541,
+      "changed_lines": 1442
     },
     {
       "order": 9,
@@ -152,9 +166,11 @@
       "files": [
         "ts/packages/gateway/src/dispatch.ts",
         "ts/packages/gateway/src/native-messages.test.ts",
-        "ts/packages/gateway/src/responses-sequence.test.ts"
+        "ts/packages/gateway/src/responses-sequence.test.ts",
+        "ts/packages/gateway/src/dispatch-review-regressions.test.ts"
       ],
-      "pull_request": 542
+      "pull_request": 542,
+      "changed_lines": 1560
     },
     {
       "order": 10,
@@ -170,9 +186,11 @@
         "ts/packages/gateway/src/namespace.test.ts",
         "ts/packages/gateway/src/query.test.ts",
         "ts/packages/gateway/src/background.test.ts",
-        "ts/packages/gateway/src/streaming.test.ts"
+        "ts/packages/gateway/src/streaming.test.ts",
+        "ts/packages/gateway/src/app-test-fixtures.ts"
       ],
-      "pull_request": 543
+      "pull_request": 543,
+      "changed_lines": 3188
     },
     {
       "order": 11,
@@ -185,7 +203,8 @@
         "ts/packages/gateway/src/app-budgets-and-accounting.test.ts",
         "ts/packages/gateway/src/app-inference-limits.test.ts"
       ],
-      "pull_request": 544
+      "pull_request": 544,
+      "changed_lines": 3045
     },
     {
       "order": 12,
@@ -195,9 +214,11 @@
       "focus": "Extension authority/version refusal, streamed-byte and duration ceilings, TTFT, credential parking and failover deadlines.",
       "files": [
         "ts/packages/gateway/src/behavior-extensions-and-stream-limits.test.ts",
-        "ts/packages/gateway/src/behavior-timing-and-credentials.test.ts"
+        "ts/packages/gateway/src/behavior-timing-and-credentials.test.ts",
+        "ts/packages/gateway/src/behavior-test-fixtures.ts"
       ],
-      "pull_request": 545
+      "pull_request": 545,
+      "changed_lines": 2201
     },
     {
       "order": 13,
@@ -209,7 +230,8 @@
         "ts/packages/gateway/src/behavior-stream-terminals.test.ts",
         "ts/packages/gateway/src/behavior-rotation-and-admission.test.ts"
       ],
-      "pull_request": 546
+      "pull_request": 546,
+      "changed_lines": 1980
     },
     {
       "order": 14,
@@ -221,7 +243,8 @@
         "ts/packages/gateway/src/behavior-settlement-and-redaction.test.ts",
         "ts/packages/gateway/src/behavior-provider-wire.test.ts"
       ],
-      "pull_request": 547
+      "pull_request": 547,
+      "changed_lines": 1633
     },
     {
       "order": 15,
@@ -235,7 +258,8 @@
         "ts/packages/cli/src/sqlite-store.test.ts",
         "ts/packages/cli/src/seed-namespaces.ts"
       ],
-      "pull_request": 548
+      "pull_request": 548,
+      "changed_lines": 3455
     },
     {
       "order": 16,
@@ -255,7 +279,8 @@
         "ts/packages/cli/src/shutdown-budget.test.ts",
         "ts/packages/cli/src/config-file.ts"
       ],
-      "pull_request": 549
+      "pull_request": 549,
+      "changed_lines": 2542
     },
     {
       "order": 17,
@@ -272,7 +297,8 @@
         "ts/packages/cli/src/config-file-paths-and-env.test.ts",
         "ts/bin/axond"
       ],
-      "pull_request": 550
+      "pull_request": 550,
+      "changed_lines": 2759
     },
     {
       "order": 18,
@@ -284,7 +310,8 @@
         "ts/packages/cli/src/config-file-parse-order.test.ts",
         "ts/packages/cli/src/config-file-syntax-and-admission.test.ts"
       ],
-      "pull_request": 551
+      "pull_request": 551,
+      "changed_lines": 1670
     },
     {
       "order": 19,
@@ -303,7 +330,8 @@
         "ts/packages/tokens/src/index.test.ts",
         "ts/packages/tokens/src/index.ts"
       ],
-      "pull_request": 552
+      "pull_request": 552,
+      "changed_lines": 1101
     },
     {
       "order": 20,
@@ -317,7 +345,8 @@
         "ts/packages/worker/src/workerd.integration.ts",
         "ts/packages/worker/wrangler.toml"
       ],
-      "pull_request": 553
+      "pull_request": 553,
+      "changed_lines": 1845
     },
     {
       "order": 21,
@@ -354,9 +383,42 @@
         "ts/scripts/sign-artifact.sh",
         ".github/workflows/typescript.yml",
         "docs/design/typescript-review-stack.md",
-        "ops/typescript-review-stack.json"
+        "ops/typescript-review-stack.json",
+        "ops/check-openapi.py",
+        "docs/design/typescript-review-findings.md"
       ],
-      "pull_request": 554
+      "pull_request": 554,
+      "changed_lines": 3074
     }
-  ]
+  ],
+  "review_hardening": {
+    "date": "2026-10-08",
+    "findings": 85,
+    "addressed": 79,
+    "contract_or_staging_clarifications": 6,
+    "dispositions": "docs/design/typescript-review-findings.md",
+    "prior_heads": {
+      "codex/ts-review-01-contract": "2906d6f2ec2c77e54844aca26640f106f9cba4b3",
+      "codex/ts-review-02-request-parsers": "c013657f732f9718e599f4c519a3d3554b137f61",
+      "codex/ts-review-03-state-primitives": "b8c1ebdbddee064d334bcbb3466bc513fa8365eb",
+      "codex/ts-review-04-wire-telemetry": "3d0228a2c7099c5c79541f44f9c679eb3317b4b8",
+      "codex/ts-review-05-config-values": "623dd8baace95371ba889f1b1b4b812968785923",
+      "codex/ts-review-06-config-shapes": "f05fbc16433b9be24e3ecf4d311cb6bce40a8063",
+      "codex/ts-review-07-config-loader": "260244363c6fb2017c22cc1f3fb35a05e3636ea5",
+      "codex/ts-review-08-config-overrides": "2009b1c1dfe4c20f647a6205b18acd63343b1c5d",
+      "codex/ts-review-09-provider-dispatch": "ada1f73b9044ed82227ee7055faf7fb1e86ea25f",
+      "codex/ts-review-10-gateway": "f4a2c1bfea62a91d10cbf8205f62c36e197c81ce",
+      "codex/ts-review-11-gateway-management": "84fee73dd52b775123cee2eee04a610165ea5235",
+      "codex/ts-review-12-stream-limits": "45ecb9f20cd4f7c49f7f64655aac176bbf8d3a6a",
+      "codex/ts-review-13-stream-recovery": "a914a68b0fdcebad410bc0a8d07e4f5c26fbb334",
+      "codex/ts-review-14-settlement-faults": "8865c9d04582db35ba932688d96c836dbe52b872",
+      "codex/ts-review-15-durable-stores": "ba70b3d8da572376b0b4b8476058404b485f355d",
+      "codex/ts-review-16-cli-services": "efe0a89a2b5697a1ea8bbc7a106257310e8cfcb1",
+      "codex/ts-review-17-cli-host": "5e909c582ce9cc8a99d1f5974995b6c139ab779e",
+      "codex/ts-review-18-cli-config-errors": "ce062c039b07ec5e4a551946b2eaf25a3133ff3b",
+      "codex/ts-review-19-extensions": "4ed2f251ad252b75f673fb3775f7ce923ad7b1cf",
+      "codex/ts-review-20-worker": "c356f540799a40099693a3fd3c09201ebb56dea3",
+      "codex/ts-review-21-release-gates": "f57a4f0d7ffcfa2508d63581b281473068353012"
+    }
+  }
 }
