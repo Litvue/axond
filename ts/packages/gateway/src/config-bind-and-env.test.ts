@@ -1011,3 +1011,8 @@ test("review regressions preserve multiline numeric types, bind validity, price 
   assert.equal(cfg.prices[0]?.cacheReadMicrodollarsPerMillion, 4n);
   assert.equal(cfg.prices[0]?.cacheWriteMicrodollarsPerMillion, 5n);
 });
+
+test("literal TOML backslashes cannot consume the following float token", async () => {
+  const config = "namespace = [[ '''abc\\''', 1.0 ]]\n" + BASE.replace(/\[\[namespace\]\][\s\S]*?(?=\[\[gateway_key\]\])/, "");
+  await assert.rejects(loadConfig(config, envSecretReader({ GW_KEY: "k" }, async () => "")), /found float/);
+});
