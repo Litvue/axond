@@ -18,7 +18,7 @@
 //! - **No floating point.** [`CanonicalValue`] has no float variant, so a
 //!   non-associative, platform-formattable value cannot enter a checksum at all.
 //!   Prices are micro-dollar integers for exactly this reason (ADR 0010), and
-//!   [`CanonicalValue::try_from_json`] rejects a JSON float with a typed error
+//!   `CanonicalValue::try_from_json` rejects a JSON float with a typed error
 //!   rather than rounding it.
 //! - **Normalized strings.** Strings are UTF-8, length-prefixed rather than
 //!   delimited or escaped (so no escaping choice can vary), and refused if they

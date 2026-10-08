@@ -1,26 +1,12 @@
-//! Resource envelopes: what a revision is made of.
+//! Content-addressed blob references for retained catalogue snapshots.
 //!
-//! A resource version is an *envelope*, not a schema. It carries identity, the
-//! scope it belongs to, its readable name, the versioned resources it depends
-//! on, and a body that is either an inline canonical value or a
-//! content-addressed [`BlobRef`]. What is inside the body — the catalogue,
-//! tenancy, secret, pricing, and policy schemas — is deliberately not fixed
-//! here: those land as later slices, and each is a body shape plus its own
-//! validation, with no change to this envelope, to the canonical serializer, or
-//! to #165's tables.
+//! A [`BlobRef`] records a payload's kind, checksum, and byte length without
+//! embedding the payload. Verification checks both length and content, so a
+//! stored catalogue cannot hydrate from truncated or substituted bytes.
 //!
-//! The envelope is what the revision machinery needs, and it is all it needs:
-//!
-//! - identity that never changes ([`ResourceId`]) versus a name that may
-//!   ([`Slug`]), so a rename is not a re-creation;
-//! - a monotonic [`ResourceVersionNumber`], so a manifest pins the exact bytes a
-//!   revision was compiled against and an older revision keeps pinning the older
-//!   ones;
-//! - explicit [`ResourceVersion::depends_on`] edges, so "this alias points at a
-//!   credential that no longer exists in this revision" is a domain-level
-//!   dangling reference rather than something only a schema-aware validator could
-//!   notice;
-//! - a scope, so a cross-tenant reference is detectable without reading any body.
+//! ADR 0063 withdrew resource identities, versions, and dependency envelopes.
+//! This module retains the content-addressed blob primitives used by catalogue
+//! snapshots.
 
 use super::canonical::{Canonical, CanonicalValue, Checksum};
 

@@ -22,7 +22,7 @@
 //!
 //! | Operation | Guarantee |
 //! | --- | --- |
-//! | [`append`](UsageJournal::append) | An accepted event is durable, or the caller is told it was not. Re-appending the same [`IdempotencyKey`] is [`Appended::AlreadyPresent`], never a second event; re-appending it with a *different record* is a [`JournalError::Conflict`] rather than a silent overwrite ([`UsageEvent::is_same_fact_as`] is what "different" means). |
+//! | [`append`](UsageJournal::append) | An accepted event is durable, or the caller is told it was not. Re-appending the same [`IdempotencyKey`] is [`Appended::AlreadyPresent`], never a second event; re-appending it with a *different record* is a [`JournalError::Conflict`] rather than a silent overwrite (`UsageEvent::is_same_fact_as` is what "different" means). |
 //! | [`claim`](UsageJournal::claim) | Hands a consumer a bounded batch of unacknowledged events under a lease. Claims respect [`OrderingKey`], so one caller's events are delivered in append order. |
 //! | [`ack`](UsageJournal::ack) | Idempotent: an event acknowledged twice is acknowledged once, so a crash between the sink write and the ack is safe to retry. |
 //! | [`quarantine`](UsageJournal::quarantine) | A poison event leaves the delivery path explicitly instead of blocking its ordering key forever. |
@@ -387,7 +387,7 @@ pub enum Appended {
         position: u64,
     },
     /// The same idempotency key was already appended, describing the same fact
-    /// ([`UsageEvent::is_same_fact_as`]). The benign case — a retried append after
+    /// (`UsageEvent::is_same_fact_as`). The benign case — a retried append after
     /// an unknown outcome — and *not* an error: the caller's intent is already
     /// satisfied, and the stored event is left exactly as it was.
     AlreadyPresent { position: u64 },

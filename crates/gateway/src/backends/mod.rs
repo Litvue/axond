@@ -11,39 +11,28 @@
 //! stateful operating modes"; `docs/maintainers/backend-contracts.md` maps these
 //! contracts to it).
 //!
-//! Eight responsibility contracts exist. This module owns the four that are
-//! control-plane-shaped, and it names the four request-path seams that already
-//! ship so the boundary between them is reviewable in one place:
+//! The retained production contracts cover catalogue ingestion and storage,
+//! spend caps, and usage delivery. ADR 0063 withdrew the control plane, secret
+//! store, rate limiter, revocation store, and object-store implementation.
 //!
 //! | Contract | Responsibility | Path | Lives in |
 //! | --- | --- | --- | --- |
-//! | [`control_plane::ControlPlaneStore`] | Durable desired state: revisions, manifests, resource versions, audit | Control plane only | here |
-//! | [`secrets::SecretStore`] | Wrapped secret material and unwrapping | Snapshot compilation only | here |
 //! | [`catalog::CatalogSource`] | Model metadata ingestion | Background refresh only | here |
 //! | [`catalog_store::CatalogStore`] | Durable retention and convergence lookup of imported catalogue snapshots | Background refresh + snapshot compilation | here |
 //! | [`crate::budget::BudgetStore`] | Spend caps | Request path (opt-in) | [`crate::budget`] |
-//! | [`crate::rate_limit::RateLimiter`] | Inbound admission | Request path (opt-in) | [`crate::rate_limit`] |
-//! | [`crate::revocation::RevocationStore`] | Precise `jti` revocation | Request path (opt-in) | [`crate::revocation`] |
 //! | [`crate::usage::UsageSink`] | Durable usage rows | Off the request path | [`crate::usage`] |
 //!
-//! The four existing seams are deliberately *not* moved, re-exported, or given
+//! The existing seams are deliberately *not* moved, re-exported, or given
 //! a common supertrait here: each keeps its own error type, its own
 //! `on_unavailable` policy, and its own tier declaration, so those stay
-//! independently reviewable. The one thing they do share is
-//! [`health::BackendHealth`], an optional diagnostic accessor: a store that
-//! talks to a remote dependency can say whether it is reachable *right now*,
-//! off the request path, so `GET /admin/v1/status` can tell an outage from a
-//! cap being hit. It is not a supertrait and not a capability a caller may
-//! route on — nothing in the request path can reach it.
+//! independently reviewable.
 //!
-//! [`RESPONSIBILITIES`] is the machine-checkable version of the table above, and
-//! it is what the tests assert against.
+//! The historical `RESPONSIBILITIES` table and `BackendPath` taxonomy are
+//! retained only in tests; they are not production exports.
 //!
 //! The catalogue store's background refresher and convergence reader are both
 //! intentionally off the request path. Requests receive a concrete immutable
 //! snapshot; they never retain a store handle or cause a catalogue query.
-//! [`object_store::ObjectStore`] is a provider-neutral storage primitive for a
-//! future control-plane implementation, not a ninth business responsibility.
 
 pub mod catalog;
 

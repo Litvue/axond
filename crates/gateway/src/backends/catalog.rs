@@ -6,7 +6,7 @@
 //! is an explicit administrative act; charging copies rates from an already
 //! admitted snapshot.** A refresh stores new or changed catalogue metadata and
 //! never enables a model for a tenant or changes which ids a request may name.
-//! Compiling [`ObservedPrice`] into a [`super::local_catalog::CatalogPriceIndex`]
+//! Compiling [`ObservedPrice`] into a [`super::catalog_price::CatalogPriceIndex`]
 //! is the conversion that makes those rates billable — not a `From` impl on the
 //! parsed document, and not a fetch on the inference path. A request copies the
 //! rates the snapshot it started under published; a later admit cannot reprice
@@ -18,7 +18,7 @@
 //! an upstream document. The conversion is integer nano-dollars to exact
 //! micro-dollars at snapshot admit.
 //!
-//! The source is [`BackendPath::Background`](super::BackendPath::Background):
+//! The source runs in the background:
 //! never on the request path, never a boot dependency. In stateful mode
 //! `/v1/models` and price lookups read the snapshot compiled from stored
 //! metadata, so an unreachable models.dev is a stale-metadata signal with
@@ -54,15 +54,8 @@
 //! semantics, and the bundled offline seed are recorded in
 //! [ADR 0043](https://github.com/Litvue/axond/blob/main/docs/adr/0043-catalogue-source-imports.md).
 //!
-//! # One filing, one projection of it
-//!
-//! Content here is filed under the model an offering is an offering *of*, which
-//! answers "who offers this model?". What a caller may *send* is a provider and
-//! that provider's own published id, and a provider may publish one model under
-//! several of those, so [`super::catalog_projection`] keys the same offerings by
-//! [`CallableId`](super::catalog_projection::CallableId) and classifies diffs
-//! over the ids a request uses. Nothing in this module changes for it: the
-//! projection borrows, adds no state, and is not a second place facts live.
+//! Content is filed under the model an offering is an offering *of*. The
+//! separate control-plane callable-id projection was withdrawn by ADR 0063.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -177,9 +170,8 @@ pub struct CatalogContentId(Checksum);
 impl CatalogContentId {
     /// The identity a stored record names.
     ///
-    /// A price book records the catalogue content it was approved against
-    /// ([`crate::desired_state::pricing`]), so the identity has to survive a round
-    /// trip through a canonical body. Constructing one does not assert that the
+    /// The identity survives a round trip through a canonical body.
+    /// Constructing one does not assert that the
     /// content is held — it names it.
     pub const fn from_checksum(checksum: Checksum) -> Self {
         Self(checksum)
@@ -478,7 +470,7 @@ impl Refusal {
 /// A failure that can name why it refused an import, in the bounded vocabulary.
 ///
 /// Implemented by every error an import can fail with, so
-/// [`LastKnownGoodCatalog::admit_result`] can count a refusal by reason without
+/// `LastKnownGoodCatalog::admit_result` can count a refusal by reason without
 /// knowing which layer produced it, and so a new error type has to state its
 /// reason rather than arrive as free text.
 pub trait Refusable {
@@ -824,8 +816,7 @@ impl ModelCapability {
 /// operator is warned about, so an unrecognized status is refused rather than
 /// flattened into "available".
 ///
-/// Unrelated to [`crate::desired_state::models::ModelLifecycle`], which is
-/// whether an operator has *put a resource in service*. This one is what the
+/// This is what the
 /// upstream says about its own model, so a `Deprecated` offering can be
 /// perfectly enabled, and a withdrawn enablement can point at an `Available`
 /// one.
@@ -1008,10 +999,8 @@ impl Canonical for PriceTier {
 /// without an explicit administrative act. Recording an observation never
 /// activates it.
 ///
-/// Not [`crate::desired_state::models::ObservedPrice`] either, and the two are
-/// not interchangeable despite the name: that one is the rate desired state
-/// carries, in **micro**-dollars per million tokens, while this one is what a
-/// source published, in **nano**-dollars per million tokens and with tiers. A
+/// This is what a source published, in **nano**-dollars per million tokens and
+/// with tiers. Applied prices use **micro**-dollars per million tokens. A
 /// value crossing that boundary is a division by 1,000 that has to round, so it
 /// belongs in the slice that performs the crossing — where the rounding
 /// direction can be stated — and never in a `From` impl a careless import could
@@ -2289,7 +2278,7 @@ impl Refreshed {
 /// The active catalogue, and the rule that a failed import cannot disturb it.
 ///
 /// Every import goes through [`LastKnownGoodCatalog::admit`] or
-/// [`LastKnownGoodCatalog::admit_result`]; there is no other way to make content
+/// `LastKnownGoodCatalog::admit_result`; there is no other way to make content
 /// active, so "a malformed payload cannot replace the active catalogue" is a
 /// property of the type rather than of each caller remembering to check.
 ///
@@ -2299,10 +2288,10 @@ impl Refreshed {
 /// — which means a *persistent* refusal is a catalogue that has stopped
 /// advancing. Nothing in this slice can raise that alarm, because refresh is not
 /// scheduled here: the source is
-/// [`BackendPath::Background`](super::BackendPath::Background) and is driven by a
+/// `BackendPath::Background` and is driven by a
 /// caller that does not exist yet. So the contract is placed on that caller,
 /// and this type is built to make it keepable rather than optional:
-/// [`LastKnownGoodCatalog::admit_result`] hands back the typed error *and* the
+/// `LastKnownGoodCatalog::admit_result` hands back the typed error *and* the
 /// snapshot that stayed active, so a scheduler cannot observe a refusal without
 /// also holding the thing that went stale, and every rejection carries a JSON
 /// Pointer to the location that caused it.
@@ -2529,7 +2518,7 @@ impl LastKnownGoodCatalog {
     /// Record a whole refresh — the one entry point that keeps the run of
     /// refusals honest whichever way the refresh ended.
     ///
-    /// [`admit_result`](Self::admit_result) only sees imports that got as far as
+    /// `admit_result` only sees imports that got as far as
     /// a parse, and a refresh can fail before that (transport, an oversized
     /// body, a URL that serves no catalogue) or succeed without one
     /// ([`CatalogRefresh::Unchanged`]). Routing every outcome through here is

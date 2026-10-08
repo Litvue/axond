@@ -5,17 +5,17 @@
 //! the failure mode is silent: a renamed instrument leaves a panel that reads
 //! zero and an alert that never fires. So the names and label keys live here as
 //! data, [`metrics`](super::metrics) is checked against this list, and
-//! [`validate_reference`] is what an asset (or a documentation table) is
+//! `validate_reference` is what an asset (or a documentation table) is
 //! validated with before it ships.
 //!
 //! The second rule this file exists to enforce is cardinality. A metric label is
 //! multiplied across every series a backend keeps, so the identity dimensions
 //! that are safe on a *usage record* — subject, credential id, request id, the
 //! revision a replica is serving — are the ones that turn a metric backend into
-//! an outage. They are refused by [`validate_label_key`] outright, by key, and
+//! an outage. They are refused by `validate_label_key` outright, by key, and
 //! the labels whose cardinality follows a deployment's own configuration
-//! ([`LabelClass::Configured`]) are refused as *default* labels, where nobody
-//! chose them per instrument: see [`validate_default_label_key`].
+//! (`LabelClass::Configured`) are refused as *default* labels, where nobody
+//! chose them per instrument: see `validate_default_label_key`.
 
 #[cfg(test)]
 use std::collections::BTreeSet;

@@ -17,10 +17,8 @@
 //!   that were accepted, and nothing updates either. Re-importing an unchanged
 //!   catalogue therefore stores nothing new
 //!   ([`Retention::AlreadyRetained`]) — idempotence is the table's shape, not a
-//!   check someone remembered to write — and a
-//!   [`CatalogOffering`](crate::desired_state::models::CatalogOffering) that
-//!   pinned an older snapshot keeps resolving the content it was published
-//!   against.
+//!   check someone remembered to write. Production readers load the active
+//!   snapshot; lookup of an older [`CatalogContentId`] is a test-only accessor.
 //! - **What is active is a pointer, not a copy.** Activation moves one
 //!   reference; it never rewrites a snapshot row. So a refresh cannot mutate
 //!   history, and rolling back to a retained catalogue is moving the pointer

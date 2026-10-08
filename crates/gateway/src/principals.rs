@@ -93,7 +93,7 @@ impl InboundKey {
     /// from a signer outside `POST /v1/tokens`.
     ///
     /// This is the predicate behind the all-namespaces credential view and
-    /// behind [`crate::status::StatusScope::Deployment`]; it lives here because
+    /// it lives here because
     /// authentication is the only place that knows how a principal was
     /// established.
     pub fn holds_direct_operator_authority(&self, default_namespace: &str) -> bool {
