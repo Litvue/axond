@@ -43,6 +43,7 @@ export function transformSseEvents(
   let delimiterCr = false;
   let swallowDelimiterLf = false;
   let forwardDelimiterLf = false;
+  let completedFrameBytes = 0;
   let ended = false;
   function append(byte: number): void {
     if (used >= maxFrameBytes) throw new Error("SSE event exceeds the byte limit");
@@ -54,6 +55,7 @@ export function transformSseEvents(
   }
   function emit(controller: ReadableStreamDefaultController<Uint8Array>): boolean {
     const parsed = parseFrame(buffer.slice(0, used));
+    if (swallowDelimiterLf) completedFrameBytes = used;
     used = 0; lineLength = 0; afterCr = false; delimiterCr = false;
     const next = transform(parsed);
     if (swallowDelimiterLf) forwardDelimiterLf = next === parsed;
@@ -85,6 +87,7 @@ export function transformSseEvents(
           if (swallowDelimiterLf) {
             swallowDelimiterLf = false;
             if (!ended && chunk[at] === 10) {
+              if (completedFrameBytes >= maxFrameBytes) throw new Error("SSE event exceeds the byte limit");
               at++;
               if (forwardDelimiterLf) { controller.enqueue(new Uint8Array([10])); return; }
             }

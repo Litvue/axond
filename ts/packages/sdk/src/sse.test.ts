@@ -179,3 +179,19 @@ test("an identity transform preserves a delayed optional delimiter LF", async ()
   const result = await readAll(transformSseEvents(chunks(["data: one\r\n\r", "\n", "data: two\r\r"]), event => { seen.push(event.data); return event; }));
   assert.equal(result.text, wire); assert.deepEqual(seen, ["one", "two"]);
 });
+
+
+test("the frame byte limit includes an optional LF across every chunk split and transform", async () => {
+  const frame = encoder.encode("data: " + "a".repeat(1024 * 1024 - 8) + "\r\r");
+  for (const split of [false, true]) {
+    for (const kind of ["identity", "rewrite", "drop"]) {
+      let cancelled = false;
+      const input = new ReadableStream<Uint8Array>({ start(c) {
+        if (split) { c.enqueue(frame); c.enqueue(encoder.encode("\n")); }
+        else { const wire = new Uint8Array(frame.length + 1); wire.set(frame); wire[frame.length] = 10; c.enqueue(wire); }
+      }, cancel() { cancelled = true; } });
+      await assert.rejects(new Response(transformSseEvents(input, event => kind === "identity" ? event : kind === "drop" ? null : { ...event, data: "small" })).arrayBuffer(), /byte limit/);
+      assert.equal(cancelled, true);
+    }
+  }
+});
