@@ -110,8 +110,8 @@ extension now restricts grants to inference and validates claims independently.
 
 ## Follow-up review of the corrected stack
 
-Fresh automated review raised 13 new threads and revised four existing findings.
-The 17 observations below were evaluated separately from the original 85.
+Fresh automated review raised 15 new threads and revised four existing findings.
+The 19 observations below were evaluated separately from the original 85.
 Confirmed edge cases received owning patches and regression coverage; contract
 observations are tied to explicit documentation. These dispositions do not
 constitute maintainer approval.
@@ -135,3 +135,5 @@ constitute maintainer approval.
 | [#548](https://github.com/Litvue/axond/pull/548) | [Read queries with write text time out early](https://github.com/Litvue/axond/pull/548#discussion_r4219826363) | SQL classifier skips literals, quoted identifiers, dollar strings and nested comments; retains writes in CTEs and locking reads. |
 | [#549](https://github.com/Litvue/axond/pull/549) | [Reopened stores overwrite fresh model caches](https://github.com/Litvue/axond/pull/549#discussion_r4211968394) | Standalone discovery needs an explicit foreign-source override; initial authority belongs to the configured loop, not Store object identity. |
 | [#549](https://github.com/Litvue/axond/pull/549) | [Valid models.dev catalogues are refused](https://github.com/Litvue/axond/pull/549#discussion_r4211968837) | Catalogue parser accepts the supported top-level neutral models/providers maps and retains the neutral model rows. |
+| [#537](https://github.com/Litvue/axond/pull/537) | First-token counters become histograms | Histogram inference uses the complete first-token suffix; a counter regression checks the exported Sum payload. |
+| [#549](https://github.com/Litvue/axond/pull/549) | Empty catalogue erases retained model IDs | Empty official maps, flat maps, arrays and wrapped arrays are refused; prior IDs and the refusal streak survive. |
