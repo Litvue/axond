@@ -58,3 +58,12 @@ test("extension wait and first-token observations retain histograms", () => {
     assert.equal(point.observations, 2); assert.equal(point.min, 1); assert.equal(point.max, 4);
   }
 });
+
+
+test("first-token counter names retain counter semantics", () => {
+  const metrics = createMetrics(); metrics.record("axond.ext.time_to_first_token_total", 1); metrics.record("axond.ext.time_to_first_token_total", 2);
+  const point = metrics.points.find(row => row.name === "axond.ext.time_to_first_token_total")!;
+  assert.equal(point.value, 3); assert.equal(point.observations, undefined);
+  const payload = metricPayload(metrics.points, {}, Date.now()) as any;
+  assert.ok(payload.resourceMetrics[0].scopeMetrics[0].metrics[0].sum);
+});

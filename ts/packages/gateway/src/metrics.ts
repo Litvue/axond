@@ -124,7 +124,7 @@ export const INSTRUMENT_KINDS: Readonly<Record<string, string>> = {
   "axond.catalog.active_age": "Gauge",
   "axond.catalog.consecutive_refusals": "Gauge"
 };
-export function isHistogram(name: string): boolean { return INSTRUMENT_KINDS[name] === "Histogram" || name.startsWith("axond.ext.") && /\.duration$|time_to_first_token|_wait$|\.wait$/.test(name); }
+export function isHistogram(name: string): boolean { return INSTRUMENT_KINDS[name] === "Histogram" || name.startsWith("axond.ext.") && /\.duration$|(?:^|\.)time_to_first_token$|_wait$|\.wait$/.test(name); }
 
 export function sanitizeAttributes(
   attributes: Record<string, string>,
