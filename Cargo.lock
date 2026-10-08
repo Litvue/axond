@@ -94,7 +94,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "axond"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "aes-kw",
  "anyhow",
@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-core"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "base64",
  "serde",
@@ -630,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "gateway-transport"
-version = "0.6.3"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "futures",
