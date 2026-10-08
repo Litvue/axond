@@ -94,6 +94,8 @@ function ensureNamespaceColumns(db: DatabaseSync): void {
 }
 
 export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
+  let summaryTail: Promise<unknown> = Promise.resolve();
+  let pendingSummaries = 0;
   const db = new DatabaseSync(path);
   const prepare = db.prepare.bind(db);
   db.prepare = (sql: string) => { const statement = prepare(sql); statement.setReadBigInts(true); return statement; };
@@ -302,8 +304,22 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
     },
     async summarizeUsage(namespace, period) {
       if (path !== ":memory:") {
-        await lock("namespace_read", () => { if (!readNamespace(db, namespace)) throw new GatewayFailure("unknown_namespace", 404, "unknown namespace"); });
-        return pagedSummary(path, namespace, period);
+        const called = Date.now();
+        const execute = async () => {
+          const acquired = Date.now();
+          let outcome: "ok" | "error" = "error";
+          try {
+            await lock("namespace_read", () => { if (!readNamespace(db, namespace)) throw new GatewayFailure("unknown_namespace", 404, "unknown namespace"); });
+            const result = await pagedSummary(path, namespace, period);
+            outcome = "ok";
+            return result;
+          } finally {
+            recordStoreCall(metrics, "sqlite", "usage_summary", acquired - called, Date.now() - acquired, outcome);
+          }
+        };
+        const task = pendingSummaries++ === 0 ? execute() : summaryTail.then(execute);
+        summaryTail = task.then(() => { pendingSummaries--; }, () => { pendingSummaries--; });
+        return task;
       }
       return lock("usage_summary", () => {
         if (!readNamespace(db, namespace)) {
