@@ -33,9 +33,11 @@ test("post-terminal stream grace closes an open body", async () => {
   const completed =
     'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":1}}}\n\n';
   const tail = 'event: provider.extension\ndata: {"type":"provider.extension"}\n\n';
+  let writeTail!: () => void;
   const upstream = await listen((_req, res) => {
     res.writeHead(200, { "content-type": "text/event-stream" });
-    res.write(completed + tail);
+    res.write(completed);
+    writeTail = () => { res.write(tail); };
   });
   const app = createAxond({
     store,
@@ -55,7 +57,7 @@ test("post-terminal stream grace closes an open body", async () => {
       responseHeaderTimeoutMs: 1_000,
       bufferedBodyTimeoutMs: 1_000,
       streamIdleTimeoutMs: 5_000,
-      streamTerminalGraceMs: 80,
+      streamTerminalGraceMs: 500,
       maxResponseBytes: 4096,
     },
   });
@@ -67,8 +69,15 @@ test("post-terminal stream grace closes an open body", async () => {
       body: JSON.stringify({ model: "fake-openai/gpt-test", stream: true, input: "hi" }),
     });
     assert.equal(response.status, 200);
-    assert.equal(await response.text(), completed + tail);
-    assert.ok(Date.now() - started < 1_000);
+    const reader = response.body!.getReader();
+    const first = await reader.read();
+    assert.equal(new TextDecoder().decode(first.value), completed);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    writeTail();
+    let wire = new TextDecoder().decode(first.value);
+    for (;;) { const next = await reader.read(); if (next.done) break; wire += new TextDecoder().decode(next.value); }
+    assert.equal(wire, completed + tail);
+    assert.ok(Date.now() - started < 2_000);
   } finally {
     upstream.close();
   }
