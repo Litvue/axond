@@ -1024,3 +1024,19 @@ test("keepalives do not reset the upstream idle deadline", async () => {
     assert.equal((wire.match(/: keepalive/g) ?? []).length, 1);
   } finally { upstream.close(); }
 });
+
+
+test("downstream pauses do not consume the next upstream read's idle budget", async () => {
+  let write!: (data: string) => void; let finish!: (data: string) => void;
+  const event = (value: string) => `data: {"choices":[{"delta":{"content":"${value}"}}]}\n\n`;
+  const upstream = await listen((_req, res) => { res.writeHead(200, { "content-type": "text/event-stream" }); write = data => { res.write(data); }; finish = data => { res.end(data); }; res.write(event("one")); });
+  try {
+    const opened = await callUpstream({ url: `${upstream.url}/chat/completions`, headers: new Headers(), body: new TextEncoder().encode("{}"), stream: true, route: "chat", onUsage() {},
+      transport: { responseHeaderTimeoutMs: 1000, bufferedBodyTimeoutMs: 1000, streamIdleTimeoutMs: 150, streamTerminalGraceMs: 1000, maxResponseBytes: 4096 } });
+    const reader = opened.response.body!.getReader(); let wire = new TextDecoder().decode((await reader.read()).value);
+    write(event("two")); await new Promise(resolve => setTimeout(resolve, 30));
+    await new Promise(resolve => setTimeout(resolve, 200)); finish(event("three") + CHAT_DONE);
+    for (;;) { const next = await reader.read(); if (next.done) break; wire += new TextDecoder().decode(next.value); }
+    assert.match(wire, /three/); assert.doesNotMatch(wire, /upstream_timeout/);
+  } finally { upstream.close(); }
+});
