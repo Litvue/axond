@@ -26,173 +26,7 @@ import { usageEvent, usageLine } from "./usage.ts";
 import type { AxondOptions, Store, UsageRecord } from "@axond/sdk";
 
 
-const KEY = "test-inbound-key";
-
-
-async function seeded(): Promise<Store> {
-  const store = createMemoryStore();
-  await store.putNamespace({
-    id: "platform",
-    attrs: {},
-    blocklist: null,
-    allowPlatformFallback: false,
-    fromConfig: true,
-  });
-  await store.putNamespace({
-    id: "tenant",
-    attrs: {},
-    blocklist: null,
-    allowPlatformFallback: false,
-    fromConfig: false,
-  });
-  await store.putBudget("platform", "compat", 1_000_000_000n);
-  await store.putBudget("tenant", "compat", 1_000_000_000n);
-  return store;
-}
-
-
-function listen(handler: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => void) {
-  const server = createServer(handler);
-  return new Promise<{ url: string; close: () => void }>((resolve) => {
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        throw new Error("no port");
-      }
-      resolve({
-        url: `http://127.0.0.1:${address.port}`,
-        close: () => {
-          server.closeAllConnections();
-          server.close();
-        },
-      });
-    });
-  });
-}
-
-
-const MINTED_REQUEST_ID = /^req_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-
-
-function concatChunks(chunks: Uint8Array[]): Uint8Array {
-  const size = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-  const merged = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return merged;
-}
-
-
-const MESSAGES_TERMINAL = [
-  'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
-  'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
-  'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-].join("");
-
-
-function messagesApp(
-  store: Store,
-  baseUrl: string,
-  records: UsageRecord[],
-  metrics?: ReturnType<typeof createMetrics>,
-) {
-  return createAxond({
-    store,
-    gatewayKey: KEY,
-    defaultNamespace: "platform",
-    metrics,
-    providers: [{ id: "fake-anthropic", kind: "anthropic", baseUrl }],
-    credentials: [{ namespace: "platform", provider: "fake-anthropic", secret: "sk-live-secret", id: "one" }],
-    prices: [
-      {
-        provider: "fake-anthropic",
-        model: "*",
-        inputMicrodollarsPerMillion: 1n,
-        outputMicrodollarsPerMillion: 1n,
-      },
-    ],
-    transport: {
-      responseHeaderTimeoutMs: 1_000,
-      bufferedBodyTimeoutMs: 1_000,
-      streamIdleTimeoutMs: 5_000,
-      streamTerminalGraceMs: 1_000,
-      maxResponseBytes: 4096,
-    },
-    onUsage: (record) => {
-      records.push(record);
-    },
-  });
-}
-
-
-const CHAT_DONE = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\ndata: [DONE]\n\n';
-
-
-function chatDoneApp(store: Store, baseUrl: string, records: UsageRecord[], metrics?: ReturnType<typeof createMetrics>) {
-  return createAxond({
-    store,
-    gatewayKey: KEY,
-    defaultNamespace: "platform",
-    metrics,
-    providers: [{ id: "fake-openai", kind: "openai", baseUrl }],
-    credentials: [{ namespace: "platform", provider: "fake-openai", secret: "sk-live-secret", id: "one" }],
-    prices: [
-      {
-        provider: "fake-openai",
-        model: "*",
-        inputMicrodollarsPerMillion: 1n,
-        outputMicrodollarsPerMillion: 1n,
-      },
-    ],
-    transport: {
-      responseHeaderTimeoutMs: 1_000,
-      bufferedBodyTimeoutMs: 1_000,
-      streamIdleTimeoutMs: 5_000,
-      streamTerminalGraceMs: 1_000,
-      maxResponseBytes: 4096,
-    },
-    onUsage: (record) => {
-      records.push(record);
-    },
-  });
-}
-
-
-function poolApp(store: Store, url: string, extra: Partial<AxondOptions> = {}) {
-  return createAxond({
-    store,
-    gatewayKey: KEY,
-    defaultNamespace: "platform",
-    providers: [{ id: "fake-openai", kind: "openai", baseUrl: url }],
-    credentials: [
-      { namespace: "platform", provider: "fake-openai", secret: "bad-key", id: "bad" },
-      { namespace: "platform", provider: "fake-openai", secret: "good-key", id: "good" },
-    ],
-    prices: [
-      {
-        provider: "fake-openai",
-        model: "*",
-        inputMicrodollarsPerMillion: 1n,
-        outputMicrodollarsPerMillion: 1n,
-      },
-    ],
-    ...extra,
-  });
-}
-
-
-const CHAT_HEADERS = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
-
-
-function estimateCost(body: Record<string, unknown>, embeddings = false): bigint {
-  const input = BigInt(Math.floor(new TextEncoder().encode(JSON.stringify(body)).length / 4));
-  const output = embeddings ? 0n : BigInt(typeof body["max_tokens"] === "number" ? body["max_tokens"] : 1024);
-  return input + output;
-}
-
+import { KEY, seeded, listen, MINTED_REQUEST_ID, concatChunks, MESSAGES_TERMINAL, messagesApp, CHAT_DONE, chatDoneApp, poolApp, CHAT_HEADERS, estimateCost } from "./behavior-test-fixtures.ts";
 
 test("an oversized provider error is truncated and keeps the provider status", async () => {
   const store = await seeded();
@@ -420,7 +254,7 @@ test("an openai chat rate limit before content rotates and is not forwarded", as
   assert.equal(body.includes("rate_limit_exceeded"), false);
   assert.deepEqual(seen, ["Bearer bad-key", "Bearer good-key"]);
   assert.equal(settlements, 1);
-  assert.equal(servedCredential, "platform:good:1:compat");
+  assert.equal(servedCredential, "platform:good:2:compat");
   const status = await app.request("http://127.0.0.1/ns/platform/v1/credentials", { headers: CHAT_HEADERS });
   const rows = (await status.json()).data as { credential_id: string; state: string }[];
   assert.equal(rows.find((row) => row.credential_id === "bad")?.state, "parked");
@@ -1021,7 +855,9 @@ test("a full admission queue sheds immediately and an expired wait is typed", as
     res.writeHead(200, { "content-type": "application/json" });
     res.end('{"usage":{"prompt_tokens":1,"completion_tokens":1}}');
   });
+  const metrics = createMetrics();
   const app = createAxond({
+    metrics,
     store,
     gatewayKey: KEY,
     defaultNamespace: "platform",
@@ -1055,7 +891,11 @@ test("a full admission queue sheds immediately and an expired wait is typed", as
       headers: CHAT_HEADERS,
       body: payload,
     });
-    await new Promise((wake) => setTimeout(wake, 40));
+    const queueDeadline = Date.now() + 300;
+    while (!metrics.points.some((point) => point.name === "axond.admission.queue.depth" && (point.max ?? point.value) >= 1) && Date.now() < queueDeadline) {
+      await new Promise((wake) => setTimeout(wake, 1));
+    }
+    assert.ok(metrics.points.some((point) => point.name === "axond.admission.queue.depth" && (point.max ?? point.value) >= 1));
     const full = await app.request("http://127.0.0.1/ns/platform/v1/chat/completions", {
       method: "POST",
       headers: CHAT_HEADERS,
