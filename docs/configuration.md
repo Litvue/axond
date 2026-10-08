@@ -193,6 +193,22 @@ the first signal closes admission. Once admission is closed — by either route 
 further signals are logged and otherwise ignored, because the deadline and the
 flush budget already bound what is left and honoring one there would kill the
 process mid-flush, discarding the usage records the sequence exists to write.
+The TypeScript process writes each of those as JSON `msg` `shutdown` with
+`phase` `requested`, `second_signal`, `admission_closed`, `signal_ignored`, or
+`deadline_expired`. The line names the signal and the admitted-request count.
+Settlement, the usage flush, and the telemetry drain share that one
+`flush_timeout_ms` deadline. Settlement may use at most half. The usage flush
+and any in-flight OTLP post get what remains, not a second full timeout. After
+the usage flush it writes `phase` `stopped` with `usage_flushed` and
+`telemetry_flushed`, and one JSON `msg` `usage_flush` per sink. A usage-flush
+timeout names `abandoned`. A finished flush names `records`. An exporter that
+misses the bound writes `msg` `telemetry_flush` with `outcome` `timeout` and
+leaves the endpoint off the line. The driver text stays off those lines.
+When the settle share ends with a spawned charge or an admitted request still
+open, it also writes `phase` `spend_unsettled` with `settlements_queued`,
+`settlements_executing`, `settlements_reserved`, and `oldest_settlement_ms`.
+A drain that finishes both counts writes neither of those fields. The line
+omits the bind address, the store path, and the gateway key.
 
 ## `[[namespace]]`
 
@@ -282,6 +298,10 @@ Not on the inference path. `GET /api/v1/providers/{id}/models` and
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `refresh_interval_seconds` | integer | `300` | Seconds between refresh rounds. The first round runs at boot; an empty provider set retries with short backoff instead of waiting the full interval. `0` is rejected. |
+
+The refresh tries each credential in the platform pool and keeps the first complete listing. With no platform credential it uses the lexicographically first tenant pool. Anthropic `has_more` and `last_id` pages are followed, up to 20 pages. Objects without an id are dropped. A listing that does not end inside that bound logs reason `page_bound` and does not store a partial page list. The first round in the process may replace a row fetched from another base URL. A later round leaves a fresh row from another base URL in place and does not call the provider. A `3xx` from `GET /models` is not followed. The credential stays on the configured URL, the cache is marked stale, and the reason is `unreachable`.
+
+A failed provider refresh writes JSON `msg` `provider_discovery` with the provider id and reason `no_credential`, `unreachable`, `denied`, `not_json`, `not_retained`, or `page_bound`. The previous cache stays in place and is marked stale when the store accepts that write. The line omits the credential, the base URL, and the driver text.
 
 ## `[[credential]]` — outbound provider keys
 
@@ -375,7 +395,7 @@ provider, a silent open socket is a half-dead connection. Every bound must be
 | `response_header_timeout_ms` | integer | `30000` | Bound on waiting for response headers (time to first byte) after dispatch. For a non-streamed call this covers the whole completion — see below. |
 | `buffered_body_timeout_ms` | integer | `30000` | Bound on reading a whole buffered response body once headers arrived. |
 | `stream_idle_timeout_ms` | integer | `120000` | Bound on waiting for the *next* chunk of an already-open stream. Not a stream lifetime: a productive stream may run for as long as it keeps producing. |
-| `stream_terminal_grace_ms` | integer | `1000` | Fixed grace for trailing byte-faithful provider extension bytes after the semantic terminal event. It does not reset on chunks; an earlier silent-body idle timeout can still close the transport first. |
+| `stream_terminal_grace_ms` | integer | `1000` | Fixed grace for trailing byte-faithful provider extension bytes after the semantic terminal event. It does not reset on chunks; an earlier silent-body idle timeout can still close the transport first. When the grace elapses with the socket still open, the TypeScript process writes JSON `msg` `terminal_remain` with `bound` `grace` and `grace_ms`. When the total stream bound elapses first, `bound` is `duration`. The line omits the endpoint. |
 | `max_response_bytes` | integer | `33554432` | Largest buffered response body that will be read. A larger one is refused as `upstream_body_too_large` rather than buffered. |
 | `max_error_bytes` | integer | `65536` | Largest provider *error* body read for diagnostics. A larger one is truncated, so the provider's own status still reaches the caller. Must not exceed `max_response_bytes`. |
 
@@ -574,7 +594,9 @@ Exactly one source (`env` or `file`) is permitted; both declared or
 neither declared is a config error. File contents are read without trimming:
 static gateway-key secrets are exact bytes, so do not leave a trailing newline
 (`printf %s 'secret' > /run/secrets/axond-gateway-key`). On Unix, a
-group/other-readable file produces a warning. A trailing newline makes a
+group/other-readable file produces a warning. The TypeScript CLI writes that
+warning as JSON `msg` `key_material` naming the path and omitting the file
+bytes. A trailing newline makes a
 file-backed static key unusable because HTTP headers cannot carry it. The resolved material is never
 logged; usage subjects use the env name or file path. Switching an existing
 key from `env` to `file` changes that subject, so in-flight or accumulated
@@ -584,7 +606,7 @@ usage sinks.
 
 Callers present the token as `Authorization: Bearer <token>` or
 `x-api-key: <token>`. Minted `axt1.` tokens are `401` and are not issued.
-The usage record's `subject` is the env var's *name*
+The usage record's `subject` is the env var's *name*, or the file path when the key is read from a file.
 ([ADR 0013](./adr/0013-inbound-auth-fails-closed.md)).
 
 A key whose `namespace` is the file default namespace may use
@@ -803,7 +825,10 @@ must still name the exact supported `/catalog.json` document.
 The configured URL is the provenance every snapshot records. A document anyone
 on the path could substitute would become the rates a request is charged at, so
 this gateway will not follow redirects: a `3xx` is a bounded refusal naming its
-status rather than an import of whatever the answer pointed at.
+status rather than an import of whatever the answer pointed at. The TypeScript
+importer does the same. A catalogue `3xx` is reason `unsupported_endpoint`. A
+model listing or an inference call keeps the credential on the configured URL
+and leaves the `Location` target unread.
 
 Refreshes are conditional: the stored ETag and `Last-Modified` are sent back, and
 a `304` confirms the active snapshot's freshness without producing new content.

@@ -45,13 +45,25 @@ not served. Management is `/api/v1`. `/admin/v1` is unmounted.
 The one static `[[gateway_key]]` authenticates every `/api/v1` and `/ns/...`
 route. Minted `axt1.` tokens are `401`. The all-namespaces credential view
 (`?namespaces=all`) is admitted only for that key when its configured
-`namespace` is the file default namespace.
+`namespace` is the file default namespace. A repeated `namespaces` parameter
+is `400` `bad_request`, as is a query component that is not percent-encoded
+UTF-8. Any other value, including an empty one, is the same `400`. Each row's
+`source` is `platform` or `byok`. The list is sorted by namespace, provider,
+and credential id. A fallback tenant sees a platform pool only when it has no
+pool of its own for that provider, and an env-derived platform label is omitted.
 
 `GET /admin/v1/status` is unmounted in production `serve()` ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md),
 [#438](https://github.com/Litvue/axond/pull/438)). A `diagnostic_router` helper
 still exists for withdrawn-tree tests; it is not composed into the listening
 app. Ask `/readyz` for load-balancer readiness and logs/metrics for Store
-health.
+health. After `SIGTERM`, `/readyz` answers `503 draining` at once and `/healthz`
+stays `200 ok`. New `/api/v1` and `/ns` requests remain admitted for
+`shutdown.drain_grace_ms`. Admission then closes: a request the process still
+accepts is `503` with `error.type = "draining"`, `Retry-After: 0`, and the
+message `the gateway is shutting down and is no longer accepting requests`,
+before authentication. The listener stops at that point. A second termination
+signal closes admission without waiting out the grace window.
+`shutdown.drain_grace_ms = 0` closes admission on the first signal.
 
 Responses is forwarded natively with only `model` rewritten and streaming is
 byte-faithful. **Every** `/v1/responses` request — initial calls as well as ones
@@ -66,6 +78,16 @@ its target or key reports the ordinary routing, credential, or upstream error.
 `/ns/{ns}/v1/chat/completions`, `/ns/{ns}/v1/messages`, and
 `/ns/{ns}/v1/embeddings` keep credential-pool rotation inside one provider.
 Alias-level failover is gone ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)).
+`failover.max_attempts` defaults to 3 and fails boot at 0. It counts target attempts. Credential rotation inside the one configured provider is a separate walk, so a cap of 1 still tries every key. Responses still uses one target.
+`admission.max_in_flight` defaults to 1024 and `admission.max_in_flight_streams` defaults to 512. `0` disables that ceiling. A replica at the request ceiling answers `503` `gateway_overloaded`. A streamed request with no stream slot answers `503` `stream_capacity_exhausted`. Both send `Retry-After: 1`. The queue is off unless `queue_capacity` and `queue_wait_ms` are set together, which also requires a finite `max_in_flight`. A full queue is `503` `admission_queue_full`. A wait that expires is `503` `admission_queue_timeout`. `max_pending_settlements` defaults to four times `max_in_flight`. When that many charges are still unsettled the replica answers `503` `settlement_capacity_exhausted` before the provider is called. An omitted stream ceiling is clamped down to a lowered `max_in_flight`. `max_in_flight_settlements` defaults to 64 and bounds how many charges run against the Store at once. A charge that waits longer than `settlement_queue_wait_ms` (default 10000) is dropped without a spend write; `0` waits without a bound. A charge that runs longer than `settlement_timeout_ms` (default 10000) is counted and still finishes; `0` disables that deadline. The age of the oldest spawned charge is `axond.settlement.oldest_pending_age`. An admitted request is `axond.settlement.in_flight` stage `reserved` until its charge is spawned. After admission closes, shutdown waits up to half of `shutdown.flush_timeout_ms` for spawned charges and counts any that remain as `axond.shutdown.abandoned_settlements`. `axond.shutdown.phase` is 1 while draining and 2 once admission closes. Requests still open at `shutdown.deadline_ms` count as `axond.shutdown.abandoned_requests`.
+A streamed response sets `content-type: text/event-stream` and `cache-control: no-cache`.
+A buffered success records `axond.request.time_to_first_token` for the credential walk. A stream records that histogram when the first provider byte is released and records `axond.upstream.time_to_first_token` when the first SSE data event is decoded. Status `upstream_error` increments `axond.upstream.errors`. A client cancel does not.
+SQLite and Postgres record `axond.store.acquire_wait`, `axond.store.query_duration`, and `axond.store.operations` for each catalogue store operation. A failed Postgres connect records the wait and `error` and does not record a query duration or an opened session. A successful Postgres call counts one opened session and one discarded session. The namespace, the SQL, and the driver text are not labels.
+A `models-dev` catalogue fetch records `axond.catalog.refusals` by `unreachable`, `denied`, `unsupported_endpoint`, `not_json`, or `not_retained`. Consecutive refusals are stored in `axond_catalog_streak`, climb across store objects on the same database, and return to 0 when an import is stored. The catalogue age is recorded after a stored import and stays absent before the first one. The source URL and the error text are not labels.
+A provider failure after a credential is selected still returns that provider error, and writes one usage record with status `upstream_error`, zero token counts, and cost 0. Spent does not increase.
+A client that cancels a stream records `client_cancelled`. When the provider has not reported usage, the charge is the prompt estimate plus one token per four characters of relayed text. A stream that relayed no text is not charged.
+An open stream that stays silent past `transport.stream_idle_timeout_ms` appends an SSE `upstream_stream_error` on the already-`200` response and records `upstream_error` for the text already relayed. Nothing is retried.
+A stream that outlives `admission.max_stream_duration_ms` before a terminal event, or whose next chunk would pass `admission.max_stream_bytes`, appends an SSE `upstream_stream_error` naming that bound. The overflowing chunk is not forwarded. Text already relayed is charged as `upstream_error`. After a terminal event the duration bound closes the body successfully. `0` disables either bound.
 
 ## Providers
 

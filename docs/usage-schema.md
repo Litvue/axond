@@ -42,6 +42,8 @@ meaning, and how they are allowed to change. The design rationale is
 | `started_at` | `timestamptz` | `recorded_at - latency_ms`. |
 | `recorded_at` | `timestamptz` | When the gateway settled the request. Excludes the sink's own batching delay. |
 
+A `request_id` minted by the gateway is `req_` plus a lowercase canonical UUIDv7, and ids minted in one process sort in the order they were minted. The TypeScript gateway uses a caller `x-request-id` of 1–128 characters from `[A-Za-z0-9._:-]` as that id.
+
 `status` describes the terminal outcome the gateway observed, not proof that a
 peer received an HTTP body. For buffered requests, `ok` means provider work and
 response middleware completed and the response was eligible to return;
@@ -57,7 +59,17 @@ The stdout and OTLP sinks carry the same fields, minus `id` and
 omitted when absent), and the OTLP sink emits it as an OTel log record with
 `event_name = axond.usage` and `axond.*` / `gen_ai.*` attributes. OTLP omits
 `axond.cost_microdollars` when cost is NULL so unpriced traffic is not
-exported as zero; `Some(0)` is still emitted.
+exported as zero; `Some(0)` is still emitted. Stdout omits a null `period`,
+`signer_kid`, `price_book`, `price_book_checksum`, and `price_catalog`, and
+still writes `cost_microdollars` as JSON null when the request was unpriced.
+Token counts and a present cost are JSON numbers. A value above 2^53 keeps every digit.
+Stdout also includes `attrs` when the request was admitted under a namespace:
+the opaque JSON copied at admission
+([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md)), between
+`namespace` and `period` (or before `subject` when `period` is omitted),
+encoded the same way a management read encodes it. A request with no namespace
+omits the field. `attrs` is not a column of the usage table, and the OTLP
+usage log does not repeat it.
 
 ## Versioning policy
 

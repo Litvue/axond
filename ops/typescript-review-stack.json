@@ -1,0 +1,428 @@
+{
+  "version": 1,
+  "main_baseline": "503103cf6df769063648d7285c6358ded043a419",
+  "conversion_source": "cb1ead38a4cb3a0dd04689946eda07e2cbecf255",
+  "regression_source": "e1264ea1a903c21393a6872821021b8c78f7b147",
+  "original_prs": [
+    531,
+    533
+  ],
+  "slices": [
+    {
+      "order": 1,
+      "branch": "codex/ts-review-01-contract",
+      "base_branch": "main",
+      "title": "feat: define TypeScript SDK and review-stage CI",
+      "focus": "Extension authority/stages, SDK state types, static authentication and unchanged Rust release ownership. The sharp security patch is included in the initial lockfile.",
+      "files": [
+        "ts/packages/cli/package.json",
+        "ts/packages/gateway/package.json",
+        "ts/packages/rate-limit/package.json",
+        "ts/packages/redact/package.json",
+        "ts/packages/sdk/package.json",
+        "ts/packages/tokens/package.json",
+        "ts/packages/worker/package.json",
+        "ts/package.json",
+        "ts/package-lock.json",
+        "ts/packages/sdk/src/index.ts",
+        "ts/packages/sdk/src/sse.ts",
+        "ts/packages/sdk/src/sse.test.ts",
+        "ts/packages/gateway/src/errors.ts",
+        "ts/packages/gateway/src/auth.ts",
+        "ts/packages/gateway/src/glob.ts",
+        "ts/scripts/lint-no-node-imports.ts",
+        "ts/scripts/check-npm-policy.ts",
+        ".gitignore",
+        "ops/ci-changes.py",
+        ".github/workflows/typescript.yml",
+        "docs/adr/0066-typescript-hono-extension-contract.md",
+        "docs/design/typescript-parity.md",
+        "docs/design/typescript-regression-gates.md",
+        ".github/workflows/ci.yml",
+        "ops/ci-success.py",
+        "docs/adr/0067-typescript-review-hardening.md"
+      ],
+      "pull_request": 534,
+      "changed_lines": 3834
+    },
+    {
+      "order": 2,
+      "branch": "codex/ts-review-02-request-parsers",
+      "base_branch": "codex/ts-review-01-contract",
+      "title": "feat: add TypeScript request and JSON parsers",
+      "focus": "Strict JSON, lossless numbers, bounded model rewriting, canonical query parsing and request IDs. Gateway-level query/property tests follow when the gateway is available.",
+      "files": [
+        "ts/packages/gateway/src/strict-json.ts",
+        "ts/packages/gateway/src/body.ts",
+        "ts/packages/gateway/src/query.ts",
+        "ts/packages/gateway/src/content-type.ts",
+        "ts/packages/gateway/src/content-type.test.ts",
+        "ts/packages/gateway/src/request-id.ts",
+        "ts/packages/gateway/src/request-id.test.ts",
+        "ts/packages/gateway/src/request-review-regressions.test.ts"
+      ],
+      "pull_request": 535,
+      "changed_lines": 2115
+    },
+    {
+      "order": 3,
+      "branch": "codex/ts-review-03-state-primitives",
+      "base_branch": "codex/ts-review-02-request-parsers",
+      "title": "feat: add namespace and budget state primitives",
+      "focus": "Namespace isolation, fixed/monthly budget calculations, calendar boundaries, idempotent settlement and SQLite persistence. Store integration tests follow the gateway factory.",
+      "files": [
+        "ts/packages/gateway/src/tzdb-data.ts",
+        "ts/packages/gateway/src/tzdb.ts",
+        "ts/packages/gateway/src/namespace.ts",
+        "ts/packages/gateway/src/memory-store.ts",
+        "ts/packages/gateway/src/scoped-store.ts",
+        "ts/packages/gateway/src/store-metrics.ts",
+        "ts/packages/cli/src/sqlite-store.ts",
+        "ts/packages/gateway/src/state-review-regressions.test.ts"
+      ],
+      "pull_request": 536,
+      "changed_lines": 1846
+    },
+    {
+      "order": 4,
+      "branch": "codex/ts-review-04-wire-telemetry",
+      "base_branch": "codex/ts-review-03-state-primitives",
+      "title": "feat: add provider wire accounting and telemetry",
+      "focus": "Provider terminal-state accounting, token/cost interpretation, trace propagation, bounded labels and admission permits.",
+      "files": [
+        "ts/packages/gateway/src/usage.ts",
+        "ts/packages/gateway/src/usage.test.ts",
+        "ts/packages/gateway/src/native-messages.ts",
+        "ts/packages/gateway/src/responses-sequence.ts",
+        "ts/packages/gateway/src/otel.ts",
+        "ts/packages/gateway/src/otel.test.ts",
+        "ts/packages/gateway/src/metrics.ts",
+        "ts/packages/gateway/src/pricing.ts",
+        "ts/packages/gateway/src/admission.ts",
+        "ts/packages/gateway/src/wire-review-regressions.test.ts"
+      ],
+      "pull_request": 537,
+      "changed_lines": 2596
+    },
+    {
+      "order": 5,
+      "branch": "codex/ts-review-05-config-values",
+      "base_branch": "codex/ts-review-04-wire-telemetry",
+      "title": "feat: add TOML scanning and Figment value primitives",
+      "focus": "Parse diagnostics, integer limits, leap seconds, environment scalar coercion and positional-field specifications. Extracted declarations are unchanged; config integration tests arrive with the loader in slices 7\u20138.",
+      "files": [
+        "ts/packages/gateway/src/config-toml.ts",
+        "ts/packages/gateway/src/config-values.ts"
+      ],
+      "pull_request": 538,
+      "changed_lines": 2756
+    },
+    {
+      "order": 6,
+      "branch": "codex/ts-review-06-config-shapes",
+      "base_branch": "codex/ts-review-05-config-values",
+      "title": "feat: add configuration shape and extraction validation",
+      "focus": "Validation order, section/sequence shapes, positional structs and source locations. This internal helper layer depends only on the earlier value/scanner modules.",
+      "files": [
+        "ts/packages/gateway/src/config-shapes.ts"
+      ],
+      "pull_request": 539,
+      "changed_lines": 1487
+    },
+    {
+      "order": 7,
+      "branch": "codex/ts-review-07-config-loader",
+      "base_branch": "codex/ts-review-06-config-shapes",
+      "title": "feat: load and validate TypeScript gateway configuration",
+      "focus": "Config load order, secret resolution/omission, storage/provider declarations, sink and catalogue refusals. Public config imports stay unchanged.",
+      "files": [
+        "ts/packages/gateway/src/config.ts",
+        "ts/packages/gateway/src/config-syntax-and-sinks.test.ts",
+        "ts/packages/gateway/src/config-syntax-and-catalog.test.ts",
+        "ts/packages/gateway/src/parsers.property.test.ts"
+      ],
+      "pull_request": 540,
+      "changed_lines": 3207
+    },
+    {
+      "order": 8,
+      "branch": "codex/ts-review-08-config-overrides",
+      "base_branch": "codex/ts-review-07-config-loader",
+      "title": "test: cover bind and environment configuration compatibility",
+      "focus": "Socket-address validation, Figment environment precedence, sequential extraction and unsupported journal/sink settings.",
+      "files": [
+        "ts/packages/gateway/src/config-bind-and-env.test.ts",
+        "ts/packages/gateway/src/config-env-sequences.test.ts"
+      ],
+      "pull_request": 541,
+      "changed_lines": 1447
+    },
+    {
+      "order": 9,
+      "branch": "codex/ts-review-09-provider-dispatch",
+      "base_branch": "codex/ts-review-08-config-overrides",
+      "title": "feat: add provider dispatch and credential failover",
+      "focus": "Credential selection/parking, deadlines, transport error classification, streaming validation and byte preservation. Process-level fault tests are in slices 13\u201315.",
+      "files": [
+        "ts/packages/gateway/src/dispatch.ts",
+        "ts/packages/gateway/src/native-messages.test.ts",
+        "ts/packages/gateway/src/responses-sequence.test.ts",
+        "ts/packages/gateway/src/dispatch-review-regressions.test.ts"
+      ],
+      "pull_request": 542,
+      "changed_lines": 1560
+    },
+    {
+      "order": 10,
+      "branch": "codex/ts-review-10-gateway",
+      "base_branch": "codex/ts-review-09-provider-dispatch",
+      "title": "feat: mount the namespaced TypeScript Hono gateway",
+      "focus": "Authentication order, namespace scoping, route/error contracts, store failure behavior and shutdown. The regression PR's error-prefix and withdrawn-route fixes are already applied.",
+      "files": [
+        "ts/packages/gateway/src/app.ts",
+        "ts/packages/gateway/src/index.ts",
+        "ts/packages/gateway/src/openapi.ts",
+        "ts/packages/gateway/src/app-recovery-and-openapi.test.ts",
+        "ts/packages/gateway/src/namespace.test.ts",
+        "ts/packages/gateway/src/query.test.ts",
+        "ts/packages/gateway/src/background.test.ts",
+        "ts/packages/gateway/src/streaming.test.ts",
+        "ts/packages/gateway/src/app-test-fixtures.ts"
+      ],
+      "pull_request": 543,
+      "changed_lines": 3190
+    },
+    {
+      "order": 11,
+      "branch": "codex/ts-review-11-gateway-management",
+      "base_branch": "codex/ts-review-10-gateway",
+      "title": "test: qualify gateway routing and budget management",
+      "focus": "Mounted-host behavior, management validation, cadence policy, duplicate settlement, pricing and inference limits.",
+      "files": [
+        "ts/packages/gateway/src/app-routes-and-validation.test.ts",
+        "ts/packages/gateway/src/app-budgets-and-accounting.test.ts",
+        "ts/packages/gateway/src/app-inference-limits.test.ts"
+      ],
+      "pull_request": 544,
+      "changed_lines": 3057
+    },
+    {
+      "order": 12,
+      "branch": "codex/ts-review-12-stream-limits",
+      "base_branch": "codex/ts-review-11-gateway-management",
+      "title": "test: qualify extension ordering and streaming deadlines",
+      "focus": "Extension authority/version refusal, streamed-byte and duration ceilings, TTFT, credential parking and failover deadlines.",
+      "files": [
+        "ts/packages/gateway/src/behavior-extensions-and-stream-limits.test.ts",
+        "ts/packages/gateway/src/behavior-timing-and-credentials.test.ts",
+        "ts/packages/gateway/src/behavior-test-fixtures.ts"
+      ],
+      "pull_request": 545,
+      "changed_lines": 2217
+    },
+    {
+      "order": 13,
+      "branch": "codex/ts-review-13-stream-recovery",
+      "base_branch": "codex/ts-review-12-stream-limits",
+      "title": "test: qualify terminal streams rotation and admission",
+      "focus": "Terminal-event recovery, malformed/incomplete SSE, local silent-TLS connect timeout, rotation boundaries and admission saturation.",
+      "files": [
+        "ts/packages/gateway/src/behavior-stream-terminals.test.ts",
+        "ts/packages/gateway/src/behavior-rotation-and-admission.test.ts"
+      ],
+      "pull_request": 546,
+      "changed_lines": 1989
+    },
+    {
+      "order": 14,
+      "branch": "codex/ts-review-14-settlement-faults",
+      "base_branch": "codex/ts-review-13-stream-recovery",
+      "title": "test: qualify settlement faults and provider secret omission",
+      "focus": "Settlement queue/execution bounds, cancellation, redacted errors, bounded provider diagnostics and native provider controls.",
+      "files": [
+        "ts/packages/gateway/src/behavior-settlement-and-redaction.test.ts",
+        "ts/packages/gateway/src/behavior-provider-wire.test.ts"
+      ],
+      "pull_request": 547,
+      "changed_lines": 1633
+    },
+    {
+      "order": 15,
+      "branch": "codex/ts-review-15-durable-stores",
+      "base_branch": "codex/ts-review-14-settlement-faults",
+      "title": "feat: add Postgres persistence and durable-store qualification",
+      "focus": "Schema provisioning, non-owner operation, migration locking, stale namespace incarnations, durable settlement/idempotency and driver/DSN omission.",
+      "files": [
+        "ts/packages/cli/src/postgres-store.ts",
+        "ts/packages/cli/src/postgres-store.test.ts",
+        "ts/packages/cli/src/sqlite-store.test.ts",
+        "ts/packages/cli/src/seed-namespaces.ts"
+      ],
+      "pull_request": 548,
+      "changed_lines": 3503
+    },
+    {
+      "order": 16,
+      "branch": "codex/ts-review-16-cli-services",
+      "base_branch": "codex/ts-review-15-durable-stores",
+      "title": "feat: add CLI discovery usage delivery and shutdown services",
+      "focus": "Catalogue/provider discovery bounds, buffered sinks/schema, shutdown deadlines and CLI argument/config-path behavior.",
+      "files": [
+        "ts/packages/cli/src/discovery.ts",
+        "ts/packages/cli/src/discovery.test.ts",
+        "ts/packages/cli/src/usage-delivery.ts",
+        "ts/packages/cli/src/usage-delivery.test.ts",
+        "ts/packages/cli/src/usage-sql.ts",
+        "ts/packages/cli/src/argv.ts",
+        "ts/packages/cli/src/product-version.ts",
+        "ts/packages/cli/src/shutdown-budget.ts",
+        "ts/packages/cli/src/shutdown-budget.test.ts",
+        "ts/packages/cli/src/config-file.ts"
+      ],
+      "pull_request": 549,
+      "changed_lines": 2577
+    },
+    {
+      "order": 17,
+      "branch": "codex/ts-review-17-cli-host",
+      "base_branch": "codex/ts-review-16-cli-services",
+      "title": "feat: host the TypeScript gateway and operator extensions",
+      "focus": "Boot order, secret material, operator extension authority/migrations, real socket cancellation and file/env configuration before store creation.",
+      "files": [
+        "ts/packages/cli/src/main.ts",
+        "ts/packages/cli/src/argv.test.ts",
+        "ts/packages/cli/src/postgres-host.test.ts",
+        "ts/packages/cli/src/extension-load.test.ts",
+        "ts/packages/cli/src/socket-close.test.ts",
+        "ts/packages/cli/src/config-file-paths-and-env.test.ts",
+        "ts/bin/axond"
+      ],
+      "pull_request": 550,
+      "changed_lines": 2759
+    },
+    {
+      "order": 18,
+      "branch": "codex/ts-review-18-cli-config-errors",
+      "base_branch": "codex/ts-review-17-cli-host",
+      "title": "test: qualify CLI configuration diagnostics and refusal order",
+      "focus": "Real-process Figment/TOML error locations, parser-before-store refusal and admission/extract precedence.",
+      "files": [
+        "ts/packages/cli/src/config-file-parse-order.test.ts",
+        "ts/packages/cli/src/config-file-syntax-and-admission.test.ts"
+      ],
+      "pull_request": 551,
+      "changed_lines": 1670
+    },
+    {
+      "order": 19,
+      "branch": "codex/ts-review-19-extensions",
+      "base_branch": "codex/ts-review-18-cli-config-errors",
+      "title": "feat: add rate limit redaction and token extensions",
+      "focus": "Namespace scoped rate limits, prompt/log redaction and minted-token authority. Extensions remain reviewed operator code, without an isolation boundary.",
+      "files": [
+        "ts/packages/rate-limit/README.md",
+        "ts/packages/rate-limit/src/index.test.ts",
+        "ts/packages/rate-limit/src/index.ts",
+        "ts/packages/redact/src/index.test.ts",
+        "ts/packages/redact/src/index.ts",
+        "ts/packages/redact/src/pattern.test.ts",
+        "ts/packages/redact/src/pattern.ts",
+        "ts/packages/tokens/src/index.test.ts",
+        "ts/packages/tokens/src/index.ts"
+      ],
+      "pull_request": 552,
+      "changed_lines": 1101
+    },
+    {
+      "order": 20,
+      "branch": "codex/ts-review-20-worker",
+      "base_branch": "codex/ts-review-19-extensions",
+      "title": "feat: host the TypeScript gateway on Workers Hyperdrive",
+      "focus": "Worker cancellation/settlement, isolate limiter scope, Hyperdrive connection rules, failed/silent peers, provisioning and configured-DSN password escaping.",
+      "files": [
+        "ts/packages/worker/src/index.ts",
+        "ts/packages/worker/src/index.test.ts",
+        "ts/packages/worker/src/workerd.integration.ts",
+        "ts/packages/worker/wrangler.toml"
+      ],
+      "pull_request": 553,
+      "changed_lines": 1845
+    },
+    {
+      "order": 21,
+      "branch": "codex/ts-review-21-release-gates",
+      "base_branch": "codex/ts-review-20-worker",
+      "title": "build: qualify TypeScript artifacts and regression gates",
+      "focus": "49-case Rust differential comparison, lossless comparison self-tests, signed compiled binary/container/SDK lanes, migration documentation and explicit parity gaps. No production cutover.",
+      "files": [
+        ".github/workflows/dependency-audit.yml",
+        "README.md",
+        "docs/clients/anthropic.md",
+        "docs/compatibility.md",
+        "docs/configuration.md",
+        "docs/design/typescript-deployment-investigation.md",
+        "docs/design/typescript-regression-evidence-2026-10-07.md",
+        "docs/index.md",
+        "docs/migration-typescript.md",
+        "docs/observability.md",
+        "docs/operations/troubleshooting.md",
+        "docs/security/threat-model-review.md",
+        "docs/typescript.md",
+        "docs/usage-schema.md",
+        "ops/check-docs.py",
+        "ops/typescript-compat.sh",
+        "tests/compat-ts/README.md",
+        "ts/Dockerfile",
+        "ts/openapi.json",
+        "ts/scripts/check-alerts.ts",
+        "ts/scripts/check-doc-samples.ts",
+        "ts/scripts/compiled-binary-smoke.sh",
+        "ts/scripts/parity.test.ts",
+        "ts/scripts/parity.ts",
+        "ts/scripts/shadow-compare.ts",
+        "ts/scripts/sign-artifact.sh",
+        ".github/workflows/typescript.yml",
+        "docs/design/typescript-review-stack.md",
+        "ops/typescript-review-stack.json",
+        "ops/check-openapi.py",
+        "docs/design/typescript-review-findings.md"
+      ],
+      "pull_request": 554,
+      "changed_lines": 3118
+    }
+  ],
+  "review_hardening": {
+    "date": "2026-10-08",
+    "findings": 85,
+    "addressed": 79,
+    "contract_or_staging_clarifications": 6,
+    "dispositions": "docs/design/typescript-review-findings.md",
+    "prior_heads": {
+      "codex/ts-review-01-contract": "2906d6f2ec2c77e54844aca26640f106f9cba4b3",
+      "codex/ts-review-02-request-parsers": "c013657f732f9718e599f4c519a3d3554b137f61",
+      "codex/ts-review-03-state-primitives": "b8c1ebdbddee064d334bcbb3466bc513fa8365eb",
+      "codex/ts-review-04-wire-telemetry": "3d0228a2c7099c5c79541f44f9c679eb3317b4b8",
+      "codex/ts-review-05-config-values": "623dd8baace95371ba889f1b1b4b812968785923",
+      "codex/ts-review-06-config-shapes": "f05fbc16433b9be24e3ecf4d311cb6bce40a8063",
+      "codex/ts-review-07-config-loader": "260244363c6fb2017c22cc1f3fb35a05e3636ea5",
+      "codex/ts-review-08-config-overrides": "2009b1c1dfe4c20f647a6205b18acd63343b1c5d",
+      "codex/ts-review-09-provider-dispatch": "ada1f73b9044ed82227ee7055faf7fb1e86ea25f",
+      "codex/ts-review-10-gateway": "f4a2c1bfea62a91d10cbf8205f62c36e197c81ce",
+      "codex/ts-review-11-gateway-management": "84fee73dd52b775123cee2eee04a610165ea5235",
+      "codex/ts-review-12-stream-limits": "45ecb9f20cd4f7c49f7f64655aac176bbf8d3a6a",
+      "codex/ts-review-13-stream-recovery": "a914a68b0fdcebad410bc0a8d07e4f5c26fbb334",
+      "codex/ts-review-14-settlement-faults": "8865c9d04582db35ba932688d96c836dbe52b872",
+      "codex/ts-review-15-durable-stores": "ba70b3d8da572376b0b4b8476058404b485f355d",
+      "codex/ts-review-16-cli-services": "efe0a89a2b5697a1ea8bbc7a106257310e8cfcb1",
+      "codex/ts-review-17-cli-host": "5e909c582ce9cc8a99d1f5974995b6c139ab779e",
+      "codex/ts-review-18-cli-config-errors": "ce062c039b07ec5e4a551946b2eaf25a3133ff3b",
+      "codex/ts-review-19-extensions": "4ed2f251ad252b75f673fb3775f7ce923ad7b1cf",
+      "codex/ts-review-20-worker": "c356f540799a40099693a3fd3c09201ebb56dea3",
+      "codex/ts-review-21-release-gates": "f57a4f0d7ffcfa2508d63581b281473068353012"
+    },
+    "followup_observations": 20,
+    "additional_threads": 16,
+    "revised_existing_findings": 4,
+    "total_threads_at_this_pass": 101
+  }
+}

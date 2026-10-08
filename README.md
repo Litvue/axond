@@ -231,6 +231,14 @@ just soak               # long streaming soak, also available on demand in CI
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for contribution and compatibility-lock
 guidance.
 
+## TypeScript port
+
+A Hono gateway in [`ts/`](./ts) runs the same compat lanes via
+`AXOND_BIN=ts/bin/axond`. It is not the release binary yet. The extension
+contract and the decision to keep the Rust tree as the conformance oracle are
+[ADR 0066](./docs/adr/0066-typescript-hono-extension-contract.md). Operators
+follow [the TypeScript notes](./docs/typescript.md).
+
 ## Releases
 
 Release-please maintains the changelog and workspace version. A release builds

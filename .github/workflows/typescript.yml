@@ -43,10 +43,162 @@ jobs:
           cache-dependency-path: |
             ts/package-lock.json
             tests/compat-ts/package-lock.json
-      - name: Review-stage unit and dependency gates
+      - name: Workspace tests
         working-directory: ts
         run: |
           npm ci
           npm test
           npm run lint:web
+          npm run check:alerts
+          npm run check:docs
           npm run check:npm
+          node --experimental-strip-types --disable-warning=ExperimentalWarning -e 'import { writeFile } from "node:fs/promises"; import { OPENAPI } from "./packages/gateway/src/openapi.ts"; await writeFile("openapi.json", JSON.stringify(OPENAPI));'
+          npm run test:workerd
+      - name: OpenAPI document
+        run: python3 ops/check-openapi.py ts/openapi.json
+      - name: Python compat lane
+        run: |
+          python3 -m pip install -r tests/compat/requirements.txt
+          AXOND_BIN=ts/bin/axond python3 -m pytest tests/compat -q
+      - name: Node SDK compat lane
+        working-directory: tests/compat-ts
+        run: |
+          npm ci
+          AXOND_BIN="${{ github.workspace }}/ts/bin/axond" npm test
+
+  shadow:
+    name: Rust shadow compare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - name: Build the Rust oracle
+        run: cargo build -p axond --locked
+      - name: Install the TypeScript gateway
+        working-directory: ts
+        run: npm ci
+      - name: Compare fixture responses and charges
+        working-directory: ts
+        run: node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/shadow-compare.ts --rust "${{ github.workspace }}/target/debug/axond" --ts "${{ github.workspace }}/ts/bin/axond"
+
+  binary:
+    name: Signed compiled binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - name: Install workspace dependencies
+        working-directory: ts
+        run: npm ci
+      - name: Install Bun 1.4.2 and cosign 2.5.2
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.2
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.bun/bin:$PATH"
+          curl -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.5.2/cosign-linux-amd64
+          chmod +x /tmp/cosign
+          sudo mv /tmp/cosign /usr/local/bin/cosign
+          bun --version
+          cosign version
+      - name: Compile, sign, verify, and boot
+        working-directory: ts
+        run: |
+          set -euo pipefail
+          bun build packages/cli/src/main.ts --compile --outfile "$RUNNER_TEMP/axond"
+          bash scripts/sign-artifact.sh "$RUNNER_TEMP/axond" "$RUNNER_TEMP/sign"
+          bash scripts/compiled-binary-smoke.sh "$RUNNER_TEMP/axond"
+
+  bun:
+    name: TypeScript unit tests on Bun
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: axond
+          POSTGRES_PASSWORD: axond
+          POSTGRES_DB: axond
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U axond -d axond"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AXOND_TEST_POSTGRES: postgres://axond:axond@localhost:5432/axond
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - name: Install workspace dependencies
+        working-directory: ts
+        run: npm ci
+      - name: Install Bun 1.4.2
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.2
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+      - name: Unit tests
+        working-directory: ts
+        run: |
+          export PATH="$HOME/.bun/bin:$PATH"
+          npm run test:bun
+
+  release-sign:
+    name: Keyless signature for a tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.14.0"
+          cache: npm
+          cache-dependency-path: ts/package-lock.json
+      - name: Install workspace dependencies
+        working-directory: ts
+        run: npm ci
+      - name: Install Bun 1.4.2 and cosign 2.5.2
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.2
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.bun/bin:$PATH"
+          curl -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.5.2/cosign-linux-amd64
+          chmod +x /tmp/cosign
+          sudo mv /tmp/cosign /usr/local/bin/cosign
+      - name: Sign the tag binary with GitHub OIDC
+        working-directory: ts
+        env:
+          COSIGN_MODE: keyless
+          COSIGN_IDENTITY_REGEXP: "(?i)https://github.com/litvue/axond/.github/workflows/typescript.yml@refs/tags/v.*"
+        run: |
+          bun build packages/cli/src/main.ts --compile --outfile "$RUNNER_TEMP/axond"
+          bash scripts/sign-artifact.sh "$RUNNER_TEMP/axond" "$RUNNER_TEMP/sign"
+      - name: Retain the signed binary and verification material
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: axond-typescript-${{ github.ref_name }}
+          path: |
+            ${{ runner.temp }}/axond
+            ${{ runner.temp }}/sign/*
+          if-no-files-found: error
