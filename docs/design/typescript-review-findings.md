@@ -106,3 +106,32 @@ extension now restricts grants to inference and validates claims independently.
 | [#554](https://github.com/Litvue/axond/pull/554) | [Large usage charges lose comparison precision](https://github.com/Litvue/axond/pull/554#discussion_r4211987034) | Addressed; see owning patch and regression checks |
 | [#554](https://github.com/Litvue/axond/pull/554) | [Metric gate overlooks common alert expressions](https://github.com/Litvue/axond/pull/554#discussion_r4211987210) | Addressed; see owning patch and regression checks |
 | [#554](https://github.com/Litvue/axond/pull/554) | [Tag signature remains on the runner](https://github.com/Litvue/axond/pull/554#discussion_r4211987391) | Addressed; see owning patch and regression checks |
+
+
+## Follow-up review of the corrected stack
+
+Fresh automated review raised 13 new threads and revised four existing findings.
+The 17 observations below were evaluated separately from the original 85.
+Confirmed edge cases received owning patches and regression coverage; contract
+observations are tied to explicit documentation. These dispositions do not
+constitute maintainer approval.
+
+| PR | Follow-up observation | Evidence |
+| --- | --- | --- |
+| [#534](https://github.com/Litvue/axond/pull/534) | [CR-terminated events stall live streams](https://github.com/Litvue/axond/pull/534#discussion_r4211719153) | SDK live-source regression delivers a completed CR event immediately and preserves a delayed LF for identity transforms. |
+| [#534](https://github.com/Litvue/axond/pull/534) | [Qualification guide depends on a review branch](https://github.com/Litvue/axond/pull/534#discussion_r4219865215) | Staged guide points to an immutable published commit. |
+| [#536](https://github.com/Litvue/axond/pull/536) | [File-backed usage summaries vanish from metrics](https://github.com/Litvue/axond/pull/536#discussion_r4219839970) | File-backed usage summaries record wait, duration, and success/failure metrics. |
+| [#536](https://github.com/Litvue/axond/pull/536) | [Unbounded concurrent summary readers](https://github.com/Litvue/axond/pull/536#discussion_r4219840170) | Independent summary queue permits one active snapshot reader per store, outside the settlement lock. |
+| [#537](https://github.com/Litvue/axond/pull/537) | [Coalesced SSE events rejected as oversized](https://github.com/Litvue/axond/pull/537#discussion_r4219825228) | Responses and Messages parse bounded parts and enforce the limit on each complete/unfinished event rather than the transport chunk. |
+| [#537](https://github.com/Litvue/axond/pull/537) | [Extension timing metrics lose histogram data](https://github.com/Litvue/axond/pull/537#discussion_r4219825521) | Extension wait and first-token observations retain histogram counts and extrema. |
+| [#537](https://github.com/Litvue/axond/pull/537) | [Collector response handling has changed](https://github.com/Litvue/axond/pull/537#discussion_r4219825756) | Collector completion uses successful headers and cancels the response body; separate tests cover missing headers and an unfinished body. |
+| [#538](https://github.com/Litvue/axond/pull/538) | [Array tokens lost after literal backslash](https://github.com/Litvue/axond/pull/538#discussion_r4219833651) | Literal TOML backslashes remain ordinary characters; nested-array float diagnostics have a regression. |
+| [#539](https://github.com/Litvue/axond/pull/539) | [Configuration validation changes accepted inputs](https://github.com/Litvue/axond/pull/539#discussion_r4219816881) | PR descriptions and ADR 0067 identify input changes; lowercase environment prefixes and malformed IPv6 hosts are refused according to the Rust contract. |
+| [#542](https://github.com/Litvue/axond/pull/542) | [Paused clients trigger false stream timeouts](https://github.com/Litvue/axond/pull/542#discussion_r4211966195) | Pending-read start persists across keepalives, while a read begun after downstream backpressure gets a fresh idle budget. |
+| [#542](https://github.com/Litvue/axond/pull/542) | [Credential probe contract needs clarification](https://github.com/Litvue/axond/pull/542#discussion_r4219823770) | Walk contract states one half-open attempt per eligible credential. |
+| [#543](https://github.com/Litvue/axond/pull/543) | [Failed metrics export delays recovery](https://github.com/Litvue/axond/pull/543#discussion_r4219824568) | Delivery time advances only after successful metrics export; failed in-flight delivery clears for retry. |
+| [#543](https://github.com/Litvue/axond/pull/543) | [Shared recorder starves another collector](https://github.com/Litvue/axond/pull/543#discussion_r4219824779) | Gateway export states remain independent for applications sharing a recorder and targeting different collectors. |
+| [#546](https://github.com/Litvue/axond/pull/546) | [Delayed terminal tail loses coverage](https://github.com/Litvue/axond/pull/546#discussion_r4219818862) | Terminal-tail test waits until the client receives the terminal event, then sends the tail during the grace window. |
+| [#548](https://github.com/Litvue/axond/pull/548) | [Read queries with write text time out early](https://github.com/Litvue/axond/pull/548#discussion_r4219826363) | SQL classifier skips literals, quoted identifiers, dollar strings and nested comments; retains writes in CTEs and locking reads. |
+| [#549](https://github.com/Litvue/axond/pull/549) | [Reopened stores overwrite fresh model caches](https://github.com/Litvue/axond/pull/549#discussion_r4211968394) | Standalone discovery needs an explicit foreign-source override; initial authority belongs to the configured loop, not Store object identity. |
+| [#549](https://github.com/Litvue/axond/pull/549) | [Valid models.dev catalogues are refused](https://github.com/Litvue/axond/pull/549#discussion_r4211968837) | Catalogue parser accepts the supported top-level neutral models/providers maps and retains the neutral model rows. |
