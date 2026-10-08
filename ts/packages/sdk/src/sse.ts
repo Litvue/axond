@@ -21,7 +21,8 @@ const decoder = new TextDecoder();
 /**
  * Transform SSE frames without splitting an event across the caller's logic.
  *
- * Incomplete frames stay buffered until the delimiter (`\n\n` or `\r\n\r\n`).
+ * Incomplete frames stay buffered until the blank-line delimiter (LF, CRLF, CR, or mixed line endings).
+ * One event is bounded to 1 MiB; exceeding that bound cancels the source.
  * Returning the same event object writes `raw` unchanged. Returning a new
  * object re-encodes the frame. Returning null drops it.
  */
@@ -30,78 +31,74 @@ export function transformSseEvents(
   transform: SseTransform,
 ): ReadableStream<Uint8Array> {
   const reader = stream.getReader();
-  let pending = new Uint8Array(0);
+  const maxFrameBytes = 1024 * 1024;
+  let buffer = new Uint8Array(1024);
+  let used = 0;
+  let chunk = new Uint8Array(0);
+  let at = 0;
+  let lineLength = 0;
+  let afterCr = false;
+  let delimiterCr = false;
+  let ended = false;
+  function append(byte: number): void {
+    if (used >= maxFrameBytes) throw new Error("SSE event exceeds the byte limit");
+    if (used === buffer.length) {
+      const next = new Uint8Array(Math.min(maxFrameBytes, buffer.length * 2));
+      next.set(buffer); buffer = next;
+    }
+    buffer[used++] = byte;
+  }
+  function emit(controller: ReadableStreamDefaultController<Uint8Array>): boolean {
+    const parsed = parseFrame(buffer.slice(0, used));
+    used = 0; lineLength = 0; afterCr = false; delimiterCr = false;
+    const next = transform(parsed);
+    if (next === null) return false;
+    controller.enqueue(next === parsed ? parsed.raw : encodeFrame(next));
+    return true;
+  }
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
-      for (;;) {
-        const frame = takeFrame(pending);
-        if (frame) {
-          pending = frame.rest;
-          const parsed = parseFrame(frame.raw);
-          const next = transform(parsed);
-          if (next === null) {
+      try {
+        for (;;) {
+          if (at === chunk.length && !ended) {
+            const next = await reader.read();
+            ended = next.done;
+            chunk = next.value ?? new Uint8Array(0); at = 0;
+            if (!ended && chunk.length === 0) continue;
+          }
+          if (delimiterCr) {
+            if (!ended && chunk[at] === 10) { append(10); at++; }
+            if (emit(controller)) return;
             continue;
           }
-          controller.enqueue(next === parsed ? parsed.raw : encodeFrame(next));
-          return;
-        }
-        const chunk = await reader.read();
-        if (chunk.done) {
-          if (pending.length > 0) {
-            controller.enqueue(pending);
-            pending = new Uint8Array(0);
+          if (ended) {
+            if (used > 0) controller.enqueue(buffer.slice(0, used));
+            controller.close(); return;
           }
-          controller.close();
-          return;
+          const byte = chunk[at++]!;
+          append(byte);
+          if (afterCr && byte === 10) { afterCr = false; continue; }
+          afterCr = false;
+          if (byte === 10 || byte === 13) {
+            const empty = lineLength === 0;
+            lineLength = 0; afterCr = byte === 13;
+            if (empty) {
+              if (byte === 13) { delimiterCr = true; continue; }
+              if (emit(controller)) return;
+            }
+          } else lineLength++;
         }
-        pending = concat(pending, chunk.value);
+      } catch (error) {
+        void reader.cancel(error).catch(() => undefined);
+        controller.error(error);
       }
     },
-    cancel(reason) {
-      return reader.cancel(reason);
-    },
+    cancel(reason) { return reader.cancel(reason); },
   });
 }
 
-function takeFrame(buffer: Uint8Array): { raw: Uint8Array; rest: Uint8Array } | null {
-  let lf = -1;
-  let crlf = -1;
-  for (let index = 0; index < buffer.length - 1; index += 1) {
-    if (lf === -1 && buffer[index] === 10 && buffer[index + 1] === 10) {
-      lf = index;
-    }
-    if (
-      crlf === -1 &&
-      index + 3 < buffer.length &&
-      buffer[index] === 13 &&
-      buffer[index + 1] === 10 &&
-      buffer[index + 2] === 13 &&
-      buffer[index + 3] === 10
-    ) {
-      crlf = index;
-    }
-    if (lf !== -1 && crlf !== -1) {
-      break;
-    }
-  }
-  let at = -1;
-  let width = 0;
-  if (lf !== -1 && (crlf === -1 || lf < crlf)) {
-    at = lf;
-    width = 2;
-  } else if (crlf !== -1) {
-    at = crlf;
-    width = 4;
-  }
-  if (at === -1) {
-    return null;
-  }
-  const end = at + width;
-  return { raw: buffer.slice(0, end), rest: buffer.slice(end) };
-}
-
 function parseFrame(raw: Uint8Array): SseEvent {
-  const text = decoder.decode(raw).replace(/\r\n/g, "\n").replace(/\n+$/, "");
+  const text = decoder.decode(raw).replace(/\r\n|\r/g, "\n").replace(/\n+$/, "");
   let event: string | null = null;
   let id: string | null = null;
   const data: string[] = [];

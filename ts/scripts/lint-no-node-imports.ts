@@ -12,7 +12,7 @@ async function walk(directory: string): Promise<void> {
       await walk(path);
       continue;
     }
-    if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts")) {
+    if (!entry.name.endsWith(".ts") || entry.name.endsWith(".test.ts") || entry.name.endsWith("-test-fixtures.ts")) {
       continue;
     }
     const text = await readFile(path, "utf8");

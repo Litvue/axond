@@ -6,6 +6,11 @@ decision on the differences below, and deployment evidence for its chosen target
 The detailed behavioral specification remains [the parity contract](typescript-parity.md)
 and [the operator compatibility contract](../compatibility.md).
 
+This guide describes qualification of the complete review stack. Early slices
+contain only their focused unit checks; the loader, gateway callers, Worker,
+shadow runner, and binary gates arrive in later slices. Merge the stack only
+after qualifying its final head, as described in [the stack guide](typescript-review-stack.md).
+
 ## Feature coverage matrix
 
 `Differential` means the same fixture scenario runs through two real processes.

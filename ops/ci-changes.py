@@ -24,7 +24,7 @@ def rust_path(path):
 def detect(event, payload, ref):
     # Tags and explicit qualification requests always exercise the full suite.
     if event == 'workflow_dispatch' or ref.startswith('refs/tags/'):
-        return {'rust': 'true', 'dependencies': 'true'}
+        return {'rust': 'true', 'dependencies': 'true', 'typescript': 'true'}
     if event == 'pull_request':
         base = payload['pull_request']['base']['sha']
         head = payload['pull_request']['head']['sha']
@@ -35,7 +35,7 @@ def detect(event, payload, ref):
     elif event == 'push':
         base, head = payload['before'], payload['after']
         if base == '0' * 40:
-            return {'rust': 'true', 'dependencies': 'true'}
+            return {'rust': 'true', 'dependencies': 'true', 'typescript': 'true'}
     else:
         raise ValueError(f'unsupported CI event: {event}')
     # --no-renames includes both sides of a move across the website boundary.
@@ -47,7 +47,8 @@ def detect(event, payload, ref):
     dependencies = rust and (event != 'pull_request' or any(
         path in dependency_paths or (path.startswith('crates/') and path.endswith('/Cargo.toml'))
         for path in paths))
-    return {'rust': str(rust).lower(), 'dependencies': str(dependencies).lower()}
+    typescript = any(not (path.startswith('website/') or path == '.github/workflows/website.yml') for path in paths)
+    return {'rust': str(rust).lower(), 'dependencies': str(dependencies).lower(), 'typescript': str(typescript).lower()}
 
 
 def self_test():
@@ -70,10 +71,10 @@ def self_test():
             for head, rust, dependencies in [(website, 'false', 'false'), (workflow, 'false', 'false'),
                                               (source, 'true', 'false'), (lock, 'true', 'true')]:
                 payload = {'pull_request': {'base': {'sha': base}, 'head': {'sha': head}}}
-                assert detect('pull_request', payload, '') == {'rust': rust, 'dependencies': dependencies}
+                assert detect('pull_request', payload, '') == {'rust': rust, 'dependencies': dependencies, 'typescript': rust}
                 for event, payload in [('push', {'before': base, 'after': head}),
                                        ('merge_group', {'merge_group': {'base_sha': base, 'head_sha': head}})]:
-                    assert detect(event, payload, '') == {'rust': rust, 'dependencies': rust}
+                    assert detect(event, payload, '') == {'rust': rust, 'dependencies': rust, 'typescript': rust}
             # A last-commit-only diff would miss the earlier source change.
             last = commit('website/README.md')
             assert detect('push', {'before': workflow, 'after': last}, '')['rust'] == 'true'
@@ -96,7 +97,7 @@ def self_test():
                 previous = git('rev-parse', 'HEAD').decode().strip()
                 head = commit(path)
                 payload = {'pull_request': {'base': {'sha': previous}, 'head': {'sha': head}}}
-                assert detect('pull_request', payload, '') == {'rust': 'true', 'dependencies': dependencies}
+                assert detect('pull_request', payload, '') == {'rust': 'true', 'dependencies': dependencies, 'typescript': 'true'}
             try:
                 detect('push', {'before': 'missing-ref', 'after': deleted}, '')
             except subprocess.CalledProcessError:
@@ -106,7 +107,7 @@ def self_test():
             previous = git('rev-parse', 'HEAD').decode().strip()
             typescript = commit('ts/packages/gateway/src/app.ts')
             assert detect('pull_request', {'pull_request': {'base': {'sha': previous}, 'head': {'sha': typescript}}}, '') == {
-                'rust': 'false', 'dependencies': 'false'}
+                'rust': 'false', 'dependencies': 'false', 'typescript': 'true'}
             mixed = commit('crates/gateway/src/lib.rs')
             assert detect('pull_request', {'pull_request': {'base': {'sha': previous}, 'head': {'sha': mixed}}}, '')['rust'] == 'true'
     finally:

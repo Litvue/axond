@@ -16,16 +16,19 @@ RELEASE = {
 }
 
 
-def expected_results(event, dependencies, rust):
+def expected_results(event, dependencies, rust, typescript="true"):
     expected = {job: "success" if rust == "true" or job in {"changes", "workflow-policy"} else "skipped" for job in COMMON}
     expected.update({job: "skipped" if rust == "false" or event == "pull_request" else "success" for job in RELEASE})
+    expected["typescript"] = "success" if typescript == "true" else "skipped"
     expected["dependency-policy"] = "success" if dependencies == "true" else "skipped"
     return expected
 
 
-def failures(needs, event, dependencies, rust):
-    expected = expected_results(event, dependencies, rust)
+def failures(needs, event, dependencies, rust, typescript="true"):
+    expected = expected_results(event, dependencies, rust, typescript)
     errors = []
+    if typescript not in {"true", "false"}:
+        errors.append("TypeScript change detection must succeed")
     if rust not in {"true", "false"}:
         errors.append("Rust change detection must succeed")
     if event == "workflow_dispatch" and rust != "true":
@@ -42,7 +45,7 @@ def failures(needs, event, dependencies, rust):
 
 
 def self_test():
-    all_jobs = COMMON | RELEASE | {"dependency-policy"}
+    all_jobs = COMMON | RELEASE | {"dependency-policy", "typescript"}
     cases = [
         ("pull_request", "false", "true"), ("pull_request", "true", "true"),
         ("push", "true", "true"), ("merge_group", "true", "true"),
@@ -63,6 +66,11 @@ def self_test():
         assert failures(needs, event, dependencies, "")
         assert failures(needs, event, "true", "false")
         assert failures({}, event, dependencies, rust)
+
+    website_needs = {job: {"result": result} for job, result in expected_results("pull_request", "false", "false", "false").items()}
+    assert not failures(website_needs, "pull_request", "false", "false", "false")
+    website_needs["typescript"]["result"] = "success"
+    assert failures(website_needs, "pull_request", "false", "false", "false")
 
     workflow = (Path(__file__).resolve().parent.parent / ".github/workflows/ci.yml").read_text()
     jobs = set(re.findall(r"^  ([\w-]+):$", workflow.split("jobs:\n", 1)[1], re.M))
@@ -91,7 +99,7 @@ if __name__ == "__main__":
         self_test()
     else:
         errors = failures(json.loads(os.environ["CI_NEEDS"]), os.environ["CI_EVENT"],
-                          os.environ["CI_DEPENDENCIES"], os.environ.get("CI_RUST", ""))
+                          os.environ["CI_DEPENDENCIES"], os.environ.get("CI_RUST", ""), os.environ.get("CI_TYPESCRIPT", ""))
         for error in errors:
             print(f"::error::{error}")
         sys.exit(bool(errors))

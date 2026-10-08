@@ -28,7 +28,7 @@ Extensions are operator and first-party code, reviewed like the gateway. There i
 
 Stages, in order: `pre-auth`, static gateway key (unless a pre-auth extension set `authenticated`), namespace resolution, `post-auth`, admission, `pre-dispatch`, upstream. A returned `Response` ends the pipeline. Code after `await next()` may replace `c.res`.
 
-An untrusted extension receives a store that requires the request namespace on every query and drops rows for any other namespace. A trusted extension receives the process store. Migrations may create only tables prefixed `axond_ext_<name>_`.
+An untrusted extension receives a read-only facade for simple SELECT projections from `axond_namespace` or extension tables with an exact namespace predicate. Arbitrary SQL requires `trusted: true`; this facade is not a sandbox (see ADR 0067). A trusted extension receives the process store. Migrations may create only tables prefixed `axond_ext_<name>_`.
 
 On a binary or Node process, `AXOND_EXTENSIONS_DIR` (or `[extensions] dir`) loads `.ts`, `.js`, and `.mjs` files at startup. Adding a file does not require rebuilding the binary; the process is restarted. On a Worker, extensions are static imports and the bundler includes them.
 

@@ -139,3 +139,20 @@ test("a multibyte character split across chunks stays one event", async () => {
   assert.deepEqual(seen, ["café"]);
   assert.equal(text, "data: café\n\n");
 });
+
+
+test("bare CR and mixed newlines cannot bypass transforms, even across chunks", async () => {
+  for (const delimiter of ["\r\r", "\n\r\n", "\r\n\n"]) {
+    const bytes = new TextEncoder().encode(`data: secret${delimiter}`);
+    const source = new ReadableStream({ start(c) { for (const byte of bytes) c.enqueue(new Uint8Array([byte])); c.close(); } });
+    const transformed = transformSseEvents(source, (event) => ({ ...event, data: event.data.replace("secret", "hidden") }));
+    assert.equal(await new Response(transformed).text(), "data: hidden\n\n");
+  }
+});
+
+test("an oversized unterminated event cancels its source", async () => {
+  let cancelled = false;
+  const source = new ReadableStream({ pull(c) { c.enqueue(new Uint8Array(64 * 1024).fill(97)); }, cancel() { cancelled = true; } });
+  await assert.rejects(new Response(transformSseEvents(source, (event) => event)).arrayBuffer(), /byte limit/);
+  assert.equal(cancelled, true);
+});

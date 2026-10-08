@@ -50,7 +50,7 @@ This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-
 | Separate connect timeout on the Bun binary and on Workers | The header and failover budgets still bound the attempt. Node applies `connect_timeout_ms` with its HTTP client. |
 | Postgres session pool (`axond.store.connections_reused`, `axond.store.pool.sessions`) and a separate usage-index append (`usage_append`) | Each Postgres call opens one client and closes it. The usage row and the spend update are one `budget_charge`. Extension `query` is not a catalogue operation. |
 | Target circuit gauge `axond.upstream.circuit_state` | Not recorded. Credential parking is the pool circuit. Target breakers stay out of core. |
-| Catalogue schema refusals (`schema`, `price`, `content`, and the rest of that vocabulary) | This importer stores a JSON document it could parse. It does not apply the models.dev schema. The refusal streak is a TypeScript table, not the Rust catalogue holder. |
+| Catalogue schema refusals (`schema`, `price`, `content`, and the rest of that vocabulary) | This importer validates a supported model-list or model-map shape and caches IDs. It does not import the Rust catalogue pricing/offerings pipeline; configured price rules remain authoritative. The refusal streak is a TypeScript table, not the Rust catalogue holder. |
 
 ## Distribution
 
