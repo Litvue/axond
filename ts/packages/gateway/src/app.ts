@@ -1213,7 +1213,7 @@ function noteLease(
   });
 }
 
-const metricExportTimes = new WeakMap<object, number>();
+const metricExportStates = new WeakMap<AxondOptions, { deliveredAt?: number; inflight?: Promise<void> }>();
 const METRIC_EXPORT_INTERVAL_MS = 30_000;
 
 async function publishTelemetry(opts: AxondOptions, spans: readonly ExportedSpan[]): Promise<void> {
@@ -1227,10 +1227,12 @@ async function publishTelemetry(opts: AxondOptions, spans: readonly ExportedSpan
     await postOtlp(target.endpoint, "traces", tracePayload(spans, resource), fetchImpl);
     const points = opts.metrics?.points;
     const now = Date.now();
-    const previous = opts.metrics ? metricExportTimes.get(opts.metrics) : undefined;
-    if (opts.metrics && points && points.length > 0 && (previous === undefined || now - previous >= METRIC_EXPORT_INTERVAL_MS)) {
-      metricExportTimes.set(opts.metrics, now);
-      await postOtlp(target.endpoint, "metrics", metricPayload(points, resource, spans[0]!.endMs), fetchImpl);
+    const state = metricExportStates.get(opts) ?? {};
+    metricExportStates.set(opts, state);
+    if (opts.metrics && points && points.length > 0 && !state.inflight && (state.deliveredAt === undefined || now - state.deliveredAt >= METRIC_EXPORT_INTERVAL_MS)) {
+      state.inflight = postOtlp(target.endpoint, "metrics", metricPayload(points, resource, spans[0]!.endMs), fetchImpl);
+      try { await state.inflight; state.deliveredAt = Date.now(); }
+      finally { state.inflight = undefined; }
     }
   } catch {
     // A collector that is down does not fail the caller.
