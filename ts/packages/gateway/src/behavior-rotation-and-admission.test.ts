@@ -66,7 +66,7 @@ test("an oversized provider error is truncated and keeps the provider status", a
   const text = await response.text();
   assert.equal(text.includes("HIDDEN_TAIL_SENTINEL"), false);
   assert.deepEqual(JSON.parse(text), {
-    error: { type: "provider_dependency_failed", message: "VISIBLE" },
+    error: { type: "provider_dependency_failed", message: "provider dependency failed" },
   });
   upstream.close();
 });
@@ -108,7 +108,7 @@ test("a stalled provider error body still returns the provider status", async ()
     });
     assert.equal(response.status, 502);
     assert.deepEqual(await response.json(), {
-      error: { type: "provider_dependency_failed", message: "upstream request failed" },
+      error: { type: "provider_dependency_failed", message: "provider dependency failed" },
     });
   } finally {
     upstream.close();

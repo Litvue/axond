@@ -292,7 +292,7 @@ function boundDiagnostic(message: string): string {
 
 export function classifyUpstream(status: number, body: string): GatewayFailure {
   const extracted = extractUpstreamMessage(body);
-  const message = extracted.length === 0 ? "upstream request failed" : boundDiagnostic(extracted);
+  const message = boundDiagnostic(extracted);
   if (isContextLengthError(body) || isContextLengthError(extracted)) {
     const httpStatus = status === 401 || status === 403 ? 502 : 400;
     return upstreamFailure("context_window_exceeded", httpStatus, message, false, status);
