@@ -41,12 +41,6 @@ function discoveryAbort(): { signal: AbortSignal; done: () => void } {
 }
 
 /**
- * The first round in this process may replace a row fetched from another
- * base URL. Later rounds leave a fresh foreign row alone.
- */
-const initializedStores = new WeakSet<object>();
-
-/**
  * Refresh provider `/models` caches and, when configured, a catalogue URL.
  * Failures mark the row stale and leave the previous payload in place.
  */
@@ -59,7 +53,7 @@ export async function discoverOnce(input: {
   platformNamespace?: string;
   /**
    * When true, a row fetched from another base URL is marked stale so this
-   * round can replace it. When omitted, only the first round in the process does.
+   * round can replace it. Otherwise a fresh foreign-source row is retained.
    */
   replaceForeignSource?: boolean;
   fetchImpl?: typeof fetch;
@@ -67,8 +61,7 @@ export async function discoverOnce(input: {
   onLog?: (record: DiscoveryLog) => void;
 }): Promise<void> {
   const fetchImpl = input.fetchImpl ?? fetch;
-  const allowReplace = input.replaceForeignSource ?? !initializedStores.has(input.store);
-  if (input.providers.length > 0) initializedStores.add(input.store);
+  const allowReplace = input.replaceForeignSource === true;
   for (const provider of input.providers) {
     await refreshProvider(input, fetchImpl, provider, allowReplace);
   }
@@ -390,6 +383,15 @@ export async function noteCatalogRefusal(
 }
 
 function catalogModels(body: unknown): unknown[] {
+  if (body !== null && typeof body === "object" && !Array.isArray(body) && "models" in body && "providers" in body) {
+    const catalog = body as { models: unknown; providers: unknown };
+    if (catalog.models === null || typeof catalog.models !== "object" || Array.isArray(catalog.models) || catalog.providers === null || typeof catalog.providers !== "object" || Array.isArray(catalog.providers)) throw new Error("invalid catalogue schema");
+    const entries = Object.entries(catalog.models);
+    if (!entries.every(([id, row]) => /^[^/]+\/[^/]+$/.test(id) && row !== null && typeof row === "object" && !Array.isArray(row) && typeof (row as { id?: unknown }).id === "string" && (row as { id: string }).id === id)) throw new Error("invalid catalogue schema");
+    if (!Object.values(catalog.providers).every(row => row !== null && typeof row === "object" && !Array.isArray(row))) throw new Error("invalid catalogue schema");
+    return entries.map(([, row]) => row);
+  }
+
   const models = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray((body as { data?: unknown }).data) ? (body as { data: unknown[] }).data : null;
   if (models) {
     if (models.every((row) => row !== null && typeof row === "object" && typeof (row as { id?: unknown }).id === "string")) return models;
@@ -418,10 +420,13 @@ export function startDiscovery(input: {
 }): () => void {
   let running = false;
   let stopped = false;
+  let initial = true;
   const run = () => {
     if (running || stopped) return;
     running = true;
-    void discoverOnce(input).catch(() => undefined).finally(() => { running = false; });
+    const replaceForeignSource = input.replaceForeignSource ?? (initial && input.providers.length > 0);
+    if (input.providers.length > 0) initial = false;
+    void discoverOnce({ ...input, replaceForeignSource }).catch(() => undefined).finally(() => { running = false; });
   };
   run();
   const timer = setInterval(run, input.intervalSeconds * 1000);

@@ -687,3 +687,23 @@ test("valid JSON with the wrong catalog shape retains the previous payload", asy
   const row = await store.getProviderModels("catalog");
   assert.deepEqual(row?.data, [{ id: "kept" }]); assert.equal(row?.stale, true);
 });
+
+
+test("models.dev catalogue maps produce the neutral model rows", async () => {
+  const store = createMemoryStore();
+  await discoverOnce({ store, providers: [], credentials: [], catalog: { source: "models-dev", sourceUrl: "https://models.dev/catalog.json" },
+    fetchImpl: async () => new Response(JSON.stringify({ models: { "openai/gpt-test": { id: "openai/gpt-test", name: "Fixture" } }, providers: { openai: { models: {} } } })) });
+  const row = await store.getProviderModels("catalog"); assert.equal(row?.stale, false); assert.deepEqual(row?.data, [{ id: "openai/gpt-test", name: "Fixture" }]);
+});
+
+test("reopening a durable store does not authorize foreign cache replacement", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "axond-discovery-authority-")); const path = join(directory, "db.sqlite"); let store = openSqliteStore(path);
+  try {
+    await store.upsertProviderModels({ provider: "p", fetchedAt: new Date().toISOString(), stale: false, source: "http://new.example", data: [{ id: "new" }] });
+    await store.close?.(); store = openSqliteStore(path);
+    let calls = 0;
+    const input = { store, providers: [{ id: "p", kind: "openai" as const, baseUrl: "http://old.example" }], credentials: [{ id: "one", provider: "p", namespace: "platform", secret: "fixture" }], catalog: { source: "none" as const }, fetchImpl: async () => { calls++; return new Response(JSON.stringify({ data: [{ id: "old" }] })); } };
+    await discoverOnce(input); assert.equal(calls, 0); assert.equal((await store.getProviderModels("p"))?.source, "http://new.example");
+    await discoverOnce({ ...input, replaceForeignSource: true }); assert.equal(calls, 1); assert.equal((await store.getProviderModels("p"))?.source, "http://old.example");
+  } finally { await store.close?.(); await rm(directory, { recursive: true, force: true }); }
+});
