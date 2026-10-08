@@ -1,0 +1,50 @@
+name = "axond"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+# Client disconnect aborts Request.signal only when this flag is set. The
+# gateway settles an open stream as client_cancelled from that signal.
+compatibility_flags = ["nodejs_compat", "enable_request_signal"]
+
+# PlanetScale Postgres is reached through Hyperdrive. Create the config on
+# PlanetScale's direct port 5432 and disable caching. Pass host, port, scheme,
+# database, user, and password as separate flags. Wrangler's URL parser rejects
+# a password that contains `/`, `#`, `?`, or `%`, and a `%` that is not two hex
+# digits parses and then fails decodeURIComponent. --origin-password stores the
+# string as given. The default TLS mode is require: TLS, with the server
+# certificate checked against WebPKI. Hostname verification is --sslmode
+# verify-full and needs --ca-certificate-id for an uploaded CA.
+#   wrangler hyperdrive create axond \
+#     --origin-host=HOST \
+#     --origin-port=5432 \
+#     --origin-scheme=postgres \
+#     --database=DB \
+#     --origin-user=USER \
+#     --origin-password=PASSWORD \
+#     --caching-disabled
+# Port 6432 is PgBouncer. Hyperdrive is already the transaction pooler, so
+# the origin should be the direct port. A cached namespace or budget read can
+# admit a deleted namespace. A role with `pg_read_all_data` and
+# `pg_write_all_data` cannot CREATE. Apply the schema once as an owner on
+# port 5432. This Worker skips that DDL when the schema is present, and names
+# a missing table or column without sending it. Fill the id from the create
+# command. Local `wrangler dev` reads
+# CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE and does not use
+# this id. That local path was exercised against Postgres 16, 17, and 18;
+# PlanetScale was not.
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "00000000000000000000000000000000"
+
+[vars]
+# Set GATEWAY_KEY with `wrangler secret put GATEWAY_KEY` before deploying.
+PROVIDERS_JSON = "[]"
+# Optional. Price rules charged on settlement. Absent leaves models unpriced.
+# PRICES_JSON = "[{\"provider\":\"openai\",\"model\":\"*\",\"inputMicrodollarsPerMillion\":1,\"outputMicrodollarsPerMillion\":1}]"
+# Optional. The request path and the cron both read this list.
+# CREDENTIALS_JSON = "[]"
+# CATALOG_SOURCE = "models-dev"
+# CATALOG_SOURCE_URL = "https://models.dev/catalog.json"
+
+# Provider model discovery and catalogue import. Same interval as the CLI default.
+[triggers]
+crons = ["*/5 * * * *"]
