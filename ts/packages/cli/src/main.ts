@@ -51,7 +51,7 @@ async function main(): Promise<void> {
   const store =
     config.storage.backend === "sqlite"
       ? openSqliteStore(config.storage.path!, metrics)
-      : await openPostgres(requirePostgresDsn(config.storage), metrics);
+      : await openPostgres(requirePostgresDsn(config.storage), metrics, config.storage.createTable);
   await seedConfigNamespaces(store, config.namespaces);
   await resolveConfigSecrets(config, envSecretReader(process.env, readGatewayKeyFile));
   redactSecrets.push(config.gatewayKey);
@@ -150,15 +150,6 @@ async function main(): Promise<void> {
   const writeLog = (record: unknown) => {
     process.stdout.write(`${JSON.stringify(record)}\n`);
   };
-  void discoverOnce({
-    store,
-    providers: config.providers,
-    credentials: config.credentials,
-    catalog: config.catalog,
-    platformNamespace: config.defaultNamespace,
-    metrics,
-    onLog: writeLog,
-  });
   const stopDiscovery = startDiscovery({
     store,
     providers: config.providers,
@@ -356,7 +347,7 @@ function requirePostgresDsn(storage: { dsn?: string; dsnEnv?: string }): string 
   return dsn;
 }
 
-async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgresStore>[1]) {
+async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgresStore>[1], createTable: boolean) {
   const setup = holdPgClient(new Client(postgresClientOptions(dsn)));
   try {
     await setup.connect();
@@ -366,7 +357,7 @@ async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgr
         const row = Array.isArray(result) ? result[result.length - 1] : result;
         return { rows: (row?.rows ?? []) as Record<string, unknown>[], rowCount: row?.rowCount ?? null };
       },
-    });
+    }, createTable);
   } finally {
     await closePgClient(setup);
   }
