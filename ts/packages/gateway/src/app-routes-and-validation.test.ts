@@ -993,7 +993,7 @@ test("budget_amounts_match_serde_numbers", async () => {
   }
 });
 
-test("cumulative metric snapshots are bounded per recorder while traces remain per request", async () => {
+test("cumulative metric snapshots are bounded per gateway while traces remain per request", async () => {
   const tasks: Promise<void>[] = []; const signals: string[] = []; const metrics = createMetrics();
   const app = createAxond({ store: createMemoryStore(), gatewayKey: KEY, defaultNamespace: "platform", providers: [], metrics,
     telemetry: { endpoint: "http://collector", fetch: async (url) => { signals.push(String(url)); return new Response(null, { status: 200 }); } },
@@ -1001,4 +1001,16 @@ test("cumulative metric snapshots are bounded per recorder while traces remain p
   for (let i = 0; i < 3; i++) { assert.equal((await app.request("http://localhost/healthz")).status, 200); await Promise.all(tasks); }
   assert.equal(signals.filter((url) => url.endsWith("/v1/traces")).length, 3);
   assert.equal(signals.filter((url) => url.endsWith("/v1/metrics")).length, 1);
+});
+
+
+test("failed metric exports retry and shared recorders do not suppress other collectors", async () => {
+  const metrics = createMetrics(), tasks: Promise<void>[] = []; const posts: string[] = []; let failed = false;
+  const build = (endpoint: string) => createAxond({ store: createMemoryStore(), gatewayKey: KEY, defaultNamespace: "platform", providers: [], metrics,
+    telemetry: { endpoint, fetch: async url => { const signal = String(url); posts.push(signal); if (signal.endsWith("/metrics") && !failed) { failed = true; return new Response(null, { status: 503 }); } return new Response(null, { status: 200 }); } },
+    onBackground: task => { tasks.push(task); } });
+  const one = build("http://collector-one"), two = build("http://collector-two");
+  for (const app of [one, one, two]) { await app.request("http://localhost/healthz"); await Promise.all(tasks); }
+  assert.equal(posts.filter(url => url === "http://collector-one/v1/metrics").length, 2);
+  assert.equal(posts.filter(url => url === "http://collector-two/v1/metrics").length, 1);
 });
