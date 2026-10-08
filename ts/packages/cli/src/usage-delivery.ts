@@ -86,6 +86,7 @@ export async function openUsageDelivery(input: {
 }): Promise<UsageDelivery> {
   const configured = input.sinks.length === 0 ? [stdoutSink()] : input.sinks;
   const writers: BufferedSink[] = [];
+  try {
   for (const sink of configured) {
     const writeStdout = input.writeStdout ?? ((line: string) => {
       process.stdout.write(line);
@@ -115,6 +116,10 @@ export async function openUsageDelivery(input: {
       continue;
     }
     writers.push(await openPostgresSink(sink, input.env, input.metrics, input.onLog));
+  }
+  } catch (error) {
+    await Promise.allSettled(writers.map((writer) => writer.flush(1000)));
+    throw error;
   }
   return {
     write(record) {
@@ -231,6 +236,8 @@ export function createBufferedUsageSink(input: {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let chain: Promise<void> = Promise.resolve();
   let closed = false;
+  let outstanding = 0;
+  let failedBatch = false;
 
   const noteDrop = (
     reason: "buffer_full" | "shutdown" | "sink_error",
@@ -271,7 +278,10 @@ export function createBufferedUsageSink(input: {
         await input.insert(rows);
         input.metrics.record("axond.usage.records_written", rows.length, { "axond.usage_sink": "postgres" });
       } catch {
+        failedBatch = true;
         noteDrop("sink_error", rows.length, "batch");
+      } finally {
+        outstanding -= rows.length;
       }
     });
   };
@@ -292,11 +302,12 @@ export function createBufferedUsageSink(input: {
       return dropped;
     },
     write(record, observedAt) {
-      if (closed || queue.length >= input.capacity) {
+      if (closed || outstanding >= input.capacity) {
         noteDrop(closed ? "shutdown" : "buffer_full", 1, "sampled");
         return;
       }
       queue.push({ record, observedAt });
+      outstanding += 1;
       if (queue.length >= input.maxBatch) {
         take();
         return;
@@ -316,8 +327,11 @@ export function createBufferedUsageSink(input: {
       }
       let settled = false;
       let failed = false;
+      const deadline = Date.now() + timeoutMs;
       const work = chain.then(async () => {
         if (pending.length === 0) {
+          failed = failedBatch;
+          await input.close?.();
           settled = true;
           return;
         }
@@ -328,9 +342,12 @@ export function createBufferedUsageSink(input: {
           failed = true;
           noteDrop("sink_error", pending.length, "batch");
         }
+        failed ||= failedBatch;
+        outstanding -= pending.length;
+        await input.close?.();
         settled = true;
       });
-      await Promise.race([work.then(() => undefined), delay(timeoutMs).then(() => undefined)]);
+      await Promise.race([work.then(() => undefined), delay(Math.max(0, deadline - Date.now())).then(() => undefined)]);
       if (!settled) {
         noteDrop("shutdown", pending.length, "silent");
         input.metrics.record("axond.usage.flushes", 1, {
@@ -346,7 +363,6 @@ export function createBufferedUsageSink(input: {
         "axond.flush_outcome": outcome,
       });
       logFlush(outcome, pending.length);
-      await input.close?.();
       return !failed;
     },
   };

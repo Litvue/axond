@@ -44,7 +44,7 @@ function discoveryAbort(): { signal: AbortSignal; done: () => void } {
  * The first round in this process may replace a row fetched from another
  * base URL. Later rounds leave a fresh foreign row alone.
  */
-let replaceForeignSource = true;
+const initializedStores = new WeakSet<object>();
 
 /**
  * Refresh provider `/models` caches and, when configured, a catalogue URL.
@@ -67,8 +67,8 @@ export async function discoverOnce(input: {
   onLog?: (record: DiscoveryLog) => void;
 }): Promise<void> {
   const fetchImpl = input.fetchImpl ?? fetch;
-  const allowReplace = input.replaceForeignSource ?? replaceForeignSource;
-  replaceForeignSource = false;
+  const allowReplace = input.replaceForeignSource ?? !initializedStores.has(input.store);
+  if (input.providers.length > 0) initializedStores.add(input.store);
   for (const provider of input.providers) {
     await refreshProvider(input, fetchImpl, provider, allowReplace);
   }
@@ -319,13 +319,15 @@ async function refreshCatalog(
   } finally {
     deadline.done();
   }
+  let data: unknown[];
+  try { data = catalogModels(body); } catch { await noteCatalogRefusal(input, "not_json"); return; }
   const fetchedAt = new Date().toISOString();
   try {
     await input.store.upsertProviderModels({
       provider: "catalog",
       fetchedAt,
       stale: false,
-      data: catalogModels(body),
+      data,
       source: sourceUrl,
     });
   } catch {
@@ -358,10 +360,11 @@ function catalogStatusReason(status: number): CatalogRefusalReason {
   return "unreachable";
 }
 
-async function noteCatalogRefusal(
+export async function noteCatalogRefusal(
   input: { store: Store; metrics?: CatalogMetrics; onLog?: (record: DiscoveryLog) => void },
   reason: CatalogRefusalReason,
 ): Promise<void> {
+  await input.store.markProviderModelsStale("catalog").catch(() => undefined);
   let next: number;
   try {
     next = await input.store.noteCatalogRefusal();
@@ -387,16 +390,18 @@ async function noteCatalogRefusal(
 }
 
 function catalogModels(body: unknown): unknown[] {
-  if (Array.isArray(body)) {
-    return body;
+  const models = Array.isArray(body) ? body : body && typeof body === "object" && Array.isArray((body as { data?: unknown }).data) ? (body as { data: unknown[] }).data : null;
+  if (models) {
+    if (models.every((row) => row !== null && typeof row === "object" && typeof (row as { id?: unknown }).id === "string")) return models;
+    throw new Error("invalid catalogue schema");
   }
-  if (body && typeof body === "object" && Array.isArray((body as { data?: unknown }).data)) {
-    return (body as { data: unknown[] }).data;
+  if (body !== null && typeof body === "object" && Object.entries(body).every(([id, row]) => /^[^/]+\/[^/]+$/.test(id) && row !== null && typeof row === "object" && !Array.isArray(row))) {
+    return Object.keys(body).map((id) => ({ id }));
   }
-  if (body && typeof body === "object") {
-    return Object.keys(body as Record<string, unknown>).map((id) => ({ id }));
+  if (body !== null && typeof body === "object" && Object.values(body).every((row) => row !== null && typeof row === "object" && !Array.isArray(row) && typeof (row as { models?: unknown }).models === "object" && (row as { models?: unknown }).models !== null)) {
+    return Object.keys(body).map((id) => ({ id }));
   }
-  return [];
+  throw new Error("invalid catalogue schema");
 }
 
 /** Background loop. The timer does not keep a CLI process alive. */
@@ -411,10 +416,15 @@ export function startDiscovery(input: {
   metrics?: CatalogMetrics;
   onLog?: (record: DiscoveryLog) => void;
 }): () => void {
+  let running = false;
+  let stopped = false;
   const run = () => {
-    void discoverOnce(input);
+    if (running || stopped) return;
+    running = true;
+    void discoverOnce(input).catch(() => undefined).finally(() => { running = false; });
   };
+  run();
   const timer = setInterval(run, input.intervalSeconds * 1000);
   timer.unref?.();
-  return () => clearInterval(timer);
+  return () => { stopped = true; clearInterval(timer); };
 }

@@ -678,3 +678,12 @@ test("discovery treats a provider body that never arrives as unreachable", { tim
   assert.equal(elapsed >= 25_000, true);
   assert.equal(elapsed < 35_000, true);
 });
+
+
+test("valid JSON with the wrong catalog shape retains the previous payload", async () => {
+  const store = createMemoryStore();
+  await store.upsertProviderModels({ provider: "catalog", source: "https://example.test/catalog.json", fetchedAt: new Date().toISOString(), stale: false, data: [{ id: "kept" }] });
+  await discoverOnce({ store, providers: [], credentials: [], catalog: { source: "models-dev", sourceUrl: "https://example.test/catalog.json" }, fetchImpl: async () => new Response('{"error":"unavailable"}') });
+  const row = await store.getProviderModels("catalog");
+  assert.deepEqual(row?.data, [{ id: "kept" }]); assert.equal(row?.stale, true);
+});

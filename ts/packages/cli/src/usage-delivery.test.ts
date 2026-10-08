@@ -456,3 +456,28 @@ test("a usage schema apply blocked on the table ends before the query limit", { 
     await drop.end();
   }
 });
+
+
+test("scheduled batches still consume buffer capacity and failures make flush fail", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let inserts = 0;
+  const sink = createBufferedUsageSink({ capacity: 1, maxBatch: 1, flushIntervalMs: 1000,
+    metrics: createMetrics(), onLog() {}, insert: async () => { inserts++; await gate; throw new Error("database unavailable"); } });
+  for (let i = 0; i < 100; i++) sink.write(sample(String(i)), new Date());
+  assert.equal(sink.dropped, 99);
+  release();
+  assert.equal(await sink.flush(1000), false);
+  assert.equal(inserts, 1);
+});
+
+test("database close shares the flush deadline", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const sink = createBufferedUsageSink({ capacity: 1, maxBatch: 1, flushIntervalMs: 1000,
+    metrics: createMetrics(), onLog() {}, insert: async () => {}, close: () => gate });
+  const start = Date.now();
+  assert.equal(await sink.flush(30), false);
+  assert.ok(Date.now() - start < 500);
+  release();
+});
