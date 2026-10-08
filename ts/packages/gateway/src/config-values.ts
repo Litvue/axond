@@ -1091,7 +1091,7 @@ function skipTomlValue(text: string, index: number): number {
     const quote = text.startsWith(opener.repeat(3), index) ? opener.repeat(3) : opener;
     index += quote.length;
     while (index < text.length) {
-      if (text[index] === "\\") {
+      if (opener === '"' && text[index] === "\\") {
         index += 2;
         continue;
       }
