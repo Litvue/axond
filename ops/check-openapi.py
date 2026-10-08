@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -60,6 +61,18 @@ def check(spec: dict) -> list[str]:
         if path not in REQUIRED_METHODS:
             failures.append(f"unexpected path {path}")
 
+    for path, item in paths.items():
+        if not isinstance(item, dict):
+            continue
+        placeholders = set(re.findall(r"\{([^}]+)\}", path))
+        for method, operation in item.items():
+            if method not in HTTP_METHODS or not isinstance(operation, dict):
+                continue
+            params = item.get("parameters", []) + operation.get("parameters", [])
+            bound = {p.get("name") for p in params if isinstance(p, dict) and p.get("in") == "path" and p.get("required") is True}
+            for name in sorted(placeholders - bound):
+                failures.append(f"{method.upper()} {path} is missing required path parameter {name}")
+
     usage = paths.get("/api/v1/namespaces/{ns}/usage", {}).get("get", {})
     params = usage.get("parameters") if isinstance(usage, dict) else None
     period = None
@@ -103,7 +116,12 @@ def self_test() -> int:
             "parameters": [{"name": "period", "in": "query", "required": True}]
         }
     }
+    for path, item in good["paths"].items():
+        item["parameters"] = [{"name": name, "in": "path", "required": True} for name in re.findall(r"\{([^}]+)\}", path)]
     assert check(good) == [], check(good)
+    unbound = json.loads(json.dumps(good))
+    unbound["paths"]["/api/v1/namespaces/{ns}"]["parameters"] = []
+    assert any("path parameter ns" in f for f in check(unbound))
 
     bad = json.loads(json.dumps(good))
     bad["openapi"] = "3.0.3"

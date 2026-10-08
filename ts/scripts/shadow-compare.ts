@@ -357,7 +357,7 @@ function chargeRows(sqlite: string): string[] {
   const db = new DatabaseSync(sqlite, { readOnly: true });
   const rows = db
     .prepare(
-      `SELECT namespace, period, model, status, cost_microdollars AS cost
+      `SELECT namespace, period, model, status, CAST(cost_microdollars AS TEXT) AS cost
        FROM axond_store_usage ORDER BY namespace, period, model, status, cost`,
     )
     .all() as Array<{ namespace: string; period: string | null; model: string; status: string; cost: number | bigint | null }>;

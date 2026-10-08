@@ -44,6 +44,16 @@
       }
     },
     "/api/v1/namespaces/{ns}": {
+      "parameters": [
+        {
+          "name": "ns",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "get": {
         "responses": {
           "200": {
@@ -67,6 +77,24 @@
       }
     },
     "/api/v1/namespaces/{ns}/budgets/{period}": {
+      "parameters": [
+        {
+          "name": "ns",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "period",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "get": {
         "responses": {
           "200": {
@@ -83,6 +111,16 @@
       }
     },
     "/api/v1/namespaces/{ns}/budget": {
+      "parameters": [
+        {
+          "name": "ns",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "get": {
         "responses": {
           "200": {
@@ -99,6 +137,16 @@
       }
     },
     "/api/v1/namespaces/{ns}/usage": {
+      "parameters": [
+        {
+          "name": "ns",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "get": {
         "parameters": [
           {
@@ -118,6 +166,16 @@
       }
     },
     "/api/v1/providers/{id}/models": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
       "get": {
         "responses": {
           "200": {
