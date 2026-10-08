@@ -97,11 +97,11 @@ export function planCredentialWalk(
   if (pinned) {
     return { attempts: [pool[0]!], parked: [] };
   }
-  const state = poolState(pools, namespace, provider);
+  const state = poolState(pools, pool[0]!.namespace, provider);
   const start = rotationStart(pool, state.tick, policy.strategy);
   state.tick += 1;
   const order = pool.map((_, index) => pool[(start + index) % pool.length]!);
-  let probe: CredentialConfig | null = null;
+  const probes: CredentialConfig[] = [];
   const healthy: CredentialConfig[] = [];
   const parked: CredentialConfig[] = [];
   for (const candidate of order) {
@@ -112,13 +112,13 @@ export function planCredentialWalk(
     }
     if (now - circuit.parkedAt >= policy.cooldownMs) {
       circuit.parkedAt = now;
-      probe = candidate;
+      probes.push(candidate);
       continue;
     }
     parked.push(candidate);
   }
-  if (probe) {
-    return { attempts: [probe, ...healthy], parked };
+  if (probes.length > 0) {
+    return { attempts: [...probes, ...healthy], parked };
   }
   if (healthy.length > 0) {
     return { attempts: healthy, parked };
@@ -557,6 +557,7 @@ function relayStream(
   let openBytes = 0;
   let inflight: Promise<ReadableStreamReadResult<Uint8Array>> | null = null;
   let sawChunkAt = Date.now();
+  let keepaliveAt = sawChunkAt;
   let terminalAt: number | null = null;
   let done = false;
   let committed = onBeforeContentRateLimit === undefined;
@@ -710,6 +711,7 @@ function relayStream(
     return true;
   };
   const failBound = (controller: ReadableStreamDefaultController<Uint8Array>, message: string) => {
+    void reader.cancel().catch(() => undefined);
     if (!committed) {
       releaseHeld(controller);
     }
@@ -733,7 +735,7 @@ function relayStream(
       try {
         value = await readWithIdle(reader, () => inflight, (next) => {
           inflight = next;
-        }, transport.streamIdleTimeoutMs, sawChunkAt, controller, () => (
+        }, transport.streamIdleTimeoutMs, sawChunkAt, keepaliveAt, (at) => { keepaliveAt = at; }, controller, () => (
           terminalAt === null ? null : terminalAt + transport.streamTerminalGraceMs
         ), durationAt, onTimeout, onTerminalRemain);
       } catch (error) {
@@ -801,6 +803,7 @@ function relayStream(
         return;
       }
       sawChunkAt = Date.now();
+      keepaliveAt = sawChunkAt;
       if (!committed && onBeforeContentRateLimit) {
         held.push(value);
         heldBytes += value.length;
@@ -1065,6 +1068,8 @@ async function readWithIdle(
   setCurrent: (next: Promise<ReadableStreamReadResult<Uint8Array>> | null) => void,
   idleMs: number,
   sawChunkAt: number,
+  keepaliveAt: number,
+  onKeepalive: (at: number) => void,
   controller: ReadableStreamDefaultController<Uint8Array>,
   graceAt: () => number | null,
   durationAt: number | null,
@@ -1077,8 +1082,8 @@ async function readWithIdle(
     read.catch(() => undefined);
     setCurrent(read);
   }
-  const started = Date.now();
-  let lastKeepalive = sawChunkAt;
+  const started = sawChunkAt;
+  let lastKeepalive = keepaliveAt;
   for (;;) {
     const now = Date.now();
     const idleLeft = idleMs - (now - started);
@@ -1119,6 +1124,7 @@ async function readWithIdle(
     }
     if (terminalDeadline === null && Date.now() - lastKeepalive >= 15_000) {
       lastKeepalive = Date.now();
+      onKeepalive(lastKeepalive);
       controller.enqueue(KEEPALIVE);
       return "keepalive";
     }
