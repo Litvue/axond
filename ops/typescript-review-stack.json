@@ -102,7 +102,7 @@
         "ts/packages/gateway/src/wire-review-regressions.test.ts"
       ],
       "pull_request": 537,
-      "changed_lines": 2587
+      "changed_lines": 2596
     },
     {
       "order": 5,
@@ -280,7 +280,7 @@
         "ts/packages/cli/src/config-file.ts"
       ],
       "pull_request": 549,
-      "changed_lines": 2567
+      "changed_lines": 2577
     },
     {
       "order": 17,
@@ -388,7 +388,7 @@
         "docs/design/typescript-review-findings.md"
       ],
       "pull_request": 554,
-      "changed_lines": 3108
+      "changed_lines": 3115
     }
   ],
   "review_hardening": {
@@ -420,8 +420,9 @@
       "codex/ts-review-20-worker": "c356f540799a40099693a3fd3c09201ebb56dea3",
       "codex/ts-review-21-release-gates": "f57a4f0d7ffcfa2508d63581b281473068353012"
     },
-    "followup_observations": 17,
-    "additional_threads": 13,
-    "revised_existing_findings": 4
+    "followup_observations": 19,
+    "additional_threads": 15,
+    "revised_existing_findings": 4,
+    "total_threads_at_this_pass": 100
   }
 }

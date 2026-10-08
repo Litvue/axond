@@ -22,7 +22,7 @@ changed file to a slice and records its base branch and review focus.
 | 1 | define TypeScript SDK and review-stage CI | 3815 | [#534](https://github.com/Litvue/axond/pull/534) |
 | 2 | add TypeScript request and JSON parsers | 2115 | [#535](https://github.com/Litvue/axond/pull/535) |
 | 3 | add namespace and budget state primitives | 1846 | [#536](https://github.com/Litvue/axond/pull/536) |
-| 4 | add provider wire accounting and telemetry | 2587 | [#537](https://github.com/Litvue/axond/pull/537) |
+| 4 | add provider wire accounting and telemetry | 2596 | [#537](https://github.com/Litvue/axond/pull/537) |
 | 5 | add TOML scanning and Figment value primitives | 2756 | [#538](https://github.com/Litvue/axond/pull/538) |
 | 6 | add configuration shape and extraction validation | 1487 | [#539](https://github.com/Litvue/axond/pull/539) |
 | 7 | load and validate TypeScript gateway configuration | 3207 | [#540](https://github.com/Litvue/axond/pull/540) |
@@ -34,12 +34,12 @@ changed file to a slice and records its base branch and review focus.
 | 13 | qualify terminal streams rotation and admission | 1989 | [#546](https://github.com/Litvue/axond/pull/546) |
 | 14 | qualify settlement faults and provider secret omission | 1633 | [#547](https://github.com/Litvue/axond/pull/547) |
 | 15 | add Postgres persistence and durable-store qualification | 3503 | [#548](https://github.com/Litvue/axond/pull/548) |
-| 16 | add CLI discovery usage delivery and shutdown services | 2567 | [#549](https://github.com/Litvue/axond/pull/549) |
+| 16 | add CLI discovery usage delivery and shutdown services | 2577 | [#549](https://github.com/Litvue/axond/pull/549) |
 | 17 | host the TypeScript gateway and operator extensions | 2759 | [#550](https://github.com/Litvue/axond/pull/550) |
 | 18 | qualify CLI configuration diagnostics and refusal order | 1670 | [#551](https://github.com/Litvue/axond/pull/551) |
 | 19 | add rate limit redaction and token extensions | 1101 | [#552](https://github.com/Litvue/axond/pull/552) |
 | 20 | host the TypeScript gateway on Workers Hyperdrive | 1845 | [#553](https://github.com/Litvue/axond/pull/553) |
-| 21 | qualify TypeScript artifacts and regression gates | 3108 | [#554](https://github.com/Litvue/axond/pull/554) |
+| 21 | qualify TypeScript artifacts and regression gates | 3115 | [#554](https://github.com/Litvue/axond/pull/554) |
 
 ## How to review a slice
 
@@ -104,14 +104,14 @@ Full source/runtime evidence is also recorded in the
 The [finding dispositions](typescript-review-findings.md) record all 85 original
 review findings: 79 addressed by code, tests, fixtures or gates, and six staging
 or contract clarifications. Fixes land in their owning slices and flow through
-all descendants. Fresh review added 13 threads and revised four existing
-findings; all 17 follow-up observations have owning fixes, tests or explicit
+all descendants. Fresh review added 15 threads and revised four existing
+findings; all 19 follow-up observations have owning fixes, tests or explicit
 contract evidence in the disposition report. The static import check passes at all 21 stack heads. Shared
 HTTP test fixtures are now introduced at their first caller and close servers
 after assertion failures. The required CI Success job includes TypeScript;
 merge queues also run the TypeScript workflow.
 
-Qualification of the complete corrected source:
+Complete runtime qualification before the final two focused fixes:
 
 - Node 22.14 with Postgres 16: 414 passed, no skips.
 - Bun 1.4.2 with Postgres 16: 413 passed; its existing native connect-timeout
@@ -127,8 +127,12 @@ Qualification of the complete corrected source:
   policies passed. npm audit: zero vulnerabilities; 43 licensed production
   packages.
 
-The corrected binary is 82,359,776 bytes, SHA-256
-`5eb66c66d4910af5e0a7a888010795984f6431bce0fa5c591f7f54ca4ba1a39e`.
+The final metric-name and empty-catalogue fixes passed all 36 affected tests
+on Node and all 36 on Bun. The binary was then recompiled, signed and smoke-tested.
+CI runs the complete suite at the published heads.
+
+The corrected binary is 82,355,680 bytes, SHA-256
+`25489178d1e92889d55635628ed925499ddac3fa97e379856f4aa5693dc025a4`.
 Local qualification does not replace CI at the pushed heads or maintainer
 approval. ADR 0067 records the authority and schema upgrade impact. Rust still
 owns the release binary/image; live deployment and release-tag OIDC evidence
