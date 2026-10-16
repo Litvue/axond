@@ -2,7 +2,18 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
 
-import { beginTrace, formatTraceparent, metricPayload, postOtlp, resolveTelemetry, signalUrl, tracePayload, usageLogPayload } from "./otel.ts";
+import {
+  beginTrace,
+  formatTraceparent,
+  metricPayload,
+  otlpFetch,
+  parseOtlpHeaders,
+  postOtlp,
+  resolveTelemetry,
+  signalUrl,
+  tracePayload,
+  usageLogPayload,
+} from "./otel.ts";
 import type { UsageRecord } from "@axond/sdk";
 
 test("resolveTelemetry is off without an endpoint and rejects other protocols", () => {
@@ -13,10 +24,63 @@ test("resolveTelemetry is off without an endpoint and rejects other protocols", 
     endpoint: "http://collector:4318",
     instanceId: "replica-a",
   });
+  assert.deepEqual(
+    resolveTelemetry({
+      endpoint: "http://collector:4318",
+      headers: "generic=value",
+      tracesHeaders: "trace=value",
+      logsHeaders: "",
+    }),
+    {
+      endpoint: "http://collector:4318",
+      headers: { traces: { trace: "value" }, metrics: { generic: "value" } },
+    },
+  );
+  assert.deepEqual(resolveTelemetry({ endpoint: "http://collector:4318" }), { endpoint: "http://collector:4318" });
   assert.throws(() => resolveTelemetry({ endpoint: "http://collector:4318", protocol: "grpc" }), /OTLP\/HTTP JSON/);
   assert.throws(() => resolveTelemetry({ endpoint: "http://collector:4318", protocol: "http/protobuf" }), /OTLP\/HTTP JSON/);
   assert.throws(() => resolveTelemetry({ endpoint: "collector:4318" }), /http:\/\/ or https:\/\//);
   assert.throws(() => resolveTelemetry({ instanceId: "has space" }), /ASCII letters/);
+});
+
+test("parseOtlpHeaders follows OTLP header parsing and rejects unsafe entries", () => {
+  assert.deepEqual(parseOtlpHeaders("k1=v1"), { k1: "v1" });
+  assert.deepEqual(parseOtlpHeaders("k1=v1,k2=v2"), { k1: "v1", k2: "v2" });
+  assert.deepEqual(parseOtlpHeaders("k1=v1=10,k2,k3"), { k1: "v1=10" });
+  assert.deepEqual(parseOtlpHeaders(" k1 = v%201 "), { k1: "v 1" });
+  assert.deepEqual(parseOtlpHeaders("k1=v%XX1"), { k1: "v%XX1" });
+  assert.deepEqual(parseOtlpHeaders("=v,k="), {});
+  assert.deepEqual(parseOtlpHeaders("bad key=v,k=a\r\nb,good=value"), { good: "value" });
+  assert.equal(parseOtlpHeaders("__proto__=value")["__proto__"], "value");
+});
+
+test("otlpFetch merges signal headers without overriding request headers", async () => {
+  const calls: Array<{ url: string; headers: Headers }> = [];
+  const base: typeof fetch = async (input, init) => {
+    const request = new Request(input, init);
+    calls.push({ url: request.url, headers: request.headers });
+    return new Response(null, { status: 200 });
+  };
+  const fetchWithHeaders = otlpFetch(
+    {
+      traces: { authorization: "Bearer trace", "content-type": "text/plain" },
+      metrics: { authorization: "Bearer metrics" },
+    },
+    base,
+  );
+
+  await fetchWithHeaders("http://collector/v1/traces?query=1", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+  });
+  await fetchWithHeaders("http://collector/v1/metrics", { method: "POST" });
+  await fetchWithHeaders("http://collector/healthz");
+
+  assert.equal(calls[0]?.headers.get("authorization"), "Bearer trace");
+  assert.equal(calls[0]?.headers.get("content-type"), "application/json");
+  assert.equal(calls[1]?.headers.get("authorization"), "Bearer metrics");
+  assert.equal(calls[2]?.headers.has("authorization"), false);
+  assert.equal(calls[2]?.url, "http://collector/healthz");
 });
 
 test("postOtlp posts a trace and accepts successful collector headers", async () => {

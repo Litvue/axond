@@ -416,10 +416,11 @@ if (seen.join(",") !== "hello,next") {
 
 ## Container
 
-`ts/Dockerfile` is the TypeScript image. The repository-root `Dockerfile` stays
-the Rust release image. A local build (`axond-ts:local`, 235 MB) served
-`GET /healthz` as `ok` and listed the configured `platform` namespace from
-SQLite inside the container.
+`ts/Dockerfile` builds a Bun-compiled `/axond` binary on the distroless Debian
+12 non-root image. The image exposes port 8080; the repository-root
+`Dockerfile` stays the Rust release image. See the
+[Litvue dev-config migration notes](./migration-typescript.md#running-on-litvues-dev-config-563)
+for publishing and boot instructions.
 
 ## Worker
 

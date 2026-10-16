@@ -16,7 +16,9 @@ def rust_path(path):
     """Website and TypeScript-only paths do not select the Rust lanes."""
     if path.startswith('website/') or path == '.github/workflows/website.yml':
         return False
-    if path.startswith('ts/') or path in {'.github/workflows/typescript.yml', 'ops/typescript-compat.sh'}:
+    if path.startswith('ts/') or path in {
+        '.github/workflows/typescript.yml', '.github/workflows/typescript-image.yml', 'ops/typescript-compat.sh'
+    }:
         return False
     return True
 
@@ -66,6 +68,7 @@ def self_test():
                 return git('rev-parse', 'HEAD').decode().strip()
             website = commit('website/src/pages/index.astro')
             workflow = commit('.github/workflows/website.yml')
+            image_workflow = commit('.github/workflows/typescript-image.yml')
             source = commit('crates/gateway/src/main.rs')
             lock = commit('Cargo.lock')
             for head, rust, dependencies in [(website, 'false', 'false'), (workflow, 'false', 'false'),
@@ -75,6 +78,9 @@ def self_test():
                 for event, payload in [('push', {'before': base, 'after': head}),
                                        ('merge_group', {'merge_group': {'base_sha': base, 'head_sha': head}})]:
                     assert detect(event, payload, '') == {'rust': rust, 'dependencies': rust, 'typescript': rust}
+            payload = {'pull_request': {'base': {'sha': workflow}, 'head': {'sha': image_workflow}}}
+            assert detect('pull_request', payload, '') == {
+                'rust': 'false', 'dependencies': 'false', 'typescript': 'true'}
             # A last-commit-only diff would miss the earlier source change.
             last = commit('website/README.md')
             assert detect('push', {'before': workflow, 'after': last}, '')['rust'] == 'true'

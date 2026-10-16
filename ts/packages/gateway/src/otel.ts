@@ -10,15 +10,24 @@ import type { UsageRecord } from "@axond/sdk";
 
 const SIGNALS = ["traces", "metrics", "logs"] as const;
 
+export type OtlpSignal = (typeof SIGNALS)[number];
+export type OtlpHeaders = Partial<Record<OtlpSignal, Record<string, string>>>;
+
 export interface TelemetryTarget {
   endpoint: string;
   instanceId?: string;
+  headers?: OtlpHeaders;
+  fetch?: typeof fetch;
 }
 
 export function resolveTelemetry(input: {
   endpoint?: string | null;
   protocol?: string | null;
   instanceId?: string | null;
+  headers?: string | null;
+  tracesHeaders?: string | null;
+  metricsHeaders?: string | null;
+  logsHeaders?: string | null;
 }): TelemetryTarget | null {
   const instanceId = validateInstanceId(input.instanceId);
   const endpoint = blank(input.endpoint);
@@ -34,10 +43,83 @@ export function resolveTelemetry(input: {
       `OTEL_EXPORTER_OTLP_PROTOCOL=\`${protocol}\` is unsupported: the TypeScript gateway exports OTLP/HTTP JSON`,
     );
   }
-  return instanceId ? { endpoint, instanceId } : { endpoint };
+  const headers: OtlpHeaders = {};
+  for (const signal of SIGNALS) {
+    const signalValue = input[`${signal}Headers`];
+    const value = signalValue === undefined || signalValue === null ? input.headers : signalValue;
+    if (value === undefined || value === null) {
+      continue;
+    }
+    const parsed = parseOtlpHeaders(value);
+    if (Object.keys(parsed).length > 0) {
+      headers[signal] = parsed;
+    }
+  }
+  return {
+    endpoint,
+    ...(instanceId ? { instanceId } : {}),
+    ...(Object.keys(headers).length > 0 ? { headers } : {}),
+  };
 }
 
-export function signalUrl(endpoint: string, signal: "traces" | "metrics" | "logs"): string {
+const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+export function parseOtlpHeaders(value: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const entry of value.split(",")) {
+    const separator = entry.indexOf("=");
+    if (separator < 0) {
+      continue;
+    }
+    const key = entry.slice(0, separator).trim();
+    const rawValue = entry.slice(separator + 1).trim();
+    if (!key || !HTTP_TOKEN.test(key) || !rawValue) {
+      continue;
+    }
+    let decoded = rawValue;
+    try {
+      decoded = decodeURIComponent(rawValue);
+    } catch {
+      // Keep malformed percent-encoding as a literal header value.
+    }
+    if (decoded.length === 0 || /[\r\n\0]/.test(decoded)) {
+      continue;
+    }
+    Object.defineProperty(headers, key, {
+      configurable: true,
+      enumerable: true,
+      value: decoded,
+      writable: true,
+    });
+  }
+  return headers;
+}
+
+export function otlpFetch(headers: OtlpHeaders, base: typeof fetch = fetch): typeof fetch {
+  return ((input: RequestInfo | URL, init?: RequestInit) => {
+    let url: URL;
+    try {
+      const inputUrl = input instanceof Request ? input.url : input;
+      url = new URL(inputUrl);
+    } catch {
+      return base(input, init);
+    }
+    const signal = SIGNALS.find((candidate) => url.pathname.endsWith(`/v1/${candidate}`));
+    const signalHeaders = signal ? headers[signal] : undefined;
+    if (!signalHeaders || Object.keys(signalHeaders).length === 0) {
+      return base(input, init);
+    }
+    const request = new Request(input, init);
+    for (const [key, value] of Object.entries(signalHeaders)) {
+      if (!request.headers.has(key)) {
+        request.headers.set(key, value);
+      }
+    }
+    return base(request);
+  }) as typeof fetch;
+}
+
+export function signalUrl(endpoint: string, signal: OtlpSignal): string {
   let base = endpoint.trim().replace(/\/+$/, "");
   for (const name of SIGNALS) {
     const suffix = `/v1/${name}`;
