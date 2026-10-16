@@ -75,26 +75,10 @@ unchanged after removing `[reload]`:
 | `[[gateway_key]]` | Keys: `env`, `namespace`; values `namespace = "platform"`, `env = "GW_INBOUND_PLATFORM_KEY"`. |
 | `[storage]` | `backend = "postgres"`, `dsn_env = "GW_STORE_DSN"`, `create_table = true`, `on_unavailable = "deny"` |
 | `[catalog]` | `source = "models-dev"`, `store = "postgres"`, `dsn_env = "GW_STORE_DSN"`, `create_table = true` |
-| `[[price]]` | Keys: `provider`, `model`, `input_microdollars_per_million`, `output_microdollars_per_million`; values are listed below. |
+| `[[price]]` | Keys: `provider`, `model`, `input_microdollars_per_million`, `output_microdollars_per_million` (all 11 entries). |
 | `[failover]` | `overall_timeout_ms = 120000` |
 | `[transport]` | `response_header_timeout_ms = 120000`, `buffered_body_timeout_ms = 120000` |
 | `[admission]` | `max_request_bytes = 8388608`, `max_in_flight = 32`, `max_in_flight_streams = 16`, `max_in_flight_per_tenant = 0`, `max_tenants = 256`, `queue_capacity = 0`, `queue_wait_ms = 0`, `max_stream_duration_ms = 230000`, `max_stream_bytes = 33554432` |
-
-The dev config's `[[price]]` entries are unchanged:
-
-| Provider/model | Input microdollars per million | Output microdollars per million |
-| --- | ---: | ---: |
-| `openai/gpt-5.4-mini-2026-03-17` | 250000 | 2000000 |
-| `openai/gpt-5.4-2026-03-05` | 1250000 | 10000000 |
-| `anthropic-covered/claude-fable-5-1` | 10000000 | 50000000 |
-| `openai/gpt-5.6-sol` | 2000000 | 16000000 |
-| `openai/gpt-5.6-luna` | 200000 | 1200000 |
-| `xai/grok-4.6` | 2000000 | 6000000 |
-| `openai/gpt-6-astra` | 10000000 | 50000000 |
-| `anthropic/claude-opus-5-5` | 4000000 | 20000000 |
-| `openai/gpt-6-sol` | 2000000 | 10000000 |
-| `openai/gpt-6-luna` | 100000 | 500000 |
-| `xai/grok-4.7` | 2000000 | 6000000 |
 
 The environment variables used by the dev config are `GW_STORE_DSN`,
 `GW_PLATFORM_OPENAI_API_KEY`, `GW_PLATFORM_ANTHROPIC_API_KEY`,
@@ -112,7 +96,7 @@ stub with `http/json`. These loopback values were test-only; the provider URLs
 above are unchanged for deployment. The compiled binary was started with:
 
 ```sh
-AXOND_CONFIG=/home/ubuntu/axond563/evidence/axond.noreload-fixture.toml /tmp/axond-ts
+AXOND_CONFIG=./axond.dev-loopback.toml ./axond
 ```
 
 The probes returned:
