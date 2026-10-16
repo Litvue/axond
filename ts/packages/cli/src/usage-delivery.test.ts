@@ -310,6 +310,46 @@ test("usage_sink_replaces_stdout_and_postgres_inserts_one_row", async () => {
   await cleanup.end();
 });
 
+test("usage OTLP sink prefers telemetry fetch over the fallback", async () => {
+  const telemetryPosts: string[] = [];
+  const fallbackPosts: string[] = [];
+  const delivery = await openUsageDelivery({
+    sinks: [
+      {
+        kind: "otlp",
+        dsnEnv: null,
+        table: "axond_usage",
+        createTable: false,
+        bufferCapacity: 10,
+        maxBatch: 500,
+        maxBatchExplicit: false,
+        flushIntervalMs: 1_000,
+      },
+    ],
+    env: {},
+    telemetry: {
+      endpoint: "http://collector",
+      fetch: async (input) => {
+        telemetryPosts.push(String(input));
+        return new Response(null, { status: 200 });
+      },
+    },
+    metrics: createMetrics([]),
+    onLog: () => undefined,
+    fetchImpl: async (input) => {
+      fallbackPosts.push(String(input));
+      return new Response(null, { status: 200 });
+    },
+  });
+
+  delivery.write(sample());
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.deepEqual(telemetryPosts, ["http://collector/v1/logs"]);
+  assert.deepEqual(fallbackPosts, []);
+  await delivery.flush(100);
+});
+
 test("loadConfig still accepts a postgres sink without opening it", async () => {
   const loaded = await loadConfig(
     `

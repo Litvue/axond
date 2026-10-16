@@ -104,7 +104,7 @@ export async function openUsageDelivery(input: {
         );
       }
       const telemetry = input.telemetry;
-      const fetchImpl = input.fetchImpl ?? fetch;
+      const fetchImpl = telemetry.fetch ?? input.fetchImpl ?? fetch;
       writers.push(immediateWriter("otlp", input.metrics, input.onLog, (record, observedAt) => {
         const body = usageLogPayload(record, resourceAttributes(telemetry.instanceId), observedAt.getTime());
         const task = postOtlp(telemetry.endpoint, "logs", body, fetchImpl).then(

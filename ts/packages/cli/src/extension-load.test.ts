@@ -334,6 +334,44 @@ test("telemetry_flush_times_out_without_the_endpoint", async () => {
   }
 });
 
+test("CLI attaches OTLP headers to trace exports", async () => {
+  const collector = createHttpServer((req, res) => {
+    req.resume();
+    requests.push({
+      path: req.url ?? "",
+      authorization: req.headers.authorization !== undefined,
+      dataset: req.headers["x-axiom-dataset"] ?? null,
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  const requests: Array<{ path: string; authorization: boolean; dataset: string | string[] | null }> = [];
+  await new Promise<void>((resolve) => collector.listen(0, "127.0.0.1", resolve));
+  const collectorPort = (collector.address() as AddressInfo).port;
+  const child = await bootShutdown({ drainGraceMs: 0, deadlineMs: 500, flushTimeoutMs: 1_500 }, "test-inbound-key", {
+    OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${collectorPort}`,
+    OTEL_EXPORTER_OTLP_PROTOCOL: "http/json",
+    OTEL_EXPORTER_OTLP_TRACES_HEADERS: "authorization=Bearer%20t,x-axiom-dataset=d",
+  });
+  try {
+    await waitFor(`${child.base}/healthz`);
+    const response = await fetch(`${child.base}/healthz`);
+    assert.equal(response.status, 200);
+    await response.text();
+    const until = Date.now() + 2_000;
+    while (Date.now() < until && !requests.some((request) => request.path === "/v1/traces")) {
+      await new Promise((wake) => setTimeout(wake, 20));
+    }
+    const trace = requests.find((request) => request.path === "/v1/traces");
+    assert.deepEqual(trace, { path: "/v1/traces", authorization: true, dataset: "d" });
+    assert.equal(child.log.stdout.includes("Bearer t"), false);
+    assert.equal(child.log.stderr.includes("Bearer t"), false);
+  } finally {
+    await child.stop();
+    await new Promise<void>((resolve) => collector.close(() => resolve()));
+  }
+});
+
 test("drain_grace_ms of 0 closes admission on the first signal", async () => {
   const child = await bootShutdown({ drainGraceMs: 0, deadlineMs: 400, flushTimeoutMs: 400 });
   try {

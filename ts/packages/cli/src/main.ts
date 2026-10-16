@@ -13,6 +13,7 @@ import {
   createMetrics,
   envSecretReader,
   loadConfig,
+  otlpFetch,
   resolveConfigSecrets,
   resolveTelemetry,
 } from "../../gateway/src/index.ts";
@@ -68,11 +69,22 @@ async function main(): Promise<void> {
       }
     }
   }
-  const telemetry = resolveTelemetry({
+  const resolvedTelemetry = resolveTelemetry({
     endpoint: process.env["OTEL_EXPORTER_OTLP_ENDPOINT"],
     protocol: process.env["OTEL_EXPORTER_OTLP_PROTOCOL"],
     instanceId: process.env["AXOND_INSTANCE_ID"],
+    headers: process.env["OTEL_EXPORTER_OTLP_HEADERS"],
+    tracesHeaders: process.env["OTEL_EXPORTER_OTLP_TRACES_HEADERS"],
+    metricsHeaders: process.env["OTEL_EXPORTER_OTLP_METRICS_HEADERS"],
+    logsHeaders: process.env["OTEL_EXPORTER_OTLP_LOGS_HEADERS"],
   });
+  const telemetry = resolvedTelemetry?.headers
+    ? {
+        endpoint: resolvedTelemetry.endpoint,
+        ...(resolvedTelemetry.instanceId ? { instanceId: resolvedTelemetry.instanceId } : {}),
+        fetch: otlpFetch(resolvedTelemetry.headers),
+      }
+    : resolvedTelemetry;
   const background = createBackgroundDrain();
   const usageDelivery = await openUsageDelivery({
     sinks: config.usageSinks,
