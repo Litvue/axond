@@ -63,6 +63,7 @@ export function resolveTelemetry(input: {
 }
 
 const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const HEADER_VALUE = /^[\t\x20-\x7e\x80-\xff]*$/;
 
 export function parseOtlpHeaders(value: string): Record<string, string> {
   const headers: Record<string, string> = {};
@@ -82,7 +83,8 @@ export function parseOtlpHeaders(value: string): Record<string, string> {
     } catch {
       // Keep malformed percent-encoding as a literal header value.
     }
-    if (decoded.length === 0 || /[\r\n\0]/.test(decoded)) {
+    const match = HEADER_VALUE.exec(decoded);
+    if (!match || match[0].length !== decoded.length) {
       continue;
     }
     Object.defineProperty(headers, key, {
@@ -109,7 +111,7 @@ export function otlpFetch(headers: OtlpHeaders, base: typeof fetch = fetch): typ
     if (!signalHeaders || Object.keys(signalHeaders).length === 0) {
       return base(input, init);
     }
-    const request = new Request(input, init);
+    const request = new Request(input, { ...init, redirect: "error" });
     for (const [key, value] of Object.entries(signalHeaders)) {
       if (!request.headers.has(key)) {
         request.headers.set(key, value);

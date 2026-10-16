@@ -39,10 +39,12 @@ On a Node process or a compiled binary, put extension files in `AXOND_EXTENSIONS
 
 `ghcr.io/litvue/axond-typescript` is built from `ts/Dockerfile` as a Bun-compiled
 binary on `gcr.io/distroless/base-debian12:nonroot`. The image runs `/axond` as
-the non-root user and listens on port `8080`. The **TypeScript image** workflow
-is its only publisher: a manual dispatch publishes `sha-<short>`, and a `v*`
-tag publishes that SHA tag plus the semver `<version>` tag. Deploy by the digest
-printed in the workflow run summary. The Rust image
+the non-root user and listens on port `8080`. Its working directory is
+`/var/lib/axond`, writable by `nonroot`; mount a volume there to persist a
+relative SQLite path. The **TypeScript image** workflow is its only publisher:
+a manual dispatch publishes `sha-<short>`, and a `v*` tag publishes that SHA
+tag plus the semver `<version>` tag. Deploy by the digest printed in the
+workflow run summary. The Rust image
 `ghcr.io/litvue/axond` and release-please workflow remain unchanged.
 
 ### Configuration differences
@@ -87,6 +89,10 @@ The environment variables used by the dev config are `GW_STORE_DSN`,
 
 Use a separate database from the Rust dev deployment: the TypeScript process
 adds its own store columns and tables described in [Store](#store).
+For a Postgres dev rollback, stop the TypeScript app and route traffic back to
+the Rust deployment; the TypeScript app never touched the Rust database. Usage
+and budget rows written by TypeScript remain in its separate database and are
+not carried back.
 
 ### Boot check
 

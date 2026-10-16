@@ -51,6 +51,11 @@ test("parseOtlpHeaders follows OTLP header parsing and rejects unsafe entries", 
   assert.deepEqual(parseOtlpHeaders("k1=v%XX1"), { k1: "v%XX1" });
   assert.deepEqual(parseOtlpHeaders("=v,k="), {});
   assert.deepEqual(parseOtlpHeaders("bad key=v,k=a\r\nb,good=value"), { good: "value" });
+  assert.deepEqual(parseOtlpHeaders("x=%01"), {});
+  assert.deepEqual(parseOtlpHeaders("x=caf\u00e9"), { x: "café" });
+  assert.deepEqual(parseOtlpHeaders("x=\u20ac"), {});
+  assert.deepEqual(parseOtlpHeaders("authorization=Bearer%20t,x-test=%01"), { authorization: "Bearer t" });
+  assert.deepEqual(parseOtlpHeaders("x=last%0A"), {});
   assert.equal(parseOtlpHeaders("__proto__=value")["__proto__"], "value");
 });
 
@@ -81,6 +86,51 @@ test("otlpFetch merges signal headers without overriding request headers", async
   assert.equal(calls[1]?.headers.get("authorization"), "Bearer metrics");
   assert.equal(calls[2]?.headers.has("authorization"), false);
   assert.equal(calls[2]?.url, "http://collector/healthz");
+});
+
+test("otlpFetch rejects redirects when injecting signal headers", async () => {
+  let destinationRequests = 0;
+  const destination = createServer((req, res) => {
+    destinationRequests += 1;
+    req.resume();
+    res.end("unexpected");
+  });
+  await new Promise<void>((resolve) => destination.listen(0, "127.0.0.1", resolve));
+  const destinationAddress = destination.address();
+  if (!destinationAddress || typeof destinationAddress === "string") {
+    destination.close();
+    throw new Error("no destination port");
+  }
+
+  const collector = createServer((req, res) => {
+    req.resume();
+    res.writeHead(307, { location: `http://127.0.0.1:${destinationAddress.port}/redirected` });
+    res.end();
+  });
+  await new Promise<void>((resolve) => collector.listen(0, "127.0.0.1", resolve));
+  const collectorAddress = collector.address();
+  if (!collectorAddress || typeof collectorAddress === "string") {
+    collector.close();
+    destination.close();
+    throw new Error("no collector port");
+  }
+
+  try {
+    const fetchWithHeaders = otlpFetch({ traces: { authorization: "Bearer trace" } });
+    await assert.rejects(
+      fetchWithHeaders(`http://127.0.0.1:${collectorAddress.port}/v1/traces`, {
+        method: "POST",
+        body: "{}",
+        redirect: "follow",
+      }),
+    );
+    assert.equal(destinationRequests, 0);
+  } finally {
+    collector.closeAllConnections();
+    destination.closeAllConnections();
+    collector.close();
+    destination.close();
+  }
 });
 
 test("postOtlp posts a trace and accepts successful collector headers", async () => {
