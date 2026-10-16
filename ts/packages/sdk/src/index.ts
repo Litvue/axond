@@ -340,7 +340,11 @@ export interface Store {
     limit: number,
   ): Promise<{ data: NamespaceWrite[]; nextCursor: string | null }>;
   putBudget(namespace: string, period: string, limit: bigint, nowMs?: number): Promise<BudgetLedger>;
-  /** `nowMs` is the gateway clock. A monthly ledger is active only in that month. */
+  /**
+   * `nowMs` is the gateway clock. A monthly ledger is active only in that month.
+   * Throws `unknown_namespace` when the namespace does not exist; `null` means
+   * the namespace exists but has no ledger for the requested period.
+   */
   getBudget(namespace: string, period: string, nowMs?: number): Promise<BudgetLedger | null>;
   putBudgetPolicy(input: BudgetPolicyWrite): Promise<BudgetPolicy>;
   /** `nowMs` is the gateway clock. A monthly policy reports that month. */

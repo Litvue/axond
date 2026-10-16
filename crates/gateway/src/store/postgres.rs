@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio_postgres::types::Type;
 use tokio_postgres::{Client, GenericClient, Transaction};
 
 use super::{
@@ -845,23 +846,25 @@ async fn read_budget(
     namespace: &str,
     period: &str,
     clock: &Arc<dyn BudgetClock>,
-) -> Result<Option<BudgetRecord>, StoreError> {
-    let row = client
-        .query_opt(
-            "SELECT
-                 b.limit_microdollars,
-                 b.spent_microdollars,
-                 c.cadence,
-                 c.timezone
-             FROM axond_store_budget b
-             LEFT JOIN axond_store_budget_cadence c ON c.namespace = b.namespace
-             WHERE b.namespace = $1 AND b.period = $2",
-            &[&namespace, &period],
+) -> Result<Option<Option<BudgetRecord>>, StoreError> {
+    let rows = client
+        .query_typed(
+            "SELECT b.limit_microdollars, b.spent_microdollars, c.cadence, c.timezone,
+                    EXISTS (SELECT 1 FROM axond_store_budget_active a
+                            WHERE a.namespace = n.id AND a.period = $2) AS active
+             FROM axond_namespace n
+             LEFT JOIN axond_store_budget b ON b.namespace = n.id AND b.period = $2
+             LEFT JOIN axond_store_budget_cadence c ON c.namespace = n.id
+             WHERE n.id = $1",
+            &[(&namespace, Type::TEXT), (&period, Type::TEXT)],
         )
         .await
         .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-    let Some(row) = row else {
+    let Some(row) = rows.into_iter().next() else {
         return Ok(None);
+    };
+    let Some(limit) = row.get::<_, Option<i64>>(0) else {
+        return Ok(Some(None));
     };
     let active = if row.get::<_, Option<String>>(2).as_deref() == Some("monthly") {
         let timezone = row
@@ -870,25 +873,15 @@ async fn read_budget(
         let tz = validate_timezone(&timezone)?;
         monthly_period_key(clock.now(), &tz) == period
     } else {
-        client
-            .query_one(
-                "SELECT EXISTS (
-                     SELECT 1 FROM axond_store_budget_active
-                     WHERE namespace = $1 AND period = $2
-                 )",
-                &[&namespace, &period],
-            )
-            .await
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?
-            .get(0)
+        row.get::<_, bool>(4)
     };
-    Ok(Some(BudgetRecord::new(
+    Ok(Some(Some(BudgetRecord::new(
         namespace,
         period,
-        from_sql_amount(row.get(0)),
-        from_sql_amount(row.get(1)),
+        from_sql_amount(limit),
+        from_sql_amount(row.get::<_, i64>(1)),
         active,
-    )))
+    ))))
 }
 
 async fn read_budget_policy(
@@ -1191,11 +1184,13 @@ impl Store for PostgresStore {
     ) -> Result<Option<BudgetRecord>, StoreError> {
         let namespace = namespace.to_owned();
         let period = period.to_owned();
+        let namespace_for_query = namespace.clone();
         let clock = Arc::clone(&self.clock);
         self.with_client(StoreOp::BudgetRead, async move |client| {
-            read_budget(client, &namespace, &period, &clock).await
+            read_budget(client, &namespace_for_query, &period, &clock).await
         })
-        .await
+        .await?
+        .ok_or(StoreError::NotFound(namespace))
     }
 
     async fn put_budget_policy(
@@ -1689,6 +1684,7 @@ async fn put_budget_tx(
     .map_err(|e| StoreError::Unavailable(e.to_string()))?;
     read_budget(tx, namespace, period, clock)
         .await?
+        .ok_or_else(|| StoreError::NotFound(namespace.to_owned()))?
         .ok_or_else(|| StoreError::Unavailable("budget row missing after put".into()))
 }
 

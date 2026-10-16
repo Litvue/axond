@@ -319,6 +319,16 @@ async fn unknown_namespace_budget_is_404() {
     let (_upstream, gateway) = boot().await;
     let http = client();
     let missing = http
+        .get(gateway.url("/api/v1/namespaces/ghost/budgets/p"))
+        .bearer_auth(GATEWAY_KEY)
+        .send()
+        .await
+        .expect("missing namespace GET");
+    assert_eq!(missing.status(), 404);
+    let body: Value = missing.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "unknown_namespace");
+
+    let missing = http
         .put(gateway.url("/api/v1/namespaces/ghost/budgets/p"))
         .bearer_auth(GATEWAY_KEY)
         .json(&json!({"limit_microdollars": 1}))
@@ -328,4 +338,14 @@ async fn unknown_namespace_budget_is_404() {
     assert_eq!(missing.status(), 404);
     let body: Value = missing.json().await.unwrap();
     assert_eq!(body["error"]["type"], "unknown_namespace");
+
+    let no_ledger = http
+        .get(gateway.url("/api/v1/namespaces/platform/budgets/no-ledger"))
+        .bearer_auth(GATEWAY_KEY)
+        .send()
+        .await
+        .expect("existing namespace without ledger");
+    assert_eq!(no_ledger.status(), 404);
+    let body: Value = no_ledger.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "unknown_budget");
 }
