@@ -36,7 +36,7 @@ pub use spans::{
     ATTEMPT_ERROR, ATTEMPT_OK, LEASE_ERROR, LEASE_PARKED, LEASE_RATE_LIMITED, LEASE_SERVED,
     credential_lease_span, finish_credential_lease, finish_upstream_attempt,
     record_attempt_failure, record_attempt_timeout, record_request, record_routing,
-    record_streamed, request_trace_id, upstream_attempt_span,
+    record_streamed, request_trace_id, store_span, upstream_attempt_span,
 };
 
 use std::sync::OnceLock;

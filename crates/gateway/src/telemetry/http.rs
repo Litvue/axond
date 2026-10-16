@@ -179,6 +179,8 @@ mod tests {
     use axum::routing::post;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tower::util::ServiceExt;
     use tracing_subscriber::layer::SubscriberExt;
@@ -333,5 +335,111 @@ mod tests {
                 .expect("credential lease");
             assert_eq!(attribute(lease, "axond.status").as_deref(), Some(status));
         }
+    }
+
+    #[tokio::test]
+    async fn budget_get_exports_store_child_span_with_store_timings() {
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        crate::telemetry::testing::keep_callsites_answerable();
+        let recording = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("axond-test"))),
+        );
+        let _default = tracing::dispatcher::set_default(&recording);
+        super::super::EXPORTING.store(true, Ordering::Relaxed);
+
+        let config = crate::config::Config::from_toml_str(
+            r#"
+[[namespace]]
+id = "platform"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "https://api.openai.com/v1"
+
+[[credential]]
+namespace = "platform"
+provider = "openai"
+env = "AXOND_PLATFORM_OPENAI"
+
+[[gateway_key]]
+namespace = "platform"
+env = "AXOND_INBOUND_KEY"
+"#,
+        )
+        .expect("config");
+        let env = HashMap::from([
+            ("AXOND_PLATFORM_OPENAI".to_owned(), "test-key".to_owned()),
+            ("AXOND_INBOUND_KEY".to_owned(), "inbound-key".to_owned()),
+        ]);
+        let store: Arc<dyn crate::store::Store> =
+            Arc::new(crate::store::SqliteStore::open(":memory:").expect("sqlite"));
+        store
+            .put_namespace(crate::store::NamespaceRecord {
+                id: "platform".into(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("namespace");
+        let state = crate::state::AppState::serving(
+            config,
+            &env,
+            Arc::new(crate::usage::UsageDelivery::telemetry(
+                crate::usage::UsageFanout::new(Vec::new()),
+            )),
+            Box::new(crate::budget::NoBudget),
+            None,
+            store,
+        )
+        .expect("state");
+        let app = crate::api::router(state).layer(TelemetryLayer);
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/api/v1/namespaces/platform/budgets/p")
+                    .header(
+                        "traceparent",
+                        format!("00-{INBOUND_TRACE}-{INBOUND_SPAN}-01"),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+
+        let spans = exporter.get_finished_spans().expect("exported spans");
+        let server = spans
+            .iter()
+            .find(|span| span.name == "http.server.request")
+            .expect("server span");
+        let store = spans
+            .iter()
+            .find(|span| span.name == "axond.store")
+            .expect("store span");
+        let attribute = |key: &str| {
+            store
+                .attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.to_string())
+        };
+        assert_eq!(store.parent_span_id, server.span_context.span_id());
+        assert_eq!(
+            attribute("axond.store.operation").as_deref(),
+            Some("budget_read")
+        );
+        assert_eq!(attribute("axond.store.backend").as_deref(), Some("sqlite"));
+        assert_eq!(attribute("axond.store.outcome").as_deref(), Some("ok"));
+        assert!(attribute("axond.store.acquire_wait_ms").is_some());
+        assert!(attribute("axond.store.query_ms").is_some());
     }
 }

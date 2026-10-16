@@ -382,11 +382,33 @@ export function createPostgresStore(
     },
     async getBudget(namespace, period, nowMs = Date.now()) {
       return withClient("budget_read", async (client) => {
-        const known = await client.query("SELECT id FROM public.axond_namespace WHERE id = $1", [namespace]);
-        if (!known.rows[0]) {
+        const result = await client.query(
+          `SELECT b.limit_microdollars, b.spent_microdollars, c.cadence, c.timezone,
+                  EXISTS (SELECT 1 FROM public.axond_store_budget_active a
+                          WHERE a.namespace = n.id AND a.period = $2) AS active
+           FROM public.axond_namespace n
+           LEFT JOIN public.axond_store_budget b ON b.namespace = n.id AND b.period = $2
+           LEFT JOIN public.axond_store_budget_cadence c ON c.namespace = n.id
+           WHERE n.id = $1`,
+          [namespace, period],
+        );
+        const row = result.rows[0];
+        if (!row) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
-        return readBudget(client, namespace, period, nowMs);
+        if (row["limit_microdollars"] === null) {
+          return null;
+        }
+        return {
+          namespace,
+          period,
+          limit: BigInt(String(row["limit_microdollars"])),
+          spent: BigInt(String(row["spent_microdollars"])),
+          active:
+            row["cadence"] === "monthly"
+              ? monthlyPeriod(nowMs, String(row["timezone"] ?? "UTC")) === period
+              : row["active"] === true,
+        };
       });
     },
     async putBudgetPolicy(input: BudgetPolicyWrite) {

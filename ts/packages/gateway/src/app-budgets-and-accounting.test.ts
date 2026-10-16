@@ -30,6 +30,93 @@ import type { Store } from "@axond/sdk";
 
 import { KEY, gateway, listenUpstream } from "./app-test-fixtures.ts";
 
+test("budget GET distinguishes a missing namespace from a missing ledger", async () => {
+  const { app, upstream } = await gateway();
+  try {
+    const headers = { authorization: `Bearer ${KEY}` };
+    const missingNamespace = await app.request(
+      "http://127.0.0.1/api/v1/namespaces/ghost/budgets/no-ledger",
+      { headers },
+    );
+    assert.equal(missingNamespace.status, 404);
+    assert.deepEqual(await missingNamespace.json(), {
+      error: { type: "unknown_namespace", message: "unknown namespace" },
+    });
+
+    const missingLedger = await app.request(
+      "http://127.0.0.1/api/v1/namespaces/platform/budgets/no-ledger",
+      { headers },
+    );
+    assert.equal(missingLedger.status, 404);
+    assert.deepEqual(await missingLedger.json(), {
+      error: { type: "unknown_budget", message: "unknown budget" },
+    });
+  } finally {
+    upstream.close();
+  }
+});
+
+test("budget GET exports an axond.store child span", async () => {
+  const store = createMemoryStore();
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+  const traces: string[] = [];
+  const background: Promise<void>[] = [];
+  const app = createAxond({
+    store,
+    providers: [],
+    gatewayKey: KEY,
+    defaultNamespace: "platform",
+    telemetry: {
+      endpoint: "http://collector",
+      fetch: async (_url, init) => {
+        if (String(_url).endsWith("/v1/traces")) {
+          traces.push(String(init?.body ?? ""));
+        }
+        return new Response(null, { status: 200 });
+      },
+    },
+    onBackground: (task) => background.push(task),
+  });
+  const response = await app.request(
+    "http://127.0.0.1/api/v1/namespaces/platform/budgets/no-ledger",
+    {
+      headers: {
+        authorization: `Bearer ${KEY}`,
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      },
+    },
+  );
+  assert.equal(response.status, 404);
+  await Promise.all(background);
+
+  const spans = (JSON.parse(traces[0]!) as {
+    resourceSpans: {
+      scopeSpans: {
+        spans: {
+          name: string;
+          spanId: string;
+          parentSpanId?: string;
+          attributes: { key: string; value: { stringValue: string } }[];
+        }[];
+      }[];
+    }[];
+  }).resourceSpans[0]!.scopeSpans[0]!.spans;
+  const server = spans.find((span) => span.name === "http.server.request");
+  const storeSpan = spans.find((span) => span.name === "axond.store");
+  assert.ok(server);
+  assert.ok(storeSpan);
+  assert.equal(storeSpan.parentSpanId, server.spanId);
+  const attribute = (key: string) => storeSpan.attributes.find((item) => item.key === key)?.value.stringValue;
+  assert.equal(attribute("axond.store.operation"), "budget_read");
+  assert.equal(attribute("axond.store.outcome"), "ok");
+});
+
 test("budget_policy_follows_the_cadence_period", async () => {
   let now = Date.parse("2026-09-30T12:00:00Z");
   const store = createMemoryStore();

@@ -1731,13 +1731,40 @@ async function management(c: Context<AxondEnv>, opts: AxondOptions, axond: Mutab
       return;
     }
     if (c.req.method === "GET") {
-      const row = await opts.store.getBudget(namespace, period, opts.clock?.() ?? Date.now());
-      if (!row) {
-        const known = await opts.store.getNamespace(namespace);
-        throw new GatewayFailure(known ? "unknown_budget" : "unknown_namespace", 404, known ? "unknown budget" : "unknown namespace");
+      const parent = requestTrace.get(c.req.raw);
+      const startedMs = Date.now();
+      let outcome: "ok" | "error" = "error";
+      try {
+        const row = await opts.store.getBudget(namespace, period, opts.clock?.() ?? Date.now());
+        outcome = "ok";
+        if (!row) {
+          throw new GatewayFailure("unknown_budget", 404, "unknown budget");
+        }
+        c.res = jsonBody(budgetRecordBody(row));
+        return;
+      } catch (error) {
+        if (error instanceof GatewayFailure && error.type === "unknown_namespace") {
+          outcome = "ok";
+        }
+        throw error;
+      } finally {
+        if (parent && opts.telemetry) {
+          const spans = requestAttempts.get(c.req.raw) ?? [];
+          spans.push({
+            name: "axond.store",
+            trace: childTrace(parent),
+            kind: 1,
+            startMs: startedMs,
+            endMs: Date.now(),
+            error: outcome === "error",
+            attributes: {
+              "axond.store.operation": "budget_read",
+              "axond.store.outcome": outcome,
+            },
+          });
+          requestAttempts.set(c.req.raw, spans);
+        }
       }
-      c.res = jsonBody(budgetRecordBody(row));
-      return;
     }
   }
   const policy = path.match(/^\/api\/v1\/namespaces\/([^/]+)\/budget$/);
