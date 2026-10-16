@@ -15,8 +15,22 @@ use tracing::Span;
 use tracing::field::Empty;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::store::StoreOp;
 use crate::telemetry::metrics;
 use crate::usage::UsageRecord;
+
+/// A child span covering one management Store operation.
+pub fn store_span(operation: StoreOp) -> Span {
+    tracing::info_span!(
+        target: "axond.store",
+        "axond.store",
+        axond.store.operation = operation.as_str(),
+        axond.store.backend = Empty,
+        axond.store.outcome = Empty,
+        axond.store.acquire_wait_ms = Empty,
+        axond.store.query_ms = Empty,
+    )
+}
 
 /// The trace the current request belongs to, when one is being recorded. Usage
 /// records carry it so a row joins the caller's trace; it is deliberately not

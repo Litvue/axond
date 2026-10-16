@@ -898,6 +898,13 @@ pub(crate) fn record_store_operation(
     execution_ms: Option<f64>,
     outcome: &'static str,
 ) {
+    let span = tracing::Span::current();
+    span.record("axond.store.backend", backend);
+    span.record("axond.store.outcome", outcome);
+    span.record("axond.store.acquire_wait_ms", acquire_wait_ms);
+    if let Some(execution_ms) = execution_ms {
+        span.record("axond.store.query_ms", execution_ms);
+    }
     let Some(instruments) = INSTRUMENTS.get() else {
         return;
     };

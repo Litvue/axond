@@ -1026,6 +1026,41 @@ test("a monthly admit locks only while creating the period row", { skip: !dsn },
   }
 });
 
+test("Postgres getBudget distinguishes missing namespaces and cadence-active periods", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  const id = `budget-read-${process.pid}-${Date.now()}`;
+  const september = Date.parse("2026-09-15T12:00:00Z");
+  await assert.rejects(
+    () => db.getBudget(id, "missing"),
+    (error: unknown) => error instanceof GatewayFailure && error.type === "unknown_namespace",
+  );
+  await db.putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+
+  await db.putBudget(id, "old", 100n, september);
+  await db.putBudget(id, "current", 100n, september);
+  assert.equal((await db.getBudget(id, "current", september))?.active, true);
+  assert.equal((await db.getBudget(id, "old", september))?.active, false);
+
+  await db.putBudgetPolicy({
+    namespace: id,
+    cadence: "monthly",
+    limit: 100n,
+    timezone: "UTC",
+    period: null,
+    nowMs: september,
+  });
+  await db.putBudget(id, "2026-08", 100n, september);
+  assert.equal((await db.getBudget(id, "2026-09", september))?.active, true);
+  assert.equal((await db.getBudget(id, "2026-08", september))?.active, false);
+});
+
 test("a write role keeps an existing postgres schema and names a missing table", async () => {
   const tables = postgresSchemaTables();
   assert.equal(tables.includes("axond_namespace"), true);

@@ -872,7 +872,8 @@ impl Store for SqliteStore {
                 params![namespace, period, limit],
             )
             .map_err(unavailable)?;
-            let rec = read_budget(&tx, &namespace, &period, &clock)?;
+            let rec = read_budget(&tx, &namespace, &period, &clock)?
+                .ok_or_else(|| StoreError::NotFound(namespace.clone()))?;
             tx.commit().map_err(unavailable)?;
             rec.ok_or_else(|| StoreError::Unavailable("budget row missing after put".into()))
         })
@@ -886,11 +887,13 @@ impl Store for SqliteStore {
     ) -> Result<Option<BudgetRecord>, StoreError> {
         let namespace = namespace.to_string();
         let period = period.to_string();
+        let namespace_for_query = namespace.clone();
         let clock = Arc::clone(&self.clock);
         self.with_conn(StoreOp::BudgetRead, move |conn| {
-            read_budget(conn, &namespace, &period, &clock)
+            read_budget(conn, &namespace_for_query, &period, &clock)
         })
-        .await
+        .await?
+        .ok_or(StoreError::NotFound(namespace))
     }
 
     async fn put_budget_policy(
@@ -1452,54 +1455,52 @@ fn read_budget(
     namespace: &str,
     period: &str,
     clock: &Arc<dyn BudgetClock>,
-) -> Result<Option<BudgetRecord>, StoreError> {
+) -> Result<Option<Option<BudgetRecord>>, StoreError> {
     let row = conn
         .query_row(
-            "SELECT
-             b.limit_microdollars,
-             b.spent_microdollars,
-             c.cadence,
-             c.timezone
-         FROM axond_store_budget b
-         LEFT JOIN axond_store_budget_cadence c ON c.namespace = b.namespace
-         WHERE b.namespace = ?1 AND b.period = ?2",
+            "SELECT b.limit_microdollars, b.spent_microdollars, c.cadence, c.timezone,
+                    EXISTS (SELECT 1 FROM axond_store_budget_active a
+                            WHERE a.namespace = n.id AND a.period = ?2) AS active
+             FROM axond_namespace n
+             LEFT JOIN axond_store_budget b ON b.namespace = n.id AND b.period = ?2
+             LEFT JOIN axond_store_budget_cadence c ON c.namespace = n.id
+             WHERE n.id = ?1",
             params![namespace, period],
             |row| {
                 Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, bool>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(unavailable)?;
-    let Some((limit, spent, cadence, timezone)) = row else {
+    let Some((limit, spent, cadence, timezone, fixed_active)) = row else {
         return Ok(None);
+    };
+    let Some(limit) = limit else {
+        return Ok(Some(None));
     };
     let active = if cadence.as_deref() == Some("monthly") {
         let timezone = timezone.unwrap_or_else(|| super::DEFAULT_TIMEZONE.into());
         let tz = validate_timezone(&timezone)?;
         monthly_period_key(clock.now(), &tz) == period
     } else {
-        conn.query_row(
-            "SELECT EXISTS (
-                 SELECT 1 FROM axond_store_budget_active
-                 WHERE namespace = ?1 AND period = ?2
-             )",
-            params![namespace, period],
-            |row| row.get(0),
-        )
-        .map_err(unavailable)?
+        fixed_active
     };
-    Ok(Some(BudgetRecord::new(
+    Ok(Some(Some(BudgetRecord::new(
         namespace,
         period,
         from_sql_amount(limit),
-        from_sql_amount(spent),
+        from_sql_amount(
+            spent
+                .ok_or_else(|| StoreError::Unavailable("budget row missing spent amount".into()))?,
+        ),
         active,
-    )))
+    ))))
 }
 
 fn read_budget_policy(

@@ -13,6 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::Instrument;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 
@@ -20,8 +21,10 @@ use crate::error::GatewayError;
 use crate::state::AppState;
 use crate::store::{
     BudgetCadence, BudgetPolicy, BudgetRecord, NamespaceRecord, ProviderModels, Store, StoreError,
-    UsageSummary, validate_attrs, validate_namespace_id, validate_period, validate_timezone,
+    StoreOp, UsageSummary, validate_attrs, validate_namespace_id, validate_period,
+    validate_timezone,
 };
+use crate::telemetry::store_span;
 
 /// Bound for the whole management request body. Attrs alone are capped at
 /// 4 KiB ([`crate::store::MAX_ATTRS_BYTES`]); this leaves room for id and
@@ -461,15 +464,14 @@ async fn get_budget(
 ) -> Result<Json<BudgetRecord>, GatewayError> {
     validate_period(&period).map_err(|err| GatewayError::BadRequest(err.to_string()))?;
     let store = store(&state)?;
-    match store.get_namespace(&ns).await {
-        Ok(Some(_)) => {}
-        Ok(None) => return Err(GatewayError::UnknownNamespace),
-        Err(StoreError::Unavailable(_)) => return Err(GatewayError::StoreUnavailable),
-        Err(err) => return Err(GatewayError::BadRequest(err.to_string())),
-    }
-    match store.get_budget(&ns, &period).await {
+    match store
+        .get_budget(&ns, &period)
+        .instrument(store_span(StoreOp::BudgetRead))
+        .await
+    {
         Ok(Some(rec)) => Ok(Json(rec)),
         Ok(None) => Err(GatewayError::UnknownBudget),
+        Err(StoreError::NotFound(_)) => Err(GatewayError::UnknownNamespace),
         Err(StoreError::Unavailable(_)) => Err(GatewayError::StoreUnavailable),
         Err(err) => Err(GatewayError::BadRequest(err.to_string())),
     }

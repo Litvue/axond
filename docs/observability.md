@@ -62,6 +62,10 @@ parked credential.
 | `axond.credential.lease` | `axond.credential.id`, `axond.credential_source`, `axond.credential.index`, `axond.status` (`served`, `rate_limited`, `error`, `parked`) |
 | `axond.revision.converge` | `axond.revision.trigger` (`boot`, `polled`, `notified`, or `pricing-boundary`), outcome, active/desired revision, lag, and generation |
 
+The budget GET emits one `axond.store` child span with `axond.store.operation`,
+`axond.store.backend`, `axond.store.outcome`, `axond.store.acquire_wait_ms`,
+and `axond.store.query_ms`.
+
 An inbound `traceparent` is **joined**, not replaced, and the context is
 injected into the upstream request, so a caller's trace runs end to end.
 
@@ -399,4 +403,3 @@ while parsing and validating the file:
 
 None of these messages contain a secret value — only env-var names, namespaces,
 and provider ids.
-

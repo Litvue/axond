@@ -37,6 +37,39 @@ test("sqlite open adds columns a Rust namespace table omitted", async () => {
   }
 });
 
+test("sqlite getBudget distinguishes missing namespaces and cadence-active periods", async () => {
+  const store = openSqliteStore(":memory:");
+  await assert.rejects(
+    () => store.getBudget("missing", "p"),
+    (error: unknown) => error instanceof GatewayFailure && error.type === "unknown_namespace",
+  );
+  await store.putNamespace({
+    id: "platform",
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: true,
+  });
+
+  const september = Date.parse("2026-09-15T12:00:00Z");
+  await store.putBudget("platform", "old", 100n, september);
+  await store.putBudget("platform", "current", 100n, september);
+  assert.equal((await store.getBudget("platform", "current", september))?.active, true);
+  assert.equal((await store.getBudget("platform", "old", september))?.active, false);
+
+  await store.putBudgetPolicy({
+    namespace: "platform",
+    cadence: "monthly",
+    limit: 100n,
+    timezone: "UTC",
+    period: null,
+    nowMs: september,
+  });
+  await store.putBudget("platform", "2026-08", 100n, september);
+  assert.equal((await store.getBudget("platform", "2026-09", september))?.active, true);
+  assert.equal((await store.getBudget("platform", "2026-08", september))?.active, false);
+});
+
 test("sqlite settlement is exactly once per request_id and survives reopen", async () => {
   const directory = await mkdtemp(join(tmpdir(), "axond-sqlite-"));
   const path = join(directory, "axond.sqlite");

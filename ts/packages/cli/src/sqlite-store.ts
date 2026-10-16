@@ -282,10 +282,33 @@ export function openSqliteStore(path: string, metrics?: StoreMetrics): Store {
     },
     getBudget(namespace, period, nowMs = Date.now()) {
       return lock("budget_read", () => {
-        if (!readNamespace(db, namespace)) {
+        const row = one(
+          db,
+          `SELECT b.limit_microdollars, b.spent_microdollars, c.cadence, c.timezone,
+                  EXISTS (SELECT 1 FROM axond_store_budget_active a
+                          WHERE a.namespace = n.id AND a.period = ?) AS active
+           FROM axond_namespace n
+           LEFT JOIN axond_store_budget b ON b.namespace = n.id AND b.period = ?
+           LEFT JOIN axond_store_budget_cadence c ON c.namespace = n.id
+           WHERE n.id = ?`,
+          [period, period, namespace],
+        );
+        if (!row) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
-        return readBudget(db, namespace, period, nowMs);
+        if (row["limit_microdollars"] === null) {
+          return null;
+        }
+        return {
+          namespace,
+          period,
+          limit: BigInt(String(row["limit_microdollars"])),
+          spent: BigInt(String(row["spent_microdollars"])),
+          active:
+            row["cadence"] === "monthly"
+              ? monthlyPeriod(nowMs, String(row["timezone"] ?? "UTC")) === period
+              : Boolean(row["active"]),
+        };
       });
     },
     putBudgetPolicy(input) {
