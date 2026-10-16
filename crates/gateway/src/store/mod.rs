@@ -453,6 +453,9 @@ pub trait Store: Send + Sync {
         limit_microdollars: u64,
     ) -> Result<BudgetRecord, StoreError>;
 
+    /// Read the ledger for a namespace and period. A missing namespace is
+    /// [`StoreError::NotFound`]; an existing namespace without a ledger for the
+    /// period is `Ok(None)`; an existing ledger is `Ok(Some(record))`.
     async fn get_budget(
         &self,
         namespace: &str,
@@ -969,6 +972,49 @@ mod tests {
             .await
             .expect_err("unknown ns");
         assert!(matches!(missing_ns, StoreError::NotFound(_)));
+        assert!(matches!(
+            store.get_budget("ghost", "2026-09").await,
+            Err(StoreError::NotFound(_))
+        ));
+        assert!(
+            store
+                .get_budget("wsp_x", "missing")
+                .await
+                .expect("existing namespace without ledger")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_monthly_budget_is_active_only_for_the_clock_month() {
+        let clock = Arc::new(FixedClock(Mutex::new(
+            "2026-09-30T23:30:00Z".parse().expect("timestamp"),
+        )));
+        let store = SqliteStore::open(":memory:")
+            .expect("memory sqlite")
+            .with_clock(Arc::clone(&clock) as Arc<dyn BudgetClock>);
+        seeded(&store).await;
+        store
+            .put_budget_policy("wsp_x", BudgetCadence::Monthly, 1_000, "UTC", None)
+            .await
+            .expect("monthly policy");
+        store
+            .put_budget("wsp_x", "2026-08", 1_000)
+            .await
+            .expect("previous month ledger");
+
+        let current = store
+            .get_budget("wsp_x", "2026-09")
+            .await
+            .expect("current budget")
+            .expect("current ledger");
+        let previous = store
+            .get_budget("wsp_x", "2026-08")
+            .await
+            .expect("previous budget")
+            .expect("previous ledger");
+        assert!(current.active);
+        assert!(!previous.active);
     }
 
     #[tokio::test]
@@ -1096,13 +1142,10 @@ mod tests {
         assert!(store.delete_namespace("wsp_x").await.expect("delete"));
         assert!(!store.delete_namespace("wsp_x").await.expect("repeat"));
         assert!(store.get_namespace("wsp_x").await.expect("get").is_none());
-        assert!(
-            store
-                .get_budget("wsp_x", "p")
-                .await
-                .expect("budget")
-                .is_none()
-        );
+        assert!(matches!(
+            store.get_budget("wsp_x", "p").await,
+            Err(StoreError::NotFound(_))
+        ));
         let usage = store
             .summarize_usage("wsp_x", "p")
             .await
@@ -1357,6 +1400,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_get_budget_unknown_namespace_is_not_found() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let store = PostgresStore::connect(&dsn, true).await.expect("connect");
+        assert!(matches!(
+            store.get_budget(&unique_ns("missing"), "p").await,
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn postgres_get_budget_fixed_cadence_reports_active_period() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let (store, ns) = postgres_seeded(&dsn).await;
+        store.put_budget(&ns, "old", 1_000).await.expect("old");
+        store
+            .put_budget(&ns, "current", 1_000)
+            .await
+            .expect("current");
+
+        assert!(
+            !store
+                .get_budget(&ns, "old")
+                .await
+                .expect("old budget")
+                .expect("old ledger")
+                .active
+        );
+        assert!(
+            store
+                .get_budget(&ns, "current")
+                .await
+                .expect("current budget")
+                .expect("current ledger")
+                .active
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_get_budget_monthly_cadence_uses_clock_month() {
+        let Some(dsn) = crate::test_services::postgres_dsn() else {
+            return;
+        };
+        let ns = unique_ns("monthly_budget_read");
+        let clock = Arc::new(FixedClock(Mutex::new(
+            "2026-09-30T23:30:00Z".parse().expect("timestamp"),
+        )));
+        let store = PostgresStore::connect(&dsn, true)
+            .await
+            .expect("connect")
+            .with_clock(Arc::clone(&clock) as Arc<dyn BudgetClock>);
+        store
+            .put_namespace(NamespaceRecord {
+                id: ns.clone(),
+                attrs: serde_json::json!({}),
+                blocklist: None,
+            })
+            .await
+            .expect("namespace");
+        store
+            .put_budget_policy(&ns, BudgetCadence::Monthly, 1_000, "UTC", None)
+            .await
+            .expect("monthly policy");
+        store
+            .put_budget(&ns, "2026-08", 1_000)
+            .await
+            .expect("previous month ledger");
+
+        assert!(
+            store
+                .get_budget(&ns, "2026-09")
+                .await
+                .expect("current budget")
+                .expect("current ledger")
+                .active
+        );
+        assert!(
+            !store
+                .get_budget(&ns, "2026-08")
+                .await
+                .expect("previous budget")
+                .expect("previous ledger")
+                .active
+        );
+    }
+
+    #[tokio::test]
     async fn postgres_first_monthly_admission_racing_delete_leaves_no_rows() {
         let Some(dsn) = crate::test_services::postgres_dsn() else {
             return;
@@ -1467,7 +1600,10 @@ mod tests {
         assert!(store.delete_namespace(&ns).await.expect("delete"));
         assert!(!store.delete_namespace(&ns).await.expect("repeat"));
         assert!(store.get_namespace(&ns).await.expect("get").is_none());
-        assert!(store.get_budget(&ns, "p").await.expect("budget").is_none());
+        assert!(matches!(
+            store.get_budget(&ns, "p").await,
+            Err(StoreError::NotFound(_))
+        ));
         assert_eq!(store.reservation_count(&ns).await.expect("holds"), 0);
         let usage = store.summarize_usage(&ns, "p").await.expect("summarize");
         assert_eq!(
@@ -1739,9 +1875,14 @@ mod tests {
                 Err(error) => panic!("{error}"),
             }
             let ns_row = a.get_namespace(&ns).await.expect("get ns");
-            let budget = a.get_budget(&ns, "p").await.expect("get budget");
+            let budget = a.get_budget(&ns, "p").await;
             if ns_row.is_none() {
-                assert!(budget.is_none(), "orphaned budget for {ns}");
+                assert!(
+                    matches!(budget, Err(StoreError::NotFound(_)) | Ok(None)),
+                    "missing namespace had a budget: {budget:?}"
+                );
+            } else {
+                assert!(budget.is_ok(), "unexpected budget error: {budget:?}");
             }
         }
     }
