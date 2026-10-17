@@ -62,9 +62,16 @@ parked credential.
 | `axond.credential.lease` | `axond.credential.id`, `axond.credential_source`, `axond.credential.index`, `axond.status` (`served`, `rate_limited`, `error`, `parked`) |
 | `axond.revision.converge` | `axond.revision.trigger` (`boot`, `polled`, `notified`, or `pricing-boundary`), outcome, active/desired revision, lag, and generation |
 
-The budget GET emits one `axond.store` child span with `axond.store.operation`,
+The budget GET and namespaced request routes emit `axond.store` child spans for
+`namespace_resolve`, `namespace_read`, and `budget_admit`, with `axond.store.operation`,
 `axond.store.backend`, `axond.store.outcome`, `axond.store.acquire_wait_ms`,
 and `axond.store.query_ms`.
+
+An unavailable request-bound Postgres call writes one sanitized warning with
+`backend`, `operation`, `phase`, `reason`, `elapsed_ms`, and `bound_ms`. The
+phase is `acquire` or `query`; the reason is `timeout`, `saturated`,
+`connect_failed`, `pool_closed`, or `query_failed`. The message is fixed and
+does not include driver details, DSNs, or addresses.
 
 An inbound `traceparent` is **joined**, not replaced, and the context is
 injected into the upstream request, so a caller's trace runs end to end.
@@ -155,8 +162,8 @@ destination receives by exactly what the refusals in
 | `axond.budget.capacity_denials` | counter | — | In-memory admissions denied because the ledger bound was exhausted. |
 | `axond.budget.namespace_denials` | counter | — | Admissions denied by `namespace_limit_microdollars` rather than by the subject's own cap. Both answer `429`. |
 | `axond.budget.retained_subjects` | gauge | — | In-memory ledgers retained after capacity-pressure pruning; watch against `max_subjects`. |
-| `axond.store.acquire_wait` | histogram (ms) | `axond.store.backend`, `axond.store.operation` | Time a Store operation waited for a connection before any SQL ran: the dispatch slot (then the connection mutex) on `sqlite`, the pool permit on `postgres` plus a fresh connect when nothing idle was available. SQLite waiters queue on that slot rather than occupying one blocking thread each. Recorded for every outcome, including a saturated dispatch. SQLite `usage_summary` waits on a **separate** read-only lane, so a long fold does not occupy the inference slot. |
-| `axond.store.query_duration` | histogram (ms) | same | Time the operation held the connection: the statement or transaction itself, after the wait. On SQLite this is captured inside the blocking closure, before the mutex is released, so runtime delay polling a finished `spawn_blocking` join is not counted as execution. Recorded for `ok` and `error`; a `saturated` operation never reached the connection and has no execution sample. |
+| `axond.store.acquire_wait` | histogram (ms) | `axond.store.backend`, `axond.store.operation` | Time a Store operation waited for a connection before any SQL ran: the dispatch slot (then the connection mutex) on `sqlite`, the pool permit on `postgres` plus a fresh connect when nothing idle was available. SQLite waiters queue on that slot rather than occupying one blocking thread each. Recorded for every outcome, including a saturated dispatch. A request-bound timeout records the stalled acquire time here with outcome `error`. SQLite `usage_summary` waits on a **separate** read-only lane, so a long fold does not occupy the inference slot. |
+| `axond.store.query_duration` | histogram (ms) | same | Time the operation held the connection: the statement or transaction itself, after the wait. On SQLite this is captured inside the blocking closure, before the mutex is released, so runtime delay polling a finished `spawn_blocking` join is not counted as execution. A request-bound timeout records the stalled query time here with outcome `error`; other errors are also recorded, while a `saturated` operation never reached the connection and has no execution sample. |
 | `axond.store.operations` | counter | `axond.store.backend`, `axond.store.operation`, `axond.store.outcome` | Store operations by outcome: `ok`, `error`, or `saturated` (Postgres pool permit or SQLite `spawn_blocking` slot not granted within its wait bound). The count behind the two histograms. |
 | `axond.store.connections_opened` | counter | `axond.store.backend` | Successful Postgres sessions. A failed `connect()` does not increment. SQLite opens once and does not count. After idle retention matches the pool size, this should rise at cold start and after dead sessions, not on every traffic burst. |
 | `axond.store.connections_reused` | counter | `axond.store.backend` | Postgres checkouts that took a healthy idle session instead of connecting. |

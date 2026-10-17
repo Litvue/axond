@@ -45,6 +45,33 @@ env = "GW_KEY"
 namespace = "platform"
 `;
 
+test("storage request timeout stays last in TOML and AXOND_ sequences", async () => {
+  const storageSequence = (requestTimeout?: number) =>
+    `["sqlite", "/tmp/axond.sqlite", "", "deny", true, [1024, 256, 50]${
+      requestTimeout === undefined ? "" : `, ${requestTimeout}`
+    }]`;
+  const storageTable = '[storage]\nbackend = "sqlite"\npath = "/tmp/axond.sqlite"';
+  const baseWithoutStorage = BASE.replace(storageTable, "");
+  const withStorageSequence = (requestTimeout?: number) =>
+    `storage = ${storageSequence(requestTimeout)}\n${baseWithoutStorage}`;
+
+  const tomlTuned = await loadConfig(withStorageSequence(250), secrets);
+  assert.equal(tomlTuned.storage.requestTimeoutMs, 250);
+  const tomlDefault = await loadConfig(withStorageSequence(), secrets);
+  assert.equal(tomlDefault.storage.requestTimeoutMs, 3_000);
+
+  const envTuned = await loadConfig(
+    BASE,
+    envSecretReader({ GW_KEY: "k", AXOND_STORAGE: storageSequence(250) }, async () => ""),
+  );
+  assert.equal(envTuned.storage.requestTimeoutMs, 250);
+  const envDefault = await loadConfig(
+    BASE,
+    envSecretReader({ GW_KEY: "k", AXOND_STORAGE: storageSequence() }, async () => ""),
+  );
+  assert.equal(envDefault.storage.requestTimeoutMs, 3_000);
+});
+
 
 test("an earlier figment key finishes before a later sequence fill", async () => {
   const tail = `

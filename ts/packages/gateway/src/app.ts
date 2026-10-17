@@ -464,6 +464,7 @@ async function bindNamespace(
         msg: "budget_unavailable",
         request_id: axond.requestId,
         stance: "allow",
+        ...(error.reason === undefined ? {} : { reason: error.reason }),
       });
       return;
     }
@@ -471,6 +472,7 @@ async function bindNamespace(
       msg: "budget_unavailable",
       request_id: axond.requestId,
       stance: "deny",
+      ...(error.reason === undefined ? {} : { reason: error.reason }),
     });
     throw new GatewayFailure("budget_unavailable", 503, "budget store is unavailable");
   }

@@ -10,12 +10,14 @@ use axum::extract::{OriginalUri, Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::Next;
 use axum::response::Response;
-use tracing::debug;
+use tracing::{Instrument, debug};
 
 use crate::error::GatewayError;
 use crate::namespace::NamespaceId;
 use crate::principals::{Capability, Presented};
 use crate::state::{AppState, ConfigSnapshot, InboundKey};
+use crate::store::StoreOp;
+use crate::telemetry::store_span;
 
 use super::{Route, RouteAuthority};
 
@@ -82,6 +84,7 @@ pub(super) async fn authenticate_middleware(
             let resolved = match state.store() {
                 Some(store) => store
                     .resolve_namespace(namespace.as_str())
+                    .instrument(store_span(StoreOp::NamespaceResolve))
                     .await
                     .map_err(GatewayError::from)?,
                 None => None,
@@ -93,6 +96,7 @@ pub(super) async fn authenticate_middleware(
             match state.store() {
                 Some(store) => store
                     .get_namespace(namespace.as_str())
+                    .instrument(store_span(StoreOp::NamespaceRead))
                     .await
                     .map_err(GatewayError::from)?,
                 None => None,

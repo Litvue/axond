@@ -22,6 +22,7 @@ import {
   postgresQueryText,
   postgresSchemaTables,
   queryPgClient,
+  type SqlExecutor,
 } from "./postgres-store.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
 import type { Store } from "@axond/sdk";
@@ -240,13 +241,13 @@ test("a silent postgres accept fails at the connect limit", { timeout: 25_000 },
   const client = holdPgClient(new pg.Client(postgresClientOptions(
     `postgres://axond:socket-secret@127.0.0.1:${address.port}/axond`,
   )));
-  const started = Date.now();
+  const started = performance.now();
   try {
     const outcome = await Promise.race([
       client.connect().then(() => "ok" as const, (error: unknown) => error),
       new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 20_000)),
     ]);
-    const ms = Date.now() - started;
+    const ms = performance.now() - started;
     assert.notEqual(outcome, "hung");
     assert.notEqual(outcome, "ok");
     assert.equal(outcome instanceof Error, true);
@@ -493,6 +494,91 @@ test("postgres store counts one session per call and omits a failed connect", as
   );
   assert.equal(JSON.stringify(failing.points).includes("sk-live-secret"), false);
   assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+});
+
+function withGuard<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`outer guard ${timeoutMs}ms`)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+test("request-path connect timeout records acquire wait and releases a late client", async () => {
+  const metrics = createMetrics();
+  let resolveConnect!: (opened: { client: SqlExecutor; release: () => Promise<void> }) => void;
+  let released = 0;
+  const store = createPostgresStore(
+    () =>
+      new Promise((resolve) => {
+        resolveConnect = resolve;
+      }),
+    metrics,
+    { requestTimeoutMs: 50 },
+  );
+  const started = performance.now();
+  await assert.rejects(
+    () => withGuard(store.resolveNamespace("platform", Date.now()), 300),
+    (error: unknown) => error instanceof StoreFailure && error.reason === "timeout",
+  );
+  const elapsed = performance.now() - started;
+  assert.equal(elapsed >= 50, true, `connect timeout returned in ${elapsed}ms`);
+  assert.equal(elapsed < 300, true, `connect timeout took ${elapsed}ms`);
+  const acquire = metrics.points.find((point) => point.name === "axond.store.acquire_wait");
+  assert.ok(acquire && acquire.max! >= 50, `acquire_wait=${acquire?.max}`);
+  const outcome = metrics.points.find((point) => point.name === "axond.store.operations");
+  assert.equal(outcome?.attributes["axond.store.outcome"], "error");
+  assert.equal(
+    metrics.points.some((point) => point.name === "axond.store.query_duration"),
+    false,
+  );
+
+  resolveConnect({
+    client: { query: async () => ({ rows: [], rowCount: 0 }) },
+    release: async () => {
+      released += 1;
+    },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(released, 1);
+});
+
+test("request-path query timeout records query duration and releases the client", async () => {
+  const metrics = createMetrics();
+  let released = 0;
+  const store = createPostgresStore(
+    async () => ({
+      client: {
+        query: async () => new Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>(() => {}),
+      },
+      release: async () => {
+        released += 1;
+      },
+    }),
+    metrics,
+    { requestTimeoutMs: 50 },
+  );
+  const started = performance.now();
+  await assert.rejects(
+    () => withGuard(store.getNamespace("platform"), 300),
+    (error: unknown) => error instanceof StoreFailure && error.reason === "timeout",
+  );
+  const elapsed = performance.now() - started;
+  assert.equal(elapsed >= 50, true, `query timeout returned in ${elapsed}ms`);
+  assert.equal(elapsed < 300, true, `query timeout took ${elapsed}ms`);
+  const query = metrics.points.find((point) => point.name === "axond.store.query_duration");
+  assert.ok(query && query.max! >= 49, `query_duration=${query?.max}`);
+  const outcome = metrics.points.find((point) => point.name === "axond.store.operations");
+  assert.equal(outcome?.attributes["axond.store.outcome"], "error");
+  assert.equal(released, 1);
 });
 
 test("postgres 16 charges one request_id once and ignores a stale incarnation", { skip: !dsn }, async () => {

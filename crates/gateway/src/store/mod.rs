@@ -92,6 +92,13 @@ impl StoreOp {
             Self::ProviderModels => "provider_models",
         }
     }
+
+    pub const fn bounded_on_request_path(self) -> bool {
+        matches!(
+            self,
+            Self::NamespaceResolve | Self::NamespaceRead | Self::BudgetAdmit
+        )
+    }
 }
 
 #[cfg(test)]
@@ -707,7 +714,11 @@ pub async fn open(
                 )));
             }
             Ok(Arc::new(
-                PostgresStore::connect(dsn, config.create_table).await?,
+                PostgresStore::connect(dsn, config.create_table)
+                    .await?
+                    .with_request_timeout(std::time::Duration::from_millis(
+                        config.request_timeout_ms,
+                    )),
             ))
         }
     }

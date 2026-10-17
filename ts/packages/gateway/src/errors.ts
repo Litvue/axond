@@ -1,8 +1,11 @@
 /** A Store call failed. The driver message is dropped so it cannot leak a DSN. */
 export class StoreFailure extends Error {
-  constructor() {
+  readonly reason?: "timeout";
+
+  constructor(reason?: "timeout") {
     super("store is unavailable");
     this.name = "StoreFailure";
+    this.reason = reason;
   }
 }
 

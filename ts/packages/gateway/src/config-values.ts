@@ -56,6 +56,7 @@ export interface LoadedConfig {
     dsn?: string;
     createTable: boolean;
     onUnavailable: "deny" | "allow";
+    requestTimeoutMs: number;
   };
   namespaces: { id: string; default: boolean; allowPlatformFallback: boolean }[];
   providers: ProviderConfig[];
@@ -687,6 +688,7 @@ export const POSITIONAL_AFTER_SERVER: ReadonlyArray<readonly [string, readonly P
       { name: "on_unavailable", kind: "enum", enumName: "StoreUnavailable", variants: ["deny", "allow"] },
       { name: "create_table", kind: "bool" },
       { name: "usage_index", kind: "struct", structName: "UsageIndexConfig", fields: USAGE_INDEX_FIELDS },
+      { name: "request_timeout_ms", kind: "int", expected: "u64" },
     ],
   ],
   [

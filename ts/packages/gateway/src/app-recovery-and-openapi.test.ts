@@ -147,7 +147,7 @@ test("allow serves a chat when the budget read fails and does not charge", async
 test("budget_store_log_names_the_stance_and_omits_the_driver_text", async () => {
   const driver = "password=secret host=db.internal:5432/axond ECONNREFUSED";
   const prompt = "PROMPT_SENTINEL";
-  const logs: { msg: string; stance?: string; request_id?: string }[] = [];
+  const logs: { msg: string; stance?: string; request_id?: string; reason?: string }[] = [];
   const store = createMemoryStore();
   await store.putNamespace({
     id: "platform",
@@ -161,7 +161,7 @@ test("budget_store_log_names_the_stance_and_omits_the_driver_text", async () => 
     get(target, prop, receiver) {
       if (prop === "resolveNamespace") {
         return async () => {
-          const failure = new StoreFailure();
+          const failure = new StoreFailure("timeout");
           failure.message = driver;
           throw failure;
         };
@@ -207,6 +207,7 @@ test("budget_store_log_names_the_stance_and_omits_the_driver_text", async () => 
   const deniedBudget = logs.filter((record) => record.msg === "budget_unavailable");
   assert.equal(deniedBudget.length, 1);
   assert.equal(deniedBudget[0]?.stance, "deny");
+  assert.equal(deniedBudget[0]?.reason, "timeout");
   assert.equal(typeof deniedBudget[0]?.request_id, "string");
   assert.equal((deniedBudget[0]?.request_id ?? "").length > 0, true);
 
@@ -236,6 +237,7 @@ test("budget_store_log_names_the_stance_and_omits_the_driver_text", async () => 
   const allowedBudget = logs.filter((record) => record.msg === "budget_unavailable" && record.stance === "allow");
   assert.equal(allowedBudget.length, 1);
   assert.equal(typeof allowedBudget[0]?.request_id, "string");
+  assert.equal(allowedBudget[0]?.reason, "timeout");
   assert.equal(allowedBudget[0]?.request_id === deniedBudget[0]?.request_id, false);
   const encoded = JSON.stringify(logs);
   assert.equal(encoded.includes(driver), false);

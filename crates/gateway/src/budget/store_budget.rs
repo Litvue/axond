@@ -7,10 +7,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tracing::Instrument;
 
 use super::{Admission, BudgetKey, BudgetStore, Denial, Reservation, UnavailablePolicy};
 use crate::config::StoreUnavailable;
-use crate::store::{Store, StoreError};
+use crate::store::{Store, StoreError, StoreOp};
+use crate::telemetry::store_span;
 
 pub struct StoreBudget {
     store: Arc<dyn Store>,
@@ -41,7 +43,12 @@ impl BudgetStore for StoreBudget {
     }
 
     async fn reserve(&self, key: &BudgetKey, _estimated_microdollars: u64) -> Admission {
-        match self.store.admit_budget(&key.namespace).await {
+        match self
+            .store
+            .admit_budget(&key.namespace)
+            .instrument(store_span(StoreOp::BudgetAdmit))
+            .await
+        {
             Ok(admit) => super::admission_from_store(admit),
             Err(StoreError::Invalid(_)) => Admission::Denied(Denial::Exceeded),
             Err(error) => self.on_unavailable(&error),

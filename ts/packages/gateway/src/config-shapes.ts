@@ -649,8 +649,7 @@ function extractStruct(
 
 /**
  * Storage keys sort `backend`, `create_table`, `dsn_env`, `on_unavailable`,
- * `path`, then `usage_index`. A float on `create_table` is reported before a
- * bad `path`.
+ * `path`, `request_timeout_ms`, then `usage_index`.
  */
 function rejectStorageExtract(toml: string, storage: Record<string, unknown>): void {
   realizePositionalEnv(storage, positionalFields("storage") ?? []);
@@ -659,6 +658,7 @@ function rejectStorageExtract(toml: string, storage: Record<string, unknown>): v
   readString(toml, "storage", storage, "dsn_env");
   readVariant(toml, "storage", storage, "on_unavailable", ["deny", "allow"], "StoreUnavailable");
   readString(toml, "storage", storage, "path");
+  readTypedInt(toml, "storage", storage, "request_timeout_ms", "u64", 3_000);
   if (Array.isArray(storage["usage_index"])) {
     storage["usage_index"] = structFromSequence(
       storage["usage_index"] as unknown[],

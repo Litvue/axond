@@ -174,6 +174,24 @@ test("storage_boot_matches_the_rust_refusals", async () => {
         "`: invalid config: `[storage.usage_index]` buffer_capacity must be at least 1\n",
     );
 
+    for (const [value, sentence] of [
+      [0, "`[storage]` request_timeout_ms must be at least 1"],
+      [60001, "`[storage]` request_timeout_ms (60001) must not exceed 60000"],
+    ] as const) {
+      const requestTimeout = join(root, `request-timeout-${value}.toml`);
+      await writeFile(
+        requestTimeout,
+        `[storage]\npath = "/tmp/axond.sqlite"\nrequest_timeout_ms = ${value}\n`,
+      );
+      const refused = await run(requestTimeout, root);
+      assert.equal(refused.code, 1);
+      assert.equal(refused.stdout, "");
+      assert.equal(
+        refused.stderr,
+        `Error: failed to load config from \`${requestTimeout}\`: invalid config: ${sentence}\n`,
+      );
+    }
+
     const floated = join(root, "float.toml");
     await writeFile(
       floated,
