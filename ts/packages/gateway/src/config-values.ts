@@ -56,6 +56,7 @@ export interface LoadedConfig {
     dsn?: string;
     createTable: boolean;
     onUnavailable: "deny" | "allow";
+    requestTimeoutMs: number;
   };
   namespaces: { id: string; default: boolean; allowPlatformFallback: boolean }[];
   providers: ProviderConfig[];

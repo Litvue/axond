@@ -88,6 +88,7 @@ Store is opened once at boot.
 | --- | --- | --- | --- |
 | `backend` | `sqlite` \| `postgres` | `sqlite` | SQLite WAL for a single replica; Postgres for HA. |
 | `path` | string | — | SQLite file path. Required for `sqlite`. `:memory:` is refused by `Config::load`. |
+| `request_timeout_ms` | integer | `3000` | Postgres request-path bound for namespace resolve/read and budget admission. Must be 1–60000. SQLite cannot cancel a dispatched blocking call; its effective bound remains the 2-second dispatch slot plus `busy_timeout`. |
 | `dsn_env` | env-var name | — | Postgres DSN environment variable. Required for `postgres`. The DSN's `sslmode` selects TLS. |
 | `create_table` | bool | `true` | Apply namespace and `axond_store_budget*` DDL (including `axond_store_budget_cadence`) at connect. Postgres deployments that migrate out of band set `false` and apply `ops/postgres/store_budget_cadence_v1.sql` alongside the other files. |
 | `on_unavailable` | `deny` \| `allow` | `deny` | When the Store cannot reserve: `deny` answers `503 budget_unavailable`; `allow` serves without a hold. |
@@ -113,7 +114,13 @@ product, plus other roles that share the instance. Checkout waits 2 s for a
 permit (50 ms in tests) and then returns `StoreError::Unavailable` with "pool
 saturated", the same typed failure as SQLite dispatch saturation. Cancelling
 the caller while waiting, while connecting, or during a query releases the
-permit and does not leak a session.
+permit and does not leak a session. Connection startup is bounded to 10 seconds
+across TLS, authentication, and session setup; `request_timeout_ms` gives request-path
+checkout (including a fresh connection) and namespace resolve/read and
+budget-admission calls one overall deadline. Missing keepalive settings are
+hardened to 30 seconds idle, 10 seconds interval, and three retries, with a
+30-second TCP user timeout; explicit DSN values win. A session whose request
+query times out is discarded rather than returned to the pool.
 
 Postgres Store budget tables are `axond_store_budget`,
 `axond_store_budget_active`, and `axond_store_budget_reservation`

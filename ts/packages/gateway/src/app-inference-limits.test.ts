@@ -493,6 +493,51 @@ namespace = "platform"
   );
 });
 
+test("storage request timeout defaults and bounds match rust", async () => {
+  const toml = `
+[storage]
+backend = "sqlite"
+path = "/tmp/axond.sqlite"
+[[namespace]]
+id = "platform"
+default = true
+[[gateway_key]]
+env = "GW_KEY"
+namespace = "platform"
+`;
+  const secrets = envSecretReader({ GW_KEY: "k" }, async () => "");
+  const loaded = await loadConfig(toml, secrets);
+  assert.equal(loaded.storage.requestTimeoutMs, 3_000);
+  const tuned = await loadConfig(
+    toml.replace('path = "/tmp/axond.sqlite"', 'path = "/tmp/axond.sqlite"\nrequest_timeout_ms = 250'),
+    secrets,
+  );
+  assert.equal(tuned.storage.requestTimeoutMs, 250);
+  const max = await loadConfig(
+    toml.replace('path = "/tmp/axond.sqlite"', 'path = "/tmp/axond.sqlite"\nrequest_timeout_ms = 60000'),
+    secrets,
+  );
+  assert.equal(max.storage.requestTimeoutMs, 60_000);
+  for (const [value, sentence] of [
+    [0, "`[storage]` request_timeout_ms must be at least 1"],
+    [60_001, "`[storage]` request_timeout_ms (60001) must not exceed 60000"],
+  ] as const) {
+    await assert.rejects(
+      loadConfig(
+        toml.replace(
+          'path = "/tmp/axond.sqlite"',
+          `path = "/tmp/axond.sqlite"\nrequest_timeout_ms = ${value}`,
+        ),
+        secrets,
+      ),
+      (error: unknown) => {
+        assert.equal(error instanceof Error ? error.message : "", sentence);
+        return true;
+      },
+    );
+  }
+});
+
 
 test("admission ceilings load from toml and reject a contradictory queue", async () => {
   const toml = `

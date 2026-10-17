@@ -262,6 +262,10 @@ pub struct StorageConfig {
     pub backend: StorageBackend,
     #[serde(default)]
     pub path: Option<String>,
+    /// Bounds a Postgres Store request-path call. SQLite cannot cancel a
+    /// dispatched blocking operation, so it keeps its dispatch and busy bounds.
+    #[serde(default = "default_storage_request_timeout_ms")]
+    pub request_timeout_ms: u64,
     #[serde(default)]
     pub dsn_env: Option<String>,
     #[serde(default)]
@@ -278,6 +282,12 @@ pub struct StorageConfig {
 fn default_storage_create_table() -> bool {
     true
 }
+
+fn default_storage_request_timeout_ms() -> u64 {
+    3_000
+}
+
+pub(crate) const MAX_STORAGE_REQUEST_TIMEOUT_MS: u64 = 60_000;
 
 /// How usage events reach the Store's management index (`GET .../usage`).
 ///
@@ -1735,6 +1745,17 @@ impl Config {
                 index.flush_interval_ms, MAX_USAGE_INDEX_FLUSH_INTERVAL_MS
             )));
         }
+        if storage.request_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "`[storage]` request_timeout_ms must be at least 1".into(),
+            ));
+        }
+        if storage.request_timeout_ms > MAX_STORAGE_REQUEST_TIMEOUT_MS {
+            return Err(ConfigError::Invalid(format!(
+                "`[storage]` request_timeout_ms ({}) must not exceed {}",
+                storage.request_timeout_ms, MAX_STORAGE_REQUEST_TIMEOUT_MS
+            )));
+        }
         match storage.backend {
             StorageBackend::Sqlite => {
                 if storage
@@ -2626,6 +2647,50 @@ namespace = "platform"
             .expect_err(needle);
             assert!(err.to_string().contains(needle), "{err}");
         }
+    }
+
+    #[test]
+    fn storage_request_timeout_defaults_and_bounds() {
+        let cfg = Config::from_toml_str(VALID).expect("valid");
+        assert_eq!(
+            cfg.storage.as_ref().expect("storage").request_timeout_ms,
+            3_000
+        );
+
+        let tuned = Config::from_toml_str(&VALID.replace(
+            "path = \":memory:\"",
+            "path = \":memory:\"\nrequest_timeout_ms = 250",
+        ))
+        .expect("tuned");
+        assert_eq!(
+            tuned.storage.as_ref().expect("storage").request_timeout_ms,
+            250
+        );
+
+        for (value, expected) in [
+            (0, "`[storage]` request_timeout_ms must be at least 1"),
+            (
+                60_001,
+                "`[storage]` request_timeout_ms (60001) must not exceed 60000",
+            ),
+        ] {
+            let error = Config::from_toml_str(&VALID.replace(
+                "path = \":memory:\"",
+                &format!("path = \":memory:\"\nrequest_timeout_ms = {value}"),
+            ))
+            .expect_err("invalid request timeout");
+            assert_eq!(error.to_string(), format!("invalid config: {expected}"));
+        }
+
+        let max = Config::from_toml_str(&VALID.replace(
+            "path = \":memory:\"",
+            "path = \":memory:\"\nrequest_timeout_ms = 60000",
+        ))
+        .expect("maximum accepted");
+        assert_eq!(
+            max.storage.as_ref().expect("storage").request_timeout_ms,
+            60_000
+        );
     }
 
     #[test]

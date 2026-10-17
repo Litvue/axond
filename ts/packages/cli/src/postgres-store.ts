@@ -46,6 +46,29 @@ export function holdPgClient(client: pg.Client): pg.Client {
  * and emit close so the request still answers.
  */
 const CLOSE_FALLBACK_MS = 1_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 3_000;
+const REQUEST_TIMEOUT = Symbol("request-path store timeout");
+const REQUEST_PATH_OPERATIONS: ReadonlySet<StoreOperation> = new Set([
+  "namespace_resolve",
+  "namespace_read",
+  "budget_admit",
+]);
+
+function raceDeadline<T>(promise: Promise<T>, deadline: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(REQUEST_TIMEOUT), Math.max(0, deadline - Date.now()));
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 export async function closePgClient(client: pg.Client): Promise<void> {
   let ending: Promise<void>;
@@ -159,14 +182,36 @@ export async function queryPgClient(client: pg.Client, sql: string, params?: rea
 export function createPostgresStore(
   connect: () => Promise<{ client: SqlExecutor; release: () => Promise<void> }>,
   metrics?: StoreMetrics,
+  options?: { requestTimeoutMs?: number },
 ): Store {
-  async function withClient<T>(operation: StoreOperation | null, fn: (client: SqlExecutor) => Promise<T>): Promise<T> {
+  async function withClient<T>(
+    operation: StoreOperation | null,
+    fn: (client: SqlExecutor) => Promise<T>,
+  ): Promise<T> {
     const called = Date.now();
+    const deadline =
+      operation !== null && REQUEST_PATH_OPERATIONS.has(operation)
+        ? called + (options?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)
+        : null;
+    const connecting = Promise.resolve().then(connect);
     let opened: { client: SqlExecutor; release: () => Promise<void> };
     try {
-      opened = await connect();
+      opened = deadline === null ? await connecting : await raceDeadline(connecting, deadline);
     } catch (error) {
       recordStoreCall(metrics, "postgres", operation, Date.now() - called, null, "error");
+      if (error === REQUEST_TIMEOUT) {
+        void connecting.then(
+          (late) => {
+            recordConnectionOpened(metrics);
+            return Promise.resolve()
+              .then(() => late.release())
+              .catch(() => undefined)
+              .finally(() => recordConnectionDiscarded(metrics));
+          },
+          () => undefined,
+        );
+        throw new StoreFailure("timeout");
+      }
       if (error instanceof GatewayFailure) {
         throw error;
       }
@@ -174,19 +219,31 @@ export function createPostgresStore(
     }
     recordConnectionOpened(metrics);
     const acquired = Date.now();
+    let releaseDetached = false;
     try {
-      const value = await fn(opened.client);
+      const query = Promise.resolve().then(() => fn(opened.client));
+      const value = deadline === null ? await query : await raceDeadline(query, deadline);
       recordStoreCall(metrics, "postgres", operation, acquired - called, Date.now() - acquired, "ok");
       return value;
     } catch (error) {
       recordStoreCall(metrics, "postgres", operation, acquired - called, Date.now() - acquired, "error");
+      if (error === REQUEST_TIMEOUT) {
+        releaseDetached = true;
+        void Promise.resolve()
+          .then(() => opened.release())
+          .catch(() => undefined)
+          .finally(() => recordConnectionDiscarded(metrics));
+        throw new StoreFailure("timeout");
+      }
       if (error instanceof GatewayFailure || error instanceof StoreFailure) {
         throw error;
       }
       throw new StoreFailure();
     } finally {
-      await opened.release().catch(() => undefined);
-      recordConnectionDiscarded(metrics);
+      if (!releaseDetached) {
+        await opened.release().catch(() => undefined);
+        recordConnectionDiscarded(metrics);
+      }
     }
   }
 

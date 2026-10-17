@@ -100,6 +100,16 @@ export async function loadConfig(
     throw configError("`[storage] on_unavailable` must be `deny` or `allow`");
   }
   validateUsageIndex(toml, storageRaw);
+  const requestTimeout = asUint(
+    readTypedInt(toml, "storage", storageRaw, "request_timeout_ms", "u64", 3_000),
+  );
+  if (requestTimeout === 0n) {
+    throw configError("`[storage]` request_timeout_ms must be at least 1");
+  }
+  if (requestTimeout > 60_000n) {
+    throw configError(`\`[storage]\` request_timeout_ms (${requestTimeout}) must not exceed 60000`);
+  }
+  const requestTimeoutMs = Number(requestTimeout);
   let storage: LoadedConfig["storage"];
   if (backend === "sqlite") {
     const path = typeof storageRaw["path"] === "string" ? storageRaw["path"] : "";
@@ -113,7 +123,7 @@ export async function loadConfig(
     if (dsnEnv.trim().length > 0) {
       throw configError('`[storage]` sqlite ignores `dsn_env`; omit it or use backend = "postgres"');
     }
-    storage = { backend, path, createTable, onUnavailable };
+    storage = { backend, path, createTable, onUnavailable, requestTimeoutMs };
   } else {
     const dsnEnv = typeof storageRaw["dsn_env"] === "string" ? storageRaw["dsn_env"] : "";
     if (dsnEnv.trim().length === 0) {
@@ -130,6 +140,7 @@ export async function loadConfig(
       ...(dsn !== undefined && dsn.length > 0 ? { dsn } : {}),
       createTable,
       onUnavailable,
+      requestTimeoutMs,
     };
   }
   const discoveryEarly = asRecord(parsed["discovery"]) ?? {};

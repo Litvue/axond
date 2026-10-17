@@ -52,7 +52,12 @@ async function main(): Promise<void> {
   const store =
     config.storage.backend === "sqlite"
       ? openSqliteStore(config.storage.path!, metrics)
-      : await openPostgres(requirePostgresDsn(config.storage), metrics, config.storage.createTable);
+      : await openPostgres(
+          requirePostgresDsn(config.storage),
+          metrics,
+          config.storage.createTable,
+          config.storage.requestTimeoutMs,
+        );
   await seedConfigNamespaces(store, config.namespaces);
   await resolveConfigSecrets(config, envSecretReader(process.env, readGatewayKeyFile));
   redactSecrets.push(config.gatewayKey);
@@ -359,7 +364,12 @@ function requirePostgresDsn(storage: { dsn?: string; dsnEnv?: string }): string 
   return dsn;
 }
 
-async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgresStore>[1], createTable: boolean) {
+async function openPostgres(
+  dsn: string,
+  metrics: Parameters<typeof createPostgresStore>[1],
+  createTable: boolean,
+  requestTimeoutMs: number,
+) {
   const setup = holdPgClient(new Client(postgresClientOptions(dsn)));
   try {
     await setup.connect();
@@ -390,7 +400,7 @@ async function openPostgres(dsn: string, metrics: Parameters<typeof createPostgr
       },
       release: () => closePgClient(client),
     };
-  }, metrics);
+  }, metrics, { requestTimeoutMs });
 }
 
 async function loadExtensionDir(dir: string | null): Promise<AxondExtension[]> {

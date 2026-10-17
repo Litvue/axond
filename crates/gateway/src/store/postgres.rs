@@ -23,7 +23,11 @@ const INCARNATION_DDL: &str = include_str!("../../sql/store_namespace_incarnatio
 const USAGE_DDL: &str = include_str!("../../sql/store_usage_v1.sql");
 const MODELS_DDL: &str = include_str!("../../sql/store_provider_models_v1.sql");
 const CADENCE_DDL: &str = include_str!("../../sql/store_budget_cadence_v1.sql");
+#[cfg(not(test))]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(test)]
 const SEED_DEADLINE: Duration = Duration::from_secs(15);
 /// Hard cap on live plus idle sessions. Fleet budget is this times replica count.
@@ -49,6 +53,7 @@ pub struct PostgresStore {
     slots: Arc<Semaphore>,
     stats: Arc<PoolStats>,
     clock: Arc<dyn BudgetClock>,
+    request_timeout: Duration,
 }
 
 /// Opened / reused / discarded plus occupancy. Shared with [`Session`] so a
@@ -69,6 +74,7 @@ impl PostgresStore {
         let mut config: tokio_postgres::Config = dsn
             .parse()
             .map_err(|e| StoreError::Invalid(format!("unparsable DSN: {e}")))?;
+        harden(&mut config);
         config.connect_timeout(CONNECT_TIMEOUT);
         config.application_name(crate::telemetry::SERVICE_NAME);
         let store = Self {
@@ -77,6 +83,7 @@ impl PostgresStore {
             slots: Arc::new(Semaphore::new(POOL_SIZE)),
             stats: Arc::new(PoolStats::default()),
             clock: Arc::new(super::SystemClock),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         };
         let mut client = store.connect_client().await?;
         if create_table {
@@ -116,6 +123,12 @@ impl PostgresStore {
         Ok(store)
     }
 
+    /// Set the deadline for request-path Store operations.
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_clock(mut self, clock: Arc<dyn BudgetClock>) -> Self {
         self.clock = clock;
@@ -123,33 +136,43 @@ impl PostgresStore {
     }
 
     async fn connect_client(&self) -> Result<Client, StoreError> {
-        let (client, connection) = self
-            .config
-            .connect(crate::usage::tls_connector())
-            .await
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        self.stats.opened.fetch_add(1, Ordering::SeqCst);
-        metrics::record_store_connection_opened(STORE_BACKEND_POSTGRES);
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                tracing::warn!(error = %e, "postgres store connection closed");
-            }
-        });
-        // The handshake already opened a session. If setup fails or this
-        // future is cancelled, Drop records the discard the Session guard
-        // would have recorded had checkout finished.
-        let mut opened = OpenedClient {
-            stats: Arc::clone(&self.stats),
-            client: Some(client),
-        };
-        opened
-            .client
-            .as_ref()
-            .expect("just opened")
-            .batch_execute("SET lock_timeout = '2s'; SET statement_timeout = '5s'")
-            .await
-            .map_err(|e| StoreError::Unavailable(e.to_string()))?;
-        Ok(opened.take())
+        match tokio::time::timeout(CONNECT_TIMEOUT, async {
+            let (client, connection) = self
+                .config
+                .connect(crate::usage::tls_connector())
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            self.stats.opened.fetch_add(1, Ordering::SeqCst);
+            metrics::record_store_connection_opened(STORE_BACKEND_POSTGRES);
+            tokio::spawn(async move {
+                if connection.await.is_err() {
+                    tracing::warn!("postgres store connection closed");
+                }
+            });
+            // The handshake already opened a session. If setup fails or this
+            // future is cancelled, Drop records the discard the Session guard
+            // would have recorded had checkout finished.
+            let mut opened = OpenedClient {
+                stats: Arc::clone(&self.stats),
+                client: Some(client),
+            };
+            opened
+                .client
+                .as_ref()
+                .expect("just opened")
+                .batch_execute("SET lock_timeout = '2s'; SET statement_timeout = '5s'")
+                .await
+                .map_err(|e| StoreError::Unavailable(e.to_string()))?;
+            Ok(opened.take())
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(StoreError::Unavailable(format!(
+                "postgres store connect exceeded {} ms",
+                CONNECT_TIMEOUT.as_millis()
+            ))),
+        }
     }
 
     fn record_occupancy(&self) {
@@ -183,9 +206,7 @@ impl PostgresStore {
         {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
-                return Err(Checkout::Failed(StoreError::Unavailable(
-                    "postgres store pool is closed".into(),
-                )));
+                return Err(Checkout::PoolClosed);
             }
             Err(_) => return Err(Checkout::Saturated),
         };
@@ -196,7 +217,7 @@ impl PostgresStore {
         } else {
             match self.connect_client().await {
                 Ok(client) => client,
-                Err(error) => return Err(Checkout::Failed(error)),
+                Err(error) => return Err(Checkout::ConnectFailed(error)),
             }
         };
         self.stats.live.fetch_add(1, Ordering::SeqCst);
@@ -244,42 +265,148 @@ impl PostgresStore {
         operation: impl AsyncFnOnce(&mut Client) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         let called = Instant::now();
-        let mut session = match self.checkout().await {
+        let deadline = op
+            .bounded_on_request_path()
+            .then(|| tokio::time::Instant::now() + self.request_timeout);
+        let checked_out = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, self.checkout()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let elapsed = called.elapsed();
+                    let bound_ms = self.request_timeout.as_millis();
+                    metrics::record_store_operation(
+                        STORE_BACKEND_POSTGRES,
+                        op,
+                        millis(elapsed),
+                        None,
+                        STORE_OUTCOME_ERROR,
+                    );
+                    warn_request_path_failure(op, "acquire", "timeout", elapsed, bound_ms);
+                    return Err(StoreError::Unavailable(format!(
+                        "postgres store {} exceeded {bound_ms} ms request bound acquiring a session",
+                        op.as_str()
+                    )));
+                }
+            },
+            None => self.checkout().await,
+        };
+        let mut session = match checked_out {
             Ok(checked_out) => checked_out,
             Err(saturated @ Checkout::Saturated) => {
+                let elapsed = called.elapsed();
                 metrics::record_store_operation(
                     STORE_BACKEND_POSTGRES,
                     op,
-                    millis(called.elapsed()),
+                    millis(elapsed),
                     None,
                     STORE_OUTCOME_SATURATED,
                 );
+                if op.bounded_on_request_path() {
+                    warn_request_path_failure(
+                        op,
+                        "acquire",
+                        "saturated",
+                        elapsed,
+                        self.request_timeout.as_millis(),
+                    );
+                }
                 return Err(saturated.into());
             }
-            Err(Checkout::Failed(error)) => {
+            Err(Checkout::PoolClosed) => {
+                let elapsed = called.elapsed();
                 metrics::record_store_operation(
                     STORE_BACKEND_POSTGRES,
                     op,
-                    millis(called.elapsed()),
+                    millis(elapsed),
                     None,
                     STORE_OUTCOME_ERROR,
                 );
+                if op.bounded_on_request_path() {
+                    warn_request_path_failure(
+                        op,
+                        "acquire",
+                        "pool_closed",
+                        elapsed,
+                        self.request_timeout.as_millis(),
+                    );
+                }
+                return Err(StoreError::Unavailable(
+                    "postgres store pool is closed".into(),
+                ));
+            }
+            Err(Checkout::ConnectFailed(error)) => {
+                let elapsed = called.elapsed();
+                metrics::record_store_operation(
+                    STORE_BACKEND_POSTGRES,
+                    op,
+                    millis(elapsed),
+                    None,
+                    STORE_OUTCOME_ERROR,
+                );
+                if op.bounded_on_request_path() {
+                    warn_request_path_failure(
+                        op,
+                        "acquire",
+                        "connect_failed",
+                        elapsed,
+                        self.request_timeout.as_millis(),
+                    );
+                }
                 return Err(error);
             }
         };
         let acquired = Instant::now();
-        let result = operation(session.client_mut()).await;
+        let result = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(deadline, operation(session.client_mut())).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let elapsed = acquired.elapsed();
+                        metrics::record_store_operation(
+                            STORE_BACKEND_POSTGRES,
+                            op,
+                            millis(acquired.saturating_duration_since(called)),
+                            Some(millis(elapsed)),
+                            STORE_OUTCOME_ERROR,
+                        );
+                        warn_request_path_failure(
+                            op,
+                            "query",
+                            "timeout",
+                            called.elapsed(),
+                            self.request_timeout.as_millis(),
+                        );
+                        return Err(StoreError::Unavailable(format!(
+                            "postgres store {} exceeded {} ms request bound running the query",
+                            op.as_str(),
+                            self.request_timeout.as_millis()
+                        )));
+                    }
+                }
+            }
+            None => operation(session.client_mut()).await,
+        };
+        let query_elapsed = acquired.elapsed();
         metrics::record_store_operation(
             STORE_BACKEND_POSTGRES,
             op,
             millis(acquired.saturating_duration_since(called)),
-            Some(millis(acquired.elapsed())),
+            Some(millis(query_elapsed)),
             if result.is_ok() {
                 STORE_OUTCOME_OK
             } else {
                 STORE_OUTCOME_ERROR
             },
         );
+        if op.bounded_on_request_path() && matches!(&result, Err(StoreError::Unavailable(_))) {
+            warn_request_path_failure(
+                op,
+                "query",
+                "query_failed",
+                called.elapsed(),
+                self.request_timeout.as_millis(),
+            );
+        }
         let reuse = match &result {
             Ok(_) => !session.client_mut().is_closed(),
             Err(error) => Self::keep_session(error) && !session.client_mut().is_closed(),
@@ -297,8 +424,10 @@ impl PostgresStore {
 enum Checkout {
     /// Every slot was held for the whole wait bound.
     Saturated,
-    /// The pool is closed, or a fresh connection could not be made.
-    Failed(StoreError),
+    /// The pool is closed.
+    PoolClosed,
+    /// A fresh connection could not be made.
+    ConnectFailed(StoreError),
 }
 
 /// A checked-out session. `client` is `Some` until [`Session::take_client`] or
@@ -389,13 +518,50 @@ impl From<Checkout> for StoreError {
     fn from(checkout: Checkout) -> Self {
         match checkout {
             Checkout::Saturated => StoreError::Unavailable("postgres store pool saturated".into()),
-            Checkout::Failed(error) => error,
+            Checkout::PoolClosed => StoreError::Unavailable("postgres store pool is closed".into()),
+            Checkout::ConnectFailed(error) => error,
         }
     }
 }
 
+fn warn_request_path_failure(
+    op: StoreOp,
+    phase: &'static str,
+    reason: &'static str,
+    elapsed: Duration,
+    bound_ms: u128,
+) {
+    tracing::warn!(
+        backend = "postgres",
+        operation = op.as_str(),
+        phase,
+        reason,
+        elapsed_ms = millis(elapsed),
+        bound_ms,
+        "request-path store call failed"
+    );
+}
+
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
+}
+
+fn harden(config: &mut tokio_postgres::Config) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if config.get_keepalives() && config.get_keepalives_idle() == Duration::from_secs(2 * 60 * 60) {
+        config.keepalives_idle(Duration::from_secs(30));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if config.get_keepalives_interval().is_none() {
+        config.keepalives_interval(Duration::from_secs(10));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if config.get_keepalives_retries().is_none() {
+        config.keepalives_retries(3);
+    }
+    if config.get_tcp_user_timeout().is_none() {
+        config.tcp_user_timeout(Duration::from_secs(30));
+    }
 }
 
 #[cfg(test)]
@@ -1866,7 +2032,16 @@ impl PostgresStore {
             slots,
             stats: Arc::new(PoolStats::default()),
             clock: Arc::new(super::SystemClock),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
+    }
+
+    fn test_store_with_request_timeout(
+        config: tokio_postgres::Config,
+        slots: Arc<Semaphore>,
+        request_timeout: Duration,
+    ) -> Self {
+        Self::test_store(config, slots).with_request_timeout(request_timeout)
     }
 
     fn pool_snapshot(&self) -> PoolSnapshot {
@@ -2051,10 +2226,452 @@ impl PostgresStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+    use tracing::Instrument;
+    use tracing_subscriber::layer::SubscriberExt;
 
     /// Heavy tests share one Postgres. They take this lock so they do not
     /// hold a wave of sessions at the same time as each other.
     static POOL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    const REQUEST_TIMEOUT: Duration = Duration::from_millis(150);
+
+    async fn silent_peer() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection");
+            let mut bytes = [0_u8; 1024];
+            while stream.read(&mut bytes).await.unwrap_or(0) != 0 {}
+        });
+        (address, server)
+    }
+
+    fn config_for(address: std::net::SocketAddr) -> tokio_postgres::Config {
+        format!(
+            "host=127.0.0.1 port={} user=x dbname=x sslmode=disable",
+            address.port()
+        )
+        .parse()
+        .expect("postgres config")
+    }
+
+    async fn stalled_query_peer() -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_message(
+            stream: &mut tokio::net::TcpStream,
+        ) -> std::io::Result<(u8, Vec<u8>)> {
+            let mut header = [0_u8; 5];
+            stream.read_exact(&mut header).await?;
+            let length = u32::from_be_bytes(header[1..].try_into().expect("length")) as usize;
+            let mut body = vec![0; length - 4];
+            stream.read_exact(&mut body).await?;
+            Ok((header[0], body))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let (query_seen, query_started) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection");
+            stream.set_nodelay(true).expect("nodelay");
+            let mut startup_length = [0_u8; 4];
+            stream
+                .read_exact(&mut startup_length)
+                .await
+                .expect("startup length");
+            let startup_length = u32::from_be_bytes(startup_length) as usize;
+            let mut startup = vec![0; startup_length - 4];
+            stream
+                .read_exact(&mut startup)
+                .await
+                .expect("startup message");
+            stream
+                .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                .await
+                .expect("startup response");
+
+            let (kind, _) = read_message(&mut stream).await.expect("SET query");
+            assert_eq!(kind, b'Q');
+            let mut setup_response = Vec::new();
+            setup_response.extend_from_slice(b"C\0\0\0\x08SET\0");
+            setup_response.extend_from_slice(b"C\0\0\0\x08SET\0");
+            setup_response.extend_from_slice(b"Z\0\0\0\x05I");
+            stream
+                .write_all(&setup_response)
+                .await
+                .expect("SET response");
+
+            let (kind, _) = read_message(&mut stream).await.expect("request query");
+            assert_eq!(kind, b'Q');
+            let _ = query_seen.send(());
+            std::future::pending::<()>().await;
+        });
+        (address, query_started, server)
+    }
+
+    #[tokio::test]
+    async fn silent_postgres_peer_is_bounded_on_namespace_resolve() {
+        let (address, server) = silent_peer().await;
+        let store = PostgresStore::test_store_with_request_timeout(
+            config_for(address),
+            Arc::new(Semaphore::new(1)),
+            REQUEST_TIMEOUT,
+        );
+        let started = Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), store.resolve_namespace("ns"))
+            .await
+            .expect("outer guard");
+        assert!(
+            matches!(result, Err(StoreError::Unavailable(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_postgres_query_is_bounded_and_records_query_time() {
+        use tracing::instrument::WithSubscriber as _;
+
+        crate::telemetry::testing::keep_callsites_answerable();
+        let (address, query_started, server) = stalled_query_peer().await;
+        let store = PostgresStore::test_store_with_request_timeout(
+            config_for(address),
+            Arc::new(Semaphore::new(1)),
+            REQUEST_TIMEOUT,
+        );
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("postgres-bound")));
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            async {
+                let result = store
+                    .resolve_namespace("ns")
+                    .instrument(crate::telemetry::store_span(StoreOp::NamespaceResolve))
+                    .await;
+                assert!(query_started.await.is_ok());
+                result
+            }
+            .with_subscriber(subscriber),
+        )
+        .await
+        .expect("outer guard");
+        assert!(
+            matches!(result, Err(StoreError::Unavailable(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        let store_span = spans
+            .iter()
+            .find(|span| span.name == "axond.store")
+            .expect("store span");
+        let query_ms = store_span
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key.as_str() == "axond.store.query_ms")
+            .expect("query timing")
+            .value
+            .to_string()
+            .parse::<f64>()
+            .expect("numeric query timing");
+        assert!(query_ms >= 150.0, "query_ms={query_ms}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn non_request_store_operation_has_a_connect_bound() {
+        let (address, server) = silent_peer().await;
+        let store = PostgresStore::test_store(config_for(address), Arc::new(Semaphore::new(1)));
+        let started = Instant::now();
+        let result =
+            tokio::time::timeout(Duration::from_secs(10), store.get_budget("ns", "period"))
+                .await
+                .expect("outer guard");
+        assert!(
+            matches!(result, Err(StoreError::Unavailable(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        server.abort();
+    }
+
+    #[test]
+    fn harden_sets_missing_socket_defaults_and_preserves_dsn_values() {
+        let mut defaults = tokio_postgres::Config::new();
+        harden(&mut defaults);
+        assert_eq!(defaults.get_keepalives_idle(), Duration::from_secs(30));
+        assert_eq!(
+            defaults.get_keepalives_interval(),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(defaults.get_keepalives_retries(), Some(3));
+        assert_eq!(
+            defaults.get_tcp_user_timeout().copied(),
+            Some(Duration::from_secs(30))
+        );
+
+        let mut explicit: tokio_postgres::Config = "host=localhost user=x dbname=x \
+            keepalives_idle=600 keepalives_interval=20 keepalives_retries=7 \
+            tcp_user_timeout=5000"
+            .parse()
+            .expect("DSN");
+        harden(&mut explicit);
+        assert_eq!(explicit.get_keepalives_idle(), Duration::from_secs(600));
+        assert_eq!(
+            explicit.get_keepalives_interval(),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(explicit.get_keepalives_retries(), Some(7));
+        assert_eq!(
+            explicit.get_tcp_user_timeout().copied(),
+            Some(Duration::from_secs(5_000))
+        );
+    }
+
+    #[tokio::test]
+    async fn namespaced_post_is_refused_before_upstream_when_store_resolve_stalls() {
+        use http_body_util::BodyExt;
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::util::ServiceExt;
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        crate::telemetry::testing::keep_callsites_answerable();
+        let (address, server) = silent_peer().await;
+        let dsn = format!(
+            "host=127.0.0.1 port={} user=x dbname=x sslmode=disable",
+            address.port()
+        );
+        let postgres = Arc::new(PostgresStore::test_store_with_request_timeout(
+            config_for(address),
+            Arc::new(Semaphore::new(1)),
+            REQUEST_TIMEOUT,
+        ));
+        let store: Arc<dyn Store> = postgres;
+
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener");
+        let upstream_address = upstream_listener.local_addr().expect("upstream address");
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let counted_hits = Arc::clone(&upstream_hits);
+        let upstream = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let hits = Arc::clone(&counted_hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "unexpected upstream request"
+                }
+            }),
+        );
+        let upstream_server =
+            tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
+        let config = crate::config::Config::from_toml_str(&format!(
+            r#"
+[storage]
+backend = "postgres"
+dsn_env = "AXOND_POSTGRES_DSN"
+request_timeout_ms = 150
+
+[[namespace]]
+id = "wsp_x"
+default = true
+
+[[provider]]
+id = "openai"
+kind = "openai"
+base_url = "http://{upstream_address}/v1"
+
+[[credential]]
+namespace = "wsp_x"
+provider = "openai"
+env = "AXOND_UPSTREAM_KEY"
+
+[[gateway_key]]
+env = "AXOND_GATEWAY_KEY"
+namespace = "wsp_x"
+
+[[price]]
+provider = "openai"
+model = "*"
+input_microdollars_per_million = 1
+output_microdollars_per_million = 1
+"#
+        ))
+        .expect("config");
+        let env = HashMap::from([
+            ("AXOND_POSTGRES_DSN".to_owned(), dsn),
+            (
+                "AXOND_UPSTREAM_KEY".to_owned(),
+                "upstream-secret".to_owned(),
+            ),
+            ("AXOND_GATEWAY_KEY".to_owned(), "gateway-secret".to_owned()),
+        ]);
+        let budget = crate::budget::StoreBudget::new(
+            Arc::clone(&store),
+            crate::config::StoreUnavailable::Deny,
+        );
+        let state = crate::state::AppState::serving(
+            config,
+            &env,
+            Arc::new(crate::usage::UsageDelivery::telemetry(
+                crate::usage::UsageFanout::new(Vec::new()),
+            )),
+            Box::new(budget),
+            None,
+            Arc::clone(&store),
+        )
+        .expect("state");
+        assert!(Arc::ptr_eq(
+            state.0.budget.store_ledger().expect("store ledger"),
+            state.store().expect("namespace store")
+        ));
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("postgres-route")));
+        let request = axum::http::Request::post("/ns/wsp_x/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(axum::http::header::AUTHORIZATION, "Bearer gateway-secret")
+            .body(axum::body::Body::from(
+                r#"{"model":"openai/gpt-4o","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .expect("request");
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::routes::router(state)
+                .layer(crate::telemetry::TelemetryLayer)
+                .oneshot(request)
+                .with_subscriber(subscriber),
+        )
+        .await
+        .expect("outer guard")
+        .expect("response");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(body["error"]["type"], "store_unavailable");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        let store_span = spans
+            .iter()
+            .find(|span| {
+                span.name == "axond.store"
+                    && span.attributes.iter().any(|attribute| {
+                        attribute.key.as_str() == "axond.store.operation"
+                            && attribute.value.to_string() == "namespace_resolve"
+                    })
+            })
+            .expect("namespace resolve span");
+        let attribute = |key: &str| {
+            store_span
+                .attributes
+                .iter()
+                .find(|attribute| attribute.key.as_str() == key)
+                .map(|attribute| attribute.value.to_string())
+        };
+        assert_eq!(attribute("axond.store.outcome").as_deref(), Some("error"));
+        let acquire_wait_ms = attribute("axond.store.acquire_wait_ms")
+            .expect("acquire wait")
+            .parse::<f64>()
+            .expect("numeric acquire wait");
+        assert!(
+            acquire_wait_ms >= 150.0,
+            "acquire_wait_ms={acquire_wait_ms}"
+        );
+
+        upstream_server.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_path_timeout_log_has_fixed_diagnostic_fields() {
+        use std::io::Write;
+
+        #[derive(Clone)]
+        struct Writer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("log buffer").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+            type Writer = Writer;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let (address, server) = silent_peer().await;
+        let logged = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Writer(Arc::clone(&logged)))
+            .with_ansi(false)
+            .finish();
+        let store = PostgresStore::test_store_with_request_timeout(
+            config_for(address),
+            Arc::new(Semaphore::new(1)),
+            REQUEST_TIMEOUT,
+        );
+        let _default = tracing::subscriber::set_default(subscriber);
+        let _ = store.resolve_namespace("ns").await;
+        let log = String::from_utf8(logged.lock().expect("log buffer").clone()).expect("utf-8");
+        assert!(log.contains("operation=\"namespace_resolve\""), "{log}");
+        assert!(log.contains("phase=\"acquire\""), "{log}");
+        assert!(log.contains("reason=\"timeout\""), "{log}");
+        assert!(log.contains("bound_ms=150"), "{log}");
+        assert!(!log.contains("127.0.0.1"), "{log}");
+        assert!(!log.contains(&address.port().to_string()), "{log}");
+        assert!(!log.contains("store unavailable:"), "{log}");
+        server.abort();
+    }
 
     #[tokio::test]
     async fn checkout_times_out_when_pool_is_saturated() {
