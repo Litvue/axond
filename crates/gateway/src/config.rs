@@ -262,10 +262,6 @@ pub struct StorageConfig {
     pub backend: StorageBackend,
     #[serde(default)]
     pub path: Option<String>,
-    /// Bounds a Postgres Store request-path call. SQLite cannot cancel a
-    /// dispatched blocking operation, so it keeps its dispatch and busy bounds.
-    #[serde(default = "default_storage_request_timeout_ms")]
-    pub request_timeout_ms: u64,
     #[serde(default)]
     pub dsn_env: Option<String>,
     #[serde(default)]
@@ -277,6 +273,10 @@ pub struct StorageConfig {
     /// Batching for the management usage index (`axond_store_usage`).
     #[serde(default)]
     pub usage_index: UsageIndexConfig,
+    /// Bounds a Postgres Store request-path call. SQLite cannot cancel a
+    /// dispatched blocking operation, so it keeps its dispatch and busy bounds.
+    #[serde(default = "default_storage_request_timeout_ms")]
+    pub request_timeout_ms: u64,
 }
 
 fn default_storage_create_table() -> bool {
@@ -2436,11 +2436,15 @@ impl Config {
             providers::{Format, Toml},
         };
         let owned;
-        let source = if s.contains("[storage]") {
+        let source = if s.contains("[storage]")
+            || s.lines()
+                .any(|line| line.trim_start().starts_with("storage = ["))
+        {
             s
         } else {
             // Append, never prepend: a leading `[storage]` table would capture
             // subsequent root keys (`mode = "stateful"`) as storage fields.
+            // A root-level storage sequence also declares storage.
             owned = format!("{s}\n\n[storage]\nbackend = \"sqlite\"\npath = \":memory:\"\n");
             &owned
         };
@@ -2655,6 +2659,34 @@ namespace = "platform"
         assert_eq!(
             cfg.storage.as_ref().expect("storage").request_timeout_ms,
             3_000
+        );
+
+        let sequence_default = Config::from_toml_str(&VALID.replace(
+            "[storage]\nbackend = \"sqlite\"\npath = \":memory:\"",
+            "storage = [\"sqlite\", \":memory:\", \"\", \"deny\", true, [1024, 256, 50]]",
+        ))
+        .expect("storage sequence with existing fields");
+        assert_eq!(
+            sequence_default
+                .storage
+                .as_ref()
+                .expect("storage")
+                .request_timeout_ms,
+            3_000
+        );
+
+        let sequence_tuned = Config::from_toml_str(&VALID.replace(
+            "[storage]\nbackend = \"sqlite\"\npath = \":memory:\"",
+            "storage = [\"sqlite\", \":memory:\", \"\", \"deny\", true, [1024, 256, 50], 250]",
+        ))
+        .expect("storage sequence with request timeout");
+        assert_eq!(
+            sequence_tuned
+                .storage
+                .as_ref()
+                .expect("storage")
+                .request_timeout_ms,
+            250
         );
 
         let tuned = Config::from_toml_str(&VALID.replace(

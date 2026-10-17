@@ -153,8 +153,8 @@ test("workerd_hyperdrive_silent_query_returns_503", async () => {
     assert.equal(listed.body.includes("socket-secret"), false);
     assert.equal(listed.body.includes("would never generate a response"), false);
     assert.equal(listed.body.includes("Query read timeout"), false);
-    assert.equal(listed.ms >= 50_000, true);
-    assert.equal(listed.ms < 70_000, true);
+    assert.equal(listed.ms >= 2_500, true);
+    assert.equal(listed.ms < 15_000, true);
   } finally {
     await worker.stop();
     silent.close();

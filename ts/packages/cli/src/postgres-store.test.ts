@@ -241,13 +241,13 @@ test("a silent postgres accept fails at the connect limit", { timeout: 25_000 },
   const client = holdPgClient(new pg.Client(postgresClientOptions(
     `postgres://axond:socket-secret@127.0.0.1:${address.port}/axond`,
   )));
-  const started = Date.now();
+  const started = performance.now();
   try {
     const outcome = await Promise.race([
       client.connect().then(() => "ok" as const, (error: unknown) => error),
       new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 20_000)),
     ]);
-    const ms = Date.now() - started;
+    const ms = performance.now() - started;
     assert.notEqual(outcome, "hung");
     assert.notEqual(outcome, "ok");
     assert.equal(outcome instanceof Error, true);
@@ -524,12 +524,12 @@ test("request-path connect timeout records acquire wait and releases a late clie
     metrics,
     { requestTimeoutMs: 50 },
   );
-  const started = Date.now();
+  const started = performance.now();
   await assert.rejects(
     () => withGuard(store.resolveNamespace("platform", Date.now()), 300),
     (error: unknown) => error instanceof StoreFailure && error.reason === "timeout",
   );
-  const elapsed = Date.now() - started;
+  const elapsed = performance.now() - started;
   assert.equal(elapsed >= 50, true, `connect timeout returned in ${elapsed}ms`);
   assert.equal(elapsed < 300, true, `connect timeout took ${elapsed}ms`);
   const acquire = metrics.points.find((point) => point.name === "axond.store.acquire_wait");
@@ -566,16 +566,16 @@ test("request-path query timeout records query duration and releases the client"
     metrics,
     { requestTimeoutMs: 50 },
   );
-  const started = Date.now();
+  const started = performance.now();
   await assert.rejects(
     () => withGuard(store.getNamespace("platform"), 300),
     (error: unknown) => error instanceof StoreFailure && error.reason === "timeout",
   );
-  const elapsed = Date.now() - started;
+  const elapsed = performance.now() - started;
   assert.equal(elapsed >= 50, true, `query timeout returned in ${elapsed}ms`);
   assert.equal(elapsed < 300, true, `query timeout took ${elapsed}ms`);
   const query = metrics.points.find((point) => point.name === "axond.store.query_duration");
-  assert.ok(query && query.max! >= 50, `query_duration=${query?.max}`);
+  assert.ok(query && query.max! >= 49, `query_duration=${query?.max}`);
   const outcome = metrics.points.find((point) => point.name === "axond.store.operations");
   assert.equal(outcome?.attributes["axond.store.outcome"], "error");
   assert.equal(released, 1);

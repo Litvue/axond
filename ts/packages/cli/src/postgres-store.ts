@@ -56,7 +56,19 @@ const REQUEST_PATH_OPERATIONS: ReadonlySet<StoreOperation> = new Set([
 
 function raceDeadline<T>(promise: Promise<T>, deadline: number): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(REQUEST_TIMEOUT), Math.max(0, deadline - Date.now()));
+    let timer: ReturnType<typeof setTimeout>;
+    const rejectWhenDue = () => {
+      const remaining = deadline - performance.now();
+      if (remaining > 0) {
+        timer = setTimeout(rejectWhenDue, Math.ceil(remaining));
+      } else {
+        reject(REQUEST_TIMEOUT);
+      }
+    };
+    timer = setTimeout(
+      rejectWhenDue,
+      Math.ceil(Math.max(0, deadline - performance.now())),
+    );
     promise.then(
       (value) => {
         clearTimeout(timer);
@@ -188,7 +200,7 @@ export function createPostgresStore(
     operation: StoreOperation | null,
     fn: (client: SqlExecutor) => Promise<T>,
   ): Promise<T> {
-    const called = Date.now();
+    const called = performance.now();
     const deadline =
       operation !== null && REQUEST_PATH_OPERATIONS.has(operation)
         ? called + (options?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)
@@ -198,7 +210,7 @@ export function createPostgresStore(
     try {
       opened = deadline === null ? await connecting : await raceDeadline(connecting, deadline);
     } catch (error) {
-      recordStoreCall(metrics, "postgres", operation, Date.now() - called, null, "error");
+      recordStoreCall(metrics, "postgres", operation, performance.now() - called, null, "error");
       if (error === REQUEST_TIMEOUT) {
         void connecting.then(
           (late) => {
@@ -218,15 +230,15 @@ export function createPostgresStore(
       throw new StoreFailure();
     }
     recordConnectionOpened(metrics);
-    const acquired = Date.now();
+    const acquired = performance.now();
     let releaseDetached = false;
     try {
       const query = Promise.resolve().then(() => fn(opened.client));
       const value = deadline === null ? await query : await raceDeadline(query, deadline);
-      recordStoreCall(metrics, "postgres", operation, acquired - called, Date.now() - acquired, "ok");
+      recordStoreCall(metrics, "postgres", operation, acquired - called, performance.now() - acquired, "ok");
       return value;
     } catch (error) {
-      recordStoreCall(metrics, "postgres", operation, acquired - called, Date.now() - acquired, "error");
+      recordStoreCall(metrics, "postgres", operation, acquired - called, performance.now() - acquired, "error");
       if (error === REQUEST_TIMEOUT) {
         releaseDetached = true;
         void Promise.resolve()

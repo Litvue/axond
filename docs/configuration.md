@@ -88,7 +88,7 @@ Store is opened once at boot.
 | --- | --- | --- | --- |
 | `backend` | `sqlite` \| `postgres` | `sqlite` | SQLite WAL for a single replica; Postgres for HA. |
 | `path` | string | — | SQLite file path. Required for `sqlite`. `:memory:` is refused by `Config::load`. |
-| `request_timeout_ms` | integer | `3000` | Postgres request-path bound for namespace resolve/read and budget admission. Must be 1–60000. SQLite cannot cancel a dispatched blocking call; its effective bound remains the 2-second dispatch slot plus `busy_timeout`. |
+| `request_timeout_ms` | integer | `3000` | Postgres request-path bound for namespace resolve/read and budget admission. Must be 1–60000. SQLite cannot cancel a dispatched blocking call; its effective bound remains the 2-second dispatch slot plus `busy_timeout`. See [ADR 0068](adr/0068-request-path-store-deadline.md). |
 | `dsn_env` | env-var name | — | Postgres DSN environment variable. Required for `postgres`. The DSN's `sslmode` selects TLS. |
 | `create_table` | bool | `true` | Apply namespace and `axond_store_budget*` DDL (including `axond_store_budget_cadence`) at connect. Postgres deployments that migrate out of band set `false` and apply `ops/postgres/store_budget_cadence_v1.sql` alongside the other files. |
 | `on_unavailable` | `deny` \| `allow` | `deny` | When the Store cannot reserve: `deny` answers `503 budget_unavailable`; `allow` serves without a hold. |
