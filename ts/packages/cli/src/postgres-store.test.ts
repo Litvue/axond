@@ -6,7 +6,9 @@ import test from "node:test";
 import pg from "pg";
 
 import { GatewayFailure, StoreFailure } from "../../gateway/src/errors.ts";
+import { budgetPolicyFromLedger } from "../../gateway/src/memory-store.ts";
 import { createMetrics } from "../../gateway/src/metrics.ts";
+import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 
 import {
   postgresWrites,
@@ -72,6 +74,84 @@ function pooledStore(metrics?: StoreMetrics, requestTimeoutMs?: number): {
     store: createPostgresStore(connector.connect, metrics, options),
     close: connector.close,
     connector,
+  };
+}
+
+async function legacyGetBudgetPolicy(client: SqlExecutor, namespace: string, nowMs: number) {
+  const known = await client.query("SELECT id FROM public.axond_namespace WHERE id = $1", [namespace]);
+  if (!known.rows[0]) {
+    throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
+  }
+  return legacyReadPolicy(client, namespace, nowMs);
+}
+
+async function legacyReadPolicy(client: SqlExecutor, namespace: string, nowMs: number) {
+  const policy = await client.query(
+    "SELECT cadence, limit_microdollars, timezone FROM public.axond_store_budget_cadence WHERE namespace = $1",
+    [namespace],
+  );
+  const row = policy.rows[0];
+  if (!row) {
+    const active = await client.query(
+      `SELECT a.period AS period, b.limit_microdollars AS limit_microdollars, b.spent_microdollars AS spent_microdollars
+       FROM public.axond_store_budget_active a
+       JOIN public.axond_store_budget b ON b.namespace = a.namespace AND b.period = a.period
+       WHERE a.namespace = $1`,
+      [namespace],
+    );
+    const legacy = active.rows[0];
+    if (!legacy) {
+      return null;
+    }
+    return budgetPolicyFromLedger({
+      namespace,
+      cadence: "fixed",
+      timezone: "UTC",
+      period: String(legacy["period"]),
+      limit: BigInt(String(legacy["limit_microdollars"])),
+      spent: BigInt(String(legacy["spent_microdollars"])),
+    });
+  }
+  const cadence = row["cadence"] === "monthly" ? "monthly" : "fixed";
+  const timezone = String(row["timezone"]);
+  let period = "";
+  if (cadence === "monthly") {
+    period = monthlyPeriod(nowMs, timezone);
+  } else {
+    const active = await client.query("SELECT period FROM public.axond_store_budget_active WHERE namespace = $1", [namespace]);
+    period = active.rows[0] ? String(active.rows[0]["period"]) : "";
+  }
+  const budget = period ? await legacyReadBudget(client, namespace, period, nowMs) : null;
+  return budgetPolicyFromLedger({
+    namespace,
+    cadence,
+    timezone,
+    period,
+    limit: budget?.limit ?? BigInt(String(row["limit_microdollars"])),
+    spent: budget?.spent ?? 0n,
+  });
+}
+
+async function legacyReadBudget(client: SqlExecutor, namespace: string, period: string, nowMs: number) {
+  const result = await client.query(
+    "SELECT limit_microdollars, spent_microdollars FROM public.axond_store_budget WHERE namespace = $1 AND period = $2",
+    [namespace, period],
+  );
+  const row = result.rows[0];
+  if (!row) {
+    return null;
+  }
+  const policy = await client.query("SELECT cadence, timezone FROM public.axond_store_budget_cadence WHERE namespace = $1", [namespace]);
+  const cadence = policy.rows[0];
+  const active =
+    cadence?.["cadence"] === "monthly"
+      ? monthlyPeriod(nowMs, String(cadence["timezone"])) === period
+      : (await client.query("SELECT period FROM public.axond_store_budget_active WHERE namespace = $1", [namespace])).rows[0]?.["period"] ===
+        period;
+  return {
+    limit: BigInt(String(row["limit_microdollars"])),
+    spent: BigInt(String(row["spent_microdollars"])),
+    active,
   };
 }
 
@@ -429,6 +509,97 @@ test("a store write limits the lock wait and a read stays one statement", async 
   ]);
 });
 
+test("budget reads use one statement for found, unknown, and null results", async () => {
+  function countedStore(rows: Record<string, unknown>[]) {
+    let calls = 0;
+    const db = createPostgresStore(async () => ({
+      client: {
+        async query() {
+          calls += 1;
+          return { rows, rowCount: rows.length };
+        },
+      },
+      release: async () => undefined,
+    }));
+    return { db, calls: () => calls };
+  }
+
+  const budgetCases = [
+    {
+      name: "found",
+      rows: [{ limit_microdollars: "17", spent_microdollars: "4", cadence: "fixed", active: true }],
+      expect: async (db: Store) => assert.equal((await db.getBudget("platform", "p1"))?.limit, 17n),
+    },
+    {
+      name: "unknown",
+      rows: [],
+      expect: async (db: Store) =>
+        assert.rejects(
+          () => db.getBudget("missing", "p1"),
+          (error: unknown) => error instanceof GatewayFailure && error.type === "unknown_namespace",
+        ),
+    },
+    {
+      name: "null",
+      rows: [{ limit_microdollars: null, spent_microdollars: null, cadence: null, active: false }],
+      expect: async (db: Store) => assert.equal(await db.getBudget("platform", "p1"), null),
+    },
+  ];
+  for (const testCase of budgetCases) {
+    const counted = countedStore(testCase.rows);
+    await testCase.expect(counted.db);
+    assert.equal(counted.calls(), 1, `getBudget ${testCase.name}`);
+  }
+
+  const policyCases = [
+    {
+      name: "found",
+      rows: [
+        {
+          cadence: "fixed",
+          policy_limit: "17",
+          timezone: "UTC",
+          active_period: "p1",
+          budget_period: "p1",
+          limit_microdollars: "17",
+          spent_microdollars: "4",
+        },
+      ],
+      expect: async (db: Store) =>
+        assert.equal((await db.getBudgetPolicy("platform"))?.limit_microdollars, 17),
+    },
+    {
+      name: "unknown",
+      rows: [],
+      expect: async (db: Store) =>
+        assert.rejects(
+          () => db.getBudgetPolicy("missing"),
+          (error: unknown) => error instanceof GatewayFailure && error.type === "unknown_namespace",
+        ),
+    },
+    {
+      name: "null",
+      rows: [
+        {
+          cadence: null,
+          policy_limit: null,
+          timezone: null,
+          active_period: null,
+          budget_period: null,
+          limit_microdollars: null,
+          spent_microdollars: null,
+        },
+      ],
+      expect: async (db: Store) => assert.equal(await db.getBudgetPolicy("platform"), null),
+    },
+  ];
+  for (const testCase of policyCases) {
+    const counted = countedStore(testCase.rows);
+    await testCase.expect(counted.db);
+    assert.equal(counted.calls(), 1, `getBudgetPolicy ${testCase.name}`);
+  }
+});
+
 test("postgres store query sends numbered binds to the driver", async () => {
   let seen = "";
   let params: readonly unknown[] = [];
@@ -619,7 +790,217 @@ test("the pooled connector reuses one session and matches per-call getBudget res
   }
 });
 
-test("the pooled connector discards statement failures and opens a fresh session", { skip: !dsn }, async () => {
+test("getBudgetPolicy matches the previous multi-statement results", { skip: !dsn }, async () => {
+  await reset();
+  const db = store();
+  const nowMs = Date.UTC(2025, 9, 15, 12);
+  const prefix = `policy-oracle-${process.pid}-${Date.now()}`;
+
+  async function addNamespace(id: string): Promise<void> {
+    await db.putNamespace({
+      id,
+      attrs: {},
+      blocklist: null,
+      allowPlatformFallback: false,
+      fromConfig: false,
+    });
+  }
+
+  async function execute(sql: string, params: unknown[] = []): Promise<void> {
+    const opened = await connect();
+    try {
+      await opened.client.query(sql, params);
+    } finally {
+      await opened.release();
+    }
+  }
+
+  async function legacy(namespace: string, at = nowMs) {
+    const opened = await connect();
+    try {
+      return await legacyGetBudgetPolicy(sqlExecutor(opened.client), namespace, at);
+    } finally {
+      await opened.release();
+    }
+  }
+
+  async function compare(namespace: string, at = nowMs) {
+    const expected = await legacy(namespace, at);
+    assert.deepEqual(await db.getBudgetPolicy(namespace, at), expected, namespace);
+    return expected;
+  }
+
+  async function comparePolicyError(namespace: string): Promise<void> {
+    const assertUnknownNamespace = (error: unknown) =>
+      error instanceof GatewayFailure && error.type === "unknown_namespace";
+    await assert.rejects(() => legacy(namespace), assertUnknownNamespace);
+    await assert.rejects(() => db.getBudgetPolicy(namespace), assertUnknownNamespace);
+  }
+
+  async function policyFailure(namespace: string): Promise<{ type: string; message: string }> {
+    try {
+      await db.getBudgetPolicy(namespace, nowMs);
+    } catch (error) {
+      assert.ok(error instanceof GatewayFailure);
+      return { type: error.type, message: error.message };
+    }
+    assert.fail("expected getBudgetPolicy to fail");
+  }
+
+  await comparePolicyError(`${prefix}-unknown`);
+
+  const nothing = `${prefix}-nothing`;
+  await addNamespace(nothing);
+  assert.equal(await compare(nothing), null);
+
+  const legacyBudget = `${prefix}-legacy-budget`;
+  await addNamespace(legacyBudget);
+  await db.putBudget(legacyBudget, "legacy-active", 101n);
+  assert.equal((await compare(legacyBudget))?.period, "legacy-active");
+
+  const legacyMissingBudget = `${prefix}-legacy-missing`;
+  await addNamespace(legacyMissingBudget);
+  await db.putBudget(legacyMissingBudget, "legacy-active", 102n);
+  await execute("DELETE FROM public.axond_store_budget WHERE namespace = $1", [legacyMissingBudget]);
+  assert.equal(await compare(legacyMissingBudget), null);
+
+  const fixedBudget = `${prefix}-fixed-budget`;
+  await addNamespace(fixedBudget);
+  await db.putBudgetPolicy({
+    namespace: fixedBudget,
+    cadence: "fixed",
+    limit: 201n,
+    timezone: "UTC",
+    period: "fixed-active",
+    nowMs,
+  });
+  assert.equal((await compare(fixedBudget))?.period, "fixed-active");
+
+  const fixedMissingBudget = `${prefix}-fixed-missing`;
+  await addNamespace(fixedMissingBudget);
+  await db.putBudgetPolicy({
+    namespace: fixedMissingBudget,
+    cadence: "fixed",
+    limit: 202n,
+    timezone: "UTC",
+    period: "fixed-active",
+    nowMs,
+  });
+  await execute("DELETE FROM public.axond_store_budget WHERE namespace = $1", [fixedMissingBudget]);
+  assert.equal((await compare(fixedMissingBudget))?.limit_microdollars, 202);
+
+  const fixedWithoutActive = `${prefix}-fixed-no-active`;
+  await addNamespace(fixedWithoutActive);
+  await db.putBudgetPolicy({
+    namespace: fixedWithoutActive,
+    cadence: "fixed",
+    limit: 203n,
+    timezone: "UTC",
+    period: "fixed-unselected",
+    nowMs,
+  });
+  await execute("DELETE FROM public.axond_store_budget_active WHERE namespace = $1", [fixedWithoutActive]);
+  const noActivePolicy = await compare(fixedWithoutActive);
+  assert.equal(noActivePolicy?.period, "");
+  assert.equal(noActivePolicy?.limit_microdollars, 203);
+
+  const monthlyBudget = `${prefix}-monthly-budget`;
+  await addNamespace(monthlyBudget);
+  await db.putBudgetPolicy({
+    namespace: monthlyBudget,
+    cadence: "monthly",
+    limit: 301n,
+    timezone: "UTC",
+    period: null,
+    nowMs,
+  });
+  assert.equal((await compare(monthlyBudget))?.period, monthlyPeriod(nowMs, "UTC"));
+
+  const monthlyMissingBudget = `${prefix}-monthly-missing`;
+  await addNamespace(monthlyMissingBudget);
+  await db.putBudgetPolicy({
+    namespace: monthlyMissingBudget,
+    cadence: "monthly",
+    limit: 302n,
+    timezone: "UTC",
+    period: null,
+    nowMs,
+  });
+  await execute(
+    "DELETE FROM public.axond_store_budget WHERE namespace = $1 AND period = $2",
+    [monthlyMissingBudget, monthlyPeriod(nowMs, "UTC")],
+  );
+  const noMonthlyBudget = await compare(monthlyMissingBudget);
+  assert.equal(noMonthlyBudget?.limit_microdollars, 302);
+  assert.equal(noMonthlyBudget?.spent_microdollars, 0);
+
+  const invalidTimezone = `${prefix}-invalid-timezone`;
+  await addNamespace(invalidTimezone);
+  await execute(
+    `INSERT INTO public.axond_store_budget_cadence (namespace, cadence, limit_microdollars, timezone)
+     VALUES ($1, 'monthly', 303, 'Invalid/Timezone')`,
+    [invalidTimezone],
+  );
+  const legacyTimezoneFailure = await (async () => {
+    try {
+      await legacy(invalidTimezone);
+    } catch (error) {
+      assert.ok(error instanceof GatewayFailure);
+      return { type: error.type, message: error.message };
+    }
+    assert.fail("expected legacy getBudgetPolicy to fail");
+  })();
+  assert.deepEqual(await policyFailure(invalidTimezone), legacyTimezoneFailure);
+
+  const boundaryCases = [
+    {
+      name: "kiritimati",
+      nowMs: Date.UTC(2025, 0, 31, 12, 30),
+      timezone: "Pacific/Kiritimati",
+      periods: ["2024-12", "2025-01", "2025-02"],
+      limits: [401n, 402n, 403n],
+      expectedLimit: 403,
+    },
+    {
+      name: "pago-pago",
+      nowMs: Date.UTC(2025, 1, 1, 10, 30),
+      timezone: "Pacific/Pago_Pago",
+      periods: ["2025-01", "2025-02", "2025-03"],
+      limits: [411n, 412n, 413n],
+      expectedLimit: 411,
+    },
+  ] as const;
+  for (const boundary of boundaryCases) {
+    const namespace = `${prefix}-${boundary.name}`;
+    await addNamespace(namespace);
+    const expectedPeriod = monthlyPeriod(boundary.nowMs, boundary.timezone);
+    assert.notEqual(expectedPeriod, monthlyPeriod(boundary.nowMs, "UTC"));
+    assert.ok(boundary.periods.includes(expectedPeriod));
+    await db.putBudgetPolicy({
+      namespace,
+      cadence: "monthly",
+      limit: 499n,
+      timezone: boundary.timezone,
+      period: null,
+      nowMs: boundary.nowMs,
+    });
+    for (const [index, period] of boundary.periods.entries()) {
+      await execute(
+        `INSERT INTO public.axond_store_budget (namespace, period, limit_microdollars, spent_microdollars)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (namespace, period) DO UPDATE SET
+           limit_microdollars = EXCLUDED.limit_microdollars,
+           spent_microdollars = EXCLUDED.spent_microdollars`,
+        [namespace, period, boundary.limits[index]!.toString(), String(index + 1)],
+      );
+    }
+    const policy = await compare(namespace, boundary.nowMs);
+    assert.equal(policy?.period, expectedPeriod);
+    assert.equal(policy?.limit_microdollars, boundary.expectedLimit);
+  }
+});
+
+test("the pooled connector discards a terminated idle session and opens a fresh one", { skip: !dsn }, async () => {
   await reset();
   const metrics = createMetrics();
   const pooled = pooledStore(metrics);
@@ -634,17 +1015,22 @@ test("the pooled connector discards statement failures and opens a fresh session
       fromConfig: false,
     });
     const checkedOut = await pooled.connector.connect();
-    await checkedOut.client.query("SET lock_timeout = '25ms'");
+    const pid = (await checkedOut.client.query("SELECT pg_backend_pid() AS pid")).rows[0]?.["pid"];
+    assert.ok(pid);
     await checkedOut.release();
     await blocker.connect();
-    await blocker.query("BEGIN");
-    await blocker.query("LOCK TABLE public.axond_namespace IN ACCESS EXCLUSIVE MODE");
-
-    await assert.rejects(
-      () => pooled.store.getBudget(id, "empty"),
-      (error: unknown) => error instanceof StoreFailure,
-    );
-    await blocker.query("ROLLBACK");
+    const terminated = await blocker.query("SELECT pg_terminate_backend($1) AS terminated", [pid]);
+    assert.equal(terminated.rows[0]?.["terminated"], true);
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      const active = await blocker.query("SELECT 1 FROM pg_stat_activity WHERE pid = $1", [pid]);
+      if (active.rowCount === 0) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal((await blocker.query("SELECT 1 FROM pg_stat_activity WHERE pid = $1", [pid])).rowCount, 0);
+    await new Promise((resolve) => setTimeout(resolve, 25));
     assert.equal(await pooled.store.getBudget(id, "empty"), null);
     const opened = metrics.points.find((point) => point.name === "axond.store.connections_opened");
     const discarded = metrics.points.find((point) => point.name === "axond.store.connections_discarded");

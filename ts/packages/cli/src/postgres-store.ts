@@ -24,7 +24,10 @@ import {
 } from "../../gateway/src/store-metrics.ts";
 
 export interface SqlExecutor {
-  query(sql: string, params?: readonly SqlValue[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+  query(
+    sql: string,
+    params?: readonly (SqlValue | readonly string[])[],
+  ): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
 }
 
 const I64_MAX = "9223372036854775807";
@@ -632,11 +635,61 @@ export function createPostgresStore(
     },
     async getBudgetPolicy(namespace, nowMs = Date.now()) {
       return withClient("budget_read", async (client) => {
-        const known = await client.query("SELECT id FROM public.axond_namespace WHERE id = $1", [namespace]);
-        if (!known.rows[0]) {
+        const result = await client.query(
+          `SELECT c.cadence, c.limit_microdollars AS policy_limit, c.timezone,
+                  a.period AS active_period,
+                  b.period AS budget_period, b.limit_microdollars, b.spent_microdollars
+           FROM public.axond_namespace n
+           LEFT JOIN public.axond_store_budget_cadence c ON c.namespace = n.id
+           LEFT JOIN public.axond_store_budget_active a ON a.namespace = n.id
+           LEFT JOIN public.axond_store_budget b
+                  ON b.namespace = n.id AND (b.period = a.period OR b.period = ANY($2::text[]))
+           WHERE n.id = $1`,
+          [namespace, monthlyPeriodCandidates(nowMs)],
+        );
+        const row = result.rows[0];
+        if (!row) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
-        return readPolicy(client, namespace, nowMs);
+        if (row["policy_limit"] == null) {
+          const activePeriod = row["active_period"] == null ? null : String(row["active_period"]);
+          if (activePeriod === null) {
+            return null;
+          }
+          const budget = result.rows.find(
+            (candidate) => candidate["budget_period"] != null && String(candidate["budget_period"]) === activePeriod,
+          );
+          if (!budget) {
+            return null;
+          }
+          return budgetPolicyFromLedger({
+            namespace,
+            cadence: "fixed",
+            timezone: "UTC",
+            period: activePeriod,
+            limit: BigInt(String(budget["limit_microdollars"])),
+            spent: BigInt(String(budget["spent_microdollars"])),
+          });
+        }
+        const cadence = row["cadence"] === "monthly" ? "monthly" : "fixed";
+        const timezone = String(row["timezone"]);
+        const activePeriod = row["active_period"] == null ? null : String(row["active_period"]);
+        const period =
+          cadence === "monthly" ? monthlyPeriod(nowMs, timezone) : (activePeriod ?? "");
+        const budget =
+          period === ""
+            ? undefined
+            : result.rows.find(
+                (candidate) => candidate["budget_period"] != null && String(candidate["budget_period"]) === period,
+              );
+        return budgetPolicyFromLedger({
+          namespace,
+          cadence,
+          timezone,
+          period,
+          limit: budget ? BigInt(String(budget["limit_microdollars"])) : BigInt(String(row["policy_limit"])),
+          spent: budget ? BigInt(String(budget["spent_microdollars"])) : 0n,
+        });
       });
     },
     settle(input) {
@@ -970,6 +1023,20 @@ async function readPolicy(client: SqlExecutor, namespace: string, nowMs: number)
     period,
     limit: budget?.limit ?? BigInt(String(row["limit_microdollars"])),
     spent: budget?.spent ?? 0n,
+  });
+}
+
+function monthlyPeriodCandidates(nowMs: number): string[] {
+  const monthStart = new Date(nowMs);
+  if (Number.isNaN(monthStart.getTime())) {
+    return [];
+  }
+  monthStart.setUTCDate(1);
+  return [-1, 0, 1].map((offset) => {
+    const candidate = new Date(monthStart);
+    candidate.setUTCMonth(candidate.getUTCMonth() + offset);
+    const timestamp = candidate.getTime();
+    return Number.isNaN(timestamp) ? "" : monthlyPeriod(timestamp, "UTC");
   });
 }
 
