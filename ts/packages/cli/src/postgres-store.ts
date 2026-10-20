@@ -17,6 +17,7 @@ import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 import {
   recordConnectionDiscarded,
   recordConnectionOpened,
+  recordConnectionReused,
   recordStoreCall,
   type StoreMetrics,
   type StoreOperation,
@@ -47,6 +48,8 @@ export function holdPgClient(client: pg.Client): pg.Client {
  */
 const CLOSE_FALLBACK_MS = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 3_000;
+const POSTGRES_POOL_SIZE = 32;
+const POSTGRES_POOL_WAIT_MS = 2_000;
 const REQUEST_TIMEOUT = Symbol("request-path store timeout");
 const REQUEST_PATH_OPERATIONS: ReadonlySet<StoreOperation> = new Set([
   "namespace_resolve",
@@ -125,6 +128,94 @@ export async function closePgClient(client: pg.Client): Promise<void> {
 export const POSTGRES_CONNECT_TIMEOUT_MS = 15_000;
 export const POSTGRES_QUERY_TIMEOUT_MS = 60_000;
 
+export interface PostgresConnector {
+  connect: () => Promise<{
+    client: SqlExecutor;
+    release: (discard?: boolean) => Promise<void>;
+  }>;
+  close: () => Promise<void>;
+}
+
+export function createPooledPostgresConnector(
+  options: pg.PoolConfig,
+  metrics?: StoreMetrics,
+): PostgresConnector {
+  const pool = new pg.Pool({
+    ...options,
+    max: POSTGRES_POOL_SIZE,
+    idleTimeoutMillis: 0,
+    connectionTimeoutMillis: POSTGRES_CONNECT_TIMEOUT_MS,
+  });
+  const checkedOut = new WeakSet<pg.PoolClient>();
+  const initialized = new WeakSet<pg.PoolClient>();
+  let closing = false;
+  pool.on("error", () => undefined);
+  pool.on("connect", (client) => {
+    client.on("error", () => undefined);
+    recordConnectionOpened(metrics);
+  });
+  pool.on("acquire", (client) => {
+    if (checkedOut.has(client)) {
+      recordConnectionReused(metrics);
+    } else {
+      checkedOut.add(client);
+    }
+  });
+  pool.on("remove", () => {
+    if (!closing) {
+      recordConnectionDiscarded(metrics);
+    }
+  });
+
+  return {
+    async connect() {
+      const pending = pool.connect();
+      let client: pg.PoolClient;
+      try {
+        client = await raceDeadline(pending, performance.now() + POSTGRES_POOL_WAIT_MS);
+      } catch (error) {
+        if (error === REQUEST_TIMEOUT) {
+          void pending.then(
+            (late) => late.release(true),
+            () => undefined,
+          ).catch(() => undefined);
+          throw new Error("postgres pool checkout timed out");
+        }
+        throw error;
+      }
+      if (!initialized.has(client)) {
+        try {
+          await queryPgClient(client, "SET lock_timeout = '2s'; SET statement_timeout = '5s'");
+          initialized.add(client);
+        } catch (error) {
+          client.release(true);
+          throw error;
+        }
+      }
+      let released = false;
+      return {
+        client: {
+          query: async (sql, params) => {
+            const result = await queryPgClient(client, sql, params);
+            return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+          },
+        },
+        release: async (discard = false) => {
+          if (released) {
+            return;
+          }
+          released = true;
+          client.release(discard);
+        },
+      };
+    },
+    close: async () => {
+      closing = true;
+      await pool.end();
+    },
+  };
+}
+
 export function postgresClientOptions(connectionString: string) {
   return {
     connectionString,
@@ -192,13 +283,14 @@ export async function queryPgClient(client: pg.Client, sql: string, params?: rea
  * closes it in `release`. Do not issue session-level SET.
  */
 export function createPostgresStore(
-  connect: () => Promise<{ client: SqlExecutor; release: () => Promise<void> }>,
+  connect: () => Promise<{ client: SqlExecutor; release: (discard?: boolean) => Promise<void> }>,
   metrics?: StoreMetrics,
-  options?: { requestTimeoutMs?: number },
+  options?: { requestTimeoutMs?: number; connectionsManaged?: boolean },
 ): Store {
   async function withClient<T>(
     operation: StoreOperation | null,
     fn: (client: SqlExecutor) => Promise<T>,
+    discardOnSuccess = false,
   ): Promise<T> {
     const called = performance.now();
     const deadline =
@@ -206,7 +298,7 @@ export function createPostgresStore(
         ? called + (options?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)
         : null;
     const connecting = Promise.resolve().then(connect);
-    let opened: { client: SqlExecutor; release: () => Promise<void> };
+    let opened: { client: SqlExecutor; release: (discard?: boolean) => Promise<void> };
     try {
       opened = deadline === null ? await connecting : await raceDeadline(connecting, deadline);
     } catch (error) {
@@ -214,11 +306,17 @@ export function createPostgresStore(
       if (error === REQUEST_TIMEOUT) {
         void connecting.then(
           (late) => {
-            recordConnectionOpened(metrics);
+            if (!options?.connectionsManaged) {
+              recordConnectionOpened(metrics);
+            }
             return Promise.resolve()
-              .then(() => late.release())
+              .then(() => late.release(true))
               .catch(() => undefined)
-              .finally(() => recordConnectionDiscarded(metrics));
+              .finally(() => {
+                if (!options?.connectionsManaged) {
+                  recordConnectionDiscarded(metrics);
+                }
+              });
           },
           () => undefined,
         );
@@ -229,9 +327,12 @@ export function createPostgresStore(
       }
       throw new StoreFailure();
     }
-    recordConnectionOpened(metrics);
+    if (!options?.connectionsManaged) {
+      recordConnectionOpened(metrics);
+    }
     const acquired = performance.now();
     let releaseDetached = false;
+    let discard = discardOnSuccess;
     try {
       const query = Promise.resolve().then(() => fn(opened.client));
       const value = deadline === null ? await query : await raceDeadline(query, deadline);
@@ -239,12 +340,18 @@ export function createPostgresStore(
       return value;
     } catch (error) {
       recordStoreCall(metrics, "postgres", operation, acquired - called, performance.now() - acquired, "error");
+      discard = shouldDiscardSession(error);
       if (error === REQUEST_TIMEOUT) {
+        discard = true;
         releaseDetached = true;
         void Promise.resolve()
-          .then(() => opened.release())
+          .then(() => opened.release(true))
           .catch(() => undefined)
-          .finally(() => recordConnectionDiscarded(metrics));
+          .finally(() => {
+            if (!options?.connectionsManaged) {
+              recordConnectionDiscarded(metrics);
+            }
+          });
         throw new StoreFailure("timeout");
       }
       if (error instanceof GatewayFailure || error instanceof StoreFailure) {
@@ -253,8 +360,10 @@ export function createPostgresStore(
       throw new StoreFailure();
     } finally {
       if (!releaseDetached) {
-        await opened.release().catch(() => undefined);
-        recordConnectionDiscarded(metrics);
+        await opened.release(discard).catch(() => undefined);
+        if (!options?.connectionsManaged) {
+          recordConnectionDiscarded(metrics);
+        }
       }
     }
   }
@@ -273,7 +382,7 @@ export function createPostgresStore(
           const result = await client.query(text, params);
           return { rows: result.rows };
         });
-      });
+      }, true);
     },
     async resolveNamespace(id, nowMs) {
       return withClient("namespace_resolve", async (client) => {
@@ -607,6 +716,10 @@ export function createPostgresStore(
   };
 }
 
+function shouldDiscardSession(error: unknown): boolean {
+  return !(error instanceof GatewayFailure);
+}
+
 /**
  * One origin connection for the whole body. Hyperdrive pins a connection only
  * inside a transaction, so a namespace admit or a delete would otherwise split
@@ -675,6 +788,13 @@ async function beginPostgresTransaction(client: SqlExecutor): Promise<void> {
   await client.query(POSTGRES_TRANSACTION_LIMITS);
 }
 
+class DiscardSessionError extends Error {
+  constructor() {
+    super("transaction rollback failed");
+    this.name = "DiscardSessionError";
+  }
+}
+
 async function withTransaction<T>(client: SqlExecutor, fn: (client: SqlExecutor) => Promise<T>): Promise<T> {
   await beginPostgresTransaction(client);
   try {
@@ -682,7 +802,15 @@ async function withTransaction<T>(client: SqlExecutor, fn: (client: SqlExecutor)
     await client.query("COMMIT");
     return value;
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => undefined);
+    let rollbackFailed = false;
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      rollbackFailed = true;
+    }
+    if (rollbackFailed) {
+      throw new DiscardSessionError();
+    }
     throw error;
   }
 }

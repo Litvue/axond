@@ -464,6 +464,9 @@ The process binary uses those same limits for its store and for a postgres usage
 A reset after a parameterized query is reported on that query, including when
 the socket does not emit close, so it does not wait out that same limit.
 The request answers 503.
+The CLI process host keeps up to 32 healthy Postgres sessions in a pool with no
+idle expiry; a failed or timed-out query discards its session. The Worker still
+opens one connection per store call because Hyperdrive pools the origin side.
 Extension migrations apply once on either store:
 a recorded id is skipped, and a failed statement names that id without the
 driver text. The two extra namespace columns

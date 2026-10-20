@@ -14,6 +14,7 @@ import {
   applyPostgresMigrationOn,
   applyPostgresSchema,
   closePgClient,
+  createPooledPostgresConnector,
   createPostgresStore,
   holdPgClient,
   POSTGRES_SCHEMA,
@@ -22,10 +23,12 @@ import {
   postgresQueryText,
   postgresSchemaTables,
   queryPgClient,
+  type PostgresConnector,
   type SqlExecutor,
 } from "./postgres-store.ts";
 import { seedConfigNamespaces } from "./seed-namespaces.ts";
 import type { Store } from "@axond/sdk";
+import type { StoreMetrics } from "../../gateway/src/store-metrics.ts";
 
 const dsn = process.env["AXOND_TEST_POSTGRES"];
 
@@ -51,6 +54,25 @@ function store(): Store {
       release: opened.release,
     };
   });
+}
+
+function pooledStore(metrics?: StoreMetrics, requestTimeoutMs?: number): {
+  store: Store;
+  close: () => Promise<void>;
+  connector: PostgresConnector;
+} {
+  const connector = createPooledPostgresConnector(postgresClientOptions(dsn!), metrics);
+  const options: { requestTimeoutMs?: number; connectionsManaged: boolean } = {
+    connectionsManaged: true,
+  };
+  if (requestTimeoutMs !== undefined) {
+    options.requestTimeoutMs = requestTimeoutMs;
+  }
+  return {
+    store: createPostgresStore(connector.connect, metrics, options),
+    close: connector.close,
+    connector,
+  };
 }
 
 async function reset(): Promise<void> {
@@ -494,6 +516,222 @@ test("postgres store counts one session per call and omits a failed connect", as
   );
   assert.equal(JSON.stringify(failing.points).includes("sk-live-secret"), false);
   assert.equal(JSON.stringify(metrics.points).includes("sk-live-secret"), false);
+});
+
+test("withClient tells connectors whether to discard a session", async () => {
+  const releases: boolean[] = [];
+  const withQuery = (query: SqlExecutor["query"], requestTimeoutMs?: number) =>
+    createPostgresStore(
+      async () => ({
+        client: { query },
+        release: async (discard = false) => {
+          releases.push(discard);
+        },
+      }),
+      undefined,
+      requestTimeoutMs === undefined ? undefined : { requestTimeoutMs },
+    );
+
+  await withQuery(async () => ({ rows: [], rowCount: 0 })).getNamespace("platform");
+  assert.deepEqual(releases, [false]);
+
+  await assert.rejects(
+    () => withQuery(async () => Promise.reject(new Error("statement failed"))).getNamespace("platform"),
+    (error: unknown) => error instanceof StoreFailure,
+  );
+  assert.deepEqual(releases, [false, true]);
+
+  await assert.rejects(
+    () =>
+      withQuery(
+        () => new Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>(() => {}),
+        10,
+      ).getNamespace("platform"),
+    (error: unknown) => error instanceof StoreFailure && error.reason === "timeout",
+  );
+  assert.deepEqual(releases, [false, true, true]);
+});
+
+test("a failed rollback discards the session", async () => {
+  let discarded = false;
+  const db = createPostgresStore(async () => ({
+    client: {
+      query: async (sql) => {
+        if (sql === "ROLLBACK" || sql.startsWith("INSERT INTO public.axond_namespace_lock")) {
+          throw new Error("transaction failed");
+        }
+        return { rows: [], rowCount: 0 };
+      },
+    },
+    release: async (discard = false) => {
+      discarded = discard;
+    },
+  }));
+  await assert.rejects(
+    () => db.putNamespace({
+      id: "rollback-failure",
+      attrs: {},
+      blocklist: null,
+      allowPlatformFallback: false,
+      fromConfig: false,
+    }),
+    (error: unknown) => error instanceof StoreFailure,
+  );
+  assert.equal(discarded, true);
+});
+
+test("the pooled connector reuses one session and matches per-call getBudget results", { skip: !dsn }, async () => {
+  await reset();
+  const metrics = createMetrics();
+  const pooled = pooledStore(metrics);
+  const perCall = store();
+  const id = `pooled-read-${process.pid}-${Date.now()}`;
+  try {
+    await assert.rejects(
+      () => pooled.store.getBudget(id, "missing"),
+      (error: unknown) => error instanceof GatewayFailure && error.type === "unknown_namespace",
+    );
+    await assert.rejects(
+      () => perCall.getBudget(id, "missing"),
+      (error: unknown) => error instanceof GatewayFailure && error.type === "unknown_namespace",
+    );
+    await perCall.putNamespace({
+      id,
+      attrs: {},
+      blocklist: null,
+      allowPlatformFallback: false,
+      fromConfig: false,
+    });
+    assert.equal(await pooled.store.getBudget(id, "empty"), await perCall.getBudget(id, "empty"));
+    await perCall.putBudget(id, "current", 987_654n);
+    for (let index = 0; index < 50; index += 1) {
+      assert.deepEqual(
+        await pooled.store.getBudget(id, "current"),
+        await perCall.getBudget(id, "current"),
+      );
+    }
+    const opened = metrics.points.find((point) => point.name === "axond.store.connections_opened");
+    const reused = metrics.points.find((point) => point.name === "axond.store.connections_reused");
+    assert.equal(opened?.value, 1);
+    assert.ok((reused?.value ?? 0) > 0);
+  } finally {
+    await pooled.close();
+  }
+});
+
+test("the pooled connector discards statement failures and opens a fresh session", { skip: !dsn }, async () => {
+  await reset();
+  const metrics = createMetrics();
+  const pooled = pooledStore(metrics);
+  const blocker = holdPgClient(new pg.Client({ connectionString: dsn }));
+  const id = `pooled-failure-${process.pid}-${Date.now()}`;
+  try {
+    await pooled.store.putNamespace({
+      id,
+      attrs: {},
+      blocklist: null,
+      allowPlatformFallback: false,
+      fromConfig: false,
+    });
+    const checkedOut = await pooled.connector.connect();
+    await checkedOut.client.query("SET lock_timeout = '25ms'");
+    await checkedOut.release();
+    await blocker.connect();
+    await blocker.query("BEGIN");
+    await blocker.query("LOCK TABLE public.axond_namespace IN ACCESS EXCLUSIVE MODE");
+
+    await assert.rejects(
+      () => pooled.store.getBudget(id, "empty"),
+      (error: unknown) => error instanceof StoreFailure,
+    );
+    await blocker.query("ROLLBACK");
+    assert.equal(await pooled.store.getBudget(id, "empty"), null);
+    const opened = metrics.points.find((point) => point.name === "axond.store.connections_opened");
+    const discarded = metrics.points.find((point) => point.name === "axond.store.connections_discarded");
+    assert.equal(opened?.value, 2);
+    assert.ok((discarded?.value ?? 0) >= 1);
+  } finally {
+    await blocker.end().catch(() => undefined);
+    await pooled.close();
+  }
+});
+
+test("a request-path timeout discards its pooled session", { skip: !dsn }, async () => {
+  await reset();
+  const metrics = createMetrics();
+  const pooled = pooledStore(metrics, 30);
+  let sleepNext = true;
+  const storeWithSlowFirstQuery = createPostgresStore(
+    async () => {
+      const opened = await pooled.connector.connect();
+      return {
+        client: {
+          query: async (sql, params) => {
+            if (sleepNext) {
+              sleepNext = false;
+              await opened.client.query("SELECT pg_sleep(0.2)");
+            }
+            return opened.client.query(sql, params);
+          },
+        },
+        release: opened.release,
+      };
+    },
+    metrics,
+    { requestTimeoutMs: 30, connectionsManaged: true },
+  );
+  try {
+    await assert.rejects(
+      () => storeWithSlowFirstQuery.getNamespace("platform"),
+      (error: unknown) => error instanceof StoreFailure && error.reason === "timeout",
+    );
+    assert.equal(await storeWithSlowFirstQuery.getNamespace("platform"), null);
+    const opened = metrics.points.find((point) => point.name === "axond.store.connections_opened");
+    const discarded = metrics.points.find((point) => point.name === "axond.store.connections_discarded");
+    assert.equal(opened?.value, 2);
+    assert.ok((discarded?.value ?? 0) >= 1);
+  } finally {
+    await pooled.close();
+  }
+});
+
+test("the pooled connector bounds concurrent sessions at 32", { skip: !dsn }, async () => {
+  await reset();
+  const metrics = createMetrics();
+  const pooled = pooledStore(metrics);
+  const id = `pooled-concurrent-${process.pid}-${Date.now()}`;
+  await pooled.store.putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  const slowStore = createPostgresStore(
+    async () => {
+      const opened = await pooled.connector.connect();
+      return {
+        client: {
+          query: async (sql, params) => {
+            if (sql.startsWith("SELECT b.limit_microdollars")) {
+              await opened.client.query("SELECT pg_sleep(0.025)");
+            }
+            return opened.client.query(sql, params);
+          },
+        },
+        release: opened.release,
+      };
+    },
+    metrics,
+    { connectionsManaged: true },
+  );
+  try {
+    await Promise.all(Array.from({ length: 64 }, () => slowStore.getBudget(id, "empty")));
+    const opened = metrics.points.find((point) => point.name === "axond.store.connections_opened");
+    assert.ok((opened?.value ?? 0) <= 32, `opened=${opened?.value}`);
+  } finally {
+    await pooled.close();
+  }
 });
 
 function withGuard<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
