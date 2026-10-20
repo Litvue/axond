@@ -29,6 +29,7 @@ import {
   applyPostgresMigration,
   applyPostgresSchema,
   closePgClient,
+  createPooledPostgresConnector,
   createPostgresStore,
   holdPgClient,
   postgresClientOptions,
@@ -49,15 +50,17 @@ async function main(): Promise<void> {
   const config = await loadOperatorConfig(configPath);
   const redactSecrets: string[] = [];
   const metrics = createMetrics(redactSecrets);
-  const store =
-    config.storage.backend === "sqlite"
-      ? openSqliteStore(config.storage.path!, metrics)
-      : await openPostgres(
-          requirePostgresDsn(config.storage),
-          metrics,
-          config.storage.createTable,
-          config.storage.requestTimeoutMs,
-        );
+  const postgres =
+    config.storage.backend === "postgres"
+    ? await openPostgres(
+        requirePostgresDsn(config.storage),
+        metrics,
+        config.storage.createTable,
+        config.storage.requestTimeoutMs,
+      )
+    : null;
+  const store = postgres?.store ?? openSqliteStore(config.storage.path!, metrics);
+  const closeStore = postgres?.close ?? (async () => undefined);
   await seedConfigNamespaces(store, config.namespaces);
   await resolveConfigSecrets(config, envSecretReader(process.env, readGatewayKeyFile));
   redactSecrets.push(config.gatewayKey);
@@ -211,6 +214,7 @@ async function main(): Promise<void> {
       writeLog(unsettled);
     }
     const usageFlushed = await usageDelivery.flush(remainingMs(deadline, Date.now()));
+    await closeWithin(remainingMs(deadline, Date.now()), closeStore);
     const telemetryFlushed = await background.drain(remainingMs(deadline, Date.now()));
     if (!telemetryFlushed) {
       writeLog({ msg: "telemetry_flush", outcome: "timeout" });
@@ -383,24 +387,27 @@ async function openPostgres(
   } finally {
     await closePgClient(setup);
   }
-  return createPostgresStore(async () => {
-    const client = holdPgClient(new Client(postgresClientOptions(dsn)));
-    try {
-      await client.connect();
-    } catch (error) {
-      await closePgClient(client);
-      throw error;
-    }
-    return {
-      client: {
-        query: async (sql, params) => {
-          const result = await queryPgClient(client, sql, params ? [...params] : []);
-          return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
-        },
-      },
-      release: () => closePgClient(client),
-    };
-  }, metrics, { requestTimeoutMs });
+  const connector = createPooledPostgresConnector(postgresClientOptions(dsn), metrics);
+  return {
+    store: createPostgresStore(connector.connect, metrics, {
+      requestTimeoutMs,
+      connectionsManaged: true,
+    }),
+    close: connector.close,
+  };
+}
+
+async function closeWithin(timeoutMs: number, close: () => Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.resolve().then(close).catch(() => undefined),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs);
+    }),
+  ]);
+  if (timer !== undefined) {
+    clearTimeout(timer);
+  }
 }
 
 async function loadExtensionDir(dir: string | null): Promise<AxondExtension[]> {

@@ -49,6 +49,10 @@ export function recordConnectionOpened(metrics: StoreMetrics | undefined): void 
   metrics?.record("axond.store.connections_opened", 1, { "axond.store.backend": "postgres" });
 }
 
+export function recordConnectionReused(metrics: StoreMetrics | undefined): void {
+  metrics?.record("axond.store.connections_reused", 1, { "axond.store.backend": "postgres" });
+}
+
 export function recordConnectionDiscarded(metrics: StoreMetrics | undefined): void {
   metrics?.record("axond.store.connections_discarded", 1, { "axond.store.backend": "postgres" });
 }

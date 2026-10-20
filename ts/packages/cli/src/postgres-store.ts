@@ -17,13 +17,17 @@ import { monthlyPeriod } from "../../gateway/src/namespace.ts";
 import {
   recordConnectionDiscarded,
   recordConnectionOpened,
+  recordConnectionReused,
   recordStoreCall,
   type StoreMetrics,
   type StoreOperation,
 } from "../../gateway/src/store-metrics.ts";
 
 export interface SqlExecutor {
-  query(sql: string, params?: readonly SqlValue[]): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
+  query(
+    sql: string,
+    params?: readonly (SqlValue | readonly string[])[],
+  ): Promise<{ rows: Record<string, unknown>[]; rowCount: number | null }>;
 }
 
 const I64_MAX = "9223372036854775807";
@@ -47,6 +51,8 @@ export function holdPgClient(client: pg.Client): pg.Client {
  */
 const CLOSE_FALLBACK_MS = 1_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 3_000;
+const POSTGRES_POOL_SIZE = 32;
+const POSTGRES_POOL_WAIT_MS = 2_000;
 const REQUEST_TIMEOUT = Symbol("request-path store timeout");
 const REQUEST_PATH_OPERATIONS: ReadonlySet<StoreOperation> = new Set([
   "namespace_resolve",
@@ -125,6 +131,97 @@ export async function closePgClient(client: pg.Client): Promise<void> {
 export const POSTGRES_CONNECT_TIMEOUT_MS = 15_000;
 export const POSTGRES_QUERY_TIMEOUT_MS = 60_000;
 
+export interface PostgresConnector {
+  connect: () => Promise<{
+    client: SqlExecutor;
+    release: (discard?: boolean) => Promise<void>;
+  }>;
+  close: () => Promise<void>;
+}
+
+export function createPooledPostgresConnector(
+  options: pg.PoolConfig,
+  metrics?: StoreMetrics,
+): PostgresConnector {
+  const pool = new pg.Pool({
+    ...options,
+    max: POSTGRES_POOL_SIZE,
+    idleTimeoutMillis: 0,
+    connectionTimeoutMillis: POSTGRES_CONNECT_TIMEOUT_MS,
+  });
+  const checkedOut = new WeakSet<pg.PoolClient>();
+  const initialized = new WeakSet<pg.PoolClient>();
+  let closing = false;
+  pool.on("error", () => undefined);
+  pool.on("connect", (client) => {
+    client.on("error", () => undefined);
+    recordConnectionOpened(metrics);
+  });
+  pool.on("acquire", (client) => {
+    if (checkedOut.has(client)) {
+      recordConnectionReused(metrics);
+    } else {
+      checkedOut.add(client);
+    }
+  });
+  pool.on("remove", () => {
+    if (!closing) {
+      recordConnectionDiscarded(metrics);
+    }
+  });
+
+  return {
+    async connect() {
+      const waitingForCapacity = pool.idleCount === 0 && pool.totalCount >= POSTGRES_POOL_SIZE;
+      const pending = pool.connect();
+      let client: pg.PoolClient;
+      try {
+        client = waitingForCapacity
+          ? await raceDeadline(pending, performance.now() + POSTGRES_POOL_WAIT_MS)
+          : await pending;
+      } catch (error) {
+        if (error === REQUEST_TIMEOUT) {
+          void pending.then(
+            (late) => late.release(false),
+            () => undefined,
+          ).catch(() => undefined);
+          throw new Error("postgres pool checkout timed out");
+        }
+        throw error;
+      }
+      if (!initialized.has(client)) {
+        try {
+          await queryPgClient(client, "SET lock_timeout = '2s'; SET statement_timeout = '5s'");
+          initialized.add(client);
+        } catch (error) {
+          client.release(true);
+          throw error;
+        }
+      }
+      let released = false;
+      return {
+        client: {
+          query: async (sql, params) => {
+            const result = await queryPgClient(client, sql, params);
+            return { rows: result.rows as Record<string, unknown>[], rowCount: result.rowCount };
+          },
+        },
+        release: async (discard = false) => {
+          if (released) {
+            return;
+          }
+          released = true;
+          client.release(discard);
+        },
+      };
+    },
+    close: async () => {
+      closing = true;
+      await pool.end();
+    },
+  };
+}
+
 export function postgresClientOptions(connectionString: string) {
   return {
     connectionString,
@@ -192,13 +289,14 @@ export async function queryPgClient(client: pg.Client, sql: string, params?: rea
  * closes it in `release`. Do not issue session-level SET.
  */
 export function createPostgresStore(
-  connect: () => Promise<{ client: SqlExecutor; release: () => Promise<void> }>,
+  connect: () => Promise<{ client: SqlExecutor; release: (discard?: boolean) => Promise<void> }>,
   metrics?: StoreMetrics,
-  options?: { requestTimeoutMs?: number },
+  options?: { requestTimeoutMs?: number; connectionsManaged?: boolean },
 ): Store {
   async function withClient<T>(
     operation: StoreOperation | null,
     fn: (client: SqlExecutor) => Promise<T>,
+    discardOnSuccess = false,
   ): Promise<T> {
     const called = performance.now();
     const deadline =
@@ -206,7 +304,7 @@ export function createPostgresStore(
         ? called + (options?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS)
         : null;
     const connecting = Promise.resolve().then(connect);
-    let opened: { client: SqlExecutor; release: () => Promise<void> };
+    let opened: { client: SqlExecutor; release: (discard?: boolean) => Promise<void> };
     try {
       opened = deadline === null ? await connecting : await raceDeadline(connecting, deadline);
     } catch (error) {
@@ -214,11 +312,17 @@ export function createPostgresStore(
       if (error === REQUEST_TIMEOUT) {
         void connecting.then(
           (late) => {
-            recordConnectionOpened(metrics);
+            if (!options?.connectionsManaged) {
+              recordConnectionOpened(metrics);
+            }
             return Promise.resolve()
-              .then(() => late.release())
+              .then(() => late.release(false))
               .catch(() => undefined)
-              .finally(() => recordConnectionDiscarded(metrics));
+              .finally(() => {
+                if (!options?.connectionsManaged) {
+                  recordConnectionDiscarded(metrics);
+                }
+              });
           },
           () => undefined,
         );
@@ -229,9 +333,12 @@ export function createPostgresStore(
       }
       throw new StoreFailure();
     }
-    recordConnectionOpened(metrics);
+    if (!options?.connectionsManaged) {
+      recordConnectionOpened(metrics);
+    }
     const acquired = performance.now();
     let releaseDetached = false;
+    let discard = discardOnSuccess;
     try {
       const query = Promise.resolve().then(() => fn(opened.client));
       const value = deadline === null ? await query : await raceDeadline(query, deadline);
@@ -239,12 +346,18 @@ export function createPostgresStore(
       return value;
     } catch (error) {
       recordStoreCall(metrics, "postgres", operation, acquired - called, performance.now() - acquired, "error");
+      discard = shouldDiscardSession(error);
       if (error === REQUEST_TIMEOUT) {
+        discard = true;
         releaseDetached = true;
         void Promise.resolve()
-          .then(() => opened.release())
+          .then(() => opened.release(true))
           .catch(() => undefined)
-          .finally(() => recordConnectionDiscarded(metrics));
+          .finally(() => {
+            if (!options?.connectionsManaged) {
+              recordConnectionDiscarded(metrics);
+            }
+          });
         throw new StoreFailure("timeout");
       }
       if (error instanceof GatewayFailure || error instanceof StoreFailure) {
@@ -253,8 +366,10 @@ export function createPostgresStore(
       throw new StoreFailure();
     } finally {
       if (!releaseDetached) {
-        await opened.release().catch(() => undefined);
-        recordConnectionDiscarded(metrics);
+        await opened.release(discard).catch(() => undefined);
+        if (!options?.connectionsManaged) {
+          recordConnectionDiscarded(metrics);
+        }
       }
     }
   }
@@ -273,7 +388,7 @@ export function createPostgresStore(
           const result = await client.query(text, params);
           return { rows: result.rows };
         });
-      });
+      }, true);
     },
     async resolveNamespace(id, nowMs) {
       return withClient("namespace_resolve", async (client) => {
@@ -523,11 +638,61 @@ export function createPostgresStore(
     },
     async getBudgetPolicy(namespace, nowMs = Date.now()) {
       return withClient("budget_read", async (client) => {
-        const known = await client.query("SELECT id FROM public.axond_namespace WHERE id = $1", [namespace]);
-        if (!known.rows[0]) {
+        const result = await client.query(
+          `SELECT c.cadence, c.limit_microdollars AS policy_limit, c.timezone,
+                  a.period AS active_period,
+                  b.period AS budget_period, b.limit_microdollars, b.spent_microdollars
+           FROM public.axond_namespace n
+           LEFT JOIN public.axond_store_budget_cadence c ON c.namespace = n.id
+           LEFT JOIN public.axond_store_budget_active a ON a.namespace = n.id
+           LEFT JOIN public.axond_store_budget b
+                  ON b.namespace = n.id AND (b.period = a.period OR b.period = ANY($2::text[]))
+           WHERE n.id = $1`,
+          [namespace, monthlyPeriodCandidates(nowMs)],
+        );
+        const row = result.rows[0];
+        if (!row) {
           throw new GatewayFailure("unknown_namespace", 404, "unknown namespace");
         }
-        return readPolicy(client, namespace, nowMs);
+        if (row["policy_limit"] == null) {
+          const activePeriod = row["active_period"] == null ? null : String(row["active_period"]);
+          if (activePeriod === null) {
+            return null;
+          }
+          const budget = result.rows.find(
+            (candidate) => candidate["budget_period"] != null && String(candidate["budget_period"]) === activePeriod,
+          );
+          if (!budget) {
+            return null;
+          }
+          return budgetPolicyFromLedger({
+            namespace,
+            cadence: "fixed",
+            timezone: "UTC",
+            period: activePeriod,
+            limit: BigInt(String(budget["limit_microdollars"])),
+            spent: BigInt(String(budget["spent_microdollars"])),
+          });
+        }
+        const cadence = row["cadence"] === "monthly" ? "monthly" : "fixed";
+        const timezone = String(row["timezone"]);
+        const activePeriod = row["active_period"] == null ? null : String(row["active_period"]);
+        const period =
+          cadence === "monthly" ? monthlyPeriod(nowMs, timezone) : (activePeriod ?? "");
+        const budget =
+          period === ""
+            ? undefined
+            : result.rows.find(
+                (candidate) => candidate["budget_period"] != null && String(candidate["budget_period"]) === period,
+              );
+        return budgetPolicyFromLedger({
+          namespace,
+          cadence,
+          timezone,
+          period,
+          limit: budget ? BigInt(String(budget["limit_microdollars"])) : BigInt(String(row["policy_limit"])),
+          spent: budget ? BigInt(String(budget["spent_microdollars"])) : 0n,
+        });
       });
     },
     settle(input) {
@@ -607,6 +772,10 @@ export function createPostgresStore(
   };
 }
 
+function shouldDiscardSession(error: unknown): boolean {
+  return !(error instanceof GatewayFailure);
+}
+
 /**
  * One origin connection for the whole body. Hyperdrive pins a connection only
  * inside a transaction, so a namespace admit or a delete would otherwise split
@@ -675,6 +844,13 @@ async function beginPostgresTransaction(client: SqlExecutor): Promise<void> {
   await client.query(POSTGRES_TRANSACTION_LIMITS);
 }
 
+class DiscardSessionError extends Error {
+  constructor() {
+    super("transaction rollback failed");
+    this.name = "DiscardSessionError";
+  }
+}
+
 async function withTransaction<T>(client: SqlExecutor, fn: (client: SqlExecutor) => Promise<T>): Promise<T> {
   await beginPostgresTransaction(client);
   try {
@@ -682,7 +858,15 @@ async function withTransaction<T>(client: SqlExecutor, fn: (client: SqlExecutor)
     await client.query("COMMIT");
     return value;
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => undefined);
+    let rollbackFailed = false;
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      rollbackFailed = true;
+    }
+    if (rollbackFailed) {
+      throw new DiscardSessionError();
+    }
     throw error;
   }
 }
@@ -842,6 +1026,20 @@ async function readPolicy(client: SqlExecutor, namespace: string, nowMs: number)
     period,
     limit: budget?.limit ?? BigInt(String(row["limit_microdollars"])),
     spent: budget?.spent ?? 0n,
+  });
+}
+
+function monthlyPeriodCandidates(nowMs: number): string[] {
+  const monthStart = new Date(nowMs);
+  if (Number.isNaN(monthStart.getTime())) {
+    return [];
+  }
+  monthStart.setUTCDate(1);
+  return [-1, 0, 1].map((offset) => {
+    const candidate = new Date(monthStart);
+    candidate.setUTCMonth(candidate.getUTCMonth() + offset);
+    const timestamp = candidate.getTime();
+    return Number.isNaN(timestamp) ? "" : monthlyPeriod(timestamp, "UTC");
   });
 }
 
