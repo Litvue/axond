@@ -77,6 +77,59 @@ function pooledStore(metrics?: StoreMetrics, requestTimeoutMs?: number): {
   };
 }
 
+async function delayedPostgresProxy(delayMs: number): Promise<{
+  connectionString: string;
+  close: () => Promise<void>;
+}> {
+  const target = new URL(dsn!);
+  const host = target.hostname.replace(/^\[|\]$/g, "");
+  const clients = new Set<import("node:net").Socket>();
+  const upstreams = new Set<import("node:net").Socket>();
+  const proxy = createServer((client) => {
+    clients.add(client);
+    let upstream: ReturnType<typeof createConnection> | undefined;
+    const timer = setTimeout(() => {
+      upstream = createConnection({ host, port: Number(target.port || 5432) });
+      upstreams.add(upstream);
+      upstream.on("connect", () => {
+        client.pipe(upstream!);
+        upstream!.pipe(client);
+      });
+      upstream.on("close", () => upstreams.delete(upstream!));
+      upstream.on("error", () => client.destroy());
+      client.on("error", () => upstream?.destroy());
+    }, delayMs);
+    client.on("close", () => {
+      clearTimeout(timer);
+      clients.delete(client);
+      upstream?.destroy();
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    proxy.once("error", reject);
+    proxy.listen(0, host, resolve);
+  });
+  const address = proxy.address();
+  if (!address || typeof address === "string") {
+    proxy.close();
+    throw new Error("no proxy port");
+  }
+  const proxied = new URL(dsn!);
+  proxied.port = String(address.port);
+  return {
+    connectionString: proxied.toString(),
+    close: async () => {
+      for (const client of clients) client.destroy();
+      for (const upstream of upstreams) upstream.destroy();
+      if (proxy.listening) {
+        await new Promise<void>((resolve, reject) => {
+          proxy.close((error) => error ? reject(error) : resolve());
+        });
+      }
+    },
+  };
+}
+
 async function legacyGetBudgetPolicy(client: SqlExecutor, namespace: string, nowMs: number) {
   const known = await client.query("SELECT id FROM public.axond_namespace WHERE id = $1", [namespace]);
   if (!known.rows[0]) {
@@ -790,6 +843,114 @@ test("the pooled connector reuses one session and matches per-call getBudget res
   }
 });
 
+test("a cold pooled connection can exceed the slot wait bound and is reused", { skip: !dsn, timeout: 15_000 }, async () => {
+  await reset();
+  const id = `pooled-cold-${process.pid}-${Date.now()}`;
+  await store().putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  const proxy = await delayedPostgresProxy(2_500);
+  const metrics = createMetrics();
+  const connector = createPooledPostgresConnector(postgresClientOptions(proxy.connectionString), metrics);
+  const db = createPostgresStore(connector.connect, metrics, { connectionsManaged: true });
+  try {
+    const started = performance.now();
+    assert.equal(await db.getBudget(id, "empty"), null);
+    assert.ok(performance.now() - started >= 2_000);
+    assert.equal(await db.getBudget(id, "empty"), null);
+    assert.equal(metrics.points.find((point) => point.name === "axond.store.connections_opened")?.value, 1);
+    assert.ok(
+      (metrics.points.find((point) => point.name === "axond.store.connections_reused")?.value ?? 0) > 0,
+    );
+  } finally {
+    await connector.close();
+    await proxy.close();
+  }
+});
+
+test("a late cold connection after a request timeout returns an initialized session to the pool", { skip: !dsn, timeout: 15_000 }, async () => {
+  await reset();
+  const id = `pooled-late-${process.pid}-${Date.now()}`;
+  await store().putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  const proxy = await delayedPostgresProxy(2_500);
+  const metrics = createMetrics();
+  const connector = createPooledPostgresConnector(postgresClientOptions(proxy.connectionString), metrics);
+  const db = createPostgresStore(connector.connect, metrics, {
+    connectionsManaged: true,
+    requestTimeoutMs: 250,
+  });
+  try {
+    await assert.rejects(
+      () => withGuard(db.resolveNamespace(id, Date.now()), 1_500),
+      (error: unknown) => error instanceof StoreFailure && error.reason === "timeout",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    assert.equal(metrics.points.find((point) => point.name === "axond.store.connections_opened")?.value, 1);
+    const warmed = await connector.connect();
+    const lockTimeout = await warmed.client.query("SHOW lock_timeout");
+    assert.equal(lockTimeout.rows[0]?.["lock_timeout"], "2s");
+    await warmed.release();
+    assert.equal((await db.resolveNamespace(id, Date.now()))?.record.id, id);
+    assert.equal(metrics.points.find((point) => point.name === "axond.store.connections_opened")?.value, 1);
+    assert.ok(
+      (metrics.points.find((point) => point.name === "axond.store.connections_reused")?.value ?? 0) >= 2,
+    );
+  } finally {
+    await connector.close();
+    await proxy.close();
+  }
+});
+
+test("a checkout that times out while saturated returns a late session to the pool", { skip: !dsn, timeout: 15_000 }, async () => {
+  await reset();
+  const id = `pooled-saturated-${process.pid}-${Date.now()}`;
+  await store().putNamespace({
+    id,
+    attrs: {},
+    blocklist: null,
+    allowPlatformFallback: false,
+    fromConfig: false,
+  });
+  const metrics = createMetrics();
+  const pooled = pooledStore(metrics);
+  const held: Array<Awaited<ReturnType<PostgresConnector["connect"]>>> = [];
+  let waiting: ReturnType<PostgresConnector["connect"]> | undefined;
+  try {
+    for (let index = 0; index < 32; index += 1) {
+      held.push(await pooled.connector.connect());
+    }
+    const started = performance.now();
+    const checkout = pooled.connector.connect();
+    waiting = checkout;
+    await assert.rejects(
+      () => withGuard(checkout, 3_500),
+      /postgres pool checkout timed out/,
+    );
+    assert.ok(performance.now() - started >= 1_900);
+    await held.shift()!.release();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(await pooled.store.getBudget(id, "empty"), null);
+    assert.equal(metrics.points.find((point) => point.name === "axond.store.connections_opened")?.value, 32);
+    assert.ok(
+      (metrics.points.find((point) => point.name === "axond.store.connections_reused")?.value ?? 0) >= 2,
+    );
+  } finally {
+    await Promise.all(held.map((opened) => opened.release()));
+    await waiting?.then((opened) => opened.release(), () => undefined);
+    await pooled.close();
+  }
+});
+
 test("getBudgetPolicy matches the previous multi-statement results", { skip: !dsn }, async () => {
   await reset();
   const db = store();
@@ -1138,8 +1299,9 @@ function withGuard<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 
 test("request-path connect timeout records acquire wait and releases a late client", async () => {
   const metrics = createMetrics();
-  let resolveConnect!: (opened: { client: SqlExecutor; release: () => Promise<void> }) => void;
+  let resolveConnect!: (opened: { client: SqlExecutor; release: (discard?: boolean) => Promise<void> }) => void;
   let released = 0;
+  let lateDiscard: boolean | undefined;
   const store = createPostgresStore(
     () =>
       new Promise((resolve) => {
@@ -1167,12 +1329,14 @@ test("request-path connect timeout records acquire wait and releases a late clie
 
   resolveConnect({
     client: { query: async () => ({ rows: [], rowCount: 0 }) },
-    release: async () => {
+    release: async (discard = false) => {
       released += 1;
+      lateDiscard = discard;
     },
   });
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(released, 1);
+  assert.equal(lateDiscard, false);
 });
 
 test("request-path query timeout records query duration and releases the client", async () => {

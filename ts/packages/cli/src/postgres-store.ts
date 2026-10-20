@@ -175,11 +175,14 @@ export function createPooledPostgresConnector(
       const pending = pool.connect();
       let client: pg.PoolClient;
       try {
-        client = await raceDeadline(pending, performance.now() + POSTGRES_POOL_WAIT_MS);
+        const waitingForCapacity = pool.idleCount === 0 && pool.totalCount >= POSTGRES_POOL_SIZE;
+        client = waitingForCapacity
+          ? await raceDeadline(pending, performance.now() + POSTGRES_POOL_WAIT_MS)
+          : await pending;
       } catch (error) {
         if (error === REQUEST_TIMEOUT) {
           void pending.then(
-            (late) => late.release(true),
+            (late) => late.release(false),
             () => undefined,
           ).catch(() => undefined);
           throw new Error("postgres pool checkout timed out");
@@ -313,7 +316,7 @@ export function createPostgresStore(
               recordConnectionOpened(metrics);
             }
             return Promise.resolve()
-              .then(() => late.release(true))
+              .then(() => late.release(false))
               .catch(() => undefined)
               .finally(() => {
                 if (!options?.connectionsManaged) {
