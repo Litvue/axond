@@ -1,5 +1,78 @@
 # Changelog
 
+## [0.7.0](https://github.com/Litvue/axond/compare/v0.6.3...v0.7.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove code withdrawn by ADR 0063 and unused code ([#499](https://github.com/Litvue/axond/issues/499))
+
+### Features
+
+* add CLI discovery usage delivery and shutdown services (TS 16/21) ([#549](https://github.com/Litvue/axond/issues/549)) ([cc4e49c](https://github.com/Litvue/axond/commit/cc4e49c51ebc9a5533ac0dd7f2da02ee3f6ad85a))
+* add configuration shape and extraction validation (TS 06/21) ([#539](https://github.com/Litvue/axond/issues/539)) ([6d119f4](https://github.com/Litvue/axond/commit/6d119f4f8b2979abadc8bbca81f8a031c8f76a10))
+* add namespace and budget state primitives (TS 03/21) ([#536](https://github.com/Litvue/axond/issues/536)) ([baf6b7e](https://github.com/Litvue/axond/commit/baf6b7e5ba0bb36be52da1068cc1cea51c0ad0b4))
+* add Postgres persistence and durable-store qualification (TS 15/21) ([#548](https://github.com/Litvue/axond/issues/548)) ([3ed15e1](https://github.com/Litvue/axond/commit/3ed15e137890c9d510ffe8b0069502548e6f84cd))
+* add provider dispatch and credential failover (TS 09/21) ([#542](https://github.com/Litvue/axond/issues/542)) ([4791178](https://github.com/Litvue/axond/commit/4791178e2549c185bff28b99a9a0ede62340c567))
+* add provider wire accounting and telemetry (TS 04/21) ([#537](https://github.com/Litvue/axond/issues/537)) ([1913dde](https://github.com/Litvue/axond/commit/1913dde89192c70522b79313daefd1f3b0dd46c2))
+* add rate limit redaction and token extensions (TS 19/21) ([#552](https://github.com/Litvue/axond/issues/552)) ([93088cd](https://github.com/Litvue/axond/commit/93088cd210fb7534c0ce748632ca3ff07fb24445))
+* add TOML scanning and Figment value primitives (TS 05/21) ([#538](https://github.com/Litvue/axond/issues/538)) ([8d9b76c](https://github.com/Litvue/axond/commit/8d9b76c4d9528a023ccc39a4abe62da27eda118b))
+* add TypeScript request and JSON parsers (TS 02/21) ([#535](https://github.com/Litvue/axond/issues/535)) ([b5fbae4](https://github.com/Litvue/axond/commit/b5fbae49041736de996e36eedd7f137211c84299))
+* define TypeScript SDK and review-stage CI (TS 01/21) ([#534](https://github.com/Litvue/axond/issues/534)) ([7a7f2b6](https://github.com/Litvue/axond/commit/7a7f2b6dbd2aad1ed0136d382ad5ef5a02c5d84e))
+* host the TypeScript gateway and operator extensions (TS 17/21) ([#550](https://github.com/Litvue/axond/issues/550)) ([08e1372](https://github.com/Litvue/axond/commit/08e13724b3c60b2735dd0beff2514fc790565c30))
+* host the TypeScript gateway on Workers Hyperdrive (TS 20/21) ([#553](https://github.com/Litvue/axond/issues/553)) ([94eed71](https://github.com/Litvue/axond/commit/94eed71e83b2e2bcc662f23995d69cc4564d739a))
+* load and validate TypeScript gateway configuration (TS 07/21) ([#540](https://github.com/Litvue/axond/issues/540)) ([935e8df](https://github.com/Litvue/axond/commit/935e8df20c587e7fd016a6a962c0c3ed4c13bb19))
+* mount the namespaced TypeScript Hono gateway (TS 10/21) ([#543](https://github.com/Litvue/axond/issues/543)) ([19e9876](https://github.com/Litvue/axond/commit/19e98762c4bae783d3806baaaf1535312724bcb3))
+* **ts:** publish the bun image and read otlp export headers ([#565](https://github.com/Litvue/axond/issues/565)) ([2405d34](https://github.com/Litvue/axond/commit/2405d343ff22aef96a8b326ddf3af47438f43e1c))
+
+
+### Bug Fixes
+
+* **deps:** bump rustls to 0.23.46 for rustsec advisories ([#564](https://github.com/Litvue/axond/issues/564)) ([0703522](https://github.com/Litvue/axond/commit/070352270ca8140952056a46b8b3611dbfa4b07f)), closes [#561](https://github.com/Litvue/axond/issues/561)
+* **deps:** bump webpki-roots and rustls-webpki for RUSTSEC-2026-0381 and RUSTSEC-2026-0382 ([#573](https://github.com/Litvue/axond/issues/573)) ([a827684](https://github.com/Litvue/axond/commit/a8276842dbaf9e360939d6ed795a1754a082011b))
+* **gateway:** bound request-path store calls ([749d06f](https://github.com/Litvue/axond/commit/749d06f2a159ec7fae94714c9c903d7a53ac8c50))
+* **gateway:** bound request-path store calls ([3a91210](https://github.com/Litvue/axond/commit/3a912106917e76d5ae95899c074b49be6c48a778))
+* **gateway:** keep storage sequence order and monotonic TS deadline ([34665a7](https://github.com/Litvue/axond/commit/34665a7d10cbad54fb165728674729a03327d80f))
+* match Rust provider errors and partial-stream charges ([#556](https://github.com/Litvue/axond/issues/556)) ([5840705](https://github.com/Litvue/axond/commit/5840705d60bee15b4439acf0fe05600ee2109cbe))
+* **release:** keep the TypeScript AXOND_VERSION in step with release-please ([#576](https://github.com/Litvue/axond/issues/576)) ([a44e4c3](https://github.com/Litvue/axond/commit/a44e4c3f63f7e99ca22ab75f335745f4091227cc))
+
+
+### Performance
+
+* **gateway:** serve the budget GET in one store round trip ([#560](https://github.com/Litvue/axond/issues/560)) ([c9c7fcd](https://github.com/Litvue/axond/commit/c9c7fcd1ad6903cd8bc51d0ecedf385fff552dfc))
+* **typescript:** pool postgres sessions in the process host ([#571](https://github.com/Litvue/axond/issues/571)) ([357c284](https://github.com/Litvue/axond/commit/357c2845939dbb0b33558a28455a1efde5f158dd))
+
+
+### Refactors
+
+* remove code withdrawn by ADR 0063 and unused code ([#499](https://github.com/Litvue/axond/issues/499)) ([503103c](https://github.com/Litvue/axond/commit/503103cf6df769063648d7285c6358ded043a419))
+
+
+### Documentation
+
+* repair Rustdoc references after feature withdrawals ([#555](https://github.com/Litvue/axond/issues/555)) ([712d6e8](https://github.com/Litvue/axond/commit/712d6e8de0e98e9cd4c916c7eb757fd4f6e39a3e))
+* TypeScript on Hono direction and deployment investigation ([#498](https://github.com/Litvue/axond/issues/498)) ([fed5a03](https://github.com/Litvue/axond/commit/fed5a03642faa4caa9ae83b5cc5a598df436dd75))
+
+
+### Tests
+
+* cover bind and environment configuration compatibility (TS 08/21) ([#541](https://github.com/Litvue/axond/issues/541)) ([f4f2d76](https://github.com/Litvue/axond/commit/f4f2d76785dd823be587783c2c4a278f6420c518))
+* qualify CLI configuration diagnostics and refusal order ([#551](https://github.com/Litvue/axond/issues/551)) ([930f45a](https://github.com/Litvue/axond/commit/930f45a8a7208fb3c61f918096ec1c9efa96321a))
+* qualify extension ordering and streaming deadlines (TS 12/21) ([#545](https://github.com/Litvue/axond/issues/545)) ([53c754f](https://github.com/Litvue/axond/commit/53c754ffe9fa72c47e6143b4f8cb951f799ab214))
+* qualify gateway routing and budget management (TS 11/21) ([#544](https://github.com/Litvue/axond/issues/544)) ([3570a82](https://github.com/Litvue/axond/commit/3570a82fae6c84206fd8a8ea032256c359954e36))
+* qualify settlement faults and provider secret omission (TS 14/21) ([#547](https://github.com/Litvue/axond/issues/547)) ([a2f004e](https://github.com/Litvue/axond/commit/a2f004ed2f09d2399c8f36990e7ad6b8bfb8fcc7))
+* qualify terminal streams rotation and admission (TS 13/21) ([#546](https://github.com/Litvue/axond/issues/546)) ([f764f2b](https://github.com/Litvue/axond/commit/f764f2bffd61c852721460e0cc57624dced2a1a4))
+
+
+### Build System
+
+* qualify TypeScript artifacts and regression gates (TS 21/21) ([#554](https://github.com/Litvue/axond/issues/554)) ([5509d29](https://github.com/Litvue/axond/commit/5509d29983536e7581c1a29bb9c6f50d16ab3d81))
+
+
+### Continuous Integration
+
+* fail a newer open PR that repeats a title or Closes line ([#483](https://github.com/Litvue/axond/issues/483)) ([2bf9398](https://github.com/Litvue/axond/commit/2bf93984fee90dc74a3e6948678cf86c324c3e67))
+
 ## [0.6.3](https://github.com/Litvue/axond/compare/v0.6.2...v0.6.3) (2026-09-10)
 
 
