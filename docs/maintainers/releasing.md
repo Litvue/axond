@@ -3,8 +3,10 @@
 Axond uses release-please with Conventional Commit PR titles. Changes to Axond's
 source/build inputs on `main` update a release PR; merging that PR tags the release
 and runs the artifact pipeline. The automatic trigger covers `crates/`, the root
-Cargo manifest and lockfile, `.cargo/`, `rust-toolchain.toml`, and `Dockerfile`.
-Website, documentation, and CI-only pushes do not start release maintenance.
+Cargo manifest and lockfile, `.cargo/`, `rust-toolchain.toml`, `Dockerfile`, and
+`release-please-config.json` / `.release-please-manifest.json`, so a release
+configuration change rebuilds the open release PR. Website, documentation, and
+CI-only pushes do not start release maintenance.
 
 Release Please also excludes commits confined to `website/` and `.github/` from
 version calculation and release notes, so a website `feat` cannot cause a bump
