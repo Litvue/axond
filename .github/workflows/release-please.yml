@@ -17,7 +17,8 @@ name: Release
 on:
   push:
     branches: [main]
-    # Release maintenance only follows changes to shipped Axond source/build inputs.
+    # Release maintenance only follows changes to shipped Axond source/build inputs
+    # and to the release-please config/manifest, which reshape the open release PR.
     # Release PRs update Cargo.toml, so merging a release still publishes its tag.
     paths:
       - 'crates/**'
@@ -26,6 +27,8 @@ on:
       - '.cargo/**'
       - 'rust-toolchain.toml'
       - 'Dockerfile'
+      - 'release-please-config.json'
+      - '.release-please-manifest.json'
   workflow_dispatch:
     inputs:
       release_tag:

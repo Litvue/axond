@@ -41,6 +41,10 @@
         {
           "type": "generic",
           "path": "docs/deployment/kubernetes.md"
+        },
+        {
+          "type": "generic",
+          "path": "ts/packages/cli/src/product-version.ts"
         }
       ]
     }

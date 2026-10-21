@@ -198,9 +198,22 @@ def check_release_scope(text: str, config: dict) -> list[str]:
     errors = []
     push = text.split("  push:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
     paths = set(re.findall(r"^      - '([^']+)'$", push, re.M))
-    required = {"crates/**", "Cargo.toml", "Cargo.lock", ".cargo/**", "rust-toolchain.toml", "Dockerfile"}
+    required = {
+        "crates/**",
+        "Cargo.toml",
+        "Cargo.lock",
+        ".cargo/**",
+        "rust-toolchain.toml",
+        "Dockerfile",
+        # A config or manifest change must rebuild the open release PR.
+        "release-please-config.json",
+        ".release-please-manifest.json",
+    }
     if paths != required:
-        errors.append("release workflow push paths must be limited to Axond source/build inputs")
+        errors.append(
+            "release workflow push paths must be limited to Axond source/build inputs "
+            "and the release-please config and manifest"
+        )
     # Release Please uses directory prefixes, not glob patterns here. A commit
     # touching both an excluded directory and Axond code remains included.
     excluded = config.get("packages", {}).get(".", {}).get("exclude-paths", [])
@@ -1212,6 +1225,8 @@ def self_test() -> int:
     assert not check_release_scope(scoped, scope_config)
     assert check_release_scope(scoped.replace("      - 'crates/**'", "      - 'website/**'"), scope_config)
     assert check_release_scope(scoped.replace("      - 'Cargo.lock'\n", ""), scope_config)
+    assert check_release_scope(scoped.replace("      - 'release-please-config.json'\n", ""), scope_config)
+    assert check_release_scope(scoped.replace("      - '.release-please-manifest.json'\n", ""), scope_config)
     assert check_release_scope(scoped, {"packages": {".": {"exclude-paths": ["website/**", ".github/**"]}}})
     assert check_release_scope(scoped, {"packages": {".": {"exclude-paths": ["website", ".github", "crates"]}}})
     print("check-release-config: decision, release-order, and release-scope self-tests passed")
