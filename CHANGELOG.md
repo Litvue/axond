@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1](https://github.com/Litvue/axond/compare/v0.7.0...v0.7.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* **deps:** bump tokio and ctutils past open advisories ([#579](https://github.com/Litvue/axond/issues/579)) ([5cf8f46](https://github.com/Litvue/axond/commit/5cf8f468f59d530d0f461a8ef11d132a00301250)), closes [#578](https://github.com/Litvue/axond/issues/578)
+* **ts:** clear undici advisories failing npm audit ([#581](https://github.com/Litvue/axond/issues/581)) ([d79103c](https://github.com/Litvue/axond/commit/d79103cecb23f84a85a0fa3446b91eb17e1056d9))
+
 ## [0.7.0](https://github.com/Litvue/axond/compare/v0.6.3...v0.7.0) (2026-10-21)
 
 
