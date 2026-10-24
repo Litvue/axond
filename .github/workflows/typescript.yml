@@ -87,9 +87,9 @@ jobs:
       - name: Install the TypeScript gateway
         working-directory: ts
         run: npm ci
-      - name: Install Bun 1.4.2
+      - name: Install Bun 1.4.4
         run: |
-          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.2
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.4
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
       - name: Compile the TypeScript candidate
         working-directory: ts
@@ -121,9 +121,9 @@ jobs:
       - name: Install workspace dependencies
         working-directory: ts
         run: npm ci
-      - name: Install Bun 1.4.2 and cosign 2.5.2
+      - name: Install Bun 1.4.4 and cosign 2.5.2
         run: |
-          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.2
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.4
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.bun/bin:$PATH"
           curl -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.5.2/cosign-linux-amd64
@@ -168,9 +168,9 @@ jobs:
       - name: Install workspace dependencies
         working-directory: ts
         run: npm ci
-      - name: Install Bun 1.4.2
+      - name: Install Bun 1.4.4
         run: |
-          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.2
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.4
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
       - name: Unit tests
         working-directory: ts
@@ -195,9 +195,9 @@ jobs:
       - name: Install workspace dependencies
         working-directory: ts
         run: npm ci
-      - name: Install Bun 1.4.2 and cosign 2.5.2
+      - name: Install Bun 1.4.4 and cosign 2.5.2
         run: |
-          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.2
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.4
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.bun/bin:$PATH"
           curl -fsSL -o /tmp/cosign https://github.com/sigstore/cosign/releases/download/v2.5.2/cosign-linux-amd64
