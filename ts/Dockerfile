@@ -5,7 +5,7 @@ COPY package.json package-lock.json ./
 COPY packages ./packages
 COPY bin ./bin
 RUN npm ci --omit=dev
-COPY --from=oven/bun:1.4.2 /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=oven/bun:1.4.4 /usr/local/bin/bun /usr/local/bin/bun
 RUN mkdir -p /out/data && bun build packages/cli/src/main.ts --compile --outfile /out/axond
 
 FROM gcr.io/distroless/base-debian12:nonroot
