@@ -19,8 +19,8 @@ Production traffic is too small to argue for Rust on performance. Over 2026-10-1
 1. **TypeScript is the only implementation.** The last Rust release is the 0.7.x line. The next minor makes the TypeScript build the release binary (`bun build --compile`) and the release image.
 2. **The oracle is the test suite, not a second gateway.** `tests/compat`, `tests/compat-ts`, and the byte-faithful streaming fixtures define parity. They run against the TypeScript gateway only.
 3. **Rust code leaves `main`.** `crates/`, `fuzz/`, the Cargo workspace files, the Rust Dockerfile, and the Rust-only CI, soak, capacity, endurance, and release steps are removed after the TypeScript artifact ships. The Rust tree stays in git history and in the 0.7.x tags.
-4. **crates.io stops.** No new `axond` crate versions are published. Existing versions are not yanked: a yank breaks existing lockfiles and withdraws nothing.
-5. **The Postgres DDL follows TypeScript.** The TypeScript Store schema becomes the shipped schema. `ops/postgres/*.sql` is replaced or removed with the Rust tree.
+4. **crates.io stops.** No new `axond` crate versions are published. Existing versions are not yanked: a yank only blocks new dependency resolution and withdraws nothing already downloaded, so it adds noise without effect.
+5. **The Postgres DDL follows TypeScript.** The TypeScript Store schema becomes the shipped Store schema. The operator-facing versioned usage schema (`usage_v2.sql` and its numbered migrations, documented in `docs/usage-schema.md`) is not dropped with the Rust tree: it stays in `ops/postgres/` as long as a TypeScript usage sink writes those tables, and any change to it follows the usage-schema versioning rules. Only Store DDL that the TypeScript gateway no longer reads is removed.
 
 Sections 2 to 7 of ADR 0066 (host-agnostic library, extension authors, shared state, settlement, SQLite, admission) are unchanged.
 
