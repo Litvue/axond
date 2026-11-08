@@ -102,13 +102,27 @@ kind delete cluster --name "$cluster" >/dev/null 2>&1 || true
 kind create cluster --name "$cluster" --config "${workdir}/kind.yaml" \
   --image "$node_image" >/dev/null
 
+# Loaded as a single-platform archive. With Docker's containerd image store,
+# `docker save` of a multi-platform image references every platform's manifest
+# but holds only the host's blobs, and `kind load docker-image` imports with
+# `--all-platforms`, so the import fails on the first missing digest.
+platform="linux/$(docker version --format '{{.Server.Arch}}')"
+load_image() {
+  local ref="$1" archive
+  archive="${workdir}/image-$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '_').tar"
+  docker save --platform "$platform" --output "$archive" "$ref"
+  kind load image-archive "$archive" --name "$cluster" >/dev/null
+}
+
 step "Loading ${image}"
-docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image" >/dev/null ||
+docker image inspect --platform "$platform" "$image" >/dev/null 2>&1 ||
+  docker pull --platform "$platform" "$image" >/dev/null ||
   fail "cannot pull ${image}; set AXOND_ROLLOUT_IMAGE to a published tag"
-kind load docker-image "$image" --name "$cluster" >/dev/null
-docker image inspect "$postgres_image" >/dev/null 2>&1 ||
-  docker pull "$postgres_image" >/dev/null || fail "cannot pull ${postgres_image}"
-kind load docker-image "$postgres_image" --name "$cluster" >/dev/null
+load_image "$image"
+docker image inspect --platform "$platform" "$postgres_image" >/dev/null 2>&1 ||
+  docker pull --platform "$platform" "$postgres_image" >/dev/null ||
+  fail "cannot pull ${postgres_image}"
+load_image "$postgres_image"
 
 step "Standing up the shared Postgres store"
 # Production overlay replicas share one namespace registry (ADR 0063). The drill
