@@ -432,7 +432,7 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             archive: tar.gz
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
           - os: windows-latest
