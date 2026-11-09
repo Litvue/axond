@@ -1092,6 +1092,17 @@ def check_no_latest_tag(text: str) -> list[str]:
     return failures
 
 
+def check_installer_defaults(installer: str) -> list[str]:
+    required = (
+        'target="${AXOND_TARGET:-}"', 'if [ -z "$target" ]; then', 'libc=gnu',
+        'for loader in /lib/ld-musl-*.so.1;', 'if [ -f "$loader" ]; then',
+        'ldd --version 2>&1 | grep -qi musl', 'libc=musl',
+        'target="x86_64-unknown-linux-$libc"', 'target="aarch64-unknown-linux-$libc"',
+    )
+    return [f"install.sh: missing host-libc target selection requirement {needle!r}"
+            for needle in required if needle not in installer]
+
+
 def check_documented_matrix() -> list[str]:
     failures: list[str] = []
     docs = {
@@ -1108,6 +1119,7 @@ def check_documented_matrix() -> list[str]:
             if platform not in text:
                 failures.append(f"{relative}: image platform {platform} is not documented")
     installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    failures.extend(check_installer_defaults(installer))
     allowlist = re.search(r"\ncase \"\$target\" in\n(.*?)\n  \*\)", installer, re.DOTALL)
     if allowlist is None:
         failures.append("install.sh: target allowlist not found")
@@ -1227,6 +1239,19 @@ def self_test() -> int:
     is compared against the *last amd64-only release*, so the constant trails the
     pin and never equals it.
     """
+    installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+    assert not check_installer_defaults(installer)
+    assert check_installer_defaults("")
+    for old, new in (
+        ("libc=gnu", "libc=musl"),
+        ("ldd --version 2>&1 | grep -qi musl", "false"),
+        ("for loader in /lib/ld-musl-*.so.1;", "for loader in /missing;"),
+        ('if [ -z "$target" ]; then', "if true; then"),
+        ('target="x86_64-unknown-linux-$libc"', 'target="x86_64-unknown-linux-musl"'),
+        ('target="aarch64-unknown-linux-$libc"', 'target="aarch64-unknown-linux-musl"'),
+    ):
+        assert old in installer
+        assert check_installer_defaults(installer.replace(old, new)), old
     last = (0, 3, 17)
     # A tag newer than the last amd64-only release resolves both architectures.
     assert platform_default((0, 3, 18), last) == NATIVE_PLATFORM

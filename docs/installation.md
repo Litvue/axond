@@ -34,10 +34,12 @@ AXOND_VERSION=0.7.1 AXOND_INSTALL_DIR=/usr/local/bin sh ./install.sh # x-release
 ```
 
 Supported installer targets match the release matrix: Linux x86-64 and Linux
-ARM64 (musl by default, glibc selectable through `AXOND_TARGET`), macOS
+ARM64 (glibc by default, musl when detected on the host), macOS
 Apple Silicon, and Windows x86-64. Other architectures must build from source
 until a release artifact is added; the full matrix is in
 [the compatibility contract](./compatibility.md#supported-platforms).
+`AXOND_TARGET` overrides automatic detection. Alpine requires `libstdc++` and
+`libgcc` for the musl binary (`apk add --no-cache libstdc++ libgcc`).
 
 A same-origin checksum detects corruption but is not independent proof of
 provenance. By default, both installers verify that checksum and do not depend
