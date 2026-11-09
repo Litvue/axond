@@ -14,6 +14,21 @@
       "include-component-in-tag": false,
       "extra-files": [
         {
+          "type": "json",
+          "path": "ts/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "ts/package-lock.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "ts/package-lock.json",
+          "jsonpath": "$.packages[\"\"].version"
+        },
+        {
           "type": "toml",
           "path": "Cargo.toml",
           "jsonpath": "$.workspace.package.version"

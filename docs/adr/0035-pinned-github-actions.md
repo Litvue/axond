@@ -9,9 +9,9 @@ Accepted
 ## Context
 
 [ADR 0004](./0004-ci-and-release-pipeline.md) puts the release fan-out in
-GitHub Actions: the release job mints a GitHub App token, publishes to crates.io
-with `CARGO_REGISTRY_TOKEN`, and signs the image digest keylessly with an OIDC
-identity bound to `release-please.yml`. Every third-party Action in that job runs
+GitHub Actions: the release job mints a GitHub App token and signs the image
+digest keylessly with an OIDC identity bound to `release-please.yml`.
+Every third-party Action in that job runs
 with the same reach as the job itself.
 
 Until now those Actions were referenced by tag or branch — `actions/checkout@v7`,

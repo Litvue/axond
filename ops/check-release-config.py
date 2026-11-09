@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -56,7 +57,9 @@ LAST_AMD64_ONLY_VERSION = (0, 3, 17)
 # Paths the repair dispatch needs in the tag it rebuilds. A tag lacking any of
 # them cannot publish or verify the image index, so the preflight refuses.
 REPAIR_REQUIRED_PATHS = (
-    "Dockerfile",
+    "ts/Dockerfile",
+    "ts/scripts/sign-artifact.sh",
+    "ops/binary-smoke.py",
     "ops/docker-smoke.sh",
     "ops/publish-image-index.sh",
     "ops/verify-image-evidence.sh",
@@ -117,6 +120,7 @@ def job_configuration(block: str) -> str:
 
 def workflow_jobs(text: str) -> dict[str, str]:
     """All top-level jobs, preserving their complete bodies."""
+    text = "\n" + text.partition("jobs:\n")[2]
     names = re.findall(r"^  ([A-Za-z0-9_-]+):$", text, re.MULTILINE)
     return {
         name: block
@@ -199,6 +203,7 @@ def check_release_scope(text: str, config: dict) -> list[str]:
     push = text.split("  push:\n", 1)[1].split("  workflow_dispatch:", 1)[0]
     paths = set(re.findall(r"^      - '([^']+)'$", push, re.M))
     required = {
+        "ts/**",
         "crates/**",
         "Cargo.toml",
         "Cargo.lock",
@@ -298,7 +303,6 @@ def check_release_ordering(text: str) -> list[str]:
         "release-image",
         "release-image-index",
         "release-image-index-promote",
-        "release-crates",
     )
     for job in publishing_jobs:
         block = jobs.get(job)
@@ -329,17 +333,6 @@ def check_release_ordering(text: str) -> list[str]:
                 "release-please.yml: release-success does not aggregate release-ci-success"
             )
 
-    crates = jobs.get("release-crates")
-    if crates is not None:
-        if "checks: read" in crates:
-            failures.append(
-                "release-please.yml: release-crates retains the obsolete crates-only checks permission"
-            )
-        if "check-runs?" in crates or "Require CI to be green" in crates:
-            failures.append(
-                "release-please.yml: release-crates retains the obsolete crates-only CI poll"
-            )
-
     publication_primitives = {
         "release-please action": "googleapis/release-please-action@",
         "GitHub release creation": "gh release create",
@@ -349,7 +342,6 @@ def check_release_ordering(text: str) -> list[str]:
         "keyless signing": "cosign sign",
         "GitHub attestation": "actions/attest@",
         "registry attestation": "push-to-registry: true",
-        "crates publication script": "run: bash ops/publish-crates.sh",
         "direct crates publication": "cargo publish",
     }
     for job, block in jobs.items():
@@ -423,12 +415,12 @@ def check_binary_gates(text: str) -> list[str]:
         "SBOM": "anchore/sbom-action@",
         "provenance attestation": "Attest binary provenance",
         "SBOM attestation": "Attest binary SBOM",
-        "static-link assertion": "Assert the musl binary is statically linked",
-        "boot smoke": "ops/tier0-gate.sh",
-        # The release must not depend on namespace creation being permitted on a
-        # hosted runner: the smoke gate degrades there instead of failing, while
-        # CI keeps proving the hermetic guarantee on every change.
-        "sandbox-restriction tolerance": 'AXOND_TIER0_ALLOW_NO_NETNS: "1"',
+        "Bun compilation": "bun build packages/cli/src/main.ts --compile",
+        "native boot smoke": "python ops/binary-smoke.py",
+        "Alpine musl smoke": "alpine:3.22",
+        "musl runtime libraries": "apk add --no-cache python3 libstdc++ libgcc",
+        "keyless archive signature": "bash ts/scripts/sign-artifact.sh",
+        "npm dependency SBOM": "path: ts",
     }
     failures = [
         f"release-please.yml: release-binaries lacks a {label} gate ({needle!r})"
@@ -467,18 +459,6 @@ def check_image_matrix(text: str) -> list[str]:
                 failures.append(
                     f"release-please.yml: {job} builds arm64 on {os_label}, not an arm64 runner"
                 )
-    # The image builds every published platform from one Dockerfile, so each
-    # architecture must map to a Rust target there too.
-    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-    if "ARG TARGETARCH" not in dockerfile:
-        failures.append(
-            "Dockerfile: TARGETARCH is not declared; the build is not platform-aware"
-        )
-    for platform in sorted(IMAGE_PLATFORMS):
-        arch = platform.split("/", 1)[1]
-        mapping = rf"\n\s+{re.escape(arch)}\) rust_target=\S+-unknown-linux-musl ;;"
-        if not re.search(mapping, dockerfile):
-            failures.append(f"Dockerfile: {arch} does not select a static musl Rust target")
     # The index script is the one place the platform list is applied at runtime.
     script = (ROOT / "ops/publish-image-index.sh").read_text(encoding="utf-8")
     declared = re.search(r"PLATFORMS=\(([^)]*)\)", script)
@@ -679,6 +659,219 @@ def check_release_success(text: str) -> list[str]:
         if f"needs['{lane}'].result }}}}\" = success" not in block:
             failures.append(f"release-please.yml: release-success does not require {lane}")
     return failures
+
+
+def workflow_steps(block: str) -> list[str]:
+    return re.findall(r"^      - [\s\S]*?(?=^      - |\Z)", block, re.MULTILINE)
+
+
+def check_ts_release(text: str) -> list[str]:
+    failures: list[str] = []
+    jobs = workflow_jobs(text)
+    expected_jobs = {"main-ci-success", "release-please", "release-metadata", "release-ci-success",
+                     "release-binaries", "release-image", "release-image-index",
+                     "release-image-index-smoke", "release-image-index-promote", "release-success"}
+    if set(jobs) != expected_jobs:
+        failures.append("release-please.yml: unexpected release job set; review CI and dry-run gates for new lanes")
+    publish_guard = "needs['release-metadata'].outputs.dry_run != 'true'"
+    dry_guard = "needs['release-metadata'].outputs.dry_run == 'true'"
+    required = {
+        "release-binaries": (
+            "node-version: 22.14.0", "npm ci", "bun-v1.4.4", "-Version 1.4.4",
+            "bun build packages/cli/src/main.ts --compile",
+            "x86_64-unknown-linux-musl) args+=(--target=bun-linux-x64-musl)",
+            "aarch64-unknown-linux-musl) args+=(--target=bun-linux-arm64-musl)",
+            'asset="axond-${RELEASE_VERSION}-${RELEASE_TARGET}.tar.gz"',
+            '$asset = "axond-$env:RELEASE_VERSION-$env:RELEASE_TARGET.zip"',
+            'tar -C release-bin -czf "dist/$asset" axond',
+            "Compress-Archive -Path release-bin/axond.exe",
+            "alpine:3.22", "apk add --no-cache python3 libstdc++ libgcc",
+            "python3 ops/binary-smoke.py release-bin/axond", "python ops/binary-smoke.py",
+            "path: ts", "COSIGN_MODE: keyless", "COSIGN_IDENTITY_REGEXP: ${{ env.SIGNER_IDENTITY }}",
+            'bash ts/scripts/sign-artifact.sh "dist/axond-${RELEASE_VERSION}-${RELEASE_TARGET}.${ARCHIVE}" dist',
+            "Attest binary provenance", "Attest binary SBOM", "cosign-release: v2.5.2",
+        ),
+        "release-image": (
+            "context: ./ts", "file: ./ts/Dockerfile",
+            "images: |\n            ${{ env.IMAGE_NAME }}\n            ${{ env.MIRROR_IMAGE_NAME }}",
+            "push: ${{ " + publish_guard + " }}", "load: ${{ " + dry_guard + " }}",
+            'cosign sign --yes "${IMAGE_NAME}@${DIGEST}"',
+            'cosign sign --yes "${MIRROR_IMAGE_NAME}@${DIGEST}"',
+            'bash ops/verify-image-evidence.sh "${IMAGE_NAME}@${DIGEST}" "$SBOM_PATH"',
+            'bash ops/verify-image-evidence.sh "${MIRROR_IMAGE_NAME}@${DIGEST}" "$SBOM_PATH"',
+        ),
+        "release-image-index-promote": (
+            'for tag in "$RELEASE_VERSION" "sha-$RELEASE_SHORT_SHA"; do',
+            'docker buildx imagetools create \\\n              --tag "${MIRROR_IMAGE_NAME}:$tag" "${IMAGE_NAME}@${INDEX_DIGEST}"',
+            'imagetools inspect "${MIRROR_IMAGE_NAME}:$tag"',
+            "--format '{{.Manifest.Digest}}'", 'if [[ "$actual" != "$INDEX_DIGEST" ]]; then',
+            'cosign sign --yes "${MIRROR_IMAGE_NAME}@${INDEX_DIGEST}"',
+            'bash ops/verify-image-evidence.sh "${MIRROR_IMAGE_NAME}@${INDEX_DIGEST}"',
+        ),
+        "release-metadata": (
+            "DRY_RUN: ${{ inputs.dry_run || false }}", 'if [[ "$DRY_RUN" == true ]]; then',
+            'open("ts/package.json")', 'commit_sha="$GITHUB_SHA"',
+            'release_tag is required unless dry_run is true',
+            'contents/ts/package.json?ref=${tag_name}', 'if [[ "$tag_version" != "$version" ]]; then',
+            'refusing Rust-era repair', 'echo "dry_run=$DRY_RUN"',
+        ),
+        "release-success": (
+            'if [[ "${{ needs[\'release-metadata\'].outputs.dry_run }}" == true ]]; then',
+            'test "${{ needs[\'release-image-index\'].result }}" = skipped',
+            'test "${{ needs[\'release-image-index-smoke\'].result }}" = skipped',
+            'test "${{ needs[\'release-image-index-promote\'].result }}" = skipped',
+        ),
+    }
+    for job, needles in required.items():
+        for needle in needles:
+            if needle not in jobs.get(job, ""):
+                failures.append(f"release-please.yml: {job} lacks TS release requirement {needle!r}")
+    for needle in (
+        "  IMAGE_NAME: ghcr.io/litvue/axond\n",
+        "  MIRROR_IMAGE_NAME: ghcr.io/litvue/axond-typescript\n",
+        "      dry_run:\n", "        type: boolean\n        default: false",
+        "release_tag:\n", "        required: false\n        type: string",
+    ):
+        if needle not in text:
+            failures.append(f"release-please.yml: missing {needle!r}")
+    commands = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    if "release-crates" in jobs or re.search(r"\bcargo (?:build|publish)\b", commands):
+        failures.append("release-please.yml: Rust build/publication is forbidden in TS release lanes")
+    if "--prefer-index" in jobs.get("release-image-index-promote", ""):
+        failures.append("release-please.yml: mirror copy must preserve the source index descriptor")
+    if not re.search(r'if \[\[ "\$actual" != "\$INDEX_DIGEST" \]\]; then\n[^\n]+\n\s+exit 1\n', jobs.get("release-image-index-promote", "")):
+        failures.append("release-please.yml: mirror digest mismatch must fail closed")
+    if "statically linked" in jobs.get("release-binaries", ""):
+        failures.append("release-please.yml: Bun musl archives are not statically linked")
+    for job in ("release-image-index", "release-image-index-smoke", "release-image-index-promote"):
+        if publish_guard not in job_configuration(jobs.get(job, "")):
+            failures.append(f"release-please.yml: {job} must be skipped in dry-run")
+    publishing = ("gh release upload", "actions/attest@", "cosign sign", "sign-artifact.sh",
+                  "docker/login-action@", "anchore/sbom-action@", "ops/verify-image-evidence.sh")
+    for job in ("release-binaries", "release-image"):
+        for step in workflow_steps(jobs.get(job, "")):
+            guard = re.search(r"^        if: (.+)$", step, re.MULTILINE)
+            guarded = guard and re.fullmatch(r"(?:runner\.os (?:!=|==) 'Windows' && )?" + re.escape(publish_guard), guard.group(1))
+            if any(needle in step for needle in publishing) and not guarded:
+                failures.append(f"release-please.yml: {job} has an unguarded dry-run publishing/evidence step: {step.splitlines()[0]}")
+    image_steps = workflow_steps(jobs.get("release-image", ""))
+    for image in ("IMAGE_NAME", "MIRROR_IMAGE_NAME"):
+        for sbom in (False, True):
+            matching = [step for step in image_steps if "actions/attest@" in step
+                        and "subject-name: ${{ env." + image + " }}" in step
+                        and ("sbom-path:" in step) == sbom and "push-to-registry: true" in step]
+            if len(matching) != 1:
+                failures.append(f"release-please.yml: {image} needs exactly one {'SBOM' if sbom else 'provenance'} attestation")
+    mirror_provenance = [step for step in workflow_steps(jobs.get("release-image-index-promote", ""))
+                         if "actions/attest@" in step and "subject-name: ${{ env.MIRROR_IMAGE_NAME }}" in step
+                         and "push-to-registry: true" in step and "sbom-path:" not in step]
+    if len(mirror_provenance) != 1:
+        failures.append("release-please.yml: mirror index needs provenance attestation")
+    metadata = jobs.get("release-metadata", "")
+    dry_branch = metadata.partition('if [[ "$DRY_RUN" == true ]]; then')[2].partition("          elif ")[0]
+    if not dry_branch or re.search(r"\bgh\s|git (?:fetch|show)|release view", dry_branch):
+        failures.append("release-please.yml: dry-run metadata must use GITHUB_SHA without tag/release lookups")
+    runners = {
+        "x86_64-unknown-linux-gnu": "ubuntu-latest", "x86_64-unknown-linux-musl": "ubuntu-latest",
+        "aarch64-unknown-linux-gnu": "ubuntu-24.04-arm", "aarch64-unknown-linux-musl": "ubuntu-24.04-arm",
+        "aarch64-apple-darwin": "macos-15", "x86_64-pc-windows-msvc": "windows-latest",
+    }
+    for target, runner in runners.items():
+        if f"- os: {runner}\n            target: {target}\n" not in jobs.get("release-binaries", ""):
+            failures.append(f"release-please.yml: {target} must build natively on {runner}")
+    return failures
+
+
+def check_product_versions(root: Path = ROOT) -> list[str]:
+    try:
+        package = json.loads((root / "ts/package.json").read_text())
+        manifest = json.loads((root / ".release-please-manifest.json").read_text())
+        lock = json.loads((root / "ts/package-lock.json").read_text())
+        product = re.search(r'AXOND_VERSION = "([^"]+)"', (root / "ts/packages/cli/src/product-version.ts").read_text())
+        version = manifest["."]
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) or any(value != version for value in (
+            package.get("version"), lock.get("version"), lock.get("packages", {}).get("", {}).get("version"),
+            product.group(1) if product else None,
+        )):
+            return ["TS package, lockfile, product-version.ts, and release-please manifest versions must agree"]
+        config = json.loads((root / "release-please-config.json").read_text())
+        extras = config["packages"]["."]["extra-files"]
+        for path, jsonpath in (("ts/package.json", "$.version"), ("ts/package-lock.json", "$.version"),
+                               ("ts/package-lock.json", '$.packages[""].version')):
+            if {"type": "json", "path": path, "jsonpath": jsonpath} not in extras:
+                return [f"release-please config must synchronize {path} {jsonpath}"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return [f"cannot validate TS product versions: {error}"]
+    return []
+
+
+def ts_release_self_test() -> None:
+    good = workflow_text()
+    assert not check_ts_release(good), check_ts_release(good)
+    mutations = (
+        ("bun build packages/cli/src/main.ts --compile", "cargo build --release"),
+        ("bun-linux-x64-musl", "bun-linux-x64"), ("bun-linux-arm64-musl", "bun-linux-arm64"),
+        ("alpine:3.22", "ubuntu:24.04"), ("libstdc++ libgcc", ""),
+        ("path: ts", "path: release-bin"), ("COSIGN_MODE: keyless", "COSIGN_MODE: key"),
+        ("COSIGN_IDENTITY_REGEXP: ${{ env.SIGNER_IDENTITY }}", "COSIGN_IDENTITY_REGEXP: .*"),
+        ("context: ./ts", "context: ."), ("file: ./ts/Dockerfile", "file: Dockerfile"),
+        ('if [[ "$actual" != "$INDEX_DIGEST" ]]; then', 'if false; then'),
+        ("docker buildx imagetools create", "docker buildx imagetools create --prefer-index=false"),
+        ('cosign sign --yes "${MIRROR_IMAGE_NAME}@${DIGEST}"', "true"),
+        ('cosign sign --yes "${MIRROR_IMAGE_NAME}@${INDEX_DIGEST}"', "true"),
+        ('bash ops/verify-image-evidence.sh "${MIRROR_IMAGE_NAME}@${DIGEST}"', "true"),
+        ('bash ops/verify-image-evidence.sh "${MIRROR_IMAGE_NAME}@${INDEX_DIGEST}"', "true"),
+        ("subject-name: ${{ env.MIRROR_IMAGE_NAME }}", "subject-name: ignored"),
+        ("push: ${{ needs['release-metadata'].outputs.dry_run != 'true' }}", "push: true"),
+        ("load: ${{ needs['release-metadata'].outputs.dry_run == 'true' }}", "load: false"),
+        ("if: needs['release-metadata'].outputs.dry_run != 'true'", "if: always()"),
+        ('tag_name=""', 'tag_name="$(gh release view latest)"'),
+        ('if [[ "$tag_version" != "$version" ]]; then', "if false; then"),
+        ('asset="axond-${RELEASE_VERSION}-${RELEASE_TARGET}.tar.gz"', 'asset="changed.tar.gz"'),
+        ('commit_sha="$GITHUB_SHA"', 'commit_sha="$GITHUB_REF"'),
+        ("target: aarch64-apple-darwin", "target: x86_64-apple-darwin"),
+        ('echo "mirror $tag resolved to $actual, expected $INDEX_DIGEST" >&2\n              exit 1', 'echo "ignored mismatch"'),
+        ('test "${{ needs[\'release-image-index\'].result }}" = skipped', "true"),
+    )
+    for old, new in mutations:
+        assert old in good, old
+        assert check_ts_release(good.replace(old, new)), old
+    for job in ("release-binaries", "release-image"):
+        for step in workflow_steps(job_block(good, job)):
+            guard = re.search(r"^        if: .*dry_run != 'true'.*\n", step, re.MULTILINE)
+            if guard and "cosign-installer@" not in step:
+                assert check_ts_release(good.replace(step, step.replace(guard.group(), ""))), step
+    assert check_ts_release(good + "\n  release-crates:\n    steps: []\n")
+    assert check_ts_release(good + "\n  rogue:\n    steps:\n      - run: cargo publish\n")
+    assert check_ts_release(good + "\n  rogue:\n    steps:\n      - run: gh release upload tag artifact\n")
+    assert check_ts_release("")
+    assert not check_product_versions(), check_product_versions()
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        assert check_product_versions(root)
+        for relative in ("ts/package.json", "ts/package-lock.json", "ts/packages/cli/src/product-version.ts",
+                         ".release-please-manifest.json", "release-please-config.json"):
+            destination = root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text((ROOT / relative).read_text())
+        assert not check_product_versions(root)
+        package = root / "ts/package.json"
+        original = package.read_text()
+        for content in ('{}', '{"version":"9.9.9"}', 'not json'):
+            package.write_text(content)
+            assert check_product_versions(root)
+        package.write_text(original)
+        for relative in ("ts/package-lock.json", ".release-please-manifest.json"):
+            path = root / relative
+            original = path.read_text()
+            data = json.loads(original)
+            data["." if relative.startswith(".") else "version"] = "not-a-release"
+            path.write_text(json.dumps(data))
+            assert check_product_versions(root)
+            path.write_text(original)
+        product = root / "ts/packages/cli/src/product-version.ts"
+        product.write_text('export const AXOND_VERSION = "9.9.9";')
+        assert check_product_versions(root)
 
 
 def cosign_installer_steps(text: str) -> list[str]:
@@ -1172,15 +1365,7 @@ def self_test() -> int:
         flags=re.DOTALL,
     )
     assert release_gate_removed != ordered
-    release_gate_removed = replace_in_job(
-        release_gate_removed,
-        "release-crates",
-        "    steps:\n",
-        "    steps:\n"
-        "      - name: Crates-only CI check\n"
-        "        run: gh api check-runs?ref=tag\n",
-    )
-    rejected(release_gate_removed, "CI was checked only inside release-crates")
+    rejected(release_gate_removed, "release CI gate removed")
     rejected(
         ordered
         + "\n  rogue-publisher:\n"
@@ -1229,7 +1414,8 @@ def self_test() -> int:
     assert check_release_scope(scoped.replace("      - '.release-please-manifest.json'\n", ""), scope_config)
     assert check_release_scope(scoped, {"packages": {".": {"exclude-paths": ["website/**", ".github/**"]}}})
     assert check_release_scope(scoped, {"packages": {".": {"exclude-paths": ["website", ".github", "crates"]}}})
-    print("check-release-config: decision, release-order, and release-scope self-tests passed")
+    ts_release_self_test()
+    print("check-release-config: decision, release-order, release-scope, and TS artifact self-tests passed")
     return 0
 
 
@@ -1249,6 +1435,8 @@ def main(argv: list[str]) -> int:
     failures.extend(check_release_scope(text, json.loads((ROOT / "release-please-config.json").read_text())))
     failures.extend(check_binary_matrix(text))
     failures.extend(check_binary_gates(text))
+    failures.extend(check_ts_release(text))
+    failures.extend(check_product_versions())
     failures.extend(check_image_matrix(text))
     failures.extend(check_image_gates(text))
     failures.extend(check_release_ordering(text))

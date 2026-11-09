@@ -51,7 +51,7 @@ unnoticed one.
 | `key_material.rs`, credential injection, error and log text | [Credential delivery and redaction](#3-credential-delivery-and-redaction) |
 | `backends/catalog.rs`, `aliases.rs`, `pricing.rs`, `[[price]]`, `/v1/models`, alias scope, wire families | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
 | `ops/postgres/`, `crates/gateway/sql/`, `store/`, `usage/`, `telemetry/` | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
-| `.github/workflows/`, `ops/publish-crates.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
+| `.github/workflows/`, `ts/scripts/sign-artifact.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
 | `ts/packages` extension loading, `AXOND_EXTENSIONS_DIR`, Worker bundling of middleware | [TypeScript extension trust](#8-typescript-extension-trust) |
 
 A change can fire more than one trigger; a credential-delivery change that also
@@ -304,7 +304,7 @@ change, not an implementation detail.
 
 ## 6. Actions, release permissions, attestations, and signing
 
-**Fires on** any change under `.github/workflows/`, to `ops/publish-crates.sh`,
+**Fires on** any change under `.github/workflows/`, to `ts/scripts/sign-artifact.sh`,
 `ops/docker-smoke.sh`, `ops/binary-smoke.py`, `ops/tier0-gate.sh`,
 `ops/install-musl-tools.sh`,
 `ops/publish-image-index.sh`, `ops/verify-image-evidence.sh`,
@@ -342,9 +342,10 @@ at the job, and a `pull_request_target` or workflow-run trigger on untrusted
 input is an ADR-level decision, not a workflow tweak.
 
 **Regression tests.** The release path is exercised on every change rather than
-at the tag: `publish-dry-run` stages a self-contained `axond` tarball (internals
-are not crates.io packages) and verifies that package, `docker-smoke` and
-`quickstart-smoke` boot what is shipped,
+at the tag: the TypeScript compiled-binary smoke boots the Bun executable;
+release dry-runs build and smoke binaries and images without publishing. Rust
+conformance lanes remain: `docker-smoke` and
+`quickstart-smoke` boot the Rust conformance image,
 `static-binary` proves the musl build and runs `ops/tier0-gate.sh`, the
 `openapi-smoke` dumps the generated OpenAPI 3.1 spec and typechecks a client from
 it, the

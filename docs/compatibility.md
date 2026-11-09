@@ -153,19 +153,21 @@ crate.
 
 ## Supported platforms
 
-Released artifacts cover these targets. Anything else builds from source; a
+Released TypeScript gateway artifacts cover these targets. The archive target
+names retain the Rust triples for installer compatibility. Anything else builds from source; a
 target is added by a release, never by an unpublished build.
 
-| Platform | Rust target | Release archive | OCI platform |
+| Platform | Archive target | Release archive | OCI platform |
 | --- | --- | --- | --- |
 | Linux x86-64, glibc | `x86_64-unknown-linux-gnu` | `.tar.gz` | — |
-| Linux x86-64, static musl | `x86_64-unknown-linux-musl` | `.tar.gz` | `linux/amd64` |
+| Linux x86-64, musl | `x86_64-unknown-linux-musl` | `.tar.gz` | `linux/amd64` |
 | Linux ARM64, glibc | `aarch64-unknown-linux-gnu` | `.tar.gz` | — |
-| Linux ARM64, static musl | `aarch64-unknown-linux-musl` | `.tar.gz` | `linux/arm64` |
+| Linux ARM64, musl | `aarch64-unknown-linux-musl` | `.tar.gz` | `linux/arm64` |
 | macOS Apple Silicon | `aarch64-apple-darwin` | `.tar.gz` | — |
 | Windows x86-64 | `x86_64-pc-windows-msvc` | `.zip` | — |
 
-Archives are named `axond-<version>-<target><extension>`. Every target in this
+Archives are named `axond-<version>-<target><extension>`. Musl archives are not
+static; Alpine needs `apk add --no-cache libstdc++ libgcc`. Every target in this
 table has a `binary-smoke` lane on a runner of its own platform.
 
 `ghcr.io/litvue/axond:<version>` and `:sha-<short>` resolve to a
@@ -175,9 +177,10 @@ than emulating one ([architecture
 selection](./deployment/docker-compose.md#architecture-selection)). Releases up to
 and including 0.3.17 published a single `linux/amd64` image. Single-platform
 references remain available as `:<version>-amd64` and `:<version>-arm64`. There is no `latest`
-tag, and adding one is not planned.
+tag, and adding one is not planned. TypeScript releases mirror the same digest
+and tags to `ghcr.io/litvue/axond-typescript`, including signatures and attestations.
 
-Every archive carries a SHA-256 sidecar, an SPDX SBOM, and provenance/SBOM
+Every archive carries SHA-256 and keyless cosign `.sig`/`.pem` sidecars, an SPDX SBOM, and provenance/SBOM
 attestations. Every published image manifest — each single-platform image and
 the multi-architecture index — is smoke-tested on its own architecture before it
 is signed, and carries a keyless signature and a provenance attestation. The
@@ -190,9 +193,9 @@ relabelled. To audit what you run, resolve the child digest for your platform
 from the index and verify that digest's SBOM attestation, or use the
 per-architecture SPDX asset on the release.
 
-Archive signing is deliberately not part of this: archives are verified through
-their checksum and GitHub attestations, and keyless signatures are an image-only
-mechanism here.
+Verify archive signatures with `cosign verify-blob` using the certificate,
+signature, and restricted workflow identity in
+[Installation and verification](./installation.md#prebuilt-release-binary).
 
 Dropping a supported platform is a minor-release, changelog-listed act under the
 same rules as the config surface below.
@@ -270,8 +273,9 @@ interface — read it at your own risk.
 
 ### The published Rust API
 
-crates.io publishes **`axond` only** — the gateway binary. Its compatibility
-surface is the config, HTTP, and telemetry contracts above, not Rust items.
+crates.io no longer receives versions; **0.7.1 was the last Rust release** and
+existing versions are not yanked. Historical `axond` packages contain the Rust
+gateway binary. Its compatibility surface is config, HTTP, and telemetry, not Rust items.
 `gateway-core` and `gateway-transport` remain unpublished git workspace members
 so the in-repo test graph can still `cargo test -p gateway-core`; they are not a
 library product and must not be `cargo add`-ed. Versions already on the registry

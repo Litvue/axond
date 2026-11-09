@@ -11,7 +11,7 @@ import sys
 COMMON = {"changes", "fmt", "clippy", "tests", "fuzz-smoke", "sdk-compat", "docs", "workflow-policy"}
 RELEASE = {
     "msrv", "api-compat", "build", "faults", "sdk-compat-ts", "openapi-smoke",
-    "rustdoc", "publish-dry-run", "static-binary", "binary-smoke", "docker-smoke",
+    "rustdoc", "static-binary", "binary-smoke", "docker-smoke",
     "cosign-format", "rollout-drill", "quickstart-smoke",
 }
 

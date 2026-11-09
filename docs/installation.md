@@ -1,6 +1,6 @@
 # Installation and verification
 
-Axond ships through crates.io, signed GitHub release archives, and GHCR. Use a
+Axond ships the TypeScript gateway through signed GitHub release archives and GHCR. Use a
 released artifact in production; build from source when developing Axond.
 
 ## Prebuilt binary installer
@@ -34,7 +34,7 @@ AXOND_VERSION=0.7.1 AXOND_INSTALL_DIR=/usr/local/bin sh ./install.sh # x-release
 ```
 
 Supported installer targets match the release matrix: Linux x86-64 and Linux
-ARM64 (static musl by default, glibc selectable through `AXOND_TARGET`), macOS
+ARM64 (musl by default, glibc selectable through `AXOND_TARGET`), macOS
 Apple Silicon, and Windows x86-64. Other architectures must build from source
 until a release artifact is added; the full matrix is in
 [the compatibility contract](./compatibility.md#supported-platforms).
@@ -54,25 +54,10 @@ AXOND_REQUIRE_ATTESTATION=1 sh ./install.sh
 
 ## crates.io source install
 
-Cargo registries distribute source packages, not precompiled executables.
-Consequently, `cargo install` downloads the published crate and compiles it on
-the local machine:
-
-```bash
-cargo install axond --locked
-axond --help
-```
-
-Pin a deployment to an explicit version when reproducibility matters:
-
-```bash
-AXOND_VERSION=0.7.1 # x-release-please-version
-cargo install axond --version "$AXOND_VERSION" --locked
-```
-
-crates.io publishes the `axond` binary crate only. `gateway-core` and
-`gateway-transport` are unpublished git workspace members, not a library
-product; older versions already on the registry are not yanked.
+crates.io no longer receives versions. **0.7.1 is the last Rust version**;
+existing versions are not yanked. `cargo install axond --version 0.7.1 --locked`
+installs that historical Rust gateway, not the current TypeScript release.
+Use the prebuilt archives or OCI image for current releases.
 
 ## Prebuilt release binary
 
@@ -81,9 +66,9 @@ Release archives are published for:
 | Target | Artifact |
 | --- | --- |
 | Linux x86_64, glibc | `x86_64-unknown-linux-gnu.tar.gz` |
-| Linux x86_64, static musl | `x86_64-unknown-linux-musl.tar.gz` |
+| Linux x86_64, musl | `x86_64-unknown-linux-musl.tar.gz` |
 | Linux aarch64, glibc | `aarch64-unknown-linux-gnu.tar.gz` |
-| Linux aarch64, static musl | `aarch64-unknown-linux-musl.tar.gz` |
+| Linux aarch64, musl | `aarch64-unknown-linux-musl.tar.gz` |
 | macOS Apple Silicon | `aarch64-apple-darwin.tar.gz` |
 | Windows x86_64 | `x86_64-pc-windows-msvc.zip` |
 
@@ -97,20 +82,37 @@ target=x86_64-unknown-linux-musl
 gh release download "$tag" --repo Litvue/axond \
   --pattern "axond-${version}-${target}.tar.gz*"
 sha256sum -c "axond-${version}-${target}.tar.gz.sha256"
+cosign verify-blob \
+  --certificate "axond-${version}-${target}.tar.gz.pem" \
+  --signature "axond-${version}-${target}.tar.gz.sig" \
+  --certificate-identity-regexp '^https://github\.com/Litvue/axond/\.github/workflows/release-please\.yml@(refs/heads/main|refs/tags/v[0-9]+\.[0-9]+\.[0-9]+)$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  "axond-${version}-${target}.tar.gz"
 gh attestation verify "axond-${version}-${target}.tar.gz" \
   --repo Litvue/axond
 tar -xzf "axond-${version}-${target}.tar.gz"
 ./axond --help
 ```
 
-The musl binary is static PIE and is the simplest Linux server installation, on
-either architecture.
+The archives contain a Bun-compiled TypeScript gateway. Each has `.sha256`,
+`.sig`, and `.pem` sidecars plus SBOM and provenance attestations. The same
+`cosign verify-blob` command applies to Windows `.zip` archives.
+Musl binaries are **not static**: on Alpine install their runtime libraries:
+
+```sh
+apk add --no-cache libstdc++ libgcc
+```
+
+These signatures apply to TypeScript releases after 0.7.1, not historical Rust
+archives. Use the tag of a TypeScript release in the example above.
 
 ## OCI image
 
 The public image is distroless, runs as non-root, contains no shell or package
 manager, and is published as a multi-architecture index covering `linux/amd64`
-and `linux/arm64`. There is no `latest` tag.
+and `linux/arm64`. The same digest and release tags are mirrored from
+`ghcr.io/litvue/axond` to `ghcr.io/litvue/axond-typescript`, with signatures and
+attestations under both names. There is no `latest` tag.
 
 Both platform children are addressable directly as `:<version>-amd64` and
 `:<version>-arm64`; an ARM host pulling the index resolves its native child
@@ -184,14 +186,15 @@ selection](./deployment/docker-compose.md#architecture-selection).
 
 ## Build from source
 
-The toolchain is pinned by `rust-toolchain.toml`:
+Build the TypeScript gateway with Node 22.14.0 and Bun 1.4.4:
 
 ```bash
 git clone https://github.com/Litvue/axond.git
 cd axond
-cargo build --release --locked -p axond
+cd ts
+npm ci
+bun build packages/cli/src/main.ts --compile --outfile axond
 ```
 
-For the static Linux build, install `musl-tools`, add the musl target to the
-*pinned* toolchain, and run `just build-static`. See
-[CONTRIBUTING.md](../CONTRIBUTING.md) for the complete local verification gate.
+The Rust tree remains a conformance oracle with its own CI; it is not the
+release artifact. See [CONTRIBUTING.md](../CONTRIBUTING.md) for local checks.

@@ -1,26 +1,19 @@
 name: Release
 
-# release-please tracks Conventional Commits on main, keeps a release PR open,
-# and on merge tags `v<major>.<minor>.<patch>` and cuts a GitHub release. That
-# release fans out into the shipped artifacts, each built from the tagged
-# commit: cross-platform binaries, a signed + attested OCI image, the
-# checksums/SBOM evidence attached to the release, and — last, because it is the
-# only irreversible one — the three crates.io packages.
-#
-# A `workflow_dispatch` with an existing release tag re-runs the artifact lanes
-# for a release that already exists (repair path); it never creates a tag or
-# release. Dispatch from the tag for a normal repair, or from `main` when the
-# workflow definition itself was fixed after the tag was cut. Because the
-# crates.io lane skips versions already on the registry, the same dispatch
-# resumes a release whose publish only partly succeeded.
+# release-please ships the TypeScript gateway: native Bun binaries and a signed,
+# attested multi-architecture image at ghcr.io/litvue/axond, mirrored without
+# digest changes to ghcr.io/litvue/axond-typescript. No crates.io publishing.
+# Dispatch repairs an existing TS release from its tag or main; dry-run builds
+# and smokes GITHUB_SHA from any ref without publishing release artifacts.
 
 on:
   push:
     branches: [main]
     # Release maintenance only follows changes to shipped Axond source/build inputs
     # and to the release-please config/manifest, which reshape the open release PR.
-    # Release PRs update Cargo.toml, so merging a release still publishes its tag.
+    # Release PRs update ts/package.json and Cargo.toml, publishing the new tag.
     paths:
+      - 'ts/**'
       - 'crates/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -33,8 +26,13 @@ on:
     inputs:
       release_tag:
         description: Existing release tag whose artifacts should be rebuilt, e.g. v0.1.0.
-        required: true
+        required: false
         type: string
+      dry_run:
+        description: Build and smoke the current commit without publishing.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,6 +40,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/litvue/axond
+  MIRROR_IMAGE_NAME: ghcr.io/litvue/axond-typescript
   # A keyless signature is issued to this workflow's job_workflow_ref, which is
   # refs/heads/main on the automatic path and refs/tags/<tag> on the dispatch
   # repair path. Only those two forms are trusted: a wider pattern would accept
@@ -270,19 +269,33 @@ jobs:
       version: ${{ steps.release.outputs.version }}
       commit_sha: ${{ steps.release.outputs.commit_sha }}
       short_sha: ${{ steps.release.outputs.short_sha }}
-      crates_publishable: ${{ steps.release.outputs.crates_publishable }}
+      dry_run: ${{ steps.release.outputs.dry_run }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Resolve automatic or requested release
         id: release
         env:
           AUTO_RELEASE_CREATED: ${{ needs['release-please'].outputs.release_created }}
           AUTO_TAG_NAME: ${{ needs['release-please'].outputs.tag_name }}
           AUTO_VERSION: ${{ needs['release-please'].outputs.version }}
+          DRY_RUN: ${{ inputs.dry_run || false }}
           DISPATCH_TAG_NAME: ${{ inputs.release_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+          if [[ "$DRY_RUN" == true ]]; then
+            version="$(python3 -c 'import json; print(json.load(open("ts/package.json"))["version"])')"
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            tag_name=""
+            commit_sha="$GITHUB_SHA"
+            release_created=true
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ -z "$DISPATCH_TAG_NAME" ]]; then
+              echo "release_tag is required unless dry_run is true" >&2
+              exit 1
+            fi
             tag_name="$DISPATCH_TAG_NAME"
             [[ "$tag_name" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
             version="${tag_name#v}"
@@ -290,6 +303,15 @@ jobs:
             commit_sha="$(
               gh api "/repos/${GITHUB_REPOSITORY}/commits/${tag_name}" --jq .sha
             )"
+            tag_version="$(gh api "/repos/${GITHUB_REPOSITORY}/contents/ts/package.json?ref=${tag_name}" --jq .content |
+              base64 --decode | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version", ""))')" || {
+              echo "$tag_name has no readable ts/package.json version; refusing Rust-era repair" >&2
+              exit 1
+            }
+            if [[ "$tag_version" != "$version" ]]; then
+              echo "$tag_name requires ts/package.json version $version, found '$tag_version'; refusing repair" >&2
+              exit 1
+            fi
             case "$GITHUB_REF" in
               "refs/tags/$tag_name")
                 if [[ "$commit_sha" != "$GITHUB_SHA" ]]; then
@@ -306,8 +328,8 @@ jobs:
                 ;;
             esac
             if [[ "$GITHUB_REF" == refs/heads/main ]]; then
-              for required_path in Dockerfile ops/docker-smoke.sh \
-                ops/binary-smoke.py ops/publish-image-index.sh \
+              for required_path in ts/Dockerfile ts/scripts/sign-artifact.sh \
+                ops/docker-smoke.sh ops/binary-smoke.py ops/publish-image-index.sh \
                 ops/verify-image-evidence.sh; do
                 required_probe="$RUNNER_TEMP/repair-${required_path//\//-}"
                 if gh api --include "/repos/${GITHUB_REPOSITORY}/contents/${required_path}?ref=${tag_name}" >"$required_probe" 2>&1; then
@@ -328,27 +350,11 @@ jobs:
               done
             fi
             release_created=true
-            crates_probe="$RUNNER_TEMP/crates-publish-probe"
-            if gh api --include "/repos/${GITHUB_REPOSITORY}/contents/ops/publish-crates.sh?ref=${tag_name}" >"$crates_probe" 2>&1; then
-              crates_publishable=true
-              echo "$tag_name contains ops/publish-crates.sh; crates lane enabled"
-            else
-              crates_status="$(sed -n '1s/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$crates_probe")"
-              if [[ "$crates_status" == 404 ]]; then
-                crates_publishable=false
-                echo "$tag_name predates ops/publish-crates.sh; crates lane skipped"
-              else
-                cat "$crates_probe" >&2
-                echo "could not determine whether $tag_name contains ops/publish-crates.sh" >&2
-                exit 1
-              fi
-            fi
           else
             tag_name="$AUTO_TAG_NAME"
             version="$AUTO_VERSION"
             release_created="${AUTO_RELEASE_CREATED:-false}"
             commit_sha="$GITHUB_SHA"
-            crates_publishable=true
           fi
           short_sha="${commit_sha:0:7}"
           {
@@ -357,7 +363,7 @@ jobs:
             echo "version=$version"
             echo "commit_sha=$commit_sha"
             echo "short_sha=$short_sha"
-            echo "crates_publishable=$crates_publishable"
+            echo "dry_run=$DRY_RUN"
           } >> "$GITHUB_OUTPUT"
 
   release-ci-success:
@@ -451,29 +457,45 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs['release-metadata'].outputs.tag_name }}
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+          ref: ${{ needs['release-metadata'].outputs.commit_sha }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          toolchain: 1.97.1
-          targets: ${{ matrix.target }}
-      # The smoke below runs on the standard library alone, but not on whatever
-      # interpreter a runner image happens to ship.
+          node-version: 22.14.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
-      - name: Install musl tools
-        if: endsWith(matrix.target, '-unknown-linux-musl')
-        timeout-minutes: 25
-        run: bash ops/install-musl-tools.sh
+      - name: Install npm dependencies
+        working-directory: ts
+        run: npm ci
+      - name: Install Bun 1.4.4 on Unix
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s -- bun-v1.4.4
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+      - name: Install Bun 1.4.4 on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ([scriptblock]::Create((Invoke-RestMethod https://bun.sh/install.ps1))) -Version 1.4.4
+          "$env:USERPROFILE\.bun\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
       - name: Build the release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} -p axond
+        working-directory: ts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ../release-bin
+          args=()
+          case "$RELEASE_TARGET" in
+            x86_64-unknown-linux-musl) args+=(--target=bun-linux-x64-musl) ;;
+            aarch64-unknown-linux-musl) args+=(--target=bun-linux-arm64-musl) ;;
+          esac
+          bun build packages/cli/src/main.ts --compile "${args[@]}" --outfile ../release-bin/axond
       - name: Package the Unix binary
         if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p release-bin dist
-          cp "target/${RELEASE_TARGET}/release/axond" release-bin/axond
           chmod 0755 release-bin/axond
           test -x release-bin/axond
           asset="axond-${RELEASE_VERSION}-${RELEASE_TARGET}.tar.gz"
@@ -482,36 +504,18 @@ jobs:
             cd dist
             shasum -a 256 "$asset" > "${asset}.sha256"
           )
-      # Every Linux archive is built on a runner of its own architecture, so the
-      # binary that ships can be booted here rather than only compiled. A musl
-      # archive that turned out dynamically linked is not the artifact the
-      # installer promises, so that is asserted before the boot.
-      - name: Assert the musl binary is statically linked
+      - name: Smoke the musl binary in Alpine
         if: endsWith(matrix.target, '-unknown-linux-musl')
         shell: bash
         run: |
-          set -euo pipefail
-          file release-bin/axond | grep -Eq 'static-pie linked|statically linked'
-          ! file release-bin/axond | grep -q 'dynamically linked'
-      # The archive that ships is booted and served here, not merely compiled —
-      # which is the reason ARM archives are built on ARM runners. The hermetic
-      # namespace is a CI guarantee, not a release one: AXOND_TIER0_ALLOW_NO_NETNS
-      # keeps boot and the whole serving path asserted while letting a runner that
-      # forbids namespace creation degrade instead of failing a valid release. The
-      # `static-binary` CI lane leaves it unset, so egress denial is still proven
-      # on every change.
-      - name: Smoke the Linux binary that ships
-        if: endsWith(matrix.target, '-unknown-linux-gnu') || endsWith(matrix.target, '-unknown-linux-musl')
-        shell: bash
-        env:
-          AXOND_TIER0_ALLOW_NO_NETNS: "1"
-        run: bash ops/tier0-gate.sh release-bin/axond
+          docker run --rm -v "$PWD:/work" -w /work alpine:3.22 sh -ec '
+            apk add --no-cache python3 libstdc++ libgcc
+            python3 ops/binary-smoke.py release-bin/axond'
       - name: Package the Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release-bin, dist | Out-Null
-          Copy-Item "target/$env:RELEASE_TARGET/release/axond.exe" release-bin/axond.exe
           $asset = "axond-$env:RELEASE_VERSION-$env:RELEASE_TARGET.zip"
           Compress-Archive -Path release-bin/axond.exe -DestinationPath "dist/$asset"
           $hash = (Get-FileHash "dist/$asset" -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -520,33 +524,49 @@ jobs:
       # exact binary that goes into the archive is booted and served here —
       # before it is attested, signed for, and attached to the release.
       - name: Smoke the packaged binary
+        if: ${{ !endsWith(matrix.target, '-unknown-linux-musl') }}
         shell: bash
-        run: python ops/binary-smoke.py release-bin/axond
+        run: python ops/binary-smoke.py release-bin/axond${{ runner.os == 'Windows' && '.exe' || '' }}
       - name: Generate binary SBOM
+        if: needs['release-metadata'].outputs.dry_run != 'true'
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          path: release-bin
+          path: ts
           format: spdx-json
           output-file: dist/axond-${{ needs['release-metadata'].outputs.version }}-${{ matrix.target }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
       - name: Attest binary provenance
+        if: needs['release-metadata'].outputs.dry_run != 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/axond-${{ needs['release-metadata'].outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
       - name: Attest binary SBOM
+        if: needs['release-metadata'].outputs.dry_run != 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/axond-${{ needs['release-metadata'].outputs.version }}-${{ matrix.target }}.${{ matrix.archive }}
           sbom-path: dist/axond-${{ needs['release-metadata'].outputs.version }}-${{ matrix.target }}.spdx.json
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: needs['release-metadata'].outputs.dry_run != 'true'
+        with:
+          cosign-release: v2.5.2
+      - name: Sign the archive keylessly
+        if: needs['release-metadata'].outputs.dry_run != 'true'
+        shell: bash
+        env:
+          COSIGN_MODE: keyless
+          COSIGN_IDENTITY_REGEXP: ${{ env.SIGNER_IDENTITY }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: bash ts/scripts/sign-artifact.sh "dist/axond-${RELEASE_VERSION}-${RELEASE_TARGET}.${ARCHIVE}" dist
       - name: Attach Unix binary assets
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && needs['release-metadata'].outputs.dry_run != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$RELEASE_TAG" dist/* --clobber
       - name: Attach Windows binary assets
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && needs['release-metadata'].outputs.dry_run != 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -555,7 +575,7 @@ jobs:
           gh release upload "$env:RELEASE_TAG" @assets --clobber
 
   # One job per published platform, each on a runner of that architecture: the
-  # image is a static musl build, so a native builder is both faster and more
+  # image is the TypeScript gateway, so a native builder is both faster and more
   # honest than emulating the other architecture. Each lane publishes its own
   # single-platform tags (`<version>-<arch>`, `sha-<short>-<arch>`) and carries
   # the full evidence chain for its own digest; `release-image-index` then joins
@@ -594,8 +614,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs['release-metadata'].outputs.tag_name }}
+          ref: ${{ needs['release-metadata'].outputs.commit_sha }}
       - name: Login to GHCR
+        if: needs['release-metadata'].outputs.dry_run != 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
@@ -606,7 +627,9 @@ jobs:
         id: metadata
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.IMAGE_NAME }}
+            ${{ env.MIRROR_IMAGE_NAME }}
           flavor: latest=false
           tags: |
             type=raw,value=${{ needs['release-metadata'].outputs.version }}-${{ matrix.arch }}
@@ -615,10 +638,11 @@ jobs:
         id: image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: .
-          file: Dockerfile
+          context: ./ts
+          file: ./ts/Dockerfile
           platforms: ${{ matrix.platform }}
-          push: true
+          push: ${{ needs['release-metadata'].outputs.dry_run != 'true' }}
+          load: ${{ needs['release-metadata'].outputs.dry_run == 'true' }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: |
             ${{ steps.metadata.outputs.labels }}
@@ -627,9 +651,10 @@ jobs:
             org.opencontainers.image.version=${{ needs['release-metadata'].outputs.version }}
           provenance: false
           sbom: false
-      - name: Smoke the published image before signing
+      - name: Smoke the image before signing or completing the dry-run
         run: bash ops/docker-smoke.sh "${IMAGE_NAME}:${RELEASE_VERSION}-${IMAGE_ARCH}"
       - name: Generate image SBOM
+        if: needs['release-metadata'].outputs.dry_run != 'true'
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ env.IMAGE_NAME }}@${{ steps.image.outputs.digest }}
@@ -638,15 +663,32 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
       - name: Attest image provenance
+        if: needs['release-metadata'].outputs.dry_run != 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
+      - name: Attest mirror image provenance
+        if: needs['release-metadata'].outputs.dry_run != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.MIRROR_IMAGE_NAME }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
       - name: Attest image SBOM
+        if: needs['release-metadata'].outputs.dry_run != 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          sbom-path: axond-image-${{ needs['release-metadata'].outputs.version }}-${{ matrix.arch }}.spdx.json
+          push-to-registry: true
+      - name: Attest mirror image SBOM
+        if: needs['release-metadata'].outputs.dry_run != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.MIRROR_IMAGE_NAME }}
           subject-digest: ${{ steps.image.outputs.digest }}
           sbom-path: axond-image-${{ needs['release-metadata'].outputs.version }}-${{ matrix.arch }}.spdx.json
           push-to-registry: true
@@ -657,17 +699,27 @@ jobs:
       # bare `cosign verify`, so the format is part of the release contract and
       # only moves with those instructions.
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        if: needs['release-metadata'].outputs.dry_run != 'true'
         with:
           cosign-release: v2.5.2
       - name: Sign the digest keylessly
-        run: cosign sign --yes "${IMAGE_NAME}@${{ steps.image.outputs.digest }}"
+        if: needs['release-metadata'].outputs.dry_run != 'true'
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+          cosign sign --yes "${MIRROR_IMAGE_NAME}@${DIGEST}"
       - name: Verify the signature and attestations
+        if: needs['release-metadata'].outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.image.outputs.digest }}
           SBOM_PATH: axond-image-${{ needs['release-metadata'].outputs.version }}-${{ matrix.arch }}.spdx.json
-        run: bash ops/verify-image-evidence.sh "${IMAGE_NAME}@${DIGEST}" "$SBOM_PATH"
+        run: |
+          bash ops/verify-image-evidence.sh "${IMAGE_NAME}@${DIGEST}" "$SBOM_PATH"
+          bash ops/verify-image-evidence.sh "${MIRROR_IMAGE_NAME}@${DIGEST}" "$SBOM_PATH"
       - name: Attach image evidence to the release
+        if: needs['release-metadata'].outputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.image.outputs.digest }}
@@ -699,6 +751,7 @@ jobs:
       - release-image
     if: >-
       !cancelled() &&
+      needs['release-metadata'].outputs.dry_run != 'true' &&
       needs['release-metadata'].result == 'success' &&
       needs['release-ci-success'].result == 'success' &&
       needs['release-image'].result == 'success' &&
@@ -717,7 +770,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs['release-metadata'].outputs.tag_name }}
+          ref: ${{ needs['release-metadata'].outputs.commit_sha }}
       - name: Login to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -747,6 +800,7 @@ jobs:
       - release-image-index
     if: >-
       !cancelled() &&
+      needs['release-metadata'].outputs.dry_run != 'true' &&
       needs['release-metadata'].result == 'success' &&
       needs['release-ci-success'].result == 'success' &&
       needs['release-image-index'].result == 'success' &&
@@ -771,7 +825,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs['release-metadata'].outputs.tag_name }}
+          ref: ${{ needs['release-metadata'].outputs.commit_sha }}
       - name: Login to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -809,6 +863,7 @@ jobs:
       - release-image-index-smoke
     if: >-
       !cancelled() &&
+      needs['release-metadata'].outputs.dry_run != 'true' &&
       needs['release-metadata'].result == 'success' &&
       needs['release-ci-success'].result == 'success' &&
       needs['release-image-index'].result == 'success' &&
@@ -830,7 +885,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs['release-metadata'].outputs.tag_name }}
+          ref: ${{ needs['release-metadata'].outputs.commit_sha }}
       - name: Login to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -845,13 +900,28 @@ jobs:
           INDEX_TAGS: ${{ needs['release-metadata'].outputs.version }} sha-${{ needs['release-metadata'].outputs.short_sha }}
           EXPECT_INDEX_DIGEST: ${{ needs['release-image-index'].outputs.digest }}
         run: bash ops/publish-image-index.sh
+      - name: Mirror the promoted index without changing its digest
+        run: |
+          set -euo pipefail
+          for tag in "$RELEASE_VERSION" "sha-$RELEASE_SHORT_SHA"; do
+            docker buildx imagetools create \
+              --tag "${MIRROR_IMAGE_NAME}:$tag" "${IMAGE_NAME}@${INDEX_DIGEST}"
+            actual="$(docker buildx imagetools inspect "${MIRROR_IMAGE_NAME}:$tag" \
+              --format '{{.Manifest.Digest}}')"
+            if [[ "$actual" != "$INDEX_DIGEST" ]]; then
+              echo "mirror $tag resolved to $actual, expected $INDEX_DIGEST" >&2
+              exit 1
+            fi
+          done
       # Pinned to the 2.x line for the same reason as the per-architecture lane:
       # the signature format consumers verify is part of the release contract.
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
           cosign-release: v2.5.2
       - name: Sign the index digest keylessly
-        run: cosign sign --yes "${IMAGE_NAME}@${INDEX_DIGEST}"
+        run: |
+          cosign sign --yes "${IMAGE_NAME}@${INDEX_DIGEST}"
+          cosign sign --yes "${MIRROR_IMAGE_NAME}@${INDEX_DIGEST}"
       # Provenance, signature, and platform assertions apply to the index; SBOM
       # attestations deliberately stay on the per-architecture children, since an
       # index has no filesystem and an "index SBOM" would be one child's document
@@ -863,10 +933,18 @@ jobs:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ needs['release-image-index'].outputs.digest }}
           push-to-registry: true
+      - name: Attest mirror index provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.MIRROR_IMAGE_NAME }}
+          subject-digest: ${{ needs['release-image-index'].outputs.digest }}
+          push-to-registry: true
       - name: Verify the index signature and attestations
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash ops/verify-image-evidence.sh "${IMAGE_NAME}@${INDEX_DIGEST}"
+        run: |
+          bash ops/verify-image-evidence.sh "${IMAGE_NAME}@${INDEX_DIGEST}"
+          bash ops/verify-image-evidence.sh "${MIRROR_IMAGE_NAME}@${INDEX_DIGEST}"
       - name: Attach the index digest to the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -901,52 +979,12 @@ jobs:
           test "${{ needs['release-ci-success'].result }}" = success
           test "${{ needs['release-binaries'].result }}" = success
           test "${{ needs['release-image'].result }}" = success
-          test "${{ needs['release-image-index'].result }}" = success
-          test "${{ needs['release-image-index-smoke'].result }}" = success
-          test "${{ needs['release-image-index-promote'].result }}" = success
-
-  # crates.io is the one irreversible lane: a published version can be yanked
-  # but never replaced or removed. So it runs last, only after the tagged
-  # commit's CI is green and every artifact lane has succeeded, and it is
-  # idempotent — a version already on the registry is skipped, which makes a
-  # re-dispatch of this workflow the resume path for a partial release
-  # (RELEASE.md, "Recovering a partial crates.io release").
-  release-crates:
-    name: crates.io publish
-    needs:
-      - release-metadata
-      - release-ci-success
-      - release-success
-    if: >-
-      !cancelled() &&
-      needs['release-metadata'].result == 'success' &&
-      needs['release-ci-success'].result == 'success' &&
-      needs['release-success'].result == 'success' &&
-      needs['release-metadata'].outputs.crates_publishable == 'true' &&
-      needs['release-metadata'].outputs.release_created == 'true'
-    # Serialize per tag so a re-dispatch cannot race the original run into a
-    # duplicate upload; never cancel, because a cancelled publish is the one
-    # that may have uploaded without recording it.
-    concurrency:
-      group: release-crates-${{ needs['release-metadata'].outputs.tag_name }}
-      cancel-in-progress: false
-    runs-on: ubuntu-latest
-    # Holds CARGO_REGISTRY_TOKEN, so the token is reachable only from this job
-    # and any environment protection rules apply before it is exposed.
-    environment: crates-io
-    permissions:
-      contents: read
-    env:
-      RELEASE_TAG: ${{ needs['release-metadata'].outputs.tag_name }}
-      RELEASE_VERSION: ${{ needs['release-metadata'].outputs.version }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs['release-metadata'].outputs.tag_name }}
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - name: Publish axond to crates.io
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: bash ops/publish-crates.sh "$RELEASE_VERSION"
+          if [[ "${{ needs['release-metadata'].outputs.dry_run }}" == true ]]; then
+            test "${{ needs['release-image-index'].result }}" = skipped
+            test "${{ needs['release-image-index-smoke'].result }}" = skipped
+            test "${{ needs['release-image-index-promote'].result }}" = skipped
+          else
+            test "${{ needs['release-image-index'].result }}" = success
+            test "${{ needs['release-image-index-smoke'].result }}" = success
+            test "${{ needs['release-image-index-promote'].result }}" = success
+          fi
