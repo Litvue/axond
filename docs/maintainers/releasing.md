@@ -2,7 +2,7 @@
 
 Axond uses release-please with Conventional Commit PR titles. Changes to Axond's
 source/build inputs on `main` update a release PR; merging that PR tags the release
-and runs the artifact pipeline. The automatic trigger covers `crates/`, the root
+and runs the artifact pipeline. The automatic trigger covers `ts/`, `crates/`, the root
 Cargo manifest and lockfile, `.cargo/`, `rust-toolchain.toml`, `Dockerfile`, and
 `release-please-config.json` / `.release-please-manifest.json`, so a release
 configuration change rebuilds the open release PR. Website, documentation, and
@@ -21,14 +21,18 @@ eligible. Existing-tag repair dispatches remain available.
    requested tag's commit, not the workflow definition's `main` commit.
 3. Require that resolved commit's exact `CI Success` aggregate before any
    archive, OCI, signing, attestation, release upload, or registry publication.
-4. Build six binary targets with checksums, SPDX SBOMs, and provenance/SBOM
-   attestations, each Linux archive booted through the Tier 0 gate on a runner
-   of its own architecture.
+4. Compile the TypeScript gateway with Node 22.14.0, npm dependencies, and Bun
+   1.4.4 on six native runners. Keep the existing Rust-triple archive names.
+   Smoke each archived binary with `ops/binary-smoke.py`; musl smoke runs in
+   Alpine with `libstdc++`/`libgcc`. Attach checksums, npm SBOMs, provenance/SBOM
+   attestations, and cosign 2.5.2 keyless `.sig`/`.pem` sidecars.
 5. Build and publish the `linux/amd64` and `linux/arm64` images, each on a native
-   runner, under their `<version>-<arch>` and `sha-<short>-<arch>` tags.
+   runner, from `ts/Dockerfile`, under `<version>-<arch>` and `sha-<short>-<arch>`
+   tags in both `ghcr.io/litvue/axond` and `ghcr.io/litvue/axond-typescript`.
+   The single build has the same digest under both names.
 6. Smoke each published single-platform image before signing it.
 7. Generate image SBOM/provenance attestations, sign the digest keylessly, and
-   verify signature plus attestations, per architecture.
+   verify signature plus attestations, per architecture and image name.
 8. Join the signed child digests into a multi-architecture index, staged under
    `sha-<short>-index`, and assert every descriptor in it is a supported platform
    child (or an attestation manifest for one).
@@ -41,19 +45,21 @@ eligible. Existing-tag repair dispatches remain available.
    attest its provenance, verify both, and attach it to the release as
    `axond-image-<version>.digest`. SBOM attestations and SPDX assets stay
    per-architecture, on the children.
-11. Require every artifact lane.
-12. Publish `axond` to crates.io.
+11. Copy the promoted primary index to `ghcr.io/litvue/axond-typescript` with
+   the same tags; fail unless every mirror tag resolves to the smoked digest.
+   Sign, attest provenance, and verify the mirror index too.
+12. Require every artifact lane.
 
-crates.io is last because a published version cannot be replaced. The publish
-script is idempotent: an existing aligned `axond` version is skipped.
-`gateway-core` and `gateway-transport` are unpublished workspace members; the
-uploaded tarball is a flatten of those sources into `axond`.
+crates.io no longer receives versions. **0.7.1 was the last Rust version**;
+existing versions are not yanked. Rust CI and Cargo.lock synchronization remain.
+The release-please manifest is the version source; JSONPath extra-files sync
+`ts/package.json` and both root lockfile version fields. TOML and generic
+extra-files keep Cargo.toml and `product-version.ts` synchronized too.
 
 ## Required GitHub configuration
 
 - Release Please GitHub App ID/private key, or the documented `GITHUB_TOKEN`
   fallback.
-- `CARGO_REGISTRY_TOKEN` in the protected `crates-io` environment.
 - Actions permission to create pull requests.
 - `CI Success` required on `main`.
 - Squash merge as the only merge method a pull request can use — see
@@ -71,8 +77,6 @@ uploaded tarball is a flatten of those sources into `axond`.
   stop the Action pins from being refreshed silently —
   [`ops/dependabot-labels.sh`](../../ops/dependabot-labels.sh) fails the
   `workflow-policy` lane instead.
-
-The crates.io token owner must have a verified email address.
 
 The `GITHUB_TOKEN` fallback can create the release PR only when organization or
 enterprise policy permits Actions-created pull requests. If that policy is
@@ -95,14 +99,14 @@ or policy; it will fail at the same PR-creation boundary.
 ## Normal release
 
 1. Ensure the release PR is current and green.
-2. Review version, changelog, Cargo metadata/lockfile, and release-managed docs
+2. Review the TS package/lockfile and embedded version, changelog, Cargo
+   metadata/lockfile, and release-managed docs
    version markers, and confirm the bump is the one
    [the classification rules](#version-classification) call for.
 3. Merge the release PR.
 4. Observe the tag/release workflow.
 5. Verify artifacts externally with `docs/installation.md`.
-6. Confirm [`axond`](https://crates.io/crates/axond) is visible and
-   `cargo install axond --locked` succeeds.
+6. Confirm both image names resolve to the same digest and carry evidence.
 
 ## Version classification
 
@@ -221,15 +225,14 @@ several minutes later inside a lane:
 
 | Path required at the tag | Why | Missing at the tag |
 | --- | --- | --- |
-| `Dockerfile`, `ops/docker-smoke.sh` | the image lane builds and smokes the published image from the tag | the dispatch fails in the preflight |
+| `ts/Dockerfile`, `ops/docker-smoke.sh` | the image lane builds and smokes the published image from the tag | the dispatch fails in the preflight |
 | `ops/binary-smoke.py` | each binary lane boots the binary it archived, before attestation, signing, and upload | the dispatch fails in the preflight |
 | `ops/publish-image-index.sh`, `ops/verify-image-evidence.sh` | the image lanes assemble the multi-architecture index from the per-platform child digests and verify the evidence attached to both | the dispatch fails in the preflight |
-| `ops/publish-crates.sh` | crates.io upload | the crates lane is skipped explicitly and the rest of the repair proceeds |
+| `ts/scripts/sign-artifact.sh` | keyless archive signing and verification | the dispatch fails in the preflight |
 
-The difference in the last row is deliberate: a skipped optional lane leaves the
-release incomplete but every published artifact still gated, while skipping a
-boot gate would attest and attach binaries nobody started — the property the
-`binary-smoke` lanes exist to hold. A gate is not allowed to degrade quietly.
+The tag must also contain `ts/package.json` with a `version` equal to the tag
+version. Rust-era tags, including v0.7.1, are refused by the current workflow.
+A missing smoke or signing gate never degrades quietly.
 
 ### Repairing a tag that predates a required path
 
@@ -261,21 +264,27 @@ dispatch: cut a release from `main` so the artifacts and the definition that
 produced them are the same reviewed tree. Do not retag, and do not publish
 artifacts from a mutated checkout.
 
-## Partial crates.io failure
+## Dry-run
 
-Identify whether `axond@<version>` is already present, fix the account/token or
-network issue, and re-dispatch the same tag. `ops/publish-crates.sh` skips an
-immutable version that is already on the registry.
+From any ref, build and smoke the commit without tag/release lookups:
 
-Never modify a packaged tarball at an existing version. If a published `axond`
-version is broken, yank it and ship a new patch release. Do not yank historical
-`gateway-core` / `gateway-transport` versions as part of this resume path.
+```bash
+gh workflow run .github/workflows/release-please.yml \
+  --repo Litvue/axond --ref <branch> -F dry_run=true
+```
+
+Version comes from `ts/package.json` at `GITHUB_SHA`. That commit must still
+pass `CI Success`. Binaries are compiled, smoked, and packaged; native images
+are built with `push=false`/`load=true` and smoked locally. Login, signing,
+attestations, release uploads, and all index jobs are skipped. A real repair
+requires `release_tag`.
 
 ## Public API compatibility
 
 The `api-compat` lane runs [`ops/api-compat.py`](../../ops/api-compat.py).
-crates.io publishes the `axond` binary only, so the published-library set is
-empty and the lane succeeds without calling `cargo-semver-checks`. The crate
+The historical crates.io product is the Rust binary only, so the
+published-library set is empty and the lane succeeds without calling
+`cargo-semver-checks`. The crate
 list comes from `cargo metadata`: a newly added published library crate is
 compared against crates.io with `cargo-semver-checks` (pinned in `ci.yml`)
 without touching the script. The script itself needs only `python3` 3.10 or
@@ -335,7 +344,7 @@ floor still builds.
 
 The policy behind this section is
 [ADR 0035](../adr/0035-pinned-github-actions.md). The release jobs can reach the
-release GitHub App token, `CARGO_REGISTRY_TOKEN`, and the keyless signing
+release GitHub App token and the keyless signing
 identity, so a third-party Action running there is as privileged as this runbook.
 `owner/action@v3` is a pointer the upstream owner can move, so every `uses:` in
 `.github/workflows` names a full commit SHA with the version in a trailing
@@ -479,9 +488,8 @@ on its own so the advisory maps to one version.
 
 ## Verification
 
-```bash
-cargo install axond --version <version> --locked
-```
-
-Also verify release checksums, GitHub attestations, the public OCI pull, cosign
-identity, image provenance, and the release evidence assets.
+Use the `cosign verify-blob` command in
+[Installation and verification](../installation.md#prebuilt-release-binary) for
+archive `.sig`/`.pem` signatures. Verify release checksums, GitHub attestations,
+the public OCI pull, cosign identity, image provenance, and the release evidence
+assets. On Alpine, musl archives require `apk add --no-cache libstdc++ libgcc`.

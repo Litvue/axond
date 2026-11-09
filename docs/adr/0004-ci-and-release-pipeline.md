@@ -6,6 +6,10 @@ Date: 2026-08-04
 
 Accepted
 
+The release product is now the TypeScript gateway per
+[ADR 0069](./0069-retire-the-rust-gateway.md); crates.io publication ended after 0.7.1.
+Rust CI remains a conformance lane.
+
 ## Context
 
 Axond is developed as a public open-source project under the Litvue org and is
@@ -34,8 +38,7 @@ of force-pushing.
 
 **CI is one job per concern** (`fmt`, `clippy`, `build`, `tests`,
 `stateful-tests`, `docs`, `dependency-policy`, `static-binary`, `binary-smoke`,
-`docker-smoke`, and `publish-dry-run` per
-[ADR 0025](./0025-crates-io-publication.md))
+and `docker-smoke`)
 behind a single required `CI-Success` gate. The hermetic `tests` lane remains
 service-free; `stateful-tests` runs the gated Redis/Postgres tests in pinned
 service containers with `AXOND_TEST_REQUIRE_SERVICES=1`, so a missing service
@@ -115,7 +118,7 @@ Pushes to `main`, `v*` tags, and `merge_group` events run that subset plus the
 full artifact bar: static musl, every published binary target's smoke,
 Docker and Compose smokes, the three-node rollout, OpenAPI and TypeScript SDK
 compatibility, release fault qualification and fresh evidence checks,
-crates.io packaging, cosign format, MSRV, build, public API compatibility,
+cosign format, MSRV, build, public API compatibility,
 and Rust documentation. Dependency policy always runs on these events.
 Manual runs use the same bar, with the existing explicit opt-in for legacy
 Postgres overlay drills.

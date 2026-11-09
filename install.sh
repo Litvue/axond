@@ -41,12 +41,24 @@ printf '%s\n' "$version" | grep -Eq \
 if [ -z "$target" ]; then
   os="$(uname -s)"
   arch="$(uname -m)"
+  libc=gnu
+  if [ "$os" = Linux ]; then
+    for loader in /lib/ld-musl-*.so.1; do
+      if [ -f "$loader" ]; then
+        libc=musl
+        break
+      fi
+    done
+    if ldd --version 2>&1 | grep -qi musl; then
+      libc=musl
+    fi
+  fi
   case "$os/$arch" in
     Linux/x86_64|Linux/amd64)
-      target="x86_64-unknown-linux-musl"
+      target="x86_64-unknown-linux-$libc"
       ;;
     Linux/aarch64|Linux/arm64)
-      target="aarch64-unknown-linux-musl"
+      target="aarch64-unknown-linux-$libc"
       ;;
     Darwin/arm64|Darwin/aarch64)
       target="aarch64-apple-darwin"

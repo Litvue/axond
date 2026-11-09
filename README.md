@@ -1,7 +1,6 @@
 # Axond
 
 [![CI](https://github.com/Litvue/axond/actions/workflows/ci.yml/badge.svg)](https://github.com/Litvue/axond/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/axond.svg)](https://crates.io/crates/axond)
 [![docs.rs](https://docs.rs/axond/badge.svg)](https://docs.rs/axond)
 [![release](https://img.shields.io/github/v/release/Litvue/axond)](https://github.com/Litvue/axond/releases/latest)
 [![license](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](#license)
@@ -26,7 +25,7 @@ credentials, usage metering, period budgets, and telemetry.
 | Inbound identity | Exactly one deployment-wide static gateway key for `/api/v1` and `/ns/...`. Minted `axt1.` tokens are `401`. |
 | Controls | Store-backed per-namespace period budgets; credential-pool rotation; per-replica admission. |
 | Operations | Required SQLite or Postgres Store, JSON logs, OTLP traces/metrics/logs, optional usage sinks. |
-| Distribution | crates.io packages, checksummed and attested release binaries, and public keyless-signed, attested OCI images. |
+| Distribution | TypeScript gateway release binaries and OCI images, checksummed, keyless-signed, and attested. |
 
 Axond is passthrough-first: it rewrites only `model`, then forwards the caller's
 native wire. It does not translate OpenAI payloads into Anthropic payloads or
@@ -108,18 +107,17 @@ inspect either script first if your policy forbids piped installers.
 Other distribution paths:
 
 ```bash
-# Cargo installs from source and compiles locally by design.
-cargo install axond --locked
-
 # Pull the current release image. There is intentionally no `latest` tag.
 AXOND_VERSION=0.7.1 # x-release-please-version
 docker pull "ghcr.io/litvue/axond:${AXOND_VERSION}"
 ```
 
-Checksummed, attested prebuilt archives are published for Linux (`x86_64` and `aarch64`, GNU and
-static musl each), macOS (`aarch64`), and Windows (`x86_64`). The OCI image is a
+Keyless-signed, checksummed, attested TypeScript gateway archives are published for Linux (`x86_64` and `aarch64`, GNU and
+musl each), macOS (`aarch64`), and Windows (`x86_64`). The OCI image is a
 multi-architecture index covering `linux/amd64` and `linux/arm64`, so one pinned
-digest deploys on either architecture. Production deployments should verify the
+digest deploys on either architecture. The same digest is mirrored at
+`ghcr.io/litvue/axond-typescript`. Musl archives need `libstdc++`/`libgcc` on
+Alpine (`apk add --no-cache libstdc++ libgcc`). Production deployments should verify the
 attestations and pin an image digest. See
 [Installation and verification](./docs/installation.md).
 
@@ -186,8 +184,8 @@ and [ADR 0063](./docs/adr/0063-stateful-only-namespaced-gateway.md).
 - Release binaries carry checksums plus provenance and SBOM attestations; the
   per-architecture images add SBOM attestations, and every published manifest
   (children and the multi-architecture index) is signed keylessly, attested for
-  provenance, and verified in the release workflow. Archives are not
-  cosign-signed.
+  provenance, and verified in the release workflow. Archives also carry keyless
+  cosign `.sig`/`.pem` sidecars; see the verification commands below.
 
 Read the [deployment security model](./docs/security/deployment-model.md) and
 latest [security review](./docs/security-review-2026-08-05.md).
@@ -234,7 +232,7 @@ guidance.
 ## TypeScript port
 
 A Hono gateway in [`ts/`](./ts) runs the same compat lanes via
-`AXOND_BIN=ts/bin/axond`. It is not the release binary yet. The extension
+`AXOND_BIN=ts/bin/axond`. It is the release binary. The extension
 contract and the decision to keep the Rust tree as the conformance oracle are
 [ADR 0066](./docs/adr/0066-typescript-hono-extension-contract.md). Operators
 follow [the TypeScript notes](./docs/typescript.md).
@@ -244,8 +242,9 @@ follow [the TypeScript notes](./docs/typescript.md).
 Release-please maintains the changelog and workspace version. A release builds
 six binary targets, publishes the `linux/amd64` and `linux/arm64` images plus the
 multi-architecture index they form — booted on both architectures before it takes
-the `<version>` tag — signs and attests artifacts, and publishes the `axond`
-binary crate to crates.io. Maintainer procedures are in the
+the `<version>` tag — and signs and attests artifacts. crates.io no longer
+receives versions: 0.7.1 was the last Rust release; existing versions are not
+yanked. Maintainer procedures are in the
 [release runbook](./docs/maintainers/releasing.md).
 
 ## License
