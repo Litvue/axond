@@ -21,6 +21,56 @@ command -v python3 >/dev/null 2>&1 || {
   exit 1
 }
 
+mkdir -p "$work/mock-bin" "$work/lib"
+cat >"$work/mock-bin/uname" <<'SH'
+#!/bin/sh
+case "$1" in
+  -s) printf '%s\n' "$TEST_OS" ;;
+  -m) printf '%s\n' "$TEST_ARCH" ;;
+  *) exit 1 ;;
+esac
+SH
+cat >"$work/mock-bin/ldd" <<'SH'
+#!/bin/sh
+printf '%s\n' "$TEST_LDD" >&2
+exit 1
+SH
+chmod +x "$work/mock-bin/uname" "$work/mock-bin/ldd"
+sed "s#/lib/ld-musl-\*\.so\.1#$work/lib/ld-musl-*.so.1#" "$root/install.sh" >"$work/detect.sh"
+grep -qF "$work/lib/ld-musl-*.so.1" "$work/detect.sh"
+
+expect_target() {
+  local os="$1" arch="$2" banner="$3" expected="$4" override="${5-}" output
+  output="$(PATH="$work/mock-bin:$PATH" TEST_OS="$os" TEST_ARCH="$arch" TEST_LDD="$banner" \
+    AXOND_VERSION=0.0.0 AXOND_TARGET="$override" AXOND_INSTALL_DRY_RUN=1 \
+    sh "$work/detect.sh")"
+  if ! printf '%s\n' "$output" | grep -qxF "target=$expected"; then
+    printf 'installer target check failed: %s/%s expected %s\n%s\n' "$os" "$arch" "$expected" "$output" >&2
+    exit 1
+  fi
+  echo "installer target check: $os/$arch -> $expected"
+}
+
+for arch in x86_64 aarch64; do
+  expect_target Linux "$arch" 'ldd (GNU libc) 2.39' "$arch-unknown-linux-gnu"
+  expect_target Linux "$arch" 'musl libc (Linux)' "$arch-unknown-linux-musl"
+  expect_target Linux "$arch" '' "$arch-unknown-linux-gnu"
+done
+touch "$work/lib/ld-musl-test.so.1"
+expect_target Linux x86_64 '' x86_64-unknown-linux-musl
+expect_target Linux aarch64 '' aarch64-unknown-linux-musl
+expect_target Linux x86_64 'musl libc' x86_64-unknown-linux-gnu x86_64-unknown-linux-gnu
+rm "$work/lib/ld-musl-test.so.1"
+expect_target Linux aarch64 'GNU libc' aarch64-unknown-linux-musl aarch64-unknown-linux-musl
+expect_target Darwin arm64 '' aarch64-apple-darwin
+if PATH="$work/mock-bin:$PATH" TEST_OS=Linux TEST_ARCH=unsupported TEST_LDD='' \
+  AXOND_VERSION=0.0.0 AXOND_TARGET='' AXOND_INSTALL_DRY_RUN=1 sh "$work/detect.sh" >"$work/error" 2>&1; then
+  echo 'installer target check failed: unsupported architecture was accepted' >&2
+  exit 1
+fi
+grep -qF 'no prebuilt binary for Linux/unsupported' "$work/error"
+echo 'installer target check: unsupported architecture refused'
+
 cat >"$work/server.py" <<'PY'
 import http.server
 import socket

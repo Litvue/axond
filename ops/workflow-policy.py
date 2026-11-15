@@ -3,8 +3,8 @@
 
 A workflow step that resolves a tag or a branch at run time runs whatever the
 upstream owner has pushed there. `actions/checkout@v7` is a moving pointer, and
-the actions in this repository can read the release GitHub App token, the
-crates.io token, and the release signing identity. So every step is pinned to a
+the actions in this repository can read the release GitHub App token and the
+release signing identity. So every step is pinned to a
 full commit SHA, with the human-readable version kept in a trailing comment, and
 this gate is what keeps a new mutable ref from being merged.
 
@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import re
+import runpy
 import sys
 import tempfile
 from pathlib import Path
@@ -246,7 +247,7 @@ def check_musl_installer(text: str, relative: str) -> list[str]:
     """Every Linux-musl lane uses the same bounded package-manager path."""
     expected_steps = {
         ".github/workflows/ci.yml": 2,
-        ".github/workflows/release-please.yml": 1,
+        ".github/workflows/release-please.yml": 0,
     }
 
     lines = text.splitlines()
@@ -433,6 +434,9 @@ def check(root: Path) -> list[str]:
     # RELEASE.md, which turns on the repository-specific transition contract.
     if (root / "RELEASE.md").is_file():
         failures.extend(check_actions_endurance_budget(root))
+        release = runpy.run_path(str(Path(__file__).with_name("check-release-config.py")))
+        failures.extend(release["check_ts_release"]((root / ".github/workflows/release-please.yml").read_text()))
+        failures.extend(release["check_product_versions"](root))
     return failures
 
 
@@ -621,21 +625,12 @@ def self_test() -> list[str]:
         "        timeout-minutes: 25\n"
         "        run: bash ops/install-musl-tools.sh\n"
     )
-    good_release_musl = (
-        "jobs:\n"
-        "  release:\n"
-        "    steps:\n"
-        "      - name: Install musl tools\n"
-        "        if: matrix.musl\n"
-        "        timeout-minutes: 25\n"
-        "        run: bash ops/install-musl-tools.sh\n"
-    )
     musl_cases = [
         ("shared bounded CI installers", ".github/workflows/ci.yml", good_musl, ""),
         (
-            "a shared bounded release installer",
+            "a TS release without Rust musl installation",
             ".github/workflows/release-please.yml",
-            good_release_musl,
+            "jobs:\n  release:\n    steps:\n",
             "",
         ),
         (
@@ -667,10 +662,10 @@ def self_test() -> list[str]:
             "found 1",
         ),
         (
-            "a missing release musl lane",
+            "an obsolete release Rust musl installer",
             ".github/workflows/release-please.yml",
-            "jobs:\n  release:\n    steps:\n",
-            "found 0",
+            good_musl,
+            "found 2",
         ),
         (
             "an inline install in another workflow",
@@ -807,6 +802,8 @@ def self_test() -> list[str]:
                 "self-test: a script outside KEY_VERIFY_FILES exempted itself by "
                 "generating a key pair"
             )
+    release = runpy.run_path(str(Path(__file__).with_name("check-release-config.py")))
+    release["ts_release_self_test"]()
     return problems
 
 

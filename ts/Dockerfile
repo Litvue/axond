@@ -1,4 +1,4 @@
-# TypeScript gateway image. The Rust Dockerfile remains the Rust release artifact.
+# TypeScript gateway release image; the root Dockerfile is the Rust CI oracle.
 FROM node:22.14-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./

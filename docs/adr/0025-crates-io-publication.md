@@ -4,13 +4,15 @@ Date: 2026-08-11
 
 ## Status
 
-Accepted historically.
+Superseded by [ADR 0069](./0069-retire-the-rust-gateway.md). crates.io no longer receives
+versions: 0.7.1 was the last Rust release, and existing versions are not yanked.
+The publication scripts and CI packaging lane described below are historical
+and have been removed.
 
 Superseded in part on 2026-09-04: crates.io ships **only** the `axond` binary
 crate. `gateway-core` and `gateway-transport` remain unpublished workspace
 members. Historical versions already on the registry are not yanked. The rest of
-this record — duplicated shipped DDL, an idempotent publish script, a packaging
-dry-run in CI, publish-last-because-immutable — still holds for that one crate.
+this record describes the former Rust publication pipeline.
 
 Supersedes the supply-chain wildcard rule and extends the release-artifact list
 of [ADR 0004](./0004-ci-and-release-pipeline.md).

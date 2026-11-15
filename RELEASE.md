@@ -10,9 +10,9 @@ evidence and known limitations; the reusable process lives in the
 | --- | --- | --- |
 | Required routes, failover, credential pools, identity, controls, telemetry, and durable usage are implemented | Met | Compatibility contract, ADRs, unit/integration tests, SDK compatibility, Store tests, Tier 0 gate, and stream soak. |
 | Public source repository | Met | `https://github.com/Litvue/axond`. |
-| Cross-platform release archives | Met | The [latest GitHub release](https://github.com/Litvue/axond/releases/latest) contains Linux x86-64 and ARM64 GNU/musl, Apple Silicon macOS, and Windows archives, checksums, SBOMs, and provenance. |
-| Public OCI image | Met | The versioned `ghcr.io/litvue/axond` image for each release is public, published as a `linux/amd64` + `linux/arm64` index, smoke-tested per architecture, signed keylessly, and attested: provenance on every manifest including the index, SBOM on the per-architecture children. |
-| crates.io package | Met | [`axond`](https://crates.io/crates/axond) is published as the gateway binary. `gateway-core` and `gateway-transport` stay unpublished workspace members. |
+| Cross-platform release archives | Met | The [latest GitHub release](https://github.com/Litvue/axond/releases/latest) contains Linux x86-64 and ARM64 GNU/musl, Apple Silicon macOS, and Windows archives, checksums, SBOMs, keyless `.sig`/`.pem` signatures, and provenance. |
+| Public OCI image | Met | The TypeScript gateway image at `ghcr.io/litvue/axond`, mirrored with the same digest to `ghcr.io/litvue/axond-typescript`, for each release is public, published as a `linux/amd64` + `linux/arm64` index, smoke-tested per architecture, signed keylessly, and attested: provenance on every manifest including the index, SBOM on the per-architecture children. |
+| Historical crates.io package | Retained | 0.7.1 was the last Rust version. crates.io no longer receives versions; existing versions are not yanked. |
 | Deployment/configuration/operator documentation | Met | Task-oriented documentation index, executable examples, references, and runbooks under `docs/`. |
 
 Current artifacts and workflow evidence are available from the
@@ -21,26 +21,26 @@ Current artifacts and workflow evidence are available from the
 
 ## Verify as an adopter
 
-```bash
-cargo install axond --locked
-```
+Release artifacts contain the Bun-compiled TypeScript gateway.
 
 Verify binaries and the OCI image with the commands in
 [Installation and verification](./docs/installation.md).
 
 The release workflow builds every artifact from the immutable tag, requires the
 tagged commit's `CI Success`, smoke-tests the published image before signing,
-and publishes crates.io last because registry versions are immutable.
+and never publishes to crates.io.
 
 ## Known limitations
 
 - Released platforms are the ones in
   [the supported platform matrix](./docs/compatibility.md#supported-platforms):
-  Linux x86-64 and ARM64 (glibc and static musl), Apple Silicon macOS, and
+  Linux x86-64 and ARM64 (glibc and musl), Apple Silicon macOS, and
   Windows x86-64, with `linux/amd64` and `linux/arm64` images. Other platforms
   build from source.
-- Release archives are verified by checksum and GitHub attestation; keyless
-  cosign signatures cover the published image manifests only.
+- Musl archives are not static; Alpine requires `libstdc++`/`libgcc`
+  (`apk add --no-cache libstdc++ libgcc`).
+- Release archives carry keyless cosign signatures; verify with the
+  `cosign verify-blob` command in the installation guide.
 - `/readyz` reports a serving, boot-validated process; it does not continuously
   probe providers or the Store.
 - Cross-provider request translation is intentionally not supported. OpenAI and
@@ -74,7 +74,6 @@ The required pull-request CI aggregate covers:
   and endurance coverage;
 - provider SDK compatibility;
 - dependency and license policy;
-- crates.io package/publish dry runs;
 - static musl build and SQLite boot-and-serve gate;
 - a boot-and-serve smoke of every released binary target, on a runner of that
   target's own platform;
@@ -87,7 +86,7 @@ with the tier matrix (ADR 0063 / #427). Request-path qualification is SQLite +
 Release jobs add archive/image SBOMs, provenance attestations, cosign signing,
 native per-architecture archive smoke — the same binary smoke against the exact
 archived binary, on a runner of that archive's own platform — published-image
-smoke, multi-architecture index platform assertions, and crates.io upload.
+smoke, and multi-architecture index platform assertions.
 Repairing an existing tag runs those gates against that tag's artifacts; which
 paths the tag must contain, and how to repair a tag that predates one of them,
 are in the

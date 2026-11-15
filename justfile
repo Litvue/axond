@@ -4,8 +4,8 @@ default:
     @just --list
 
 # Format, lint (warnings = errors), test, fuzz smoke, docs, supply-chain, and
-# release packaging — the CI gates.
-check: fmt-check clippy fuzz-seam-clippy test fuzz-smoke docs deny publish-dry-run msrv api-compat workflow-policy deploy-check
+# workflow policy — the CI gates.
+check: fmt-check clippy fuzz-seam-clippy test fuzz-smoke docs deny msrv api-compat workflow-policy deploy-check
 
 # `fuzz/` is a separate workspace, so `--all` and `--workspace` do not reach it.
 fmt:
@@ -59,7 +59,6 @@ docs-check: ops-venv
     python3 ops/check-release-config.py
     python3 ops/qualification-evidence.py --self-test
     python3 ops/promote-qualification.py --self-test
-    python3 ops/stage-axond-crate.py --self-test
     sh -n install.sh
     bash -n ops/publish-image-index.sh
     bash -n ops/verify-image-evidence.sh
@@ -143,12 +142,6 @@ actionlint:
 # Supply-chain policy: advisories, licenses, sources (see deny.toml).
 deny:
     cargo deny --locked --all-features check
-
-# Package and publish-dry-run the flattened axond crate. No upload, no token;
-# the real publish only ever runs from the tagged release workflow. Internals
-# stay unpublished workspace members.
-publish-dry-run:
-    ops/publish-crates.sh --dry-run
 
 # Provider-SDK compatibility: the vendors' own Python SDKs against a real
 # axond and the committed fixtures. Offline; needs python3.
