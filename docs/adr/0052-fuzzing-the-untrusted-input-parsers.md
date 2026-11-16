@@ -4,6 +4,8 @@ Date: 2026-08-12
 
 ## Status
 
+Superseded by [ADR 0069](./0069-retire-the-rust-gateway.md); the Rust gate was removed.
+
 Accepted
 
 ## Context

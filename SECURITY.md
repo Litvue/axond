@@ -47,7 +47,7 @@ Findings that require an already-compromised trust boundary the
 trusted — for example an operator who can read the process environment, or a
 holder of a static `[[gateway_key]]` acting within its own namespace. Missing
 hardening with no demonstrated impact, dependency advisories with no reachable
-path (the [dependency policy](./deny.toml) lane tracks those in the open), and
+path (the [npm policy](./ts/scripts/check-npm-policy.ts) tracks those in the open), and
 volumetric denial of service against your own deployment are handled as ordinary
 issues. Report it privately anyway if you are unsure; triage is our job, not
 yours.
@@ -119,9 +119,7 @@ to be.
 4. A backport to the previous supported minor when that release is affected.
 5. Publication of the GitHub Security Advisory with a CVE requested through
    GitHub, the affected and fixed version ranges, and the workaround if one
-   exists. `RUSTSEC` coordination for the published `axond` crate happens here
-   too, so `cargo audit` and the repository's
-   [dependency policy](./.github/workflows/dependency-audit.yml) lane see it.
+   exists. Current dependency advisories are tracked by npm audit and the TS npm policy.
 6. A `CHANGELOG.md` entry referencing the advisory, and any configuration
    change the fix requires documented in the
    [compatibility contract](./docs/compatibility.md).
@@ -136,8 +134,8 @@ Prevention is documented separately, and is the more useful read if you are
 deploying rather than reporting: the
 [deployment security model](./docs/security/deployment-model.md) for trust
 boundaries, the [production checklist](./docs/deployment/production-checklist.md)
-before going live, the [fuzzing](./docs/security/fuzzing.md) for what
-the config, token, and query parsers are continuously tested against, and the
+before going live, the [retired fuzzing record](./docs/security/fuzzing.md) for
+historical parser coverage and the TS fuzzing open question, and the
 [security review](./docs/security-review-2026-08-05.md) for the reviewed
 baseline.
 

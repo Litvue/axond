@@ -1,8 +1,9 @@
 # TypeScript gateway
 
-The supported operator artifact is still the Rust binary described in the
-[README](../README.md). This page is the TypeScript port tracked by
-[ADR 0066](./adr/0066-typescript-hono-extension-contract.md).
+TypeScript is the sole gateway implementation and release path under
+[ADR 0069](./adr/0069-retire-the-rust-gateway.md).
+[ADR 0066](./adr/0066-typescript-hono-extension-contract.md) defines embedding
+and the extension contract.
 
 ## Run the Node process
 
@@ -15,7 +16,7 @@ export GW_INBOUND_KEY=...
 ```
 
 `./bin/axond --version` prints `axond` and the workspace version from
-`Cargo.toml`. `--help` and `-h` print the same help text as the Rust binary.
+`ts/package.json`. `--help` and `-h` print usage help.
 Both finish before the config file is opened. Any other argument, including
 `mint`, `keygen`, `revoke`, `check`, `migrate`, `admin`, and `budget`, exits 2
 and does not boot.
@@ -29,7 +30,7 @@ is not TOML uses the `config load:` prefix. Other boot failures use the same
 
 SQLite `:memory:` is refused, including with surrounding whitespace. A SQLite
 file that sets `dsn_env`, or a Postgres file that sets `path`, fails boot with
-the Rust sentence. `[storage.usage_index]` uses the same bounds: `buffer_capacity`
+the established validation message. `[storage.usage_index]` uses the same bounds: `buffer_capacity`
 at least 1 and at most Tokio's permit limit, `max_batch` at least 1, at most
 4096, and no greater than the buffer, and `flush_interval_ms` at most 24h.
 `0` is a legal flush interval. A float, a negative, or a string in that table
@@ -42,18 +43,18 @@ with `Error: store: store unavailable: env \`…\` is unset or empty`.
 
 A credential or gateway key that names an unknown namespace or provider, a
 duplicate credential id, a weight of 0, an empty `env`, or both `env` and
-`file` on one gateway key is `invalid config` with the Rust sentence. That
+`file` on one gateway key is `invalid config` with the established validation message. That
 check runs before the store opens. An unset credential env, or a gateway key
 file that is missing, empty, a directory, or not UTF-8, is
 `Error: config resolution failed: …` after the store is open. The file error
-uses Rust's `entity not found`, `is a directory`, and `not valid UTF-8`
+uses `entity not found`, `is a directory`, and `not valid UTF-8`
 wording. A price row that names an unknown provider, and
 `failover.failure_threshold = 0`, are reported before a bad credential.
 
-An enabled `[catalog]` uses the Rust bounds. `source = "models-dev"` with no
+An enabled `[catalog]` validates catalogue bounds. `source = "models-dev"` with no
 `source_url` fetches `https://models.dev/catalog.json`. A plaintext URL, a URL
 with embedded credentials, a hostless URL, and any document other than
-`/catalog.json` fails boot with the Rust sentence, and the credential is not
+`/catalog.json` fails boot with the established validation message, and the credential is not
 echoed. `source = "seed"` rejects `source_url`. A zero refresh interval, a
 timeout above the interval, and a retry ceiling above the interval fail boot.
 `discovery.refresh_interval_seconds = 0` is reported before those catalogue
@@ -235,7 +236,7 @@ newline keeps the escape diagram on that line. `café = 1` is
 `a€` uses three carets and `a😀` uses four. `n = café` stays one
 caret, on `c`.
 
-`axond.toml` is the same file the Rust binary reads. Withdrawn sections still
+`axond.toml` retains the historical configuration format. Withdrawn sections still
 fail the boot. Point `AXOND_EXTENSIONS_DIR`, or `[extensions] dir`, at a
 directory of `.ts`, `.js`, or `.mjs` files. Each file's default export is an
 extension with `apiVersion: 1`. Restart the process to pick up a new file; do
@@ -417,8 +418,7 @@ if (seen.join(",") !== "hello,next") {
 ## Container
 
 `ts/Dockerfile` builds a Bun-compiled `/axond` binary on the distroless Debian
-12 non-root image. The image exposes port 8080; the repository-root
-`Dockerfile` stays the Rust release image. See the
+12 non-root image. The image exposes port 8080 and is the release image. See the
 [Litvue dev-config migration notes](./migration-typescript.md#running-on-litvues-dev-config-563)
 for publishing and boot instructions.
 
@@ -471,11 +471,10 @@ Extension migrations apply once on either store:
 a recorded id is skipped, and a failed statement names that id without the
 driver text. The two extra namespace columns
 `allow_platform_fallback` and `from_config` are applied by the TypeScript
-process, including on a namespace table the Rust binary already created.
-They are not in the Rust `ops/postgres` scripts. Catalogue refusal
+process, including on a namespace table created by a historical Rust release.
+Store provisioning and embedded usage DDL are maintained for TypeScript under `ops/postgres/`. Catalogue refusal
 counts live in `axond_catalog_streak`. Namespace create, delete, and budget
-writes lock `axond_namespace_lock`. The Rust process does not read those
-objects.
+writes lock `axond_namespace_lock`. These objects belong to the TypeScript store.
 
-Operators moving a process between the two binaries should follow the
+Operators upgrading from a historical Rust release should follow the
 [migration guide](./migration-typescript.md).

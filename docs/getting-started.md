@@ -141,16 +141,16 @@ docker compose \
   up -d --build
 ```
 
-Or build the Rust binary directly:
+Or run the TypeScript gateway directly (Node 22.14.0):
 
 ```bash
-cargo build -p axond --locked
+(cd ts && npm ci)
 AXOND_CONFIG=ops/compose/axond.quickstart.toml \
 GW_PLATFORM_OPENAI_API_KEY=placeholder-openai-key \
 GW_PLATFORM_ANTHROPIC_API_KEY=placeholder-anthropic-key \
 GW_ACME_OPENAI_API_KEY=placeholder-acme-openai-key \
 GW_INBOUND_PLATFORM_KEY=quickstart-platform-key \
-  target/debug/axond
+  ts/bin/axond
 ```
 
 Next, choose an [installation path](./installation.md), connect an

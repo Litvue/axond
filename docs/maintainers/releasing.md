@@ -2,9 +2,8 @@
 
 Axond uses release-please with Conventional Commit PR titles. Changes to Axond's
 source/build inputs on `main` update a release PR; merging that PR tags the release
-and runs the artifact pipeline. The automatic trigger covers `ts/`, `crates/`, the root
-Cargo manifest and lockfile, `.cargo/`, `rust-toolchain.toml`, `Dockerfile`, and
-`release-please-config.json` / `.release-please-manifest.json`, so a release
+and runs the artifact pipeline. The automatic trigger covers `ts/`,
+`release-please-config.json` and `.release-please-manifest.json`, so a release
 configuration change rebuilds the open release PR. Website, documentation, and
 CI-only pushes do not start release maintenance.
 
@@ -50,11 +49,10 @@ eligible. Existing-tag repair dispatches remain available.
    Sign, attest provenance, and verify the mirror index too.
 12. Require every artifact lane.
 
-crates.io no longer receives versions. **0.7.1 was the last Rust version**;
-existing versions are not yanked. Rust CI and Cargo.lock synchronization remain.
-The release-please manifest is the version source; JSONPath extra-files sync
-`ts/package.json` and both root lockfile version fields. TOML and generic
-extra-files keep Cargo.toml and `product-version.ts` synchronized too.
+The Rust tree and its release synchronization were removed under
+[ADR 0069](../adr/0069-retire-the-rust-gateway.md).
+The release-please manifest is the version source. Extra-files synchronize the
+TS package/lockfile, `product-version.ts` and release-managed documentation.
 
 ## Required GitHub configuration
 
@@ -81,7 +79,7 @@ extra-files keep Cargo.toml and `product-version.ts` synchronized too.
 The `GITHUB_TOKEN` fallback can create the release PR only when organization or
 enterprise policy permits Actions-created pull requests. If that policy is
 disabled, use the GitHub App path for full automation. The workflow still
-updates the conventional release branch and synchronizes `Cargo.lock` after a
+updates the conventional release branch after a
 denied PR creation, so a maintainer can open the prepared branch manually:
 
 ```bash
@@ -99,8 +97,7 @@ or policy; it will fail at the same PR-creation boundary.
 ## Normal release
 
 1. Ensure the release PR is current and green.
-2. Review the TS package/lockfile and embedded version, changelog, Cargo
-   metadata/lockfile, and release-managed docs
+2. Review the TS package/lockfile and embedded version, changelog, and release-managed docs
    version markers, and confirm the bump is the one
    [the classification rules](#version-classification) call for.
 3. Merge the release PR.
@@ -125,25 +122,11 @@ all, which is not a classification to audit but an absence of one.
 
 A feature riding in a patch is therefore the configured behaviour, not a
 misclassification: `0.x` gives a patch no compatibility promise a minor keeps, so
-the distinction that matters is the one
-[`CONTRIBUTING.md`](../../CONTRIBUTING.md) names — a **public API break or an MSRV
-raise is a minor**, and both reach that bump through a breaking commit title, not
-by editing the version in the release PR.
-
-So a release PR is correctly classified when, for the commits it rolls up:
-
-- the `api-compat` lane passed on it — today that is an empty published-library
-  set, because `axond` has no public Rust API; a newly publishable library crate
-  would be compared against crates.io here;
-- [`ops/api-compat-overrides.toml`](../../ops/api-compat-overrides.toml) has no
-  entry for that baseline, since an entry means a reviewed break, which is a
-  minor;
-- `rust-version` is unchanged and the `msrv` lane passed.
-
-When a break or an MSRV raise did land without a breaking commit title, the fix
-is a new commit on `main` that carries one — release-please then recomputes the
-version. Do not hand-edit the version in the release PR: the next push
-regenerates it.
+the distinction that matters is a documented public contract break: it is a
+minor, carried by a breaking commit title. Review HTTP, configuration and
+telemetry changes against the compatibility contract. If a break landed without
+that title, add a correcting breaking commit on `main`; do not hand-edit the
+version in the release PR, which release-please regenerates.
 
 ### Duplicated changelog entries
 
@@ -279,66 +262,11 @@ are built with `push=false`/`load=true` and smoked locally. Login, signing,
 attestations, release uploads, and all index jobs are skipped. A real repair
 requires `release_tag`.
 
-## Public API compatibility
+## Implementation compatibility
 
-The `api-compat` lane runs [`ops/api-compat.py`](../../ops/api-compat.py).
-The historical crates.io product is the Rust binary only, so the
-published-library set is empty and the lane succeeds without calling
-`cargo-semver-checks`. The crate
-list comes from `cargo metadata`: a newly added published library crate is
-compared against crates.io with `cargo-semver-checks` (pinned in `ci.yml`)
-without touching the script. The script itself needs only `python3` 3.10 or
-newer — the same floor as the provider-SDK lockfile — which CI proves with
-`ops/api-compat.py --self-test` on 3.10.
-
-Run it before pushing a change that would publish a library crate:
-
-```bash
-just api-compat
-```
-
-When the break is unintended, fix the API. When it is intended:
-
-1. Confirm the break is worth it against
-   [`docs/compatibility.md`](../compatibility.md#the-published-rust-api) — pre-1.0,
-   a break is a **minor** bump, so it cannot ride in a patch.
-2. Add one entry to
-   [`ops/api-compat-overrides.toml`](../../ops/api-compat-overrides.toml) with the
-   crate, the published `baseline` exactly as the gate reports it, the
-   justification, and `reviewed_in` pointing at this pull request or an ADR.
-   Reviewers are approving that entry, not a switch.
-3. Use a `feat!:`/`fix!:` (breaking) Conventional Commit title so release-please
-   takes the minor bump, and describe the migration in the changelog body.
-4. After the release, delete the entry — the gate prints that it no longer
-   applies, because the break is now part of the baseline. An override only ever
-   matches the one baseline it names, so a forgotten entry cannot mask the next
-   break.
-
-If the lane fails without reaching a comparison (no registry access, a build
-error, a crate that has never been published), it reports that instead of a
-break; fix the invocation rather than adding an override.
-
-## Rust version floor
-
-The MSRV is `rust-version` in `[workspace.package]`, and the `msrv` lane runs
-[`ops/msrv-gate.sh`](../../ops/msrv-gate.sh): it builds the workspace on the
-first patch of that minor and refuses drift between `Cargo.toml`,
-`rust-toolchain.toml`, the `Dockerfile`, and the crate manifests. The pinned
-`1.97.1` lanes are unchanged by it — the floor is proved in its own lane rather
-than by weakening the stable one. The build needs `rustup`, because that is the
-only way to select the floor: without it the lane fails instead of compiling with
-an ambient newer compiler and calling the MSRV verified. Use
-`AXOND_MSRV_CHECK_ONLY_POLICY=1 ops/msrv-gate.sh` to run the declaration checks
-alone.
-
-To raise the floor, in one PR: bump `rust-version`, bump `rust-toolchain.toml`
-and the `Dockerfile` stage if they now trail it, update the `toolchain:` pins in
-the workflows, update the table in
-[`docs/compatibility.md`](../compatibility.md#the-rust-version-floor-msrv), and
-land it as a **minor** release with a changelog entry that says why. To raise
-only the pinned developer toolchain, bump `rust-toolchain.toml` and the workflow
-pins and leave `rust-version` alone; the `msrv` lane then keeps proving the older
-floor still builds.
+HTTP, configuration and telemetry are the supported public contracts.
+Rust library compatibility and MSRV gates were retired under ADR 0069.
+There is no Cargo lockfile synchronization or registry publication step.
 
 ## Workflow Action pins
 
@@ -456,14 +384,9 @@ gh api repos/actions/checkout/commits/v7.0.1 --jq .sha
 
 Bumping a pin by hand follows the same rule: resolve the tag to its SHA, write
 both, and let the lane confirm the format. Where an action publishes no usable
-release tag the comment names the upstream branch the SHA was taken from
-(`dtolnay/rust-toolchain@… # stable`), which is also the pin most likely to need
-a manual refresh. Dependabot only ever rewrites a SHA pin to another SHA and
-edits the comment to match — it cannot turn a pin into a `@v1` tag ref, and the
-lane would reject one if it did — but for that branch pin it may propose the SHA
-behind the upstream `v1` tag with the comment rewritten to `# v1`. That is still
-immutable, and it is a deliberate change of which upstream ref the pin follows:
-take it only if tracking the tag is what you want, and keep `# stable` otherwise.
+release tag, document the upstream ref used to resolve the SHA and review
+whether that ref remains appropriate. Dependabot updates immutable pins and
+comments together; it must not replace a SHA with a mutable tag.
 A proposed *major* bump is not a pin change: read the upstream
 release notes for renamed inputs and changed defaults before taking it, because
 the pinned SHA is what CI will run until someone changes it again.

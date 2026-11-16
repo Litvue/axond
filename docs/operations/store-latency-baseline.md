@@ -1,5 +1,12 @@
 # Store latency baseline
 
+> Historical Rust qualification only. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> removed the Rust harnesses and their CI workflows. The evidence in
+> `qualification/` is retained unchanged; it does not qualify the TypeScript
+> gateway. Commands, driver paths and required lanes below describe the former
+> harness, not runnable checks on current main. TS performance/fault qualification
+> requires new evidence.
+
 How much of a request's cost is the Store, how that differs between SQLite and
 Postgres, and how to measure a change against it. This is the evidence the
 Store-contention epic ([#459](https://github.com/Litvue/axond/issues/459)) is

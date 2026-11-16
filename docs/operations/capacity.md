@@ -1,5 +1,12 @@
 # Capacity qualification
 
+> Historical Rust qualification only. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> removed the Rust harnesses and their CI workflows. The evidence in
+> `qualification/` is retained unchanged; it does not qualify the TypeScript
+> gateway. Commands, driver paths and required lanes below describe the former
+> harness, not runnable checks on current main. TS performance/fault qualification
+> requires new evidence.
+
 What one Axond replica costs to serve, how the numbers were produced, and which
 of them a change is allowed to move. The design and its boundaries are
 [ADR 0033](../adr/0033-capacity-qualification-harness.md); the bounds the

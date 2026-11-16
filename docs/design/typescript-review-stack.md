@@ -1,5 +1,12 @@
 # TypeScript conversion review stack
 
+> Historical conversion investigation/evidence. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> made TypeScript the sole implementation and removed the Rust tree and comparison
+> runners. Rust paths, shadow jobs and commands below describe the recorded
+> conversion baseline, not current gates. Current verification is the TS suite,
+> SDK compatibility and release binary/image smoke; see
+> [the TypeScript gateway](../typescript.md).
+
 All 21 PRs are ready for review. Start with [#534](https://github.com/Litvue/axond/pull/534);
 reviews can proceed across the stack, and merges must follow dependency order.
 

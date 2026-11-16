@@ -569,6 +569,15 @@ def self_test() -> int:
         minimum=1,
     )
     assert present == [], present
+    assert review_trigger_failures(
+        '`test("a human readable title")`',
+        {"a human readable title"},
+        minimum=1,
+    ) == []
+    spaced_rename = review_trigger_failures(
+        '`test("a renamed human readable title")`', set(), minimum=0
+    )
+    assert len(spaced_rename) == 1 and "does not exist under ts/" in spaced_rename[0]
     # A rename that the page did not follow is the rot this gate exists for.
     renamed = review_trigger_failures("`a_renamed_test_is_still_named`", set(), minimum=0)
     assert len(renamed) == 1 and "does not exist under ts/" in renamed[0], renamed
@@ -590,11 +599,15 @@ def self_test() -> int:
         )
         (typescript / "app.test.ts").write_text(
             'test("typescript_title_is_a_declared_test", () => {})\n'
+            'test("a human readable title", () => {})\n'
+            "test('a single quoted title', () => {})\n"
             "function helper_name_is_declared() {}\n",
             encoding="utf-8",
         )
         names = declared_test_names(typescript)
         assert "typescript_title_is_a_declared_test" in names, names
+        assert "a human readable title" in names, names
+        assert "a single quoted title" in names, names
         assert "helper_name_is_declared" in names, names
         assert "dependency_test_must_not_count" not in names, names
 
@@ -787,17 +800,24 @@ def declared_test_names(typescript: Path) -> set[str]:
                 continue
             text = source.read_text(encoding="utf-8")
             declared.update(re.findall(r"\bfunction\s+([a-z0-9_]+)", text))
-            declared.update(re.findall(r"""\btest\(\s*["']([a-z0-9_]+)["']""", text))
+            declared.update(
+                match[0] or match[1]
+                for match in re.findall(r"""\btest\(\s*(?:"([^"\n]+)"|'([^'\n]+)')""", text)
+            )
     return declared
 
 
 def review_trigger_failures(text: str, declared: set[str], *, minimum: int = 40) -> list[str]:
-    """Named tests on the trigger page must still be declared in Rust or TypeScript."""
+    """Named tests on the trigger page must still be declared in TypeScript."""
     named = {
         candidate
         for candidate in re.findall(r"`([a-z0-9_]+)`", text)
         if candidate.count("_") >= 3
     }
+    named.update(
+        match[0] or match[1]
+        for match in re.findall(r"""`test\((?:"([^"\n]+)"|'([^'\n]+)')\)`""", text)
+    )
     failures = [
         "docs/security/threat-model-review.md: named test "
         f"{name!r} does not exist under ts/"
@@ -819,8 +839,9 @@ def check_review_trigger_tests() -> list[str]:
     documented test name rots silently: a rename in the TypeScript tests leaves the page
     pointing at coverage nobody has. Every backticked lowercase identifier with
     three or more underscores in it is treated as a test function and must be
-    declared under `ts/` (`function`, or a `test("snake_case")`
-    title). Shorter identifiers are configuration keys and field names
+    declared under `ts/` (`function`, or a named `test` title).
+    Human-readable titles use explicit backticked `test("title with spaces")`
+    references so a rename is checked too. Shorter identifiers are configuration keys and field names
     (`allow_platform_fallback`, `credential_source`), which other checks and the
     configuration reference already cover.
     """

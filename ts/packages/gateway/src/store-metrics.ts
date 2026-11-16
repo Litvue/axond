@@ -1,5 +1,5 @@
 /**
- * Store timing series from `crates/gateway/src/telemetry/catalog.rs`.
+ * Store timing series shared by the database implementations.
  * Labels stay inside the closed backend, operation, and outcome vocabularies.
  */
 

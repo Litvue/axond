@@ -3,7 +3,7 @@
  *
  * `npm audit` covers the whole lockfile, including devDependencies. Licenses
  * are checked on the production graph (`npm ci --omit=dev`), which is what the
- * container installs. The allow list matches deny.toml, plus 0BSD for tslib.
+ * container installs. The production license allow list includes 0BSD for tslib.
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";

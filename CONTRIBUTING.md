@@ -3,13 +3,13 @@
 ## Website and Axond CI
 
 Changes confined to `website/` and `.github/workflows/website.yml` run the website
-checks without installing Rust or starting Axond's build, test, Docker, or
+checks without installing gateway dependencies or starting Axond's build, test, Docker, or
 Kubernetes jobs. A small change detector and workflow-policy check still report
 `CI Success`, so branch protection does not wait on a missing workflow.
 
 PRs use the complete diff from their merge base; main pushes and merge queues
-use the full event range. Mixed website/Axond changes retain normal Rust CI.
-Release tags and manual qualification runs always execute the full suite.
+use the full event range. Mixed website/Axond changes retain normal TypeScript CI.
+Release tags and manual workflow runs always execute the full suite.
 Unknown paths keep Axond checks enabled, and failed change detection fails CI.
 
 Cloudflare's GitHub app deploys the website independently. Website-only changes
@@ -30,106 +30,44 @@ update, and what to say about release impact.
 
 ## Development
 
-Requires the toolchain pinned in [`rust-toolchain.toml`](./rust-toolchain.toml).
-That pin is newer than the project's minimum supported Rust version, which is
-`rust-version` in [`Cargo.toml`](./Cargo.toml); `just msrv` builds the workspace
-on that floor the way CI does.
+Use Node 22.14.0 and npm, matching the TypeScript workflow:
 
 ```bash
-just check      # fmt --check, clippy -D warnings, tests, the fuzz smoke, docs,
-                # supply chain, packaging, MSRV, public-API compatibility, and
-                # workflow policy — the CI gates
-just run        # run against ./axond.toml
-just compat     # run the Python SDK compatibility lane
-just compat-ts  # run the TypeScript SDK compatibility lane
-just fuzz-smoke # replay the committed fuzz corpora (see fuzz/README.md)
-just msrv       # build on the declared minimum supported Rust version
-just api-compat # published-library API gate (empty set is success)
+cd ts
+npm ci
+npm test
+cd ..
+just check
 just workflow-policy
-                # check the Action pins, workflow permissions, and the release
-                # signer restriction
+just actionlint
 ```
 
-Or without `just`:
+`just check` runs TS tests, web lint, alert checks, executable documentation
+samples, and npm dependency policy. `just run` starts `ts/bin/axond` against
+`axond.toml`; set its referenced environment variables first.
+`just quickstart-smoke` exercises Compose; the source overlay
+`docker-compose.build.yml` builds `ts/Dockerfile`.
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-```
+The gateway job in [typescript.yml](./.github/workflows/typescript.yml) runs
+the Python and Node SDK compatibility suites against `ts/bin/axond`.
+Their dependency owners are [tests/compat/requirements.in](./tests/compat/requirements.in)
+and [tests/compat-ts/package.json](./tests/compat-ts/package.json).
+Postgres integration tests use `AXOND_TEST_POSTGRES`; without it, service
+tests skip. Request-path tests use isolated SQLite or memory stores.
 
-Request-path tests boot a temp SQLite file and hit `/ns/{ns}/v1`. Redis is
-not required. Optional Postgres HA tests skip when `AXOND_TEST_POSTGRES_DSN`
-is unset:
+Rust harnesses, fuzzing, MSRV and public Rust API gates were retired under
+[ADR 0069](./docs/adr/0069-retire-the-rust-gateway.md). Parser changes still need
+regression tests; TypeScript fuzz equivalents remain an open question.
 
-```bash
-docker run -d --name axond-test-postgres -e POSTGRES_PASSWORD=axond-ci \
-  -p 55432:5432 postgres:17.6-alpine
-AXOND_TEST_POSTGRES_DSN=postgres://postgres:axond-ci@127.0.0.1:55432/postgres \
-AXOND_TEST_REQUIRE_SERVICES=1 cargo test -p axond --all-features --locked
-```
-
-The SDK compatibility lane uses the hash-pinned lockfile at
-[`tests/compat/requirements.txt`](./tests/compat/requirements.txt). Refresh it
-with `just compat-lock`; the recipe resolves from
-[`requirements.in`](./tests/compat/requirements.in) while excluding releases
-published less than seven days ago. The refresh requires
-[`uv`](https://docs.astral.sh/uv/getting-started/installation/) on `PATH`.
-Review the generated diff, then run `just compat`.
-
-The same claim is made through the vendors' Node SDKs by
-[`tests/compat-ts`](./tests/compat-ts), which pins the SDKs, the TypeScript
-toolchain, and the Node runtime exactly and type-checks the calls before running
-them. `ops/compat-ts-pins.py` (`just compat-ts-pins`) enforces those pins; how to
-bump an SDK is in [that lane's README](./tests/compat-ts/README.md).
-
-Touching a parser that reads untrusted input — configuration, provider wire, or
-a query string? [`fuzz/`](./fuzz/README.md) is a separate Cargo workspace, so the
-root checks skip it; `just fuzz-smoke` runs the required pull-request replay on
-stable, and `just fuzz <target>` runs a bounded coverage-guided run once
-[`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz) and a nightly toolchain
-are installed. A reproducer belongs in `fuzz/seeds/<target>/` in the same PR as
-the fix. Because that workspace locks its own graph and depends on `axond` by
-path, adding or bumping a dependency of any `crates/` member leaves
-`fuzz/Cargo.lock` stale: run `just fuzz-lock` and commit it, which the `Fuzz
-smoke` lane asks for by name before it replays anything.
-
-`gateway-core` and `gateway-transport` are unpublished workspace members, not a
-crates.io library product. `just api-compat` still runs: an empty published
-library set is success, and a newly publishable library crate is compared
-against crates.io the day it is added (needs
-[`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
-and network access in that case):
-
-```bash
-just api-compat
-```
-
-The gate itself runs on `python3` 3.10 or newer, so `just api-compat-self-test`
-works offline and without `cargo-semver-checks`; `just msrv` needs `rustup`, and
-fails rather than measuring the floor with a newer compiler.
-
-`just deploy-check`, which `just check` includes, renders the shipped Kubernetes
-manifests, so it needs `kustomize` or `kubectl` on `PATH` and network access the
-first time it builds its venv from
-[`ops/deploy-requirements.txt`](./ops/deploy-requirements.txt) (refreshed with
-`just deploy-lock`).
-
-A documented HTTP, config, or MSRV break is a minor, via a breaking commit
-title; see
-[the release runbook](./docs/maintainers/releasing.md#version-classification).
-Raising the MSRV follows
-[the same runbook](./docs/maintainers/releasing.md#rust-version-floor). If a
-library crate is later published, a public Rust API break uses
-[`ops/api-compat-overrides.toml`](./ops/api-compat-overrides.toml) as described
-in [public API compatibility](./docs/maintainers/releasing.md#public-api-compatibility).
+A documented HTTP, config or telemetry break is a minor bump via a breaking
+commit title; see [version classification](./docs/maintainers/releasing.md#version-classification).
 
 ## Conventions
 
-- **Warnings are errors.** CI runs clippy with `-D warnings`; keep it clean.
-- **Public API breaks and MSRV bumps are minor releases.** Both are covered by
-  [the compatibility contract](./docs/compatibility.md) and gated in CI; neither
-  is a patch. They are also the *only* things that make a pre-1.0 release a
+- **Keep all TypeScript checks green.** Do not disable tests or dependency policy.
+- **Public contract breaks are minor releases.** They are covered by
+  [the compatibility contract](./docs/compatibility.md) and gated in CI; a break
+  is not a patch. Contract breaks are the *only* things that make a pre-1.0 release a
   minor, and they get there through a breaking commit title — everything else,
   features included, ships as a patch. See
   [version classification](./docs/maintainers/releasing.md#version-classification).

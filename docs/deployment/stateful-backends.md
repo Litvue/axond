@@ -55,7 +55,7 @@ hard-coded `public`. A table that does not exist yet is not checked: with
 the off-path sink drops rejected batches and increments the dropped-record
 metric.
 
-Use `sslmode=require` in production DSNs. Axond uses rustls and webpki roots.
+Use `sslmode=require` in production DSNs. The TS process uses its Postgres driver's TLS implementation; the Worker connects through Hyperdrive.
 
 ## Supported versions
 

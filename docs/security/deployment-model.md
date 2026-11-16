@@ -41,7 +41,8 @@ same time; there is one key, so there is no overlap window.
 
 ## Network
 
-Axond uses rustls for provider HTTP and TLS-enabled Postgres connections.
+Axond uses its host runtime's HTTP/TLS implementation for providers and the
+Postgres driver for TLS-enabled database connections.
 It deliberately does not terminate inbound TLS. A trusted reverse proxy or load
 balancer must provide TLS, caller network policy, and streaming-compatible
 timeouts without stripping authentication headers.

@@ -86,7 +86,7 @@ Compose profile, and SDK examples.
 ## Install
 
 The recommended path installs the checksum-verified prebuilt binary; it does not
-download the repository or invoke the Rust compiler:
+download the repository or compile the gateway:
 
 ```bash
 # Linux x86-64 or macOS Apple Silicon
@@ -209,42 +209,33 @@ The [documentation index](./docs/index.md) is organized by task:
 
 ## Development
 
-The Rust toolchain is pinned in
-[`rust-toolchain.toml`](./rust-toolchain.toml). Run the core code, package, and
-supply-chain gate with:
+The gateway lives in [`ts/`](./ts). Use Node 22.14.0:
 
 ```bash
+cd ts
+npm ci
+npm test
+cd ..
 just check
 ```
 
-Useful focused checks:
+`just quickstart-smoke` exercises Compose. Add `docker-compose.build.yml`
+to build current source from `ts/Dockerfile`.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the development workflow.
 
-```bash
-just quickstart-smoke  # build current source and exercise the Compose path
-just compat            # OpenAI and Anthropic SDKs against a real local axond
-just tier0              # prove a temp SQLite file boots and serves /ns/{ns}/v1
-just soak               # long streaming soak, also available on demand in CI
-```
+## TypeScript gateway
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for contribution and compatibility-lock
-guidance.
-
-## TypeScript port
-
-A Hono gateway in [`ts/`](./ts) runs the same compat lanes via
-`AXOND_BIN=ts/bin/axond`. It is the release binary. The extension
-contract and the decision to keep the Rust tree as the conformance oracle are
-[ADR 0066](./docs/adr/0066-typescript-hono-extension-contract.md). Operators
-follow [the TypeScript notes](./docs/typescript.md).
+TypeScript is the sole implementation and release artifact under
+[ADR 0069](./docs/adr/0069-retire-the-rust-gateway.md). The Rust tree is retained
+only in history and v0.7.x tags, not as a conformance oracle.
+The [TypeScript notes](./docs/typescript.md) cover embedding and extensions.
 
 ## Releases
 
 Release-please maintains the changelog and workspace version. A release builds
 six binary targets, publishes the `linux/amd64` and `linux/arm64` images plus the
 multi-architecture index they form — booted on both architectures before it takes
-the `<version>` tag — and signs and attests artifacts. crates.io no longer
-receives versions: 0.7.1 was the last Rust release; existing versions are not
-yanked. Maintainer procedures are in the
+the `<version>` tag — and signs and attests artifacts. The retired Rust package receives no new versions; historical versions are not yanked. Maintainer procedures are in the
 [release runbook](./docs/maintainers/releasing.md).
 
 ## License

@@ -4,6 +4,8 @@ Date: 2026-11-02
 
 ## Status
 
+Decision 3 is implemented by the [Rust removal](https://github.com/Litvue/axond/commit/b51d6f4fce3f7b218a330a0d946be98242f9293d): the Rust tree and machinery are removed; history and v0.7.x tags retain them.
+
 Accepted. Supersedes section 1 of [ADR 0066](./0066-typescript-hono-extension-contract.md).
 
 ## Context

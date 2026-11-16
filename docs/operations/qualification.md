@@ -1,5 +1,12 @@
 # The production qualification packet
 
+> Historical Rust qualification only. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> removed the Rust harnesses and their CI workflows. The evidence in
+> `qualification/` is retained unchanged; it does not qualify the TypeScript
+> gateway. Commands, driver paths and required lanes below describe the former
+> harness, not runnable checks on current main. TS performance/fault qualification
+> requires new evidence.
+
 What has actually been measured about running Axond on the request path, what
 has only been harnessed, and what has not yet been retained — in one place, so
 the difference between a merged harness and an answered question stays visible.

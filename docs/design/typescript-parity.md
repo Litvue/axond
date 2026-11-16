@@ -1,5 +1,12 @@
 # TypeScript gateway parity contract
 
+> Historical conversion investigation/evidence. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> made TypeScript the sole implementation and removed the Rust tree and comparison
+> runners. Rust paths, shadow jobs and commands below describe the recorded
+> conversion baseline, not current gates. Current verification is the TS suite,
+> SDK compatibility and release binary/image smoke; see
+> [the TypeScript gateway](../typescript.md).
+
 This is the contract for `ts/` against the post-[ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md) Rust gateway. [ADR 0066](../adr/0066-typescript-hono-extension-contract.md) records the decisions. The conformance launcher is `ops/typescript-compat.sh`.
 
 ## Same wire

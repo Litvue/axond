@@ -1,6 +1,5 @@
 /**
- * Monotonic `req_` + UUIDv7 mint, matching `Uuid7Generator` in
- * `crates/gateway/src/desired_state/ids.rs`.
+ * Monotonic `req_` + UUIDv7 request identifier generator.
  *
  * The 48-bit timestamp is Unix milliseconds. The 12-bit sequence advances when
  * the clock has not moved, carries into the next millisecond when it is
