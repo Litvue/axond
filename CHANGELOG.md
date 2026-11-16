@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.8.0](https://github.com/Litvue/axond/compare/v0.7.1...v0.8.0) (2026-11-16)
+
+
+### ⚠ BREAKING CHANGES
+
+* **release:** ship the typescript gateway as the release artifact ([#593](https://github.com/Litvue/axond/issues/593))
+
+### Features
+
+* **release:** ship the typescript gateway as the release artifact ([#593](https://github.com/Litvue/axond/issues/593)) ([cead1e5](https://github.com/Litvue/axond/commit/cead1e592cf86d2a9b9dee1a54c8aa87288cb96f))
+
+
+### Bug Fixes
+
+* **deps:** bump hono and @hono/node-server for moderate advisories ([#594](https://github.com/Litvue/axond/issues/594)) ([0ec5931](https://github.com/Litvue/axond/commit/0ec59318454f71e61dd50a70f12444e847521c80))
+
+
+### Documentation
+
+* **adr:** retire the rust gateway ([#588](https://github.com/Litvue/axond/issues/588)) ([4cb1ec0](https://github.com/Litvue/axond/commit/4cb1ec01cdb88f60ff3e6b44e7d5e11b231c4ab2))
+
 ## [0.7.1](https://github.com/Litvue/axond/compare/v0.7.0...v0.7.1) (2026-10-24)
 
 
