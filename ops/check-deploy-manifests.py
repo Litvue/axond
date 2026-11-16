@@ -32,7 +32,6 @@ from __future__ import annotations
 import copy
 import os
 import re
-import runpy
 import shutil
 import subprocess
 import sys
@@ -55,9 +54,8 @@ PRODUCTION = ROOT / "deploy/kubernetes/overlays/production"
 AUTOSCALING = ROOT / "deploy/kubernetes/components/autoscaling"
 KUBERNETES_DOC = ROOT / "docs/deployment/kubernetes.md"
 RECOVERY_DOC = ROOT / "docs/operations/backup-and-recovery.md"
-CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 ROLLOUT_DRILL = ROOT / "ops/rollout-drill.sh"
-TELEMETRY_SOURCE = ROOT / "crates/gateway/src/telemetry/mod.rs"
+TELEMETRY_SOURCE = ROOT / "ts/packages/gateway/src/otel.ts"
 
 IMAGE_REPOSITORY = "ghcr.io/litvue/axond"
 # The digest the production overlay ships with. It is not a real image, and that
@@ -169,15 +167,15 @@ def shutdown_budget_ms() -> int:
     Hardcoding 25s here would make this gate agree with a stale copy of the
     defaults rather than with the process the manifest runs.
     """
-    source = (ROOT / "crates/gateway/src/config.rs").read_text(encoding="utf-8")
+    source = (ROOT / "ts/packages/gateway/src/config.ts").read_text(encoding="utf-8")
     total = 0
     for field in ("drain_grace_ms", "deadline_ms", "flush_timeout_ms"):
         match = re.search(
-            rf"fn default_shutdown_{field}\(\) -> u64 \{{\s*([\d_]+)\s*\}}",
+            rf'readTypedInt\(toml, "shutdown", row, "{field}", "u64", ([\d_]+)\)',
             source,
         )
         if match is None:
-            raise RuntimeError(f"could not read default_shutdown_{field} from config.rs")
+            raise RuntimeError(f"could not read default_shutdown_{field} from config.ts")
         total += int(match.group(1).replace("_", ""))
     return total
 
@@ -438,9 +436,9 @@ def check_telemetry_egress(
     renamed allowance fails the same way, so the rule is required rather than
     merely constrained when it happens to be present.
     """
-    if 'Some("http/protobuf")' not in telemetry_source:
+    if '"content-type": "application/json"' not in telemetry_source:
         return [
-            "crates/gateway/src/telemetry/mod.rs no longer names the OTLP protocol this policy "
+            "ts/packages/gateway/src/otel.ts no longer names the OTLP protocol this policy "
             "was written for; re-derive the collector egress port"
         ]
     failures: list[str] = []
@@ -601,41 +599,6 @@ def check_example_secret(
     return failures
 
 
-def unblocked_lane(jobs: dict[str, Any], lane: str) -> str | None:
-    """Why a drill would not block its selected CI event (ADR 0004).
-
-    The aggregate delegates to ci-success.py. Check both its workflow wiring
-    and that a failed drill actually fails that event's gate.
-    """
-    success = jobs["CI-Success"]
-    if lane not in success["needs"]:
-        return f"CI-Success does not require {lane}"
-    required_env = {
-        "CI_NEEDS": "${{ toJSON(needs) }}",
-        "CI_EVENT": "${{ github.event_name }}",
-        "CI_RUST": "${{ needs.changes.outputs.rust }}",
-        "CI_DEPENDENCIES": "${{ needs.changes.outputs.dependencies }}",
-    }
-    if not any(
-        str(step.get("run", "")).strip() == "python3 ops/ci-success.py"
-        and all(step.get("env", {}).get(key) == value for key, value in required_env.items())
-        for step in success["steps"]
-    ):
-        return f"CI-Success does not pass the job results and event to the gate for {lane}"
-    gate = runpy.run_path(str(ROOT / "ops/ci-success.py"))
-    event = "push"
-    expected = gate["expected_results"](event, "true", "true")
-    if expected.get(lane) != "success":
-        return f"CI-Success does not require a successful {lane} on {event}"
-    needs = {job: {"result": result} for job, result in expected.items()}
-    if gate["failures"](needs, event, "true", "true"):
-        return f"CI-Success cannot pass the selected {event} lanes"
-    needs[lane]["result"] = "failure"
-    if not gate["failures"](needs, event, "true", "true"):
-        return f"CI-Success accepts a failed {lane} on {event}"
-    return None
-
-
 def check_recovery_objectives(page: str) -> list[str]:
     """Operator recovery objectives stay documented after the qualification drill retired."""
     failures: list[str] = []
@@ -647,8 +610,8 @@ def check_recovery_objectives(page: str) -> list[str]:
     return failures
 
 
-def check_rollout_drill(workflow: dict[str, Any], page: str, drill: str) -> list[str]:
-    """The spread constraints have a scheduling proof, and CI runs it.
+def check_rollout_drill(page: str, drill: str) -> list[str]:
+    """The optional rollout drill preserves its scheduling counterfactual.
 
     Whether a rolling update completes is decided by kube-scheduler, not by the
     manifest, so `check_topology_spread` can only assert the shape that makes it
@@ -659,17 +622,6 @@ def check_rollout_drill(workflow: dict[str, Any], page: str, drill: str) -> list
     never be placed.
     """
     failures: list[str] = []
-    jobs = workflow["jobs"]
-    lane = jobs.get("rollout-drill")
-    if lane is None:
-        failures.append(".github/workflows/ci.yml: the rollout-drill lane is missing")
-    elif not any("ops/rollout-drill.sh" in str(step.get("run", "")) for step in lane["steps"]):
-        failures.append(".github/workflows/ci.yml: the rollout-drill lane does not run the drill")
-    elif (reason := unblocked_lane(jobs, "rollout-drill")) is not None:
-        failures.append(
-            f".github/workflows/ci.yml: {reason}, so a rollout that cannot schedule would not "
-            "block a merge"
-        )
     if "ops/rollout-drill.sh" not in page:
         failures.append("docs/deployment/kubernetes.md: ops/rollout-drill.sh is not documented")
     if "has to deadlock" not in drill:
@@ -1011,12 +963,11 @@ def self_test() -> int:
         "telemetry egress derived from a protocol the gateway no longer names",
         check_telemetry_egress(
             production,
-            telemetry.replace('Some("http/protobuf")', 'Some("grpc")'),
+            telemetry.replace('"content-type": "application/json"', '"content-type": "application/grpc"'),
             "overlays/production",
         ),
     )
 
-    workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
     recovery = RECOVERY_DOC.read_text(encoding="utf-8")
 
     production_kustomization = (PRODUCTION / "kustomization.yaml").read_text(encoding="utf-8")
@@ -1038,24 +989,11 @@ def self_test() -> int:
 
     kubernetes_page = KUBERNETES_DOC.read_text(encoding="utf-8")
     rollout = ROLLOUT_DRILL.read_text(encoding="utf-8")
-    if check_rollout_drill(workflow, kubernetes_page, rollout):
+    if check_rollout_drill(kubernetes_page, rollout):
         failures.append("self-test: the committed rollout drill wiring must pass the gate")
-    optional_rollout = copy.deepcopy(workflow)
-    optional_rollout["jobs"]["CI-Success"]["needs"].remove("rollout-drill")
-    expect_failure(
-        "optional rollout lane", check_rollout_drill(optional_rollout, kubernetes_page, rollout)
-    )
-    unasserted_rollout = copy.deepcopy(workflow)
-    for step in unasserted_rollout["jobs"]["CI-Success"]["steps"]:
-        if "run" in step:
-            step["run"] = "true"
-    expect_failure(
-        "a needed rollout lane CI-Success never asserts",
-        check_rollout_drill(unasserted_rollout, kubernetes_page, rollout),
-    )
     expect_failure(
         "rollout drill without its counterfactual",
-        check_rollout_drill(workflow, kubernetes_page, rollout.replace("has to deadlock", "runs")),
+        check_rollout_drill(kubernetes_page, rollout.replace("has to deadlock", "runs")),
     )
 
     for failure in failures:
@@ -1084,7 +1022,6 @@ def main(argv: list[str]) -> int:
         *check_digest_scope(),
         *check_recovery_objectives(RECOVERY_DOC.read_text(encoding="utf-8")),
         *check_rollout_drill(
-            yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8")),
             KUBERNETES_DOC.read_text(encoding="utf-8"),
             ROLLOUT_DRILL.read_text(encoding="utf-8"),
         ),

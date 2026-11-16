@@ -204,12 +204,6 @@ def check_release_scope(text: str, config: dict) -> list[str]:
     paths = set(re.findall(r"^      - '([^']+)'$", push, re.M))
     required = {
         "ts/**",
-        "crates/**",
-        "Cargo.toml",
-        "Cargo.lock",
-        ".cargo/**",
-        "rust-toolchain.toml",
-        "Dockerfile",
         # A config or manifest change must rebuild the open release PR.
         "release-please-config.json",
         ".release-please-manifest.json",
@@ -224,7 +218,7 @@ def check_release_scope(text: str, config: dict) -> list[str]:
     excluded = config.get("packages", {}).get(".", {}).get("exclude-paths", [])
     if not {"website", ".github"}.issubset(excluded) or any("*" in path for path in excluded):
         errors.append("release-please must exclude website and .github directory prefixes")
-    if "crates" in excluded or "." in excluded:
+    if "ts" in excluded or "." in excluded:
         errors.append("release-please must retain Axond source commits")
     return errors
 
@@ -1433,12 +1427,12 @@ def self_test() -> int:
     scope_config = json.loads((ROOT / "release-please-config.json").read_text())
     scoped = workflow_text()
     assert not check_release_scope(scoped, scope_config)
-    assert check_release_scope(scoped.replace("      - 'crates/**'", "      - 'website/**'"), scope_config)
-    assert check_release_scope(scoped.replace("      - 'Cargo.lock'\n", ""), scope_config)
+    assert check_release_scope(scoped.replace("      - 'ts/**'", "      - 'website/**'"), scope_config)
+    assert check_release_scope(scoped.replace("      - 'ts/**'\n", ""), scope_config)
     assert check_release_scope(scoped.replace("      - 'release-please-config.json'\n", ""), scope_config)
     assert check_release_scope(scoped.replace("      - '.release-please-manifest.json'\n", ""), scope_config)
     assert check_release_scope(scoped, {"packages": {".": {"exclude-paths": ["website/**", ".github/**"]}}})
-    assert check_release_scope(scoped, {"packages": {".": {"exclude-paths": ["website", ".github", "crates"]}}})
+    assert check_release_scope(scoped, {"packages": {".": {"exclude-paths": ["website", ".github", "ts"]}}})
     ts_release_self_test()
     print("check-release-config: decision, release-order, release-scope, and TS artifact self-tests passed")
     return 0

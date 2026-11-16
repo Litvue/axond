@@ -31,8 +31,8 @@ mkdir -p "$RUN_DIR" "$EVIDENCE_DIR"
 chmod 700 "$RUN_DIR"
 
 if [[ ! -x "$VERIFY_AXOND_BINARY" ]]; then
-  echo "verify-axond: building axond (cargo build -p axond --locked)" >&2
-  cargo build -p axond --locked
+  echo "verify-axond: installing TypeScript gateway dependencies" >&2
+  (cd ts && npm ci)
 fi
 if [[ ! -x "$VERIFY_AXOND_BINARY" ]]; then
   echo "verify-axond: missing ${VERIFY_AXOND_BINARY}" >&2

@@ -42,8 +42,7 @@ overlay="${root}/deploy/kubernetes/overlays/production"
 # The published image for the version in this workspace, so the drill runs the
 # gateway the overlay would deploy rather than a stand-in that cannot fail its
 # own readiness probe.
-version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\([^"]*\)".*/\1/p' \
-  "${root}/Cargo.toml" | head -n 1)"
+version="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "${root}/ts/package.json")"
 image="${AXOND_ROLLOUT_IMAGE:-ghcr.io/litvue/axond:${version}}"
 postgres_image="${AXOND_ROLLOUT_POSTGRES_IMAGE:-postgres:17.6-alpine}"
 

@@ -489,6 +489,12 @@ test("openapi is 3.1 and lists the management routes", async () => {
   assert.equal(response.status, 200);
   const spec = await response.json();
   assert.equal(spec.openapi, "3.1.0");
+  for (const path of ["/api/v1/namespaces/{ns}", "/api/v1/namespaces/{ns}/budgets/{period}", "/api/v1/namespaces/{ns}/budget", "/api/v1/namespaces/{ns}/usage"]) {
+    assert.equal(spec.paths[path].get.responses["200"].content["application/json"].schema.type, "object");
+  }
+  const policy = spec.paths["/api/v1/namespaces/{ns}/budget"].put.requestBody;
+  assert.equal(policy.required, true);
+  assert.deepEqual(policy.content["application/json"].schema.required, ["cadence", "limit_microdollars"]);
   assert.ok(spec.paths["/api/v1/namespaces/{ns}/usage"].get.parameters[0].required);
   upstream.close();
 });

@@ -12,11 +12,6 @@ on:
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -36,8 +31,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       typescript: ${{ steps.filter.outputs.typescript }}
-      rust: ${{ steps.filter.outputs.rust }}
-      dependencies: ${{ steps.filter.outputs.dependencies }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -46,335 +39,13 @@ jobs:
         name: Detect changed components
         run: python3 ops/ci-changes.py
 
-  fmt:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  clippy:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-          components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-  # The pinned lanes above build on 1.97.1; consumers are only promised the
-  # declared MSRV floor, so that floor is built separately rather than assumed.
-  msrv:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
-    name: MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - name: Check the declared MSRV and the toolchain declarations that track it
-        run: ops/msrv-gate.sh
-
-  # Published library crates' Rust API, compared against crates.io. Axond's
-  # product is the binary, so an empty library set is success. Blocking when a
-  # library is published: an intentional break needs a reviewed entry in
-  # ops/api-compat-overrides.toml.
-  api-compat:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
-    name: Public API compatibility
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - name: Install pinned semver tooling
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: cargo-semver-checks@0.50.0
-      # The gate must run on the oldest Python the contributor flow supports, not
-      # just on whatever a runner ships, so the floor is exercised explicitly.
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.10'
-      - name: Prove the gate runs on the Python floor
-        run: python3 --version && ops/api-compat.py --self-test
-      - name: Compare published library crates against crates.io (none is success)
-        run: ops/api-compat.py
-
-  build:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - run: cargo build --workspace --all-targets --all-features --locked
-
-  tests:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
-    name: Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - run: cargo test --workspace --locked
-      # The reduced capacity profiles run inside the suite above; their result
-      # artifacts are kept so an envelope has evidence behind it (ADR 0033).
-      # `warn`: an earlier target failing stops the suite before the capacity
-      # binary runs, and that lane's finding is the failing test, not a missing
-      # artifact. The `Capacity` workflow runs the binary alone and insists.
-      - name: Publish the reduced capacity results
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: capacity-results-reduced
-          path: target/capacity/**/*.json
-          if-no-files-found: warn
-      # The endurance smoke tier, likewise: the same driver and assertions the
-      # off-platform qualification run exercises for twelve hours, at seconds. The smoke
-      # directory alone — the sequential regression also publishes a soak-tier
-      # artifact of a twenty-second run, and a bundle of smoke evidence is not
-      # where a soak-tier file should be found.
-      - name: Publish the endurance smoke results
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: endurance-results-smoke
-          path: |
-            target/endurance/smoke/*.json
-            target/endurance/smoke/*.samples.jsonl
-            target/endurance/smoke/**/*.bin
-          if-no-files-found: warn
-          retention-days: 90
-
-  faults:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
-    name: Request-path fault matrix
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      # The fault matrix qualifies timing, so it does not run beside the rest of
-      # the suite: this step has the machine to itself, one row at a time.
-      # Provider and transport rows run on the SQLite boot. Redis budget and
-      # rate-limit rows skip because those backends are withdrawn (ADR 0063).
-      - name: Note the request-path fault lane start
-        run: echo "fault_lane_started_ms=$(($(date +%s%N) / 1000000))" >>"$GITHUB_ENV"
-      - name: Qualify the provider and transport fault rows
-        run: cargo test -p axond --all-features --locked --release --test faults -- --test-threads=1
-        env:
-          AXOND_FAULT_MATRIX: "1"
-      # A passing test can still leave no artifact if its row set or writer is
-      # accidentally bypassed. Require every provider/transport row to have
-      # fresh, passing evidence before publishing the directory.
-      - name: Check the request-path fault evidence
-        run: python3 ops/check-fault-evidence.py --since-unix-ms "$fault_lane_started_ms"
-      - name: Publish the request-path fault-matrix results
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: fault-results-request-path
-          path: target/faults/**/*.json
-          if-no-files-found: error
-          retention-days: 90
-
-  # The pull-request half of the fuzzing program (`fuzz/`, issue #212). The
-  # coverage-guided runs are scheduled in `fuzz.yml` because they are unbounded;
-  # what every change gets is this: the committed corpora and their fixed
-  # derivations replayed through the same target bodies, on the pinned stable
-  # toolchain, under panic, time, and allocation bounds. Required, so a parser
-  # that starts panicking on a known input cannot merge.
-  fuzz-smoke:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
-    name: Fuzz smoke
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: fuzz
-          cache-targets: false
-      # A gateway dependency added or bumped outside a release leaves this
-      # workspace's lock stale, and every `--locked` step below then fails on a
-      # lockfile error that names no remedy. Failing here instead names one.
-      - name: Check that fuzz/Cargo.lock records the gateway graph
-        working-directory: fuzz
-        run: |
-          cargo fetch --locked || {
-            echo "::error file=fuzz/Cargo.lock::fuzz/Cargo.lock does not match the"\
-              "gateway crates' dependencies; run \`just fuzz-lock\` and commit it"
-            exit 1
-          }
-      # The root `fmt` and `clippy` lanes cannot reach a separate workspace, so
-      # the fuzz code would otherwise be the only Rust here without either gate.
-      - name: Format
-        working-directory: fuzz
-        run: cargo fmt --all -- --check
-      # `--no-default-features` here too: with the default feature on, this would
-      # compile libFuzzer's C++ sources and the `#![no_main]` targets on stable,
-      # coupling a required lane to a dependency the replay does not need. The
-      # coverage-guided targets are linted on nightly in `fuzz.yml`.
-      - name: Clippy
-        working-directory: fuzz
-        run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
-      # And the seam in `crates/gateway`, which neither of the clippy lanes above
-      # reaches: `fuzz_seam.rs` is `#![cfg(fuzzing)]`, so the root lane builds it
-      # as an empty library, and the fuzz workspace does not lint `axond` because
-      # it is a path dependency rather than a primary package. Turning the cfg on
-      # is what puts the seam and the `#[cfg(fuzzing)]` items it reaches in `mint`
-      # and `routes` under the same `-D warnings` as the rest of the repository.
-      - name: Clippy the fuzzing seam
-        run: cargo clippy -p axond --lib --all-features --locked -- -D warnings
-        env:
-          RUSTFLAGS: --cfg fuzzing
-      # `--no-default-features` drops libfuzzer-sys: the replay is the part that
-      # must run without nightly or a sanitizer runtime.
-      - name: Replay the committed fuzz corpora
-        working-directory: fuzz
-        run: cargo run --no-default-features --locked --bin fuzz-smoke
-
-  sdk-compat:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
-    name: Provider-SDK compatibility
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-      - name: Build the gateway the SDKs will talk to
-        run: cargo build -p axond --locked
-      - name: Check compatibility lock inputs
-        run: |
-          set -euo pipefail
-          # Keep every direct input pin present in the generated lockfile.
-          mapfile -t pins < <(grep -E '^[A-Za-z0-9_.-]+==' tests/compat/requirements.in || true)
-          ((${#pins[@]} > 0)) || { echo "no direct pins found" >&2; exit 1; }
-          for pin in "${pins[@]}"; do
-            # shellcheck disable=SC2016 # sed expression is intentionally literal
-            escaped_pin="$(printf '%s' "$pin" | sed 's/[.[\*^$()+?{|\\]/\\&/g')"
-            grep -Eq "^${escaped_pin}([[:space:];\\]|$)" tests/compat/requirements.txt || {
-              echo "missing direct pin in lockfile: $pin" >&2
-              exit 1
-            }
-          done
-      # Hermetic: the SDKs are pointed at a local fake upstream serving the
-      # committed fixtures, so this lane makes no provider call and needs no key.
-      - name: Install the pinned provider SDKs
-        run: pip install --require-hashes -r tests/compat/requirements.txt
-      - name: Drive axond with the vendors' own SDKs
-        run: pytest tests/compat -q
-        env:
-          AXOND_BIN: ${{ github.workspace }}/target/debug/axond
-
-  # The same wire claim through the vendors' Node SDKs, which additionally
-  # type-checks every call against the SDKs' own definitions. Deliberately a
-  # second runtime rather than a second assertion: a customer runs one of these.
-  sdk-compat-ts:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
-    name: Provider-SDK compatibility (TypeScript)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: tests/compat-ts/.nvmrc
-          cache: npm
-          cache-dependency-path: tests/compat-ts/package-lock.json
-      - name: Build the gateway the SDKs will talk to
-        run: cargo build -p axond --locked
-      - name: Check the compatibility pins
-        run: |
-          ops/compat-ts-pins.py --self-test
-          ops/compat-ts-pins.py
-      # Hermetic: the SDKs are pointed at a local fake upstream serving the
-      # committed fixtures, so this lane makes no provider call and needs no key.
-      - name: Install the pinned provider SDKs from the lockfile
-        run: npm ci --ignore-scripts
-        working-directory: tests/compat-ts
-      - name: Type-check and drive axond with the vendors' own Node SDKs
-        run: npm test
-        working-directory: tests/compat-ts
-        env:
-          AXOND_BIN: ${{ github.workspace }}/target/debug/axond
-
-  # The management spec is generated from the code and is the Litvue client
-  # input. This lane dumps it, checks OpenAPI 3.1 + mounted routes, lints with
-  # Spectral, and typechecks a generated TypeScript client. The client is not
-  # shipped from this repo.
   openapi-smoke:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
+    if: ${{ needs.changes.outputs.typescript == 'true' && github.event_name != 'pull_request' }}
     name: OpenAPI smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: tests/openapi-smoke/.nvmrc
@@ -383,9 +54,9 @@ jobs:
       - name: Dump the generated OpenAPI 3.1 spec
         run: |
           mkdir -p target
-          AXOND_OPENAPI_OUT="${{ github.workspace }}/target/openapi.json" \
-            cargo test -p axond --locked --bin axond -- \
-            api::tests::openapi_spec_is_31_and_covers_mounted_routes --exact
+          cd ts
+          npm ci
+          node --experimental-strip-types --disable-warning=ExperimentalWarning -e 'import { writeFile } from "node:fs/promises"; import { OPENAPI } from "./packages/gateway/src/openapi.ts"; await writeFile("../target/openapi.json", JSON.stringify(OPENAPI));'
       - name: Check OpenAPI 3.1 and mounted /api/v1 routes
         run: |
           python3 ops/check-openapi.py --self-test
@@ -399,7 +70,7 @@ jobs:
 
   docs:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' }}
+    if: ${{ needs.changes.outputs.typescript == 'true' }}
     name: Documentation
     runs-on: ubuntu-latest
     steps:
@@ -492,46 +163,9 @@ jobs:
           target/deploy-venv/bin/python ops/check-deploy-manifests.py --self-test
           target/deploy-venv/bin/python ops/check-deploy-manifests.py
 
-  rustdoc:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
-    name: Rust documentation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - name: Doc
-        run: cargo doc --workspace --no-deps --all-features --locked
-        env:
-          RUSTDOCFLAGS: -D warnings
-
-  dependency-policy:
-    needs: changes
-    if: ${{ needs.changes.outputs.dependencies == 'true' }}
-    name: Dependency policy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-      - name: Install pinned policy tools
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: cargo-deny@0.20.2
-      - name: Check advisories, licenses, bans, and sources
-        run: cargo deny --locked --all-features check
-
-  # Every `uses:` in this repository resolves to a reviewed commit SHA rather
-  # than a tag or branch, so an upstream force-push cannot change what runs in a
-  # job that can reach the release tokens. This lane is what keeps a new mutable
-  # ref out, and lints the workflow definitions themselves.
   workflow-policy:
+    needs: changes
+    if: ${{ needs.changes.outputs.typescript == 'true' }}
     name: Workflow policy
     runs-on: ubuntu-latest
     steps:
@@ -560,10 +194,6 @@ jobs:
           shellcheck ops/actionlint.sh
           ops/actionlint.sh --self-test
           ops/actionlint.sh
-      - name: Prove the musl installer is bounded and retrying
-        run: |
-          shellcheck ops/install-musl-tools.sh
-          bash ops/install-musl-tools.sh --self-test
       - name: Refuse a newer open PR with the same title or Closes line
         if: ${{ github.event_name == 'pull_request' }}
         env:
@@ -573,112 +203,9 @@ jobs:
           GITHUB_PR_BODY: ${{ github.event.pull_request.body }}
         run: python3 ops/check-duplicate-prs.py
 
-  static-binary:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
-    name: Static musl binary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-          targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - name: Install musl tools
-        timeout-minutes: 25
-        run: bash ops/install-musl-tools.sh
-      - name: Build the static single binary
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl -p axond
-      - name: Assert the binary is statically linked
-        run: |
-          set -euo pipefail
-          bin=target/x86_64-unknown-linux-musl/release/axond
-          test -x "$bin"
-          # The musl target emits a static-PIE executable, which `file` reports as
-          # "static-pie linked"; a plain static binary reads "statically linked".
-          # Either is fully static — a dynamic build would say "dynamically linked".
-          file "$bin" | grep -Eq 'static-pie linked|statically linked'
-          ! file "$bin" | grep -q 'dynamically linked'
-      - name: SQLite boot and serve
-        run: ops/tier0-gate.sh target/x86_64-unknown-linux-musl/release/axond
-
-  # Every target in the release `binaries` matrix, booted and served through the
-  # portable runner on a runner of its own platform — a cross-compiled binary
-  # that never ran is not evidence that it ships working. The musl entry keeps
-  # the stronger `static-binary` gate above (kernel-enforced network denial,
-  # which has no macOS or Windows equivalent) and adds the portable assertions
-  # on top, so all four targets are judged against the same serving contract.
-  binary-smoke:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
-    name: Binary smoke ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          # Native ARM64 runners: a cross-compiled aarch64 binary could not be
-          # booted here, and booting it is the whole point of this lane.
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-          - os: macos-15
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          toolchain: 1.97.1
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-targets: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-      - name: Install musl tools
-        if: endsWith(matrix.target, '-unknown-linux-musl')
-        timeout-minutes: 25
-        run: bash ops/install-musl-tools.sh
-      # The release profile is what ships: a debug binary would smoke different
-      # code than the archives the installer downloads.
-      - name: Build the release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} -p axond
-      - name: Boot the release binary and probe the serving contract
-        shell: bash
-        run: python ops/binary-smoke.py "target/${{ matrix.target }}/release/axond"
-
-  docker-smoke:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
-    name: Docker smoke
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Build the image
-        run: docker build --tag axond-ci-smoke .
-      - name: Boot the container and probe /healthz
-        run: bash ops/docker-smoke.sh axond-ci-smoke
-
-  # `release-please.yml` asks a major-4 installer for a 2.x cosign binary, and
-  # whether that still works is an upstream question no linter can answer. This
-  # installs cosign exactly as the release does and signs a throwaway image and
-  # index with it, asserting the signature lands where docs/installation.md
-  # tells operators to look. The release cannot catch this itself: it verifies
-  # its own output with the binary that produced it.
   cosign-format:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
+    if: ${{ needs.changes.outputs.typescript == 'true' && github.event_name != 'pull_request' }}
     name: Cosign signing format
     runs-on: ubuntu-latest
     steps:
@@ -693,52 +220,9 @@ jobs:
           shellcheck ops/check-cosign-format.sh
           bash ops/check-cosign-format.sh
 
-  # Whether a rolling update completes is a scheduling outcome, not a manifest
-  # property: kube-scheduler counting skew across ReplicaSets decides it, and no
-  # rendered manifest can answer it. So the production overlay is rolled out on a
-  # real three-worker cluster — the shape where `maxUnavailable: 0` and a hard
-  # per-node spread deadlock each other — and the drill then removes the scoping
-  # and requires the same rollout to hang, which is what keeps the first result
-  # from passing for the wrong reason.
-  rollout-drill:
-    needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
-    name: Rollout drill (three nodes)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Downloaded and checksummed rather than taken from an action, because the
-      # cluster tool is as much a supply-chain input as the actions are, and the
-      # workflow policy's SHA pinning does not reach inside one.
-      - name: Install kind and kubectl
-        env:
-          KIND_VERSION: v0.30.0
-          KIND_SHA256: 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889
-          KUBECTL_VERSION: v1.33.4
-          KUBECTL_SHA256: c2ba72c115d524b72aaee9aab8df8b876e1596889d2f3f27d68405262ce86ca1
-        run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/kind \
-            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          echo "${KIND_SHA256}  /tmp/kind" | sha256sum --check --strict
-          sudo install -m 0755 /tmp/kind /usr/local/bin/kind
-          curl -fsSL -o /tmp/kubectl \
-            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          echo "${KUBECTL_SHA256}  /tmp/kubectl" | sha256sum --check --strict
-          sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
-      # The overlay's digest sentinel names no servable image, and the workspace
-      # version is unpublished until release, so the drill deploys this commit's
-      # own image.
-      - name: Build the image the overlay deploys
-        run: docker build --tag axond-ci-rollout .
-      - name: Roll the production overlay out on three nodes
-        env:
-          AXOND_ROLLOUT_IMAGE: axond-ci-rollout
-        run: bash ops/rollout-drill.sh
-
   quickstart-smoke:
     needs: changes
-    if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}
+    if: ${{ needs.changes.outputs.typescript == 'true' && github.event_name != 'pull_request' }}
     name: Compose quickstart smoke
     runs-on: ubuntu-latest
     steps:
@@ -754,26 +238,10 @@ jobs:
     needs:
       - typescript
       - changes
-      - fmt
-      - clippy
-      - msrv
-      - api-compat
-      - build
-      - tests
-      - faults
-      - rustdoc
-      - fuzz-smoke
-      - sdk-compat
-      - sdk-compat-ts
       - openapi-smoke
       - docs
-      - dependency-policy
       - workflow-policy
-      - static-binary
-      - binary-smoke
-      - docker-smoke
       - cosign-format
-      - rollout-drill
       - quickstart-smoke
     runs-on: ubuntu-latest
     steps:
@@ -782,7 +250,5 @@ jobs:
         env:
           CI_NEEDS: ${{ toJSON(needs) }}
           CI_TYPESCRIPT: ${{ needs.changes.outputs.typescript }}
-          CI_RUST: ${{ needs.changes.outputs.rust }}
           CI_EVENT: ${{ github.event_name }}
-          CI_DEPENDENCIES: ${{ needs.changes.outputs.dependencies }}
         run: python3 ops/ci-success.py

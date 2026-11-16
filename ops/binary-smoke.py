@@ -139,7 +139,7 @@ def resolve_binary(argument: str | None) -> Path:
         candidates = (
             [Path(env)]
             if env
-            else [ROOT / "target" / "release" / "axond", ROOT / "target" / "debug" / "axond"]
+            else [ROOT / "ts" / "bin" / "axond"]
         )
     for candidate in candidates:
         for path in (candidate, candidate.with_suffix(".exe")):
@@ -322,8 +322,7 @@ def main() -> int:
     parser.add_argument(
         "binary",
         nargs="?",
-        help="axond binary to smoke; defaults to $AXOND_BIN, then a release "
-        "build, then a debug build",
+        help="axond binary to smoke; defaults to $AXOND_BIN, then ts/bin/axond",
     )
     arguments = parser.parse_args()
     try:

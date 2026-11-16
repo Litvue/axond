@@ -64,7 +64,7 @@ current_digest() {
 }
 
 workspace_version() {
-  sed -n 's/^version = "\([^"]*\)"$/\1/p' "${repo_root}/Cargo.toml" | head -n 1
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "${repo_root}/ts/package.json"
 }
 
 overlay_names=()
