@@ -108,7 +108,7 @@ Other distribution paths:
 
 ```bash
 # Pull the current release image. There is intentionally no `latest` tag.
-AXOND_VERSION=0.8.0 # x-release-please-version
+AXOND_VERSION=0.8.1 # x-release-please-version
 docker pull "ghcr.io/litvue/axond:${AXOND_VERSION}"
 ```
 

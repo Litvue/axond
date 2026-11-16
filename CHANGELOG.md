@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/Litvue/axond/compare/v0.8.0...v0.8.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* **release:** build macOS and Windows TypeScript binaries ([#597](https://github.com/Litvue/axond/issues/597)) ([29abe53](https://github.com/Litvue/axond/commit/29abe53a75ede2ba3e8623c7885c84f7f40f3b20))
+
 ## [0.8.0](https://github.com/Litvue/axond/compare/v0.7.1...v0.8.0) (2026-11-16)
 
 
