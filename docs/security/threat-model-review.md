@@ -355,7 +355,9 @@ lane drives both installers in dry-run with `AXOND_REQUIRE_ATTESTATION` — incl
 a deliberately wrong `AXOND_REPOSITORY` and an invalid setting that must fail —
 and `ops/check-installer-download.sh` holds the installer's failure diagnostics
 apart, so a transport failure is never reported as a missing release asset —
-`dependency-policy` runs `cargo deny` with no ignore entries, `api-compat`
+`dependency-policy` runs `cargo deny` with no ignore entries except
+RUSTSEC-2026-0459 (bundled SQLite in the retired Rust gateway, accepted until
+the Rust tree is removed under ADR 0069), `api-compat`
 and `msrv` hold the published surface and the floor, and `fuzz-smoke` replays the
 committed [fuzz corpora](./fuzzing.md) through the parsers reached before
 authentication. Keep the installer
