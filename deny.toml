@@ -16,7 +16,13 @@ version = 2
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 unmaintained = "all"
-ignore = []
+ignore = [
+    # libsqlite3-sys 0.30 (rusqlite 0.32, bundled) carries the C SQLite flaw.
+    # Releases ship the TypeScript gateway since #593 (ADR 0069), so no new
+    # artifact contains this crate. Remove this entry with the Rust tree.
+    # https://rustsec.org/advisories/RUSTSEC-2026-0459
+    { id = "RUSTSEC-2026-0459", reason = "Rust gateway retired by ADR 0069; ends with the Rust tree removal" },
+]
 
 [licenses]
 version = 2
