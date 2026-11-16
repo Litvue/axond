@@ -8,33 +8,23 @@ import re
 import sys
 
 
-COMMON = {"changes", "fmt", "clippy", "tests", "fuzz-smoke", "sdk-compat", "docs", "workflow-policy"}
-RELEASE = {
-    "msrv", "api-compat", "build", "faults", "sdk-compat-ts", "openapi-smoke",
-    "rustdoc", "static-binary", "binary-smoke", "docker-smoke",
-    "cosign-format", "rollout-drill", "quickstart-smoke",
-}
+COMMON = {"changes", "typescript", "docs", "workflow-policy"}
+RELEASE = {"openapi-smoke", "cosign-format", "quickstart-smoke"}
 
 
-def expected_results(event, dependencies, rust, typescript="true"):
-    expected = {job: "success" if rust == "true" or job in {"changes", "workflow-policy"} else "skipped" for job in COMMON}
-    expected.update({job: "skipped" if rust == "false" or event == "pull_request" else "success" for job in RELEASE})
-    expected["typescript"] = "success" if typescript == "true" else "skipped"
-    expected["dependency-policy"] = "success" if dependencies == "true" else "skipped"
+def expected_results(event, typescript="true"):
+    expected = {job: "success" if typescript == "true" or job == "changes" else "skipped" for job in COMMON}
+    expected.update({job: "skipped" if typescript == "false" or event == "pull_request" else "success" for job in RELEASE})
     return expected
 
 
-def failures(needs, event, dependencies, rust, typescript="true"):
-    expected = expected_results(event, dependencies, rust, typescript)
+def failures(needs, event, typescript="true"):
+    expected = expected_results(event, typescript)
     errors = []
     if typescript not in {"true", "false"}:
         errors.append("TypeScript change detection must succeed")
-    if rust not in {"true", "false"}:
-        errors.append("Rust change detection must succeed")
-    if event == "workflow_dispatch" and rust != "true":
-        errors.append("manual qualification must run Rust checks")
-    if dependencies not in {"true", "false"} or (rust == "true" and event != "pull_request" and dependencies != "true") or (rust == "false" and dependencies != "false"):
-        errors.append("dependency change detection must agree with the selected suite")
+    if event == "workflow_dispatch" and typescript != "true":
+        errors.append("manual qualification must run TypeScript checks")
     if needs.keys() != expected.keys():
         errors.append(f"unexpected job set: missing={sorted(expected.keys() - needs.keys())}, extra={sorted(needs.keys() - expected.keys())}")
     for job, result in expected.items():
@@ -45,32 +35,22 @@ def failures(needs, event, dependencies, rust, typescript="true"):
 
 
 def self_test():
-    all_jobs = COMMON | RELEASE | {"dependency-policy", "typescript"}
-    cases = [
-        ("pull_request", "false", "true"), ("pull_request", "true", "true"),
-        ("push", "true", "true"), ("merge_group", "true", "true"),
-        ("workflow_dispatch", "true", "true"),
-        ("pull_request", "false", "false"), ("push", "false", "false"),
-        ("merge_group", "false", "false"),
-    ]
-    for event, dependencies, rust in cases:
-        needs = {job: {"result": result} for job, result in expected_results(event, dependencies, rust).items()}
-        assert not failures(needs, event, dependencies, rust)
-        for job in all_jobs:
-            original = needs[job]["result"]
-            for result in {"success", "failure", "cancelled", "skipped"} - {original}:
-                needs[job]["result"] = result
-                assert failures(needs, event, dependencies, rust), (event, job, result)
-            needs[job]["result"] = original
-        assert failures(needs, event, "", rust)
-        assert failures(needs, event, dependencies, "")
-        assert failures(needs, event, "true", "false")
-        assert failures({}, event, dependencies, rust)
-
-    website_needs = {job: {"result": result} for job, result in expected_results("pull_request", "false", "false", "false").items()}
-    assert not failures(website_needs, "pull_request", "false", "false", "false")
-    website_needs["typescript"]["result"] = "success"
-    assert failures(website_needs, "pull_request", "false", "false", "false")
+    all_jobs = COMMON | RELEASE
+    for event in ("pull_request", "push", "merge_group", "workflow_dispatch"):
+        for selected in ("true", "false"):
+            if event == "workflow_dispatch" and selected == "false":
+                continue
+            needs = {job: {"result": result} for job, result in expected_results(event, selected).items()}
+            assert not failures(needs, event, selected)
+            for job in all_jobs:
+                original = needs[job]["result"]
+                for result in {"success", "failure", "cancelled", "skipped"} - {original}:
+                    needs[job]["result"] = result
+                    assert failures(needs, event, selected), (event, job, result)
+                needs[job]["result"] = original
+            assert failures(needs, event, "")
+            assert failures({}, event, selected)
+    assert failures({}, "workflow_dispatch", "false")
 
     workflow = (Path(__file__).resolve().parent.parent / ".github/workflows/ci.yml").read_text()
     jobs = set(re.findall(r"^  ([\w-]+):$", workflow.split("jobs:\n", 1)[1], re.M))
@@ -79,19 +59,15 @@ def self_test():
     assert set(re.findall(r"^      - ([\w-]+)$", gate, re.M)) == all_jobs
     for job in RELEASE:
         block = re.search(rf"^  {job}:\n(.*?)(?=^  [\w-]+:|\Z)", workflow, re.M | re.S).group(1)
-        assert "if: ${{ needs.changes.outputs.rust == 'true' && github.event_name != 'pull_request' }}" in block, job
+        assert "if: ${{ needs.changes.outputs.typescript == 'true' && github.event_name != 'pull_request' }}" in block, job
         assert "    needs: changes" in block, job
-    tests = workflow.split("  tests:\n", 1)[1].split("\n  faults:", 1)[0]
-    assert "cargo test --workspace --locked" in tests
-    assert "--release" not in tests
     assert "tags: ['v*']" in workflow
     assert "if: ${{ always() }}" in gate
-    for job in COMMON - {"changes", "workflow-policy"}:
+    for job in COMMON - {"changes"}:
         block = re.search(rf"^  {job}:\n(.*?)(?=^  [\w-]+:|\Z)", workflow, re.M | re.S).group(1)
-        assert "if: ${{ needs.changes.outputs.rust == 'true' }}" in block, job
+        assert "if: ${{ needs.changes.outputs.typescript == 'true' }}" in block, job
         assert "    needs: changes" in block, job
-    assert "CI_RUST: ${{ needs.changes.outputs.rust }}" in gate
-    print("CI gate self-test passed: website-only, Rust, main/tag, merge queue, manual, failure/skip cases")
+    print("CI gate self-test passed: website-only, TypeScript, main/tag, merge queue, manual, failure/skip cases")
 
 
 if __name__ == "__main__":
@@ -99,7 +75,7 @@ if __name__ == "__main__":
         self_test()
     else:
         errors = failures(json.loads(os.environ["CI_NEEDS"]), os.environ["CI_EVENT"],
-                          os.environ["CI_DEPENDENCIES"], os.environ.get("CI_RUST", ""), os.environ.get("CI_TYPESCRIPT", ""))
+                          os.environ.get("CI_TYPESCRIPT", ""))
         for error in errors:
             print(f"::error::{error}")
         sys.exit(bool(errors))

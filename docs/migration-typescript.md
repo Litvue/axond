@@ -1,6 +1,9 @@
 # Moving a process to the TypeScript gateway
 
-The release artifact for this 0.x line is still the Rust binary. [ADR 0066](./adr/0066-typescript-hono-extension-contract.md) keeps those crates as the conformance oracle. This page is how an operator runs the TypeScript process on the same config and store, and how to switch back.
+TypeScript is now the sole release artifact under
+[ADR 0069](./adr/0069-retire-the-rust-gateway.md). The Rust source and oracle
+jobs were removed; v0.7.x tags retain that unmaintained implementation.
+Back up the database before upgrading and validate on an isolated copy.
 
 ## Config
 
@@ -16,7 +19,8 @@ Declare one deployment-wide `[[gateway_key]]`. A per-namespace list is withdrawn
 
 There is no usage-row migration. SQLite and Postgres keep `axond_store_usage`, and one `request_id` is still the charge key. Point `[storage] path` or `dsn_env` at the existing database.
 
-The TypeScript process adds two columns on `axond_namespace`, `allow_platform_fallback` and `from_config`, and tables `axond_catalog_streak`, `axond_namespace_lock`, and `axond_schema_lock`. Those are not in the Rust `ops/postgres` scripts. Rust does not read `axond_catalog_streak` or the lock tables. Opening the same SQLite file from the Rust binary leaves the extra objects in place.
+The TypeScript process adds two columns on `axond_namespace`, `allow_platform_fallback` and `from_config`, and tables `axond_catalog_streak`, `axond_namespace_lock`, and `axond_schema_lock`. Current Store provisioning is owned by the TS SQLite/Postgres implementations;
+operator-facing usage DDL remains under `ops/postgres/`.
 
 A role that can `CREATE` adds the two columns to an existing `axond_namespace` and creates the missing tables. A second boot does not rebuild existing rows. A role that cannot `CREATE` leaves an existing schema in place and names a missing table or a missing namespace column. On a Worker that sentence is the log line `schema_unavailable`, and the HTTP response stays `store_unavailable`. After an owner has applied the schema, that same role serves namespace create and list. The Worker log does not record `schema_unavailable` for that request. Extension migrations run at process start on SQLite and on Postgres. Each statement is recorded in `axond_schema_migrations` and a second boot skips that id. A failed statement is rolled back and is not recorded. The error names the migration id and omits the driver text.
 
@@ -41,15 +45,14 @@ On a Node process or a compiled binary, put extension files in `AXOND_EXTENSIONS
 binary on `gcr.io/distroless/base-debian12:nonroot`. The image runs `/axond` as
 the non-root user and listens on port `8080`. Its working directory is
 `/var/lib/axond`, writable by `nonroot`; mount a volume there to persist a
-relative SQLite path. The **TypeScript image** workflow is its only publisher:
-a manual dispatch publishes `sha-<short>`, and a `v*` tag publishes that SHA
-tag plus the semver `<version>` tag. Deploy by the digest printed in the
-workflow run summary. The Rust image
-`ghcr.io/litvue/axond` and release-please workflow remain unchanged.
+relative SQLite path. The release workflow publishes the same image digest
+to `ghcr.io/litvue/axond` and `ghcr.io/litvue/axond-typescript`, with signed
+per-architecture artifacts and a multi-architecture index. See the
+[release runbook](./maintainers/releasing.md); deploy by verified digest.
 
 ### Configuration differences
 
-| Setting | Rust 0.6 dev | TypeScript gateway | Action |
+| Setting | Historical Rust 0.6 dev | TypeScript gateway | Action |
 | --- | --- | --- | --- |
 | `[reload] watch = false` | The Rust main also refuses this withdrawn section (ADR 0063). | Boot fails because `reload` is withdrawn. | Delete `[reload]`. |
 | `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` | Litvue's Rust exporter uses OTLP/HTTP protobuf. | Boot fails; the TypeScript exporter supports OTLP/HTTP JSON only. | Set `http/json`. |
@@ -87,12 +90,9 @@ The environment variables used by the dev config are `GW_STORE_DSN`,
 `GW_PLATFORM_ANTHROPIC_COVERED_API_KEY`, `GW_PLATFORM_XAI_API_KEY`,
 `GW_INBOUND_PLATFORM_KEY`, and `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
-Use a separate database from the Rust dev deployment: the TypeScript process
-adds its own store columns and tables described in [Store](#store).
-For a Postgres dev rollback, stop the TypeScript app and route traffic back to
-the Rust deployment; the TypeScript app never touched the Rust database. Usage
-and budget rows written by TypeScript remain in its separate database and are
-not carried back.
+The historical dev trial used separate Rust and TypeScript databases; its
+switch-back did not migrate new usage or budget rows. For current upgrades,
+validate a backup on an isolated TS deployment before switching traffic.
 
 ### Boot check
 
@@ -128,10 +128,12 @@ The same config was mounted read-only into `axond-typescript:local` with
 
 ## Rollback
 
-Stop the TypeScript process. Start the Rust binary with the same `AXOND_CONFIG` and the same SQLite file. `/healthz` stays a liveness check on both. Namespaces created through `POST /api/v1/namespaces` remain in the store.
+Stop the process and restore the pre-upgrade database backup before restarting
+a pinned previous artifact if schema compatibility has not been qualified.
+The historical switch-back experiment used the retired Rust binary; it is not
+a current automated gate or a supported mixed-version deployment recipe.
+Rust is available only from history and v0.7.x tags, not the current tree.
 
-That switch was exercised on this host. The TypeScript process created `streak-rollback` (`201`) on a fresh SQLite file that also held `axond_catalog_streak` with `consecutive_refusals` 2. After that process stopped, `target/debug/axond` on the same file answered `/healthz` `ok`, listed `platform` and `streak-rollback`, and returned `200` `{"data":[],"object":"list"}` from `GET /ns/platform/v1/models`. Rust stderr was empty.
-
-The root `Dockerfile`, Kubernetes, Azure, and Compose manifests stay on the Rust image. The TypeScript image is published separately by the **TypeScript image** workflow and does not change the Rust release artifact.
-
-A shadow compare of the fixture suite is `ts/scripts/shadow-compare.ts`. It checks status, parsed JSON, and charged `(model, status, cost)`. It is not a production traffic sample. A Worker Hyperdrive config points at PlanetScale's direct port 5432 with caching disabled. The template passes `--origin-host`, `--origin-port`, `--origin-scheme`, `--database`, `--origin-user`, and `--origin-password`, because a connection-string password containing `/`, `#`, `?`, or `%` is rejected by Wrangler's URL parser. The default TLS mode is `require` (TLS, WebPKI), and `--sslmode verify-full` also needs `--ca-certificate-id`. Port 6432 is PgBouncer, and Hyperdrive is already the pooler. Live Hyperdrive against PlanetScale is not part of this repository's test environment.
+The shadow and cross-binary conformance runners were removed under ADR 0069.
+Current evidence comes from TS tests, SDK compatibility, streaming fixtures
+and release binary/image smoke, not a second implementation.

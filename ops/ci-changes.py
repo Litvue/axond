@@ -12,21 +12,10 @@ def git(*args):
     return subprocess.check_output(['git', *args], stderr=subprocess.PIPE)
 
 
-def rust_path(path):
-    """Website and TypeScript-only paths do not select the Rust lanes."""
-    if path.startswith('website/') or path == '.github/workflows/website.yml':
-        return False
-    if path.startswith('ts/') or path in {
-        '.github/workflows/typescript.yml', '.github/workflows/typescript-image.yml', 'ops/typescript-compat.sh'
-    }:
-        return False
-    return True
-
-
 def detect(event, payload, ref):
     # Tags and explicit qualification requests always exercise the full suite.
     if event == 'workflow_dispatch' or ref.startswith('refs/tags/'):
-        return {'rust': 'true', 'dependencies': 'true', 'typescript': 'true'}
+        return {'typescript': 'true'}
     if event == 'pull_request':
         base = payload['pull_request']['base']['sha']
         head = payload['pull_request']['head']['sha']
@@ -37,20 +26,14 @@ def detect(event, payload, ref):
     elif event == 'push':
         base, head = payload['before'], payload['after']
         if base == '0' * 40:
-            return {'rust': 'true', 'dependencies': 'true', 'typescript': 'true'}
+            return {'typescript': 'true'}
     else:
         raise ValueError(f'unsupported CI event: {event}')
     # --no-renames includes both sides of a move across the website boundary.
     paths = git('diff', '--name-only', '--no-renames', '-z', base, head).decode().split('\0')
     paths = [path for path in paths if path]
-    rust = any(rust_path(path) for path in paths)
-    dependency_paths = {'Cargo.lock', 'Cargo.toml', 'fuzz/Cargo.lock', 'fuzz/Cargo.toml',
-                        'deny.toml', '.github/workflows/ci.yml', 'ops/ci-changes.py'}
-    dependencies = rust and (event != 'pull_request' or any(
-        path in dependency_paths or (path.startswith('crates/') and path.endswith('/Cargo.toml'))
-        for path in paths))
     typescript = any(not (path.startswith('website/') or path == '.github/workflows/website.yml') for path in paths)
-    return {'rust': str(rust).lower(), 'dependencies': str(dependencies).lower(), 'typescript': str(typescript).lower()}
+    return {'typescript': str(typescript).lower()}
 
 
 def self_test():
@@ -69,41 +52,38 @@ def self_test():
             website = commit('website/src/pages/index.astro')
             workflow = commit('.github/workflows/website.yml')
             image_workflow = commit('.github/workflows/typescript-image.yml')
-            source = commit('crates/gateway/src/main.rs')
-            lock = commit('Cargo.lock')
-            for head, rust, dependencies in [(website, 'false', 'false'), (workflow, 'false', 'false'),
-                                              (source, 'true', 'false'), (lock, 'true', 'true')]:
+            source = commit('ts/packages/gateway/src/app.ts')
+            lock = commit('ts/package-lock.json')
+            for head, selected in [(website, 'false'), (workflow, 'false'), (source, 'true'), (lock, 'true')]:
                 payload = {'pull_request': {'base': {'sha': base}, 'head': {'sha': head}}}
-                assert detect('pull_request', payload, '') == {'rust': rust, 'dependencies': dependencies, 'typescript': rust}
+                assert detect('pull_request', payload, '') == {'typescript': selected}
                 for event, payload in [('push', {'before': base, 'after': head}),
                                        ('merge_group', {'merge_group': {'base_sha': base, 'head_sha': head}})]:
-                    assert detect(event, payload, '') == {'rust': rust, 'dependencies': rust, 'typescript': rust}
+                    assert detect(event, payload, '') == {'typescript': selected}
             payload = {'pull_request': {'base': {'sha': workflow}, 'head': {'sha': image_workflow}}}
-            assert detect('pull_request', payload, '') == {
-                'rust': 'false', 'dependencies': 'false', 'typescript': 'true'}
+            assert detect('pull_request', payload, '') == {'typescript': 'true'}
             # A last-commit-only diff would miss the earlier source change.
             last = commit('website/README.md')
-            assert detect('push', {'before': workflow, 'after': last}, '')['rust'] == 'true'
+            assert detect('push', {'before': workflow, 'after': last}, '')['typescript'] == 'true'
             # PRs compare with the merge base, not unrelated updates on main.
             git('checkout', '-qb', 'other-main', base)
-            other = commit('Cargo.toml')
-            assert detect('pull_request', {'pull_request': {'base': {'sha': other}, 'head': {'sha': website}}}, '')['rust'] == 'false'
+            other = commit('ts/package.json')
+            assert detect('pull_request', {'pull_request': {'base': {'sha': other}, 'head': {'sha': website}}}, '')['typescript'] == 'false'
             git('checkout', '-q', last)
-            git('mv', 'crates/gateway/src/main.rs', 'website/moved.rs'); git('commit', '-qm', 'move')
+            git('mv', 'ts/packages/gateway/src/app.ts', 'website/moved.ts'); git('commit', '-qm', 'move')
             moved = git('rev-parse', 'HEAD').decode().strip()
-            assert detect('push', {'before': last, 'after': moved}, '')['rust'] == 'true'
-            git('rm', 'website/moved.rs'); git('commit', '-qm', 'delete website file')
+            assert detect('push', {'before': last, 'after': moved}, '')['typescript'] == 'true'
+            git('rm', 'website/moved.ts'); git('commit', '-qm', 'delete website file')
             deleted = git('rev-parse', 'HEAD').decode().strip()
-            assert detect('push', {'before': moved, 'after': deleted}, '')['rust'] == 'false'
-            assert detect('push', {}, 'refs/tags/v1.0.0')['rust'] == 'true'
-            assert detect('workflow_dispatch', {}, '')['rust'] == 'true'
-            assert detect('push', {'before': '0'*40, 'after': deleted}, '')['rust'] == 'true'
-            for path, dependencies in [('install.sh', 'false'), ('future-component/source.rs', 'false'),
-                                       ('crates/gateway/Cargo.toml', 'true'), ('fuzz/Cargo.lock', 'true')]:
+            assert detect('push', {'before': moved, 'after': deleted}, '')['typescript'] == 'false'
+            assert detect('push', {}, 'refs/tags/v1.0.0')['typescript'] == 'true'
+            assert detect('workflow_dispatch', {}, '')['typescript'] == 'true'
+            assert detect('push', {'before': '0'*40, 'after': deleted}, '')['typescript'] == 'true'
+            for path in ['install.sh', 'future-component/source.ts', 'ts/package.json', 'ops/check-docs.py']:
                 previous = git('rev-parse', 'HEAD').decode().strip()
                 head = commit(path)
                 payload = {'pull_request': {'base': {'sha': previous}, 'head': {'sha': head}}}
-                assert detect('pull_request', payload, '') == {'rust': 'true', 'dependencies': dependencies, 'typescript': 'true'}
+                assert detect('pull_request', payload, '') == {'typescript': 'true'}
             try:
                 detect('push', {'before': 'missing-ref', 'after': deleted}, '')
             except subprocess.CalledProcessError:
@@ -112,10 +92,9 @@ def self_test():
                 raise AssertionError('invalid diff must fail closed')
             previous = git('rev-parse', 'HEAD').decode().strip()
             typescript = commit('ts/packages/gateway/src/app.ts')
-            assert detect('pull_request', {'pull_request': {'base': {'sha': previous}, 'head': {'sha': typescript}}}, '') == {
-                'rust': 'false', 'dependencies': 'false', 'typescript': 'true'}
-            mixed = commit('crates/gateway/src/lib.rs')
-            assert detect('pull_request', {'pull_request': {'base': {'sha': previous}, 'head': {'sha': mixed}}}, '')['rust'] == 'true'
+            assert detect('pull_request', {'pull_request': {'base': {'sha': previous}, 'head': {'sha': typescript}}}, '') == {'typescript': 'true'}
+            mixed = commit('ops/future.py')
+            assert detect('pull_request', {'pull_request': {'base': {'sha': previous}, 'head': {'sha': mixed}}}, '')['typescript'] == 'true'
     finally:
         os.chdir(original)
     print('CI change detection passed: PR, multi-commit push, merge queue, rename, deletion, tag, manual, invalid diff')

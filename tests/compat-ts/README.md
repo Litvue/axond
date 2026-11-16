@@ -4,20 +4,20 @@ The vendors' own **Node** SDKs — [`openai`](https://www.npmjs.com/package/open
 and [`@anthropic-ai/sdk`](https://www.npmjs.com/package/@anthropic-ai/sdk) —
 driving a real `axond` process against the committed fixtures in
 [`../fixtures`](../fixtures). The sibling of [`../compat`](../compat), which does
-the same with the Python SDKs, and of `crates/gateway/tests`, which does it with
-a raw HTTP client ([ADR 0014](../../docs/adr/0014-compatibility-and-soak-harness.md)).
+the same with the Python SDKs ([ADR 0014](../../docs/adr/0014-compatibility-and-soak-harness.md)).
 
 Offline by construction: no provider account, no network call to a provider, no
 real secret. The fake upstream is a loopback `node:http` server serving the same
-fixture bytes the other two harnesses serve, and the gateway key and provider
+fixture bytes the Python harness serves, and the gateway key and provider
 keys are literals generated into a temporary config.
 
 ```bash
-just compat-ts    # build the gateway, install the locked SDKs, run the lane
+(cd ts && npm ci)
+(cd tests/compat-ts && npm ci && npm test)
 ```
 
-Or by hand, from this directory, with a built `axond` on the path `AXOND_BIN`
-names (the debug build by default):
+Or by hand, from this directory, with `AXOND_BIN` optionally overriding
+`ts/bin/axond` (the default, relative to the repository root):
 
 ```bash
 npm ci --ignore-scripts

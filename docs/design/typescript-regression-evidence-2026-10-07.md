@@ -1,5 +1,12 @@
 # TypeScript regression audit — 2026-10-07
 
+> Historical conversion investigation/evidence. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> made TypeScript the sole implementation and removed the Rust tree and comparison
+> runners. Rust paths, shadow jobs and commands below describe the recorded
+> conversion baseline, not current gates. Current verification is the TS suite,
+> SDK compatibility and release binary/image smoke; see
+> [the TypeScript gateway](../typescript.md).
+
 This is local validation of the regression-gate changes on top of conversion
 head `cb1ead38a4cb3a0dd04689946eda07e2cbecf255` (PR #531). The Rust sources on
 that head are unchanged from `503103cf6df769063648d7285c6358ded043a419`, the

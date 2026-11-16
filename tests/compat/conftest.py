@@ -1,7 +1,7 @@
 """Boot a real axond binary against the fake upstream, once per session.
 
 The binary is located by ``AXOND_BIN`` (the CI lane passes the path it built);
-otherwise the debug build is used, so ``cargo build && pytest tests/compat`` is
+otherwise the TypeScript CLI is used, so ``pytest tests/compat`` is
 all a local run needs.
 """
 
@@ -27,7 +27,7 @@ UPSTREAM_OPENAI_KEY = "test-upstream-openai-key"
 UPSTREAM_ANTHROPIC_KEY = "test-upstream-anthropic-key"
 
 def _binary() -> Path:
-    path = Path(os.environ.get("AXOND_BIN", REPO_ROOT / "target/debug/axond"))
+    path = Path(os.environ.get("AXOND_BIN", REPO_ROOT / "ts/bin/axond"))
     if not path.exists():
         raise RuntimeError(f"axond binary not found at {path}; build it first")
     return path

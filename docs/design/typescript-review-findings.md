@@ -1,5 +1,12 @@
 # TypeScript automated review dispositions
 
+> Historical conversion investigation/evidence. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> made TypeScript the sole implementation and removed the Rust tree and comparison
+> runners. Rust paths, shadow jobs and commands below describe the recorded
+> conversion baseline, not current gates. Current verification is the TS suite,
+> SDK compatibility and release binary/image smoke; see
+> [the TypeScript gateway](../typescript.md).
+
 Date: 2026-10-08. This pass evaluated 85 existing findings across the stacked
 PRs. The rows identify findings, including duplicates; they are not a count
 of distinct defects. 79 are addressed by implementation, regression tests,

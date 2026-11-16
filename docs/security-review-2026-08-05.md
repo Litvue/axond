@@ -1,5 +1,10 @@
 # Security review — 2026-08-05
 
+> Historical Rust review at the commit named below, not a review of current TS
+> code. [ADR 0069](./adr/0069-retire-the-rust-gateway.md) removed that tree and its
+> supply-chain machinery. See [current review triggers](./security/threat-model-review.md)
+> for TS evidence and coverage gaps.
+
 Scope: the beta qualification review of secret handling, tenant isolation, and
 the release supply chain. Reviewed at commit `1dd3a14` on `main` plus the
 changes in this PR. Line references are to that state of the tree.

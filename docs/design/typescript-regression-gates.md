@@ -1,5 +1,12 @@
 # TypeScript conversion regression gates
 
+> Historical conversion investigation/evidence. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> made TypeScript the sole implementation and removed the Rust tree and comparison
+> runners. Rust paths, shadow jobs and commands below describe the recorded
+> conversion baseline, not current gates. Current verification is the TS suite,
+> SDK compatibility and release binary/image smoke; see
+> [the TypeScript gateway](../typescript.md).
+
 The conversion is not ready to replace the Rust release solely because its test
 count is green. A release needs evidence for the supported contract, an explicit
 decision on the differences below, and deployment evidence for its chosen target.

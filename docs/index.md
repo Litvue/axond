@@ -24,7 +24,7 @@ disk as records.
 
 ## Install
 
-- [Installation and verification](./installation.md) — crates.io, signed
+- [Installation and verification](./installation.md) — signed
   binaries, OCI images, checksums, SBOMs, signatures, and attestations.
 - [Docker Compose](./deployment/docker-compose.md) — pull-first SQLite
   quickstart and Postgres overlay.
@@ -108,13 +108,13 @@ disk as records.
 - [Threat-model review triggers](./security/threat-model-review.md) — which
   changes require a security review, and the regression tests, threat-model or
   ADR updates, and release-impact statement each one owes.
-- [Compatibility gates](./compatibility.md#the-published-rust-api) — the MSRV
-  floor, and the published-library API check (empty set is success).
+- [Compatibility contract](./compatibility.md#implementation-and-runtime) — the
+  TS runtime, HTTP, configuration and telemetry surfaces.
 - [Backend responsibility boundaries](./maintainers/backend-contracts.md) — the
-  eight responsibility-specific backend contracts, which paths they may be
+  responsibility-specific backend contracts, which paths they may be
   called from, and why there is no universal state backend.
 - [Release runbook](./maintainers/releasing.md) — release-please, artifact
-  repair, crates.io ordering, and verification.
+  repair, artifact ordering, and verification.
 - [Release readiness](../RELEASE.md) — current public-beta evidence and known
   limitations.
 - [Architecture decisions](./adr) — accepted design decisions and consequences.

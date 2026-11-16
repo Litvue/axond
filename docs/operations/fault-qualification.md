@@ -1,5 +1,12 @@
 # Fault qualification
 
+> Historical Rust qualification only. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> removed the Rust harnesses and their CI workflows. The evidence in
+> `qualification/` is retained unchanged; it does not qualify the TypeScript
+> gateway. Commands, driver paths and required lanes below describe the former
+> harness, not runnable checks on current main. TS performance/fault qualification
+> requires new evidence.
+
 How a replica behaves when the provider or the network to it fails — and the
 evidence that says so. This page is the fault half of the production
 qualification programme; the load half is

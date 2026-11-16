@@ -2,7 +2,7 @@
  * Boot a real axond binary against the fake upstream, once per test file.
  *
  * The binary is located by `AXOND_BIN` (the CI lane passes the path it built);
- * otherwise the debug build is used, so `cargo build -p axond && npm test` is
+ * otherwise the TypeScript CLI is used, so `npm test` is
  * all a local run needs. The generated config is the same shape the Python lane
  * generates, so the two lanes differ only in which SDK drives the gateway.
  */
@@ -48,7 +48,7 @@ export interface StartOptions {
 }
 
 function binary(): string {
-  const path = process.env["AXOND_BIN"] ?? join(REPO_ROOT, "target/debug/axond");
+  const path = process.env["AXOND_BIN"] ?? join(REPO_ROOT, "ts/bin/axond");
   if (!existsSync(path)) {
     throw new Error(`axond binary not found at ${path}; build it first`);
   }

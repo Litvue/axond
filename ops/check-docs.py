@@ -27,9 +27,7 @@ def markdown_files() -> list[Path]:
         ROOT / "SECURITY.md",
     ]
     files.extend((ROOT / "docs").rglob("*.md"))
-    files.extend((ROOT / "crates").rglob("README.md"))
     files.extend((ROOT / "tests").rglob("README.md"))
-    files.append(ROOT / "fuzz/README.md")
     # Only committed documentation is ours to check; an installed dependency
     # tree (the TypeScript compatibility lane's `node_modules`) is not.
     return sorted(
@@ -112,13 +110,7 @@ def check_relative_links(files: list[Path]) -> list[str]:
 
 
 def workspace_version() -> str:
-    cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
-    match = re.search(
-        r"\[workspace\.package\]\s+version\s*=\s*\"([^\"]+)\"", cargo
-    )
-    if not match:
-        raise RuntimeError("could not read workspace.package.version")
-    return match.group(1)
+    return json.loads((ROOT / "ts/package.json").read_text(encoding="utf-8"))["version"]
 
 
 def check_release_markers() -> list[str]:
@@ -185,7 +177,6 @@ def check_stale_claims(files: list[Path]) -> list[str]:
     for source in files + [
         ROOT / "axond.example.toml",
         ROOT / ".agents/skills/testing-axond/SKILL.md",
-        ROOT / "ops/tier0-gate.sh",
     ]:
         # Whitespace-insensitive, because these pages are hard-wrapped: a phrase
         # that spans a line break is the same claim, and matching the raw text
@@ -199,54 +190,27 @@ def check_stale_claims(files: list[Path]) -> list[str]:
     return failures
 
 
-def check_route_contract() -> list[str]:
-    routes = ROOT / "crates/gateway/src/routes"
-    if routes.is_dir():
-        source = "\n".join(
-            path.read_text(encoding="utf-8") for path in sorted(routes.glob("*.rs"))
-        )
-    else:
-        source = (ROOT / "crates/gateway/src/routes.rs").read_text(encoding="utf-8")
-    documented = (ROOT / "docs/compatibility.md").read_text(encoding="utf-8")
-    registered = set(re.findall(r'path:\s*"(/[^"]+)"', source))
-    return [
+def route_contract_failures(source: str, documented: str) -> list[str]:
+    registered = set(re.findall(r'app\.(?:get|post|put|delete)\("(/[^"]+)"', source))
+    registered.update(re.findall(r'path === "(/[^"]+)"', source))
+    failures = [
         f"docs/compatibility.md: registered route {route!r} is not documented"
         for route in sorted(registered)
         if route not in documented
     ]
+    documented_routes = re.findall(r"(/[^`\s]+)", documented)
+    for pattern in re.findall(r'path\.match\(/(\^.*?\$)/\)', source):
+        pattern = pattern.replace(r"\/", "/")
+        if not any(re.fullmatch(pattern, route) for route in documented_routes):
+            failures.append(f"docs/compatibility.md: registered route pattern {pattern!r} is not documented")
+    return failures
 
 
-def check_msrv_documented() -> list[str]:
-    """The published MSRV policy names the versions the manifests actually pin.
-
-    `ops/msrv-gate.sh` keeps the manifests, the Dockerfile, and the pinned
-    toolchain consistent with each other; this keeps the operator-facing
-    statement of the policy consistent with them.
-    """
-    cargo = (ROOT / "Cargo.toml").read_text(encoding="utf-8")
-    msrv = re.search(r"^rust-version\s*=\s*\"([^\"]+)\"", cargo, re.MULTILINE)
-    if msrv is None:
-        return ["Cargo.toml: [workspace.package] rust-version is not declared"]
-    pinned = re.search(
-        r"^channel\s*=\s*\"([^\"]+)\"",
-        (ROOT / "rust-toolchain.toml").read_text(encoding="utf-8"),
-        re.MULTILINE,
+def check_route_contract() -> list[str]:
+    return route_contract_failures(
+        (ROOT / "ts/packages/gateway/src/app.ts").read_text(encoding="utf-8"),
+        (ROOT / "docs/compatibility.md").read_text(encoding="utf-8"),
     )
-    if pinned is None:
-        return ["rust-toolchain.toml: no [toolchain] channel is pinned"]
-
-    heading = "### The Rust version floor (MSRV)"
-    document = (ROOT / "docs/compatibility.md").read_text(encoding="utf-8")
-    if heading not in document:
-        return [f"docs/compatibility.md: {heading!r} section is missing"]
-    start = document.index(heading)
-    end = document.find("\n### ", start + len(heading))
-    section = document[start : end if end != -1 else len(document)]
-    return [
-        f"docs/compatibility.md: the MSRV section does not mention {value!r}"
-        for value in (msrv.group(1), pinned.group(1))
-        if value not in section
-    ]
 
 
 def workflow_job_targets(workflow: str, job: str) -> list[str]:
@@ -312,7 +276,7 @@ def smoke_matrix_failures(
 
 def check_smoke_matrix() -> list[str]:
     return smoke_matrix_failures(
-        workflow_job_targets("ci.yml", "binary-smoke"),
+        workflow_job_targets("release-please.yml", "release-binaries"),
         workflow_job_targets("release-please.yml", "release-binaries"),
         (ROOT / "docs/compatibility.md").read_text(encoding="utf-8"),
     )
@@ -369,7 +333,7 @@ def sdk_matrix_failures(
                     f"the pin {owner} installs"
                 )
     for runtime, version, owner in (
-        ("Python", python_runtime, "the sdk-compat lane in ci.yml"),
+        ("Python", python_runtime, "the gateway lane in typescript.yml"),
         ("Node", node_runtime, "tests/compat-ts/.nvmrc"),
     ):
         if not version:
@@ -397,7 +361,7 @@ def check_sdk_matrix() -> list[str]:
     manifest = json.loads((ROOT / "tests/compat-ts/package.json").read_text(encoding="utf-8"))
     python_runtime = re.search(
         r"^\s+python-version:\s*'?([\d.]+)'?\s*$",
-        job_block((ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"), "sdk-compat"),
+        job_block((ROOT / ".github/workflows/typescript.yml").read_text(encoding="utf-8"), "gateway"),
         re.MULTILINE,
     )
     node = (ROOT / "tests/compat-ts/.nvmrc").read_text(encoding="utf-8").strip()
@@ -484,6 +448,12 @@ def self_test() -> int:
     The gate's whole value is that it fails; a check that only ever passes on the
     committed tree would be indistinguishable from no check at all.
     """
+    assert route_contract_failures("", "") == []
+    assert route_contract_failures('app.get("/healthz", handler)', "`/healthz`") == []
+    assert route_contract_failures('app.get("/healthz", handler)', "")
+    pattern_route = r'const one = path.match(/^\/api\/v1\/namespaces\/([^/]+)$/);'
+    assert route_contract_failures(pattern_route, "`/api/v1/namespaces/{ns}`") == []
+    assert route_contract_failures(pattern_route, "")
     workflow = (
         "jobs:\n"
         "  binary-smoke:\n"
@@ -599,9 +569,18 @@ def self_test() -> int:
         minimum=1,
     )
     assert present == [], present
+    assert review_trigger_failures(
+        '`test("a human readable title")`',
+        {"a human readable title"},
+        minimum=1,
+    ) == []
+    spaced_rename = review_trigger_failures(
+        '`test("a renamed human readable title")`', set(), minimum=0
+    )
+    assert len(spaced_rename) == 1 and "does not exist under ts/" in spaced_rename[0]
     # A rename that the page did not follow is the rot this gate exists for.
     renamed = review_trigger_failures("`a_renamed_test_is_still_named`", set(), minimum=0)
-    assert len(renamed) == 1 and "does not exist under crates/ or ts/" in renamed[0], renamed
+    assert len(renamed) == 1 and "does not exist under ts/" in renamed[0], renamed
     # Configuration keys stay below the three-underscore floor.
     assert review_trigger_failures("`allow_platform_fallback`", set(), minimum=0) == []
     thin = review_trigger_failures(
@@ -611,11 +590,6 @@ def self_test() -> int:
     assert len(thin) == 1 and "only 1 named tests remain" in thin[0], thin
     with tempfile.TemporaryDirectory() as raw:
         records = Path(raw)
-        crates = records / "crates"
-        crates.mkdir()
-        (crates / "floor.rs").write_text(
-            "fn rust_only_name_is_declared() {}\n", encoding="utf-8"
-        )
         typescript = records / "ts"
         typescript.mkdir()
         modules = typescript / "node_modules"
@@ -625,12 +599,15 @@ def self_test() -> int:
         )
         (typescript / "app.test.ts").write_text(
             'test("typescript_title_is_a_declared_test", () => {})\n'
+            'test("a human readable title", () => {})\n'
+            "test('a single quoted title', () => {})\n"
             "function helper_name_is_declared() {}\n",
             encoding="utf-8",
         )
-        names = declared_test_names(crates, typescript)
-        assert "rust_only_name_is_declared" in names, names
+        names = declared_test_names(typescript)
         assert "typescript_title_is_a_declared_test" in names, names
+        assert "a human readable title" in names, names
+        assert "a single quoted title" in names, names
         assert "helper_name_is_declared" in names, names
         assert "dependency_test_must_not_count" not in names, names
 
@@ -671,17 +648,6 @@ def self_test() -> int:
         empty_record = check_adr_numbering(records)
         assert len(empty_record) == 1, empty_record
         assert "does not start with" in empty_record[0], empty_record
-
-    package = '[package]\nname = "axond"\n\n[[bin]]\nname = "axond"\n'
-    distinct = f'{package}\n[lib]\nname = "axond_fuzz_seam"\n'
-    assert documented_target_failures("m", distinct) == []
-    assert documented_target_failures("m", package) == []
-    # The clash, spelled out and — the easier one to reintroduce — defaulted to
-    # the package name by leaving `[lib] name` off entirely.
-    for clashing in (f'{package}\n[lib]\nname = "axond"\n', f"{package}\n[lib]\n"):
-        shadowed = documented_target_failures("m", clashing)
-        assert len(shadowed) == 1, shadowed
-        assert "after a binary of the same crate" in shadowed[0], shadowed
 
     # Fragments: the slug rules a cross-link relies on, and the rename it breaks.
     page = (
@@ -825,34 +791,36 @@ def check_front_door_size() -> list[str]:
     return failures
 
 
-def declared_test_names(crates: Path, typescript: Path | None) -> set[str]:
-    """Rust `fn` names plus TypeScript `function` and `test("snake_case")` titles."""
+def declared_test_names(typescript: Path) -> set[str]:
+    """TypeScript function names and named test titles."""
     declared: set[str] = set()
-    if crates.is_dir():
-        for source in crates.rglob("*.rs"):
-            declared.update(
-                re.findall(r"\bfn\s+([a-z0-9_]+)", source.read_text(encoding="utf-8"))
-            )
-    if typescript is not None and typescript.is_dir():
+    if typescript.is_dir():
         for source in typescript.rglob("*.ts"):
             if "node_modules" in source.parts or ".wrangler" in source.parts:
                 continue
             text = source.read_text(encoding="utf-8")
             declared.update(re.findall(r"\bfunction\s+([a-z0-9_]+)", text))
-            declared.update(re.findall(r"""\btest\(\s*["']([a-z0-9_]+)["']""", text))
+            declared.update(
+                match[0] or match[1]
+                for match in re.findall(r"""\btest\(\s*(?:"([^"\n]+)"|'([^'\n]+)')""", text)
+            )
     return declared
 
 
 def review_trigger_failures(text: str, declared: set[str], *, minimum: int = 40) -> list[str]:
-    """Named tests on the trigger page must still be declared in Rust or TypeScript."""
+    """Named tests on the trigger page must still be declared in TypeScript."""
     named = {
         candidate
         for candidate in re.findall(r"`([a-z0-9_]+)`", text)
         if candidate.count("_") >= 3
     }
+    named.update(
+        match[0] or match[1]
+        for match in re.findall(r"""`test\((?:"([^"\n]+)"|'([^'\n]+)')\)`""", text)
+    )
     failures = [
         "docs/security/threat-model-review.md: named test "
-        f"{name!r} does not exist under crates/ or ts/"
+        f"{name!r} does not exist under ts/"
         for name in sorted(named - declared)
     ]
     if len(named) < minimum:
@@ -868,11 +836,12 @@ def check_review_trigger_tests() -> list[str]:
     """Every test the threat-model trigger page names still exists.
 
     The page is only useful if its named tests are the *real* floor, and a
-    documented test name rots silently: a rename in the crates leaves the page
+    documented test name rots silently: a rename in the TypeScript tests leaves the page
     pointing at coverage nobody has. Every backticked lowercase identifier with
     three or more underscores in it is treated as a test function and must be
-    declared under `crates/` (`fn`) or `ts/` (`function`, or a `test("snake_case")`
-    title). Shorter identifiers are configuration keys and field names
+    declared under `ts/` (`function`, or a named `test` title).
+    Human-readable titles use explicit backticked `test("title with spaces")`
+    references so a rename is checked too. Shorter identifiers are configuration keys and field names
     (`allow_platform_fallback`, `credential_source`), which other checks and the
     configuration reference already cover.
     """
@@ -884,63 +853,8 @@ def check_review_trigger_tests() -> list[str]:
         ]
     return review_trigger_failures(
         page.read_text(encoding="utf-8"),
-        declared_test_names(ROOT / "crates", ROOT / "ts"),
+        declared_test_names(ROOT / "ts"),
     )
-
-
-def documented_target_failures(relative: str, text: str) -> list[str]:
-    """The library-versus-binary name clash in one manifest, if it has one."""
-    library = re.search(r"^\[lib\]$(.*?)(?=^\[|\Z)", text, re.M | re.S)
-    if not library:
-        return []
-    named = re.search(r'^name = "([^"]+)"', library.group(1), re.M)
-    if named:
-        name = named.group(1)
-    else:
-        # An omitted `[lib] name` defaults to the package name, which for a
-        # package whose binary is named after it *is* the clash. Resolve it the
-        # way Cargo does rather than skipping the manifest.
-        package = re.search(r"^\[package\]$(.*?)(?=^\[|\Z)", text, re.M | re.S)
-        packaged = (
-            re.search(r'^name = "([^"]+)"', package.group(1), re.M) if package else None
-        )
-        if not packaged:
-            return [f"{relative}: neither `[package]` nor `[lib]` names the library"]
-        name = packaged.group(1)
-    binaries = [
-        match.group(1)
-        for match in re.finditer(
-            r"^\[\[bin\]\]$.*?^name = \"([^\"]+)\"", text, re.M | re.S
-        )
-    ]
-    if name not in binaries:
-        return []
-    return [
-        f"{relative}: the library is named {name!r} after a binary of the same "
-        "crate, so `cargo doc` documents only one of them and the other's modules "
-        "are no longer rustdoc-linted"
-    ]
-
-
-def check_documented_targets() -> list[str]:
-    """No crate names a library after one of its own binaries.
-
-    `cargo doc` documents one target per crate name, so a library sharing a
-    binary's name quietly takes its place: `target/doc/axond/` becomes the
-    library's, every module under the binary stops being rustdoc-linted, and the
-    `Documentation` lane keeps passing with `RUSTDOCFLAGS=-D warnings` covering
-    nothing. Marking the library `doc = false` does not help — it removes the
-    whole crate from the documentation instead. Only distinct names keep both.
-    """
-    failures: list[str] = []
-    for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml")):
-        failures.extend(
-            documented_target_failures(
-                str(manifest.relative_to(ROOT)),
-                manifest.read_text(encoding="utf-8"),
-            )
-        )
-    return failures
 
 
 def record_profiles(record: str) -> dict[str, dict[str, float]]:
@@ -1200,14 +1114,12 @@ def main(argv: list[str]) -> int:
     failures.extend(check_release_markers())
     failures.extend(check_stale_claims(files))
     failures.extend(check_route_contract())
-    failures.extend(check_msrv_documented())
     failures.extend(check_smoke_matrix())
     failures.extend(check_sdk_matrix())
     failures.extend(check_disclosure_routing())
     failures.extend(check_release_script_triggers())
     failures.extend(check_review_trigger_tests())
     failures.extend(check_front_door_size())
-    failures.extend(check_documented_targets())
     failures.extend(check_adr_numbering())
     failures.extend(check_capacity_envelope())
     if failures:

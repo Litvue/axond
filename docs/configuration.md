@@ -1,7 +1,7 @@
 # Configuration reference
 
 Every section, key, and default the gateway reads today, cross-checked against
-[`crates/gateway/src/config.rs`](../crates/gateway/src/config.rs).
+[`ts/packages/gateway/src/config.ts`](../ts/packages/gateway/src/config.ts).
 [`axond.example.toml`](../axond.example.toml) is the same surface with prose;
 this is the lookup table.
 
@@ -634,7 +634,7 @@ migrations, and backup/restore ownership.
 | Key | Type | Default | Applies to | Meaning |
 | --- | --- | --- | --- | --- |
 | `kind` | `stdout` \| `postgres` \| `otlp` | — | all | Destination. Declare several; each buffers independently. |
-| `dsn_env` | string | — | `postgres` | *Name* of the env var holding the connection string. Required and non-empty for `postgres`. `sslmode=require` in the DSN turns on TLS (rustls + webpki roots). |
+| `dsn_env` | string | — | `postgres` | *Name* of the env var holding the connection string. Required and non-empty for `postgres`. `sslmode=require` in the DSN turns on TLS (using the host Postgres driver). |
 | `table` | string | `axond_usage` | `postgres` | Destination table; `schema.table` allowed. Validated as an identifier, so it cannot carry SQL. |
 | `create_table` | bool | `false` | `postgres` | Apply the shipped DDL at boot. Off because most deployments give the gateway's role no DDL rights. |
 | `buffer_capacity` | integer | `10000` | `postgres` | Records buffered before the fan-out drops. Must be ≥ 1. Not used when the journal is enabled. |

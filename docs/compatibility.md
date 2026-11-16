@@ -53,9 +53,8 @@ and credential id. A fallback tenant sees a platform pool only when it has no
 pool of its own for that provider, and an env-derived platform label is omitted.
 
 `GET /admin/v1/status` is unmounted in production `serve()` ([ADR 0063](./adr/0063-stateful-only-namespaced-gateway.md),
-[#438](https://github.com/Litvue/axond/pull/438)). A `diagnostic_router` helper
-still exists for withdrawn-tree tests; it is not composed into the listening
-app. Ask `/readyz` for load-balancer readiness and logs/metrics for Store
+[#438](https://github.com/Litvue/axond/pull/438)). The former Rust diagnostic
+router was removed with the retired tree. Ask `/readyz` for load-balancer readiness and logs/metrics for Store
 health. After `SIGTERM`, `/readyz` answers `503 draining` at once and `/healthz`
 stays `200 ok`. New `/api/v1` and `/ns` requests remain admitted for
 `shutdown.drain_grace_ms`. Admission then closes: a request the process still
@@ -67,8 +66,8 @@ signal closes admission without waiting out the grace window.
 
 Responses is forwarded natively with only `model` rewritten and streaming is
 byte-faithful. **Every** `/v1/responses` request — initial calls as well as ones
-carrying a `previous_response_id` — considers only its alias's first configured
-target and first configured credential, and never fails over or rotates
+carrying a `previous_response_id` — considers only its resolved provider
+and first configured credential, and never fails over or rotates
 credentials. That is what lets a continuation reach the provider that stored the
 response without gateway state; the trade-off is that the Responses route has no
 failover, so a first-target outage or an exhausted first key is returned to the
@@ -271,56 +270,12 @@ interface — read it at your own risk.
   terminates at a bound, which is a behaviour change rather than a status
   change, since there was no earlier response to reclassify.
 
-### The published Rust API
+### Implementation and runtime
 
-crates.io no longer receives versions; **0.7.1 was the last Rust release** and
-existing versions are not yanked. Historical `axond` packages contain the Rust
-gateway binary. Its compatibility surface is config, HTTP, and telemetry, not Rust items.
-`gateway-core` and `gateway-transport` remain unpublished git workspace members
-so the in-repo test graph can still `cargo test -p gateway-core`; they are not a
-library product and must not be `cargo add`-ed. Versions already on the registry
-are not yanked.
-
-`axond` does carry a library target, but it is empty outside `--cfg fuzzing`: it
-exists so the out-of-tree [fuzz project](./security/fuzzing.md) can link the
-parsers under test, exports nothing to any other consumer, and is therefore
-excluded from the compatibility gate rather than promised.
-
-A required CI lane still runs [`ops/api-compat.py`](../ops/api-compat.py): an
-empty published-library set is success. If a workspace member is later marked
-publishable and exports a library, that lane compares it with
-[`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks)
-against the version already on crates.io. An intentional break of such an API is
-a minor bump plus a reviewed entry in
-[`ops/api-compat-overrides.toml`](../ops/api-compat-overrides.toml); the process
-is in the [release runbook](./maintainers/releasing.md#public-api-compatibility).
-
-### The Rust version floor (MSRV)
-
-The minimum supported Rust version is **1.97**, declared once as
-`rust-version` in `[workspace.package]` and inherited by every workspace crate,
-so `cargo install axond` on 1.97.0 resolves and builds.
-
-The floor and the toolchain this repository builds with are deliberately
-different things:
-
-| Declaration | Value | Why |
-| --- | --- | --- |
-| `rust-version` (`Cargo.toml`) | `1.97` | the floor consumers may rely on; enforced by Cargo for them |
-| `rust-toolchain.toml` | `1.97.1` | one pinned patch for reproducible `rustfmt`/`clippy` results |
-| `FROM rust:` (`Dockerfile`) | `1.97` | the release image builds on the floor's minor |
-| CI lanes | `1.97.1`, plus one `1.97.0` MSRV lane | the stable lane keeps its pin; the floor is proved separately |
-
-`ops/msrv-gate.sh` is the enforcement: it reads the floor from `Cargo.toml`,
-refuses a pinned toolchain older than it, refuses a `Dockerfile` or a crate
-manifest that drifts from it, and then builds the workspace — `--locked`, all
-features, all targets — on the first patch of that minor. A dependency bump that
-quietly raises its own MSRV therefore fails in CI rather than in a consumer's
-build.
-
-Raising the floor is a **minor** bump with a changelog entry, treated like any
-other break in this document, and is done for a reason that is written down —
-not merely because a newer compiler exists.
+TypeScript is the sole implementation and release artifact
+([ADR 0069](./adr/0069-retire-the-rust-gateway.md)). Rust public API and minimum
+compiler guarantees no longer apply. Historical v0.7.x tags retain the old tree.
+The current compatibility surface is HTTP, configuration and telemetry.
 
 ### Telemetry
 
@@ -368,9 +323,8 @@ claim here cannot drift from what CI and the release actually do:
 | Matrix | Owner (source of truth) | Exercised by |
 | --- | --- | --- |
 | Supported versions for fixes | [`SECURITY.md`](../SECURITY.md) — latest `0.x` release plus the immediately previous minor, security fixes only | the release/backport process |
-| Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml), listed under [supported platforms](#supported-platforms) above: six archive targets plus the `linux/amd64` + `linux/arm64` image index | the release workflow; on every change the `binary-smoke` matrix boots each target on a runner of its own platform, the musl `static-binary` lane adds the Tier 0 network-denial gate, and `docker-smoke` covers the image |
-| Provider-SDK compatibility | [`tests/compat/requirements.in`](../tests/compat/requirements.in) (exact pins, hash-locked in `requirements.txt`) and [`tests/compat-ts/package.json`](../tests/compat-ts/package.json) with [`.nvmrc`](../tests/compat-ts/.nvmrc) (exact pins, hash-locked in `package-lock.json`) | the required `sdk-compat` and `sdk-compat-ts` lanes against committed fixtures ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)) |
-| Rust floor and published API | `rust-version` in [`Cargo.toml`](../Cargo.toml); [`ops/api-compat.py`](../ops/api-compat.py) (empty published-library set is success) | the required `msrv` and `api-compat` lanes |
+| Release targets | the `binaries` matrix in [`release-please.yml`](../.github/workflows/release-please.yml), listed under [supported platforms](#supported-platforms) | archived binary smoke on each native target and published image smoke in the release path |
+| Provider-SDK compatibility | [`tests/compat/requirements.in`](../tests/compat/requirements.in) (exact pins, hash-locked in `requirements.txt`) and [`tests/compat-ts/package.json`](../tests/compat-ts/package.json) with [`.nvmrc`](../tests/compat-ts/.nvmrc) (exact pins, hash-locked in `package-lock.json`) | the gateway job in `typescript.yml` against committed fixtures ([ADR 0014](./adr/0014-compatibility-and-soak-harness.md)) |
 
 Adding a target, an SDK, or a supported version means editing the owner file
 above; this document describes the policy and restates a value only where a gate
@@ -382,28 +336,15 @@ holds the restatement to its owner. `ops/check-docs.py` is that gate:
 - every SDK version and runtime in the [client matrix](#clients) must be the one
   its owner file pins and the lane installs, so a pin bump that stops here is a
   failing gate rather than a compatibility claim about a release CI no longer
-  exercises;
-- the MSRV section must name the floor `Cargo.toml` declares and the toolchain
-  pinned in `rust-toolchain.toml`.
+  exercises.
 
-Every released target is booted and served, not merely compiled. On each change
-and again at the tag, for the exact binary that is archived,
-[`ops/binary-smoke.py`](../ops/binary-smoke.py) asserts that `/healthz` and
-`/readyz` answer unauthenticated, that `/ns/{ns}/v1/models` requires a gateway
-key and lists cached `provider-id/model-id` ids, that an unprefixed model is
-refused as `model_unprefixed`, and that one chat completion completes against a
-local fixture upstream. Each
-Linux archive runs it on a runner of its own architecture, so an ARM64 archive is
-booted on ARM64 rather than emulated. Linux musl is held to more:
-[`ops/tier0-gate.sh`](../ops/tier0-gate.sh) boots it inside a network namespace
-that denies egress and DNS, which is why a datastore or outbound dependency added
-to the default path fails there first. That gate is Linux-only by construction,
-so macOS and Windows get the portable subset.
+Every released target is booted and served by
+[`ops/binary-smoke.py`](../ops/binary-smoke.py) in the release path, including
+dry-runs, before upload or attestation. The portable smoke checks unauthenticated
+probes, authenticated models, an unprefixed model refusal, and a buffered fixture
+completion. Native runners cover each target; image smoke covers both image
+architectures. The TS compiled-binary job also checks the local executable.
 
-What is *not* covered: the hermetic Tier 0 gate applies to
-`x86_64-unknown-linux-musl` alone on every change — every Linux archive passes
-through it at release time, but there with the namespace treated as best-effort
-([ADR 0018](./adr/0018-tier-0-hermetic-boot-gate.md)) — the smoke exercises one
-buffered fixture request rather than streaming or a real provider, and the SDKs
-exercised end to end are the Python and Node ones above — no Go SDK, and no other
-runtime.
+The former Rust Tier 0 network-denial gate was retired with the Rust tree.
+These smokes do not prove hermetic boot, streaming behavior or real-provider
+availability. SDK compatibility covers the pinned Python and Node clients above.

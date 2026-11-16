@@ -112,7 +112,7 @@ state layout.
   configuration.
 - Do not roll back to a binary that predates a Store table it now relies on,
   such as `axond_namespace_incarnation`.
-- Published crates.io versions and release tags are immutable. Fix forward with
+- Published release artifacts and release tags are immutable. Fix forward with
   a new patch release rather than replacing artifacts.
 
 ## Post-deploy verification

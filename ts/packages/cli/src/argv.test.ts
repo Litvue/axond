@@ -10,8 +10,7 @@ const BIN = new URL("../../../bin/axond", import.meta.url);
 const WITHDRAWN = ["mint", "keygen", "revoke", "check", "migrate", "admin", "budget"] as const;
 
 test("argv_matches_clap_before_config_load", async () => {
-  const cargo = readFileSync(new URL("../../../../Cargo.toml", import.meta.url), "utf8");
-  const version = /^version = "([^"]+)"/m.exec(cargo)?.[1];
+  const version = JSON.parse(readFileSync(new URL("../../../package.json", import.meta.url), "utf8")).version;
   assert.equal(AXOND_VERSION, version);
   assert.equal(versionText(), `axond ${version}\n`);
 

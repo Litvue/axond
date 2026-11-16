@@ -233,7 +233,7 @@ editing, and neither hard-codes a datasource uid.
 **The metric names in these assets are checked against the binary's canonical
 catalogue.** A rule or panel referencing a metric axond does not emit, a label an
 instrument does not declare, or a closed-vocabulary value that is not in the
-vocabulary fails `cargo test`, so an asset cannot drift away from what the
+vocabulary fails `npm run check:alerts` in `ts/`, so an asset cannot drift away from what the
 gateway actually exports. The same gate checks that every `runbook_url` anchor in
 the rules resolves to a section of this page, and that every failure mode on this
 page has at least one rule.

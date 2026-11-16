@@ -1,5 +1,12 @@
 # TypeScript release conformance qualification
 
+> Historical conversion investigation/evidence. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> made TypeScript the sole implementation and removed the Rust tree and comparison
+> runners. Rust paths, shadow jobs and commands below describe the recorded
+> conversion baseline, not current gates. Current verification is the TS suite,
+> SDK compatibility and release binary/image smoke; see
+> [the TypeScript gateway](../typescript.md).
+
 This qualification compares the downloaded Rust **v0.6.3** release with a Bun
 compiled TypeScript candidate based on merged main
 `5509d29983536e7581c1a29bb9c6f50d16ab3d81`. It also compares the fault suite with

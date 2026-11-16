@@ -1,8 +1,8 @@
 /**
  * A fake provider upstream serving the committed wire fixtures.
  *
- * The TypeScript twin of `tests/compat/fake_upstream.py` and
- * `crates/gateway/tests/support/upstream.rs`: same fixtures, same target-model
+ * The TypeScript twin of `tests/compat/fake_upstream.py`:
+ * same fixtures, same target-model
  * vocabulary, so every harness qualifies the gateway against identical bytes
  * (ADR 0014).
  */

@@ -1,5 +1,12 @@
 # Axond in TypeScript: investigation and direction
 
+> Historical conversion investigation/evidence. [ADR 0069](../adr/0069-retire-the-rust-gateway.md)
+> made TypeScript the sole implementation and removed the Rust tree and comparison
+> runners. Rust paths, shadow jobs and commands below describe the recorded
+> conversion baseline, not current gates. Current verification is the TS suite,
+> SDK compatibility and release binary/image smoke; see
+> [the TypeScript gateway](../typescript.md).
+
 Date: 2026-09-28, updated 2026-09-29. Status: direction chosen by the maintainer, not yet recorded as an ADR.
 
 The direction is a TypeScript gateway built on Hono, written against Web-standard APIs so one codebase serves Cloudflare Workers, Bun, Node, and a compiled single binary. Every extension is a Hono middleware, so extending the gateway means writing a `.ts` file instead of recompiling Rust. A factory function (`createAxond`) doubles as an SDK: anyone can mount the gateway in their own Hono app, deploy it to a Worker, or containerize it. The Worker path runs against PlanetScale Postgres through Hyperdrive and works without changing the SQL. The single-binary goal survives through `bun build --compile` (94.7 MiB, or 99.3 MB, in my test), and I verified that such a binary loads an extension `.ts` file from disk at runtime without a rebuild. Whole-gateway WASM is a bad fit, and the WASM guardrail idea is dropped because the guardrail turned out to be unreachable in production. The hard problems are now the extension contract (stability, trust, and byte-faithful streaming) rather than the port itself.

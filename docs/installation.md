@@ -54,11 +54,10 @@ AXOND_REQUIRE_ATTESTATION=1 sh ./install.sh
 .\install.ps1 -RequireAttestation
 ```
 
-## crates.io source install
+## Historical Rust releases
 
-crates.io no longer receives versions. **0.7.1 is the last Rust version**;
-existing versions are not yanked. `cargo install axond --version 0.7.1 --locked`
-installs that historical Rust gateway, not the current TypeScript release.
+The retired Rust package receives no new versions. Historical v0.7.x tags
+retain the Rust tree; install current artifacts through the paths above.
 Use the prebuilt archives or OCI image for current releases.
 
 ## Prebuilt release binary
@@ -198,5 +197,5 @@ npm ci
 bun build packages/cli/src/main.ts --compile --outfile axond
 ```
 
-The Rust tree remains a conformance oracle with its own CI; it is not the
-release artifact. See [CONTRIBUTING.md](../CONTRIBUTING.md) for local checks.
+TypeScript is the only implementation. The Rust tree and comparison jobs were
+removed under [ADR 0069](./adr/0069-retire-the-rust-gateway.md).

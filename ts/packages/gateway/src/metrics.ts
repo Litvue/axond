@@ -1,5 +1,4 @@
 /** Metric names that remain after ADR 0063. Dashboards and alerts match these strings. */
-/** Names from `crates/gateway/src/telemetry/catalog.rs` that dashboards and alerts match. */
 export const METRIC_NAMES = [
   "axond.http.server.requests",
   "axond.http.server.duration",

@@ -14,8 +14,7 @@
     "lint:web": "node --experimental-strip-types scripts/lint-no-node-imports.ts",
     "check:alerts": "node --experimental-strip-types scripts/check-alerts.ts",
     "check:docs": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/check-doc-samples.ts",
-    "check:npm": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/check-npm-policy.ts",
-    "test:parity": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/shadow-compare.ts"
+    "check:npm": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/check-npm-policy.ts"
   },
   "engines": {
     "node": ">=22.14"

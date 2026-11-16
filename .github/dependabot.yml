@@ -6,10 +6,6 @@ version: 2
 # and the version comment in step, so the pins stay current without anyone
 # watching upstream releases by hand.
 #
-# Cargo dependencies are deliberately not managed here: `deny.toml` plus the
-# `dependency-policy` lane and the scheduled `dependency-audit.yml` run cover
-# them, and a lockfile bump has to go through `cargo update` and the full test
-# matrix rather than a per-crate PR.
 updates:
   - package-ecosystem: github-actions
     directory: /

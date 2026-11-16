@@ -46,12 +46,12 @@ unnoticed one.
 
 | Change touches | Trigger |
 | --- | --- |
-| `routes/auth.rs`, `principals.rs`, `[[gateway_key]]`, the `/ns/{ns}/v1` and `/api/v1` authentication path | [Authentication and authorization](#1-authentication-and-authorization) |
-| Namespace resolution, `namespace.rs`, `credentials.rs` pool lookup, `allow_platform_fallback`, `budget/`, `admission.rs`, the store's namespace rows | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
-| `key_material.rs`, credential injection, error and log text | [Credential delivery and redaction](#3-credential-delivery-and-redaction) |
-| `backends/catalog.rs`, `aliases.rs`, `pricing.rs`, `[[price]]`, `/v1/models`, alias scope, wire families | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
-| `ops/postgres/`, `crates/gateway/sql/`, `store/`, `usage/`, `telemetry/` | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
-| `.github/workflows/`, `ts/scripts/sign-artifact.sh`, `install.sh`, `install.ps1`, `Dockerfile`, `deny.toml` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
+| `ts/packages/gateway/src/auth.ts`, `ts/packages/gateway/src/app.ts`, `[[gateway_key]]`, the `/ns/{ns}/v1` and `/api/v1` authentication path | [Authentication and authorization](#1-authentication-and-authorization) |
+| Namespace resolution, `ts/packages/gateway/src/namespace.ts`, `ts/packages/gateway/src/dispatch.ts` pool lookup, `allow_platform_fallback`, `ts/packages/gateway/src/app.ts`, `ts/packages/gateway/src/admission.ts`, the store's namespace rows | [Tenant and namespace scoping](#2-tenant-and-namespace-scoping) |
+| `ts/packages/gateway/src/config.ts`, credential injection, error and log text | [Credential delivery and redaction](#3-credential-delivery-and-redaction) |
+| `ts/packages/cli/src/discovery.ts`, `ts/packages/gateway/src/glob.ts`, `ts/packages/gateway/src/pricing.ts`, `[[price]]`, `/v1/models`, alias scope, wire families | [Catalogue and model entitlement](#4-catalogue-and-model-entitlement) |
+| `ops/postgres/`, `ts/packages/cli/src/postgres-store.ts`, `ts/packages/cli/src/sqlite-store.ts`, `ts/packages/cli/src/usage-delivery.ts`, `ts/packages/gateway/src/otel.ts` | [Persistence, migrations, telemetry, and usage](#5-persistence-migrations-telemetry-and-usage) |
+| `.github/workflows/`, `ts/scripts/sign-artifact.sh`, `install.sh`, `install.ps1`, `ts/Dockerfile`, `ts/scripts/check-npm-policy.ts` | [Actions, release permissions, attestations, and signing](#6-actions-release-permissions-attestations-and-signing) |
 | `ts/packages` extension loading, `AXOND_EXTENSIONS_DIR`, Worker bundling of middleware | [TypeScript extension trust](#8-typescript-extension-trust) |
 
 A change can fire more than one trigger; a credential-delivery change that also
@@ -60,21 +60,20 @@ adds a Postgres table fires two, and owes both sets.
 ## 1. Authentication and authorization
 
 **Fires on** any change to how a request is authenticated or what it is then
-allowed to do: the `authenticate` path in `crates/gateway/src/routes/auth.rs`,
-principal resolution in `crates/gateway/src/principals.rs`, the static
+allowed to do: the `authenticate` path in `ts/packages/gateway/src/auth.ts`,
+principal resolution in `ts/packages/gateway/src/auth.ts`, the static
 `[[gateway_key]]`, a new authenticated route, and anything that widens what the
 key can reach.
 
-**Regression tests.** The fail-closed floor is
-`every_authenticated_route_rejects_a_request_without_a_gateway_key`; a new route
-belongs in it, not beside it. Namespaced inference authenticates before the
-namespace is read: `every_canonical_namespace_route_authenticates_first` and
-`noncanonical_namespace_encoding_is_a_typed_refusal_after_authentication`.
-`/api/v1` is authenticated the same way: `openapi_json_requires_the_gateway_key`
-holds the spec document. Withdrawn surfaces
-stay withdrawn: `admin_v1_is_unmounted` holds that `/admin/v1` is 404 even with
-an operator bearer, and `the_withdrawn_commands_are_not_parsed` holds that the
-removed CLI subcommands are unknown rather than accepted and inert.
+**Regression tests.** `unknown_gateway_key_is_rejected_before_namespace_lookup`
+holds the invalid-key boundary before namespace lookup;
+`noncanonical_namespace_path_is_invalid_after_authentication` holds the
+canonical path refusal. `test("withdrawn routes stay unmounted")` covers the removed
+admin and unprefixed inference surfaces.
+`argv_matches_clap_before_config_load` refuses withdrawn CLI commands.
+The former exhaustive missing-key, all-canonical-routes and OpenAPI-authentication
+tests have no equivalent TS regression; this is a coverage gap, not a weaker
+authentication contract.
 
 **Threat model and ADRs.** [ADR 0013](../adr/0013-inbound-auth-fails-closed.md)
 (no keyless mode) and
@@ -97,26 +96,26 @@ an earlier release accepted is a minor bump with a rollback note.
 
 **Fires on** any change to how a caller's namespace is derived or how it bounds
 what they reach: namespace rows in the store, credential pool resolution in
-`crates/gateway/src/credentials.rs`, `allow_platform_fallback`, per-namespace
-budgets in `crates/gateway/src/budget/`, per-tenant admission in
-`crates/gateway/src/admission.rs`, the namespace filter on catalogue and
+`ts/packages/gateway/src/dispatch.ts`, `allow_platform_fallback`, per-namespace
+budgets in `ts/packages/gateway/src/app.ts`, per-tenant admission in
+`ts/packages/gateway/src/admission.ts`, the namespace filter on catalogue and
 credential-status responses, and boot validation that rejects a credential
 naming an undefined namespace or provider.
 
-**Regression tests.** Isolation at credential resolution:
-`byok_namespace_uses_its_own_pool_and_never_borrows_by_default`,
-`platform_fallback_yields_the_whole_platform_pool_attributed_to_platform`, and
-`api_created_namespace_inherits_platform_credentials`. Response scoping:
-`models_intersect_namespace_access_with_alias_scope`. Shared-state scoping:
-`a_saturated_tenant_leaves_other_tenants_their_capacity` and
-`a_refused_tenant_does_not_consume_the_global_ceiling`. Namespace lifecycle:
-`delete_namespace_is_idempotent_and_fail_closed_on_recreate`. Usage:
-`usage_summary_matches_rows_for_namespace_and_period` holds that
-`GET /api/v1/namespaces/{ns}/usage` totals only that namespace's rows for the
-requested period; `usage_summary_requires_period_query` refuses a missing
-period rather than summing across periods. A new
-cross-namespace read needs a test proving it is one-directional and off by
-default.
+**Regression tests.** `test("fallback credential status hides an env-derived platform label")`
+covers own BYOK selection, fallback attribution, API-created namespace fallback,
+and closed namespaces in the credential-status view.
+`usage_summary_matches_the_rust_grouping` holds namespace/period accounting;
+`test("management routes match the compatibility contract")` refuses a missing usage
+period and checks idempotent namespace deletion.
+`test("delete then recreate bumps incarnation so a late settle does not charge")`
+holds the SQLite recreation boundary.
+Per-tenant admission is no longer in core. The optional rate-limit extension
+has `test("store mode on postgres saturates one namespace and leaves another its capacity")`;
+this does not establish the former global-concurrency admission properties.
+Alias-scope intersection was withdrawn; routing uses provider/model IDs.
+A new cross-namespace read needs a test proving it is one-directional and off
+by default.
 
 **Threat model and ADRs.** [ADR 0003](../adr/0003-namespaced-credentials-and-byok.md)
 and [ADR 0006](../adr/0006-credential-pools-per-namespace-provider.md) define the
@@ -140,28 +139,26 @@ it is intended.
 ## 3. Credential delivery and redaction
 
 **Fires on** any change to how secret material enters, is held, moves, or is
-described: `crates/gateway/src/key_material.rs`, credential resolution in
-`crates/gateway/src/credentials.rs`, header injection and failure description in
-`crates/gateway-transport/src/lib.rs`, a new `expose_secret` call site, a new
-`Debug`/`Display`/`Serialize` derive on a type that can reach one, and the text
+described: `ts/packages/gateway/src/config.ts`, credential resolution in
+`ts/packages/gateway/src/dispatch.ts`, header injection and failure description in
+`ts/packages/gateway/src/dispatch.ts`, a new secret access call site, a new
+serialization or inspection path on a type that can reach one, and the text
 of any error, log, span, or metric that could carry a value rather than a
 reference.
 
-**Regression tests.** Delivery: the exact-bytes rules in
-`resolves_env_without_trimming`, `rejects_missing_empty_and_invalid_utf8_files`,
-and `resolves_file_bytes_without_trimming`. Outbound description:
-`a_described_failure_keeps_the_endpoint_and_drops_its_secrets`, the regression
-for the one finding of the security review. A provider error that echoes the
-outbound credential is returned with that value replaced by `[REDACTED]`.
-`provider_error_replaces_the_echoed_credential` covers the caller body for both
-the Bearer key and the Anthropic `x-api-key`.
-`messages_wire_headers_default_the_version_and_keep_the_caller_pin` sends
-`anthropic-version` (the caller pin, or `2023-06-01` when omitted) and
-`x-api-key`, and does not copy the gateway `Authorization` or a caller `Accept`.
-Attribution without disclosure:
-`fallback_status_hides_default_platform_label_but_keeps_explicit_id`.
+**Regression tests.** `test("credential and gateway key graph matches the rust refusals")`
+covers missing/empty/invalid-UTF-8 secret files and preserves a file's newline.
+`file_gateway_key_keeps_exact_bytes` checks the real file reader.
+`upstream_transport_log_names_the_reason_and_omits_the_address` holds bounded,
+non-address diagnostics rather than retaining the endpoint.
+`provider_error_replaces_the_echoed_credential` covers caller bodies for both
+Bearer and Anthropic keys.
+`messages_wire_headers_default_the_version_and_keep_the_caller_pin` holds
+provider header injection. `test("fallback credential status hides an env-derived platform label")`
+holds attribution without disclosure. There is no dedicated TS regression for
+environment-secret whitespace preservation.
 
-A new `expose_secret` call site is a review item in its own right: the security
+A new secret access call site is a review item in its own right: the security
 review counts them, so a PR that adds one says why the count changed. Boot
 failures must name the *reference* (the env-var or file name), and a test should
 assert that, not just that an error occurred.
@@ -185,34 +182,29 @@ addition: it belongs in the [configuration reference](../configuration.md) and
 ## 4. Catalogue and model entitlement
 
 **Fires on** any change to what a caller may discover or invoke: alias scope
-patterns in `crates/gateway/src/aliases.rs`, wire families, the `/v1/models`
-projection, catalogue ingestion in `crates/gateway/src/backends/catalog.rs`,
-request-path pricing in `crates/gateway/src/pricing.rs` and `[[price]]`, and any
+patterns in `ts/packages/gateway/src/glob.ts`, wire families, the `/ns/{ns}/v1/models`
+projection, catalogue ingestion in `ts/packages/cli/src/discovery.ts`,
+request-path pricing in `ts/packages/gateway/src/pricing.ts` and `[[price]]`, and any
 new route that exposes model or provider metadata.
 
-**Regression tests.** Pattern semantics are the entitlement boundary:
-`patterns_match_case_sensitively_and_union`, `prefix_does_not_subsume_other_globs`,
-`an_empty_scope_permits_nothing`, and `invalid_patterns_are_rejected`; a glob
-change that broadens a match is a privilege change. Projection:
-`models_requires_a_gateway_key`, `models_lists_the_callers_aliases`, and the
-namespace intersection tests in trigger 2. Inference is `/ns/{ns}/v1`, the
-namespace must exist in the store, and the models list is that path's
-catalogue: `namespaced_completion_and_namespace_api`. Configured `[[model]]`
-aliases were withdrawn in ADR 0063; routing is `provider-id/model-id`.
-
-Ingestion must stay inert:
-`observed_pricing_is_metadata_not_activation`,
-`the_source_is_background_only_and_declares_incremental_refresh`, and
-`an_unreachable_source_is_retryable_and_never_a_boot_failure`; upstream
-catalogue data must never become an entitlement or an admission dependency. The
-source a deployment reads must be the source it configured:
-`a_catalogue_source_url_must_be_https`,
-`a_catalogue_source_url_must_have_a_host_without_credentials`, and
-`a_redirected_source_is_refused_rather_than_followed`. Provider streams are
-untrusted input: `responses_stream_rejects_event_and_payload_type_disagreement`
-and `native_stream_rejects_event_and_payload_type_disagreement`. A new route is
-also covered mechanically: `ops/check-docs.py` fails a registered route that the
-[compatibility contract](../compatibility.md) does not document.
+**Regression tests.** `test("a buffered chat completion rewrites the model and forwards the provider credential")`
+exercises namespaced inference; `test("management routes match the compatibility contract")`
+exercises namespace management. `provider_model_cache_follows_the_rust_source` holds
+source-bound model projection, and
+`test("an absent namespace is unknown and an unprefixed model is refused")` holds
+namespace existence and provider/model routing.
+`test("catalogue boot matches the rust refusals")` rejects plaintext catalogue URLs
+and URL credentials. `catalogue_and_listing_redirects_are_not_followed_and_omit_the_secret`
+refuses redirects; `test("a failed discovery keeps the last catalogue and a fresh row rejects a different source")`
+keeps prior metadata on failure.
+`test("responses sequence names the broken event")` rejects Responses SSE event/type
+disagreement. The equivalent dedicated native Messages disagreement regression
+is absent. Alias entitlement globs were withdrawn; namespace blocklist validation
+is covered by `namespace_attrs_and_blocklist_match_the_rust_limits`.
+The old alias algebra, observed-pricing inertness, background/incremental-source,
+and all-route auth assertions are not established by these tests.
+A new registered route must also appear in the
+[compatibility contract](../compatibility.md), enforced by `ops/check-docs.py`.
 
 Approved price books, pinned catalogue offerings, durable enablements, and the
 availability projection were withdrawn with
@@ -222,9 +214,9 @@ availability projection were withdrawn with
 and [ADR 0012](../adr/0012-native-provider-routes.md) bound wire families and
 native routes; [ADR 0043](../adr/0043-catalogue-source-imports.md) holds
 observed rates as metadata and [ADR 0056](../adr/0056-request-path-pricing.md)
-covers request-path pricing. `CatalogSource`'s background-only placement is in
+covers request-path pricing. Background discovery ownership is in
 [backend contracts](../maintainers/backend-contracts.md). Item 2 of the security
-review's accepted-risk section is why `/v1/models` is authenticated and scoped;
+review's accepted-risk section is why `/ns/{ns}/v1/models` is authenticated and scoped;
 re-read it before changing that projection.
 
 **Release impact.** Entitlement changes are visible to clients: a pattern
@@ -237,9 +229,9 @@ already asks operators to review.
 ## 5. Persistence, migrations, telemetry, and usage
 
 **Fires on** any change to durable shape or emitted data: files under
-`ops/postgres/` or `crates/gateway/sql/`, the store in `crates/gateway/src/store/`,
-the sinks and row shapes in `crates/gateway/src/usage/`, span and metric
-attributes in `crates/gateway/src/telemetry/`, log call sites, and the retention
+`ops/postgres/` or `ts/packages/cli/src/postgres-store.ts`, the store in `ts/packages/cli/src/sqlite-store.ts`,
+the sinks and row shapes in `ts/packages/cli/src/usage-delivery.ts`, span and metric
+attributes in `ts/packages/gateway/src/otel.ts`, log call sites, and the retention
 or delivery guarantees of usage records.
 
 Provider failure diagnostics on attempt spans are bounded to 4 KiB and omit
@@ -258,23 +250,28 @@ attempt `axond.status` as `error` on the same matrix.
 `stream` and a non-string `previous_response_id` before the provider is called,
 and the error omits the value.
 
-**Regression tests.** The two copies of the shipped DDL are gated by
-`every_shipped_ddl_file_exists_in_both_locations` and
-`the_two_copies_of_each_shipped_ddl_file_are_byte_identical`: an operator
-applying `ops/postgres/*.sql` by hand and a gateway applying its embedded copy
-must produce the same table, and a row-shape change is a new `*_v<N>.sql` rather
-than an edit. `sqlite_usage_summary_groups_by_model_and_status` holds the store
-usage index that `GET .../usage` reads: per-model per-status counts, null cost
-as zero, and duplicate `request_id` ignored. Row and statement safety:
-`the_row_shape_matches_the_shipped_ddl`, `every_column_is_bound_once_per_row`,
-`a_batch_never_exceeds_the_parameter_limit`,
-`table_names_that_could_carry_sql_are_rejected`,
-`a_schema_qualified_table_keeps_its_index_names_unqualified`, and
-`a_later_chunk_failure_rolls_back_the_whole_batch`. The Postgres-backed tests
-(`a_batch_lands_in_postgres` and the store tests) skip without services, so run
-them the way [CONTRIBUTING](../../CONTRIBUTING.md#development) documents. A new
-emitted field needs a test that it carries a non-secret identifier: usage rows
-carry `credential_id` and `credential_source`, never material.
+**Regression tests.** `test("embedded usage ddl matches ops/postgres")` checks embedded
+DDL against every shipped usage migration, schema-qualified index naming and the
+row width. `test("sqlite usage summary groups in byte order and saturates at the signed cap")`
+holds grouped usage; `usage_summary_matches_the_rust_grouping` checks the HTTP
+projection. `usage_sink_replaces_stdout_and_postgres_inserts_one_row` writes
+and reads a Postgres usage row when `AXOND_TEST_POSTGRES` is set.
+`test("a postgres sink rejects a missing dsn, a bad table, and a batch that does not fit")`
+covers configuration refusals, not exhaustive SQL injection or bind accounting.
+There are no equivalent TS tests for every-column binding, the parameter ceiling,
+exact full row shape or whole-batch rollback across chunks; SQL-carrying table-name rejection is
+not exhaustively tested either. Do not infer those
+guarantees from the DDL test.
+A new emitted field needs a test proving it carries a non-secret identifier:
+usage rows carry credential identifiers, never material.
+
+Telemetry disclosure is held by `test("metrics drop secret and content sentinels")`,
+`test("otlp json joins traceparent and omits the prompt")`, and
+`request_log_carries_server_span_fields_and_omits_content`: emitted metrics,
+traces and request logs must omit content and secret material. Accounting
+idempotency is held by `test("ten settlements of one request_id charge once")`
+and `test("sqlite settlement is exactly once per request_id and survives reopen")`;
+duplicate execution must not double-charge, including after restart.
 
 **Threat model and ADRs.** [ADR 0007](../adr/0007-telemetry-model.md),
 [ADR 0009](../adr/0009-durable-usage-sinks.md), and
@@ -284,15 +281,10 @@ logs, spans, metrics, and usage rows carry references only. Free-form caller
 input must not become a metric attribute; that is a cardinality *and* a
 disclosure decision.
 
-A change to the *delivery guarantee* is part of this trigger too, not just a
-change to the row. The billing-grade usage outbox
-([ADR 0049](../adr/0049-billing-grade-usage-outbox.md)) puts a durable write on
-the request path for deployments that opt in, so the review question is
-availability as much as disclosure: with the defaults, an outbox that is full or
-unreachable refuses requests, and the escapes from that (`capacity_policy =
-"drop-oldest"`, `on_undurable = "serve"`) are accounted losses rather than silent
-ones. Quarantined events are deliberately not prunable: an operator's evidence
-must not be deleted to free capacity.
+A change to the *delivery guarantee* fires this trigger too. The historical
+billing-grade outbox in ADR 0049 is not implemented by the TS core. The Store
+usage insert is the charge; external usage sinks remain buffered best-effort
+delivery. Do not claim historical outbox qualification for the current process.
 
 **Release impact.** Schema changes are ordered operator work: name the DDL that
 must be applied before writers, whether mixed versions may run, and the rollback
@@ -305,11 +297,10 @@ change, not an implementation detail.
 ## 6. Actions, release permissions, attestations, and signing
 
 **Fires on** any change under `.github/workflows/`, to `ts/scripts/sign-artifact.sh`,
-`ops/docker-smoke.sh`, `ops/binary-smoke.py`, `ops/tier0-gate.sh`,
-`ops/install-musl-tools.sh`,
+`ops/docker-smoke.sh`, `ops/binary-smoke.py`,
 `ops/publish-image-index.sh`, `ops/verify-image-evidence.sh`,
-`ops/msrv-gate.sh`, `ops/api-compat.py`, `install.sh`,
-`install.ps1`, the `Dockerfile`, or `deny.toml`; a new workflow, job permission,
+`ts/scripts/check-npm-policy.ts`, `install.sh`,
+`install.ps1`, `ts/Dockerfile`; a new workflow, job permission,
 secret, or environment; a new or bumped third-party action; and any change to
 what is attested, signed, or verified.
 
@@ -341,28 +332,22 @@ that changes any part of it says which part and why. A new job that needs
 at the job, and a `pull_request_target` or workflow-run trigger on untrusted
 input is an ADR-level decision, not a workflow tweak.
 
-**Regression tests.** The release path is exercised on every change rather than
-at the tag: the TypeScript compiled-binary smoke boots the Bun executable;
-release dry-runs build and smoke binaries and images without publishing. Rust
-conformance lanes remain: `docker-smoke` and
-`quickstart-smoke` boot the Rust conformance image,
-`static-binary` proves the musl build and runs `ops/tier0-gate.sh`, the
-`openapi-smoke` dumps the generated OpenAPI 3.1 spec and typechecks a client from
-it, the
-`binary-smoke` lanes boot and serve every released target on a runner of its own
-platform and the release lanes repeat that against the archived binary, the `docs`
-lane drives both installers in dry-run with `AXOND_REQUIRE_ATTESTATION` — including
-a deliberately wrong `AXOND_REPOSITORY` and an invalid setting that must fail —
-and `ops/check-installer-download.sh` holds the installer's failure diagnostics
-apart, so a transport failure is never reported as a missing release asset —
-`dependency-policy` runs `cargo deny` with no ignore entries except
-RUSTSEC-2026-0459 (bundled SQLite in the retired Rust gateway, accepted until
-the Rust tree is removed under ADR 0069), `api-compat`
-and `msrv` hold the published surface and the floor, and `fuzz-smoke` replays the
-committed [fuzz corpora](./fuzzing.md) through the parsers reached before
-authentication. Keep the installer
-verification paths covered: an installer that can be made to skip attestation
-verification is a supply-chain regression.
+**Regression tests.** The TypeScript gateway job runs workspace tests, SDK
+compatibility and `check:npm` dependency policy. The compiled-binary smoke boots
+the Bun executable. Release dry-runs build and smoke binaries and images without
+publishing; `ops/binary-smoke.py` and `ops/docker-smoke.sh` exercise archived
+binaries and images in the release path before signing and attestation.
+The non-PR `quickstart-smoke` builds the TS image, and `openapi-smoke` generates
+the spec from TS `OPENAPI` and typechecks its client. The docs lane drives both
+installers in dry-run with `AXOND_REQUIRE_ATTESTATION`, including wrong-repository
+and invalid-setting refusals. `ops/check-installer-download.sh` distinguishes
+transport failures from missing release assets.
+Rust API-compatibility, MSRV and fuzz lanes were retired with the Rust tree under
+[ADR 0069](../adr/0069-retire-the-rust-gateway.md). TypeScript fuzz equivalents
+remain an open question; parser regression and property tests are not a claim
+of coverage-guided fuzzing.
+Keep installer verification covered: a path that bypasses attestation is a
+supply-chain regression.
 
 **Threat model and ADRs.** [ADR 0004](../adr/0004-ci-and-release-pipeline.md),
 [ADR 0025](../adr/0025-crates-io-publication.md), and
@@ -387,7 +372,7 @@ Withdrawn with [ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md). The
 stateful control plane, its principal directory, `/admin/v1`, breakglass, and
 OIDC administration no longer exist, so this trigger has no mechanism to review.
 Reintroducing an administrative surface or principal model needs a new ADR and a
-new trigger here; `admin_v1_is_unmounted` holds that the old surface stays gone.
+new trigger here; `test("withdrawn routes stay unmounted")` holds that the old surface stays gone.
 
 ## 8. TypeScript extension trust
 
@@ -395,9 +380,8 @@ new trigger here; `admin_v1_is_unmounted` holds that the old surface stays gone.
 order, `apiVersion`, migration prefix checks, the untrusted store scope, or
 `AXOND_EXTENSIONS_DIR`.
 
-**Regression tests.** The Rust authentication floor in section 1 still holds
-for the process operators run today. The TypeScript suite names the same
-floor: `unknown_gateway_key_is_rejected_before_namespace_lookup` rejects an
+**Regression tests.** The authentication floor in section 1 applies to the
+release process: `unknown_gateway_key_is_rejected_before_namespace_lookup` rejects an
 unknown gateway key before it reads a namespace;
 `noncanonical_namespace_path_is_invalid_after_authentication` refuses a
 percent-encoded namespace segment without echoing it;
@@ -419,11 +403,10 @@ while omitting secret values.
 **Threat model and ADRs.** [ADR 0066](../adr/0066-typescript-hono-extension-contract.md)
 is the decision: extensions are operator and first-party code with no
 third-party isolation boundary. Trusted extensions see the process store.
-Untrusted ones see only the request namespace. The Rust binary's static-key
-boundary is unchanged until a later minor ships the TypeScript artifact.
+Untrusted ones see only the request namespace. The static-key boundary is the TypeScript gateway's compiled outer boundary.
 
-**Release impact.** None for the Rust release binary. The TypeScript process
-is an additional artifact.
+**Release impact.** Extensions run inside the sole release process. Changes to
+extension loading or trust affect the supported TypeScript artifact.
 
 ## Recording the review
 

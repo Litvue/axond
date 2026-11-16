@@ -1,7 +1,7 @@
 """A fake provider upstream serving the committed wire fixtures.
 
-The Python twin of ``crates/gateway/tests/support/upstream.rs``: same fixtures,
-same target-model vocabulary, so the SDK lane and the Rust lane qualify the
+The Python twin of ``tests/compat-ts/src/fakeUpstream.ts``: same fixtures,
+same target-model vocabulary, so both SDK lanes qualify the
 gateway against identical bytes (ADR 0014).
 """
 

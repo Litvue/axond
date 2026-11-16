@@ -28,10 +28,10 @@ source .cursor/skills/verify-axond/helpers/env.sh
 
 What launch actually does:
 
-1. `cargo build -p axond --locked` if `target/debug/axond` is missing (toolchain is `rust-toolchain.toml`).
+1. Uses `ts/bin/axond` (Node 22.14.0); install dependencies first with `(cd ts && npm ci)`.
 2. Claims two free loopback ports (gateway + fixture upstream). Never binds `:8080`.
 3. Writes a throwaway TOML + SQLite under `target/verify-axond/runs/<run-id>/`.
-4. Starts `helpers/fake-upstream.py` (committed wire fixtures from `tests/fixtures/`) then `target/debug/axond`.
+4. Starts `helpers/fake-upstream.py` (committed wire fixtures from `tests/fixtures/`) then `ts/bin/axond`.
 5. Does **not** publish a period budget. Inference is fail-closed until a recipe `PUT`s one.
 
 Placeholder env (always these values; they are not production secrets):
@@ -55,11 +55,16 @@ Isolation: two launched runs may share a host. Each has its own bind, sqlite fil
 Read-only. Passes only when all of these hold:
 
 - `target/verify-axond/runs/<id>/run.env` exists (this run was launched by `launch.sh`).
-- The recorded axond PID is alive and its `/proc/<pid>/exe` is `target/debug/axond`.
+- The recorded axond PID is alive and owns the expected gateway process.
 - That PID owns `127.0.0.1:<gateway-port>` in listen state.
 - `AXOND_CONFIG` in the process environment is this run's TOML.
 - `GET /healthz` → body `ok`; `GET /readyz` → body `ready`.
 - `axond --version` matches the version recorded at launch.
+
+Known limitation: the current doctor's `/proc/<pid>/exe` check expects a native
+binary, while `ts/bin/axond` launches Node. It will reject that executable path.
+Do not claim a green doctor or bypass this guard; the helper needs a separate
+runtime-aware identity fix before it can provide a passing TS proof.
 
 If anything looks off, run doctor before guessing. A green Compose stack on `:8080` is not this instance.
 
@@ -100,7 +105,7 @@ Proof lives in `target/verify-axond/evidence/<run-id>/` and **must survive clean
 
 Required for a passing proof:
 
-- The real user path: HTTP to the listening replica, not internal setters, not `cargo test`, not test-only routers.
+- The real user path: HTTP to the listening replica, not internal setters, not unit tests, not test-only routers.
 - The action and the resulting state: `drive/<step>/request.txt` plus `status` plus `response.body`.
 - Side effects alongside the HTTP body:
   - Store: `python3 .cursor/skills/verify-axond/helpers/store-get.py --sqlite "$AXOND_VERIFY_SQLITE" --namespaces` or `--budget <ns> <period>` (tables `axond_namespace`, `axond_store_budget`).

@@ -26,7 +26,7 @@ platform_models_file="${probe_dir}/platform-models"
 acme_models_file="${probe_dir}/acme-models"
 unauth_file="${probe_dir}/unauth"
 chat_file="${probe_dir}/chat"
-# The gateway default is 30,000 ms (crates/gateway/src/config.rs). Keep the
+# The gateway default is 30,000 ms (ts/packages/gateway/src/config.ts). Keep the
 # client deadline five seconds beyond it so typed transport errors can surface.
 gateway_overall_timeout_ms=30000
 chat_timeout_seconds=$((gateway_overall_timeout_ms / 1000 + 5))

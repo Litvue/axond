@@ -2,7 +2,9 @@
 # pulling the released image used by the public quickstart.
 services:
   axond:
-    build: .
+    build:
+      context: ./ts
+      dockerfile: Dockerfile
     image: axond:quickstart
     # A source build is not constrained by what any release published: the
     # Dockerfile builds either architecture natively, so this stays unpinned even

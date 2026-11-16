@@ -1,6 +1,4 @@
-/target
-**/*.rs.bk
-*.pdb
+/target/
 
 # Local config / secrets — never commit real keys
 /axond.toml

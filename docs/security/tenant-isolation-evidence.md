@@ -1,28 +1,22 @@
-# Tenant isolation: what is proven, and where
+# Tenant isolation: current evidence
 
-Isolation between tenants is the property axond is most expected to hold. This
-page maps each part of it to the mechanism that enforces it and the test that
-would fail if it stopped. The tenant unit is the namespace: an API-created row
-in the store, selected by the canonical `/ns/{ns}/v1` path
-([ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md)).
+TypeScript is the sole implementation under
+[ADR 0069](../adr/0069-retire-the-rust-gateway.md). The tenant unit is the namespace
+selected from the canonical `/ns/{ns}/v1` path after static-key authentication.
+The static key is deployment-wide, not a per-tenant authorization credential.
 
-## The layers
-
-| Layer | Mechanism | Where the evidence is |
+| Layer | Mechanism | Evidence owner under `ts/packages/` |
 | --- | --- | --- |
-| Routing | The namespace comes from the authenticated `/ns/{ns}/v1` path, and an unknown namespace is refused before dispatch | `routes::auth`, `routes::mod` |
-| Credentials | Pool lookup is keyed on the caller's namespace; platform fallback is explicit and attributed | `credentials` |
-| Store | Namespace, budget, and usage rows are keyed on the namespace | `store::sqlite`, `store::postgres` |
-| Runtime | Catalogue, credential selection, and accounting are keyed on the caller's namespace | `routes::mod` unit tests |
+| Authentication | Reject unknown keys before namespace lookup; reject noncanonical paths | `gateway/src/app-routes-and-validation.test.ts` |
+| Credentials | Own BYOK pool, explicit platform fallback, non-secret status labels | `gateway/src/query.test.ts` |
+| Store | Namespace/period usage grouping; incarnation rejects late settlement after recreation | `gateway/src/app-budgets-and-accounting.test.ts`, `cli/src/sqlite-store.test.ts`, `cli/src/postgres-store.test.ts` |
+| Extensions | Untrusted queries require request namespace; optional store rate limiter isolates counters | `gateway/src/app-recovery-and-openapi.test.ts`, `rate-limit/src/index.test.ts` |
 
-## Withdrawn layers
+See [threat-model triggers](./threat-model-review.md) for exact current test names
+and gaps. Credential-status tests are not full inference-dispatch isolation
+evidence. Per-tenant concurrency admission is not in core.
 
-The control-plane layers this page used to map (tenant and project domain
-scopes, the administrative authorization service, row-level security, and the
-tenancy constraints in the control-plane SQL) were withdrawn with
-[ADR 0063](../adr/0063-stateful-only-namespaced-gateway.md) and have no
-mechanism left to test. So was the binary-level isolation suite
-(`crates/gateway/tests/tenant_isolation.rs`): it exercised per-key namespace
-isolation, minted tokens, and per-namespace aliases, none of which the one
-static gateway key has.
-
+The control-plane and minted-token isolation suite was withdrawn under ADR 0063.
+Remaining Rust harnesses were removed under ADR 0069. Historical qualification
+does not prove these properties for the TS process; Postgres tests require their
+configured service and skipped tests are not passing evidence.

@@ -8,7 +8,7 @@ VERIFY_AXOND_HELPERS="$(cd "$(dirname "$_verify_axond_this")" && pwd)"
 VERIFY_AXOND_SKILL="$(cd "$VERIFY_AXOND_HELPERS/.." && pwd)"
 VERIFY_AXOND_REPO="$(cd "$VERIFY_AXOND_SKILL/../../.." && pwd)"
 VERIFY_AXOND_ROOT="${VERIFY_AXOND_REPO}/target/verify-axond"
-VERIFY_AXOND_BINARY="${VERIFY_AXOND_REPO}/target/debug/axond"
+VERIFY_AXOND_BINARY="${VERIFY_AXOND_REPO}/ts/bin/axond"
 
 verify_axond_run_id() {
   if [[ -n "${AXOND_VERIFY_RUN:-}" ]]; then

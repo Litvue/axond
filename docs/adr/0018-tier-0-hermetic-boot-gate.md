@@ -4,6 +4,8 @@ Date: 2026-08-09
 
 ## Status
 
+Superseded by [ADR 0069](./0069-retire-the-rust-gateway.md); the Rust gate was removed.
+
 Accepted historically. Amended by
 [ADR 0063](./0063-stateful-only-namespaced-gateway.md): the gate still runs,
 but it boots a temp SQLite file. It is not a no-datastore promise.

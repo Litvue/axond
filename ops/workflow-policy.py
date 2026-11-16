@@ -48,13 +48,6 @@ ANCHORED_IDENTITY = re.compile(r"^\s*SIGNER_IDENTITY:\s*\^.+\$\s*$")
 # of this list, which is the point.
 KEY_VERIFY_FILES = frozenset({"ops/check-cosign-format.sh"})
 
-ACTIONS_ENDURANCE_WORKFLOW = ".github/workflows/endurance.yml"
-ACTIONS_ENDURANCE_MAX_JOB_MINUTES = 15
-ACTIONS_ENDURANCE_SMOKE_JOBS = {
-    "endurance": "the_endurance_smoke_tier_qualifies_and_publishes_its_evidence",
-}
-
-
 def workflows(root: Path) -> list[Path]:
     directory = root / ".github" / "workflows"
     return sorted(p for p in directory.glob("*.y*ml") if p.is_file())
@@ -243,60 +236,6 @@ def check_signer_identity(text: str, relative: str) -> list[str]:
     return failures
 
 
-def check_musl_installer(text: str, relative: str) -> list[str]:
-    """Every Linux-musl lane uses the same bounded package-manager path."""
-    expected_steps = {
-        ".github/workflows/ci.yml": 2,
-        ".github/workflows/release-please.yml": 0,
-    }
-
-    lines = text.splitlines()
-    blocks: list[tuple[int, str]] = []
-    for index, line in enumerate(lines):
-        match = re.match(r"^(\s*)- name:\s*Install musl tools\s*$", line)
-        if not match:
-            continue
-        indent = match.group(1)
-        end = index + 1
-        while end < len(lines) and not lines[end].startswith(f"{indent}- "):
-            end += 1
-        blocks.append((index + 1, "\n".join(lines[index:end])))
-
-    failures: list[str] = []
-    expected = expected_steps.get(relative)
-    if expected is not None and len(blocks) != expected:
-        failures.append(
-            f"{relative}: expected {expected} bounded musl install step(s), found "
-            f"{len(blocks)}"
-        )
-    for number, block in blocks:
-        if not re.search(
-            r"^\s*run:\s*bash ops/install-musl-tools\.sh\s*$", block, re.MULTILINE
-        ):
-            failures.append(
-                f"{relative}:{number}: musl install must use the shared bounded "
-                "ops/install-musl-tools.sh path"
-            )
-        timeout = re.search(r"^\s*timeout-minutes:\s*(\d+)\s*$", block, re.MULTILINE)
-        if not timeout or int(timeout.group(1)) != 25:
-            failures.append(
-                f"{relative}:{number}: musl install needs the reviewed 25-minute "
-                "outer timeout that its inner-budget self-test targets"
-            )
-        if re.search(r"^\s*continue-on-error:\s*true\s*$", block, re.MULTILINE):
-            failures.append(
-                f"{relative}:{number}: musl installation must remain fail-closed"
-            )
-
-    for number, line in enumerate(lines, 1):
-        if re.search(r"apt-get[^\n]*musl-tools", line):
-            failures.append(
-                f"{relative}:{number}: inline musl-tools installation bypasses the "
-                "shared timeout and retry policy"
-            )
-    return failures
-
-
 def nested_block(lines: list[str], start: int, indent: int) -> list[str]:
     """Return the lines nested below one line at `indent` spaces."""
     end = start + 1
@@ -333,71 +272,6 @@ def dispatch_block(text: str) -> list[str]:
     return []
 
 
-def check_actions_endurance_budget(root: Path) -> list[str]:
-    """GitHub Actions may exercise endurance smoke, never a configurable soak."""
-    relative = ACTIONS_ENDURANCE_WORKFLOW
-    path = root / relative
-    if not path.is_file():
-        return [f"{relative}: Actions endurance smoke workflow is missing"]
-    text = path.read_text(encoding="utf-8")
-    failures: list[str] = []
-
-    for marker in (
-        "_soak_tier_",
-        "ENDURANCE_DURATION_MS",
-        "43200000",
-        "qualification-evidence.py",
-        "promote-qualification.py",
-        "qualification-record",
-    ):
-        if marker in text:
-            failures.append(
-                f"{relative}: Actions endurance workflow contains soak-only "
-                f"marker {marker!r}"
-            )
-
-    dispatch = dispatch_block(text)
-    for line in dispatch:
-        match = re.match(r"^      ([A-Za-z0-9_-]+):\s*$", line)
-        if match and re.search(
-            r"(?:duration|hours?|minutes?|soak)", match.group(1), re.IGNORECASE
-        ):
-            failures.append(
-                f"{relative}: Actions endurance must not expose duration-like "
-                f"workflow_dispatch input {match.group(1)!r}"
-            )
-
-    jobs = named_blocks(text, "jobs")
-    unexpected = sorted(set(jobs) - set(ACTIONS_ENDURANCE_SMOKE_JOBS))
-    if unexpected:
-        failures.append(
-            f"{relative}: Actions endurance workflow has non-smoke jobs {unexpected}"
-        )
-    for job, smoke_test in ACTIONS_ENDURANCE_SMOKE_JOBS.items():
-        block = jobs.get(job)
-        if block is None:
-            failures.append(f"{relative}: endurance smoke job {job!r} is missing")
-            continue
-        body = "\n".join(block)
-        timeout = re.search(r"(?m)^    timeout-minutes:\s*(\d+)\s*$", body)
-        if timeout is None:
-            failures.append(
-                f"{relative}: endurance smoke job {job!r} needs an explicit "
-                f"{ACTIONS_ENDURANCE_MAX_JOB_MINUTES}-minute timeout"
-            )
-        elif int(timeout.group(1)) > ACTIONS_ENDURANCE_MAX_JOB_MINUTES:
-            failures.append(
-                f"{relative}: endurance smoke job {job!r} timeout exceeds "
-                f"{ACTIONS_ENDURANCE_MAX_JOB_MINUTES} minutes"
-            )
-        if smoke_test not in body:
-            failures.append(
-                f"{relative}: endurance smoke job {job!r} does not invoke "
-                f"{smoke_test}"
-            )
-    return failures
-
-
 def check(root: Path) -> list[str]:
     files = workflows(root)
     if not files:
@@ -412,7 +286,6 @@ def check(root: Path) -> list[str]:
         failures.extend(check_permissions(text, relative))
         failures.extend(check_signer_identity(text, relative))
         failures.extend(check_cosign_verify(text, relative))
-        failures.extend(check_musl_installer(text, relative))
         for action, sha, comment, where in pins:
             first = seen.setdefault(action, (sha, comment, where))
             if first[0] != sha:
@@ -433,7 +306,6 @@ def check(root: Path) -> list[str]:
     # without carrying Axond's release documents. A real checkout always has
     # RELEASE.md, which turns on the repository-specific transition contract.
     if (root / "RELEASE.md").is_file():
-        failures.extend(check_actions_endurance_budget(root))
         release = runpy.run_path(str(Path(__file__).with_name("check-release-config.py")))
         failures.extend(release["check_ts_release"]((root / ".github/workflows/release-please.yml").read_text()))
         failures.extend(release["check_product_versions"](root))
@@ -542,147 +414,6 @@ def self_test() -> list[str]:
         ),
     ]
     problems: list[str] = []
-
-    with tempfile.TemporaryDirectory() as raw:
-        root = Path(raw)
-        workflow_dir = root / ".github" / "workflows"
-        workflow_dir.mkdir(parents=True)
-        actions_smoke = (
-            "name: Endurance smoke\n"
-            "on:\n"
-            "  workflow_dispatch:\n"
-            "    inputs:\n"
-            "      note:\n"
-            "        type: string\n"
-            "permissions:\n  contents: read\n"
-            "jobs:\n"
-            "  endurance:\n"
-            "    timeout-minutes: 15\n"
-            "    steps:\n"
-            "      - run: cargo test the_endurance_smoke_tier_qualifies_and_publishes_its_evidence\n"
-        )
-        endurance = root / ".github/workflows/endurance.yml"
-        endurance.parent.mkdir(parents=True, exist_ok=True)
-        endurance.write_text(actions_smoke, encoding="utf-8")
-        failures = check_actions_endurance_budget(root)
-        if failures:
-            problems.append(
-                f"self-test: bounded Actions endurance smoke was rejected: {failures}"
-            )
-
-        endurance.write_text(
-            actions_smoke.replace(
-                "    inputs:\n",
-                "    inputs:\n"
-                "      duration_ms:\n"
-                "        default: '43200000'\n"
-                "        type: string\n",
-                1,
-            ),
-            encoding="utf-8",
-        )
-        failures = check_actions_endurance_budget(root)
-        if not any("duration-like" in failure for failure in failures):
-            problems.append(
-                "self-test: a twelve-hour Actions endurance input/default was accepted"
-            )
-
-        endurance.write_text(
-            actions_smoke.replace("    timeout-minutes: 15\n", "    timeout-minutes: 16\n", 1),
-            encoding="utf-8",
-        )
-        failures = check_actions_endurance_budget(root)
-        if not any("timeout exceeds 15 minutes" in failure for failure in failures):
-            problems.append(
-                "self-test: an Actions endurance job over fifteen minutes was accepted"
-            )
-
-        endurance.write_text(
-            actions_smoke.replace(
-                "the_endurance_smoke_tier_qualifies_and_publishes_its_evidence",
-                "the_endurance_soak_tier_qualifies_and_publishes_its_evidence",
-                1,
-            ),
-            encoding="utf-8",
-        )
-        failures = check_actions_endurance_budget(root)
-        if not any("does not invoke" in failure for failure in failures):
-            problems.append(
-                "self-test: an Actions endurance soak entry point was accepted"
-            )
-
-    good_musl = (
-        "jobs:\n"
-        "  static:\n"
-        "    steps:\n"
-        "      - name: Install musl tools\n"
-        "        timeout-minutes: 25\n"
-        "        run: bash ops/install-musl-tools.sh\n"
-        "  smoke:\n"
-        "    steps:\n"
-        "      - name: Install musl tools\n"
-        "        if: matrix.musl\n"
-        "        timeout-minutes: 25\n"
-        "        run: bash ops/install-musl-tools.sh\n"
-    )
-    musl_cases = [
-        ("shared bounded CI installers", ".github/workflows/ci.yml", good_musl, ""),
-        (
-            "a TS release without Rust musl installation",
-            ".github/workflows/release-please.yml",
-            "jobs:\n  release:\n    steps:\n",
-            "",
-        ),
-        (
-            "an inline apt installer",
-            ".github/workflows/ci.yml",
-            good_musl.replace(
-                "run: bash ops/install-musl-tools.sh",
-                "run: sudo apt-get install -y musl-tools",
-                1,
-            ),
-            "shared bounded",
-        ),
-        (
-            "a missing outer timeout",
-            ".github/workflows/ci.yml",
-            good_musl.replace("        timeout-minutes: 25\n", "", 1),
-            "reviewed 25-minute",
-        ),
-        (
-            "an outer timeout shorter than the reviewed budget",
-            ".github/workflows/ci.yml",
-            good_musl.replace("        timeout-minutes: 25\n", "        timeout-minutes: 20\n", 1),
-            "reviewed 25-minute",
-        ),
-        (
-            "only one musl lane",
-            ".github/workflows/ci.yml",
-            good_musl.split("  smoke:\n", 1)[0],
-            "found 1",
-        ),
-        (
-            "an obsolete release Rust musl installer",
-            ".github/workflows/release-please.yml",
-            good_musl,
-            "found 2",
-        ),
-        (
-            "an inline install in another workflow",
-            ".github/workflows/other.yml",
-            "jobs:\n  job:\n    steps:\n"
-            "      - run: sudo apt-get install -y musl-tools\n",
-            "inline musl-tools",
-        ),
-    ]
-    for description, relative, body, expected in musl_cases:
-        failures = check_musl_installer(body, relative)
-        if expected and not any(expected in failure for failure in failures):
-            problems.append(
-                f"self-test: {description} was not rejected for {expected!r}: {failures}"
-            )
-        if not expected and failures:
-            problems.append(f"self-test: {description} was rejected: {failures}")
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
