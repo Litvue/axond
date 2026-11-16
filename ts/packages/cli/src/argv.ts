@@ -26,12 +26,13 @@ export function helpText(bin: string): string {
 /**
  * Node and `bun file.ts` put the runtime in `argv[0]` and this file in
  * `argv[1]`. A compiled Bun binary keeps `argv[0]` as `bun` and `argv[1]` as
- * `/$bunfs/root/<entry>`; the file the operator invoked is `execPath`.
+ * `/$bunfs/root/<entry>` (`B:/~BUN/root/<entry>` on Windows); the file the
+ * operator invoked is `execPath`.
  */
 export function cliArguments(argv: readonly string[], execPath = ""): readonly string[] {
   const invoked = basename(argv[0] ?? "");
   const script = argv[1];
-  if (argv[0] === "bun" && script?.startsWith("/$bunfs/")) {
+  if (argv[0] === "bun" && script !== undefined && isBunfsEntry(script)) {
     return [usageBin(execPath), ...argv.slice(2)];
   }
   if (
@@ -42,6 +43,10 @@ export function cliArguments(argv: readonly string[], execPath = ""): readonly s
     return ["axond", ...argv.slice(2)];
   }
   return argv.length > 0 ? argv : ["axond"];
+}
+
+function isBunfsEntry(script: string): boolean {
+  return script.startsWith("/$bunfs/") || script.startsWith("B:/~BUN/") || script.startsWith("B:\\~BUN\\");
 }
 
 /** Clap 4.6.6 with `std`, `help`, `usage`, and `error-context`, and no other flags. */

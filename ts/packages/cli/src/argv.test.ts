@@ -153,6 +153,8 @@ test("argv_matches_clap_before_config_load", async () => {
     "--version",
   ]);
   assert.deepEqual(cliArguments(["bun", "/$bunfs/root/axond", "mint"], "/opt/bin/axond"), ["axond", "mint"]);
+  assert.deepEqual(cliArguments(["bun", "B:/~BUN/root/axond"], "C:/bin/axond.exe"), ["axond.exe"]);
+  assert.deepEqual(cliArguments(["bun", "B:\\~BUN\\root\\axond", "-V"], "C:/bin/axond.exe"), ["axond.exe", "-V"]);
   assert.deepEqual(parseArgv(cliArguments(["bun", "/$bunfs/root/axond", "--help"], "/tmp/axond-ts/axond")), {
     action: "stdout",
     code: 0,

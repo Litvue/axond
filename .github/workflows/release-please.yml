@@ -489,7 +489,7 @@ jobs:
             x86_64-unknown-linux-musl) args+=(--target=bun-linux-x64-musl) ;;
             aarch64-unknown-linux-musl) args+=(--target=bun-linux-arm64-musl) ;;
           esac
-          bun build packages/cli/src/main.ts --compile "${args[@]}" --outfile ../release-bin/axond
+          bun build packages/cli/src/main.ts --compile ${args[@]+"${args[@]}"} --outfile ../release-bin/axond
       - name: Package the Unix binary
         if: runner.os != 'Windows'
         shell: bash
